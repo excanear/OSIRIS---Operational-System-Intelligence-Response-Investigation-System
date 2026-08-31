@@ -54,6 +54,16 @@ pub trait AuditLog {
 /// (ARCHITECTURE.md §22/§17.2). Stands in for the control-plane store's
 /// audit table until osiris-storage exists (Phase 1); the `AuditLog` trait
 /// is the seam that migration happens behind.
+///
+/// Single-writer-per-path: this type provides no cross-process locking
+/// (only an in-process Mutex). If two FileAuditLog instances — in the same
+/// or different processes — hold the same path open and both call
+/// `append` concurrently, the hash chain can silently fork (both read the
+/// same tail hash before either writes). ARCHITECTURE.md §22 describes
+/// osiris-audit as used by both the Agent and Server processes; a later
+/// phase must either give each process its own audit log file, or add
+/// real cross-process locking (e.g. O_APPEND + advisory flock) before two
+/// processes share one path.
 pub struct FileAuditLog {
     path: PathBuf,
     lock: Mutex<()>,
@@ -212,6 +222,18 @@ impl AuditLog for FileAuditLog {
         Ok(entries)
     }
 
+    /// Verifies the hash chain's internal consistency: detects any modification
+    /// to a stored entry's fields, and detects reordering (since each entry's
+    /// prev_entry_hash must match its predecessor's entry_hash). Does NOT detect
+    /// truncation — deleting the most recent N entries from the file produces a
+    /// chain that still verifies successfully from genesis, since nothing in
+    /// the file records the expected chain length or a sealed head. Does NOT
+    /// prevent a full log rewrite by an attacker with write access to the file,
+    /// since the chain is unkeyed (anyone can recompute it from genesis) —
+    /// this matches ARCHITECTURE.md §17.2's acknowledgment that the audit
+    /// mechanism is "not preventable at the OS level alone." A future phase
+    /// should add a separately-persisted head pointer/entry count to close the
+    /// truncation gap.
     fn verify_chain(&self) -> Result<(), AuditLogError> {
         let entries = self.read_all()?;
         let mut expected_prev = GENESIS_HASH.to_string();
