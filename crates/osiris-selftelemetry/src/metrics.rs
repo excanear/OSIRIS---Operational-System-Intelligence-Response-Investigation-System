@@ -37,11 +37,13 @@ impl MetricsRegistry {
             return c.clone();
         }
         let mut counters = self.counters.write().unwrap();
-        counters.entry(name.to_string()).or_insert_with(Counter::default).clone()
+        counters.entry(name.to_string()).or_default().clone()
     }
 
     pub fn snapshot(&self) -> HashMap<String, u64> {
-        self.counters.read().unwrap()
+        self.counters
+            .read()
+            .unwrap()
             .iter()
             .map(|(k, v)| (k.clone(), v.get()))
             .collect()

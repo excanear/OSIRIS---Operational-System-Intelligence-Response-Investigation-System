@@ -37,11 +37,20 @@ mod tests {
     #[test]
     fn failed_outranks_degraded_outranks_healthy() {
         assert!(
-            HealthState::Failed { last_error: "x".into() }.severity_rank()
-                > HealthState::Degraded { last_error: "x".into() }.severity_rank()
+            HealthState::Failed {
+                last_error: "x".into()
+            }
+            .severity_rank()
+                > HealthState::Degraded {
+                    last_error: "x".into()
+                }
+                .severity_rank()
         );
         assert!(
-            HealthState::Degraded { last_error: "x".into() }.severity_rank()
+            HealthState::Degraded {
+                last_error: "x".into()
+            }
+            .severity_rank()
                 > HealthState::Healthy.severity_rank()
         );
     }

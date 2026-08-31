@@ -67,7 +67,10 @@ pub struct FileRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum NetworkDirection { Inbound, Outbound }
+pub enum NetworkDirection {
+    Inbound,
+    Outbound,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkRef {
@@ -127,7 +130,10 @@ pub struct NamespaceRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CgroupVersion { V1, V2 }
+pub enum CgroupVersion {
+    V1,
+    V2,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CgroupRef {

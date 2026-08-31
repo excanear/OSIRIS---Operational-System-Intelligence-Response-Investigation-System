@@ -14,17 +14,33 @@ pub const GENESIS_HASH: &str = "000000000000000000000000000000000000000000000000
 #[derive(Debug, thiserror::Error)]
 pub enum AuditLogError {
     #[error("failed to open audit log at {path}: {source}")]
-    Open { path: PathBuf, #[source] source: std::io::Error },
+    Open {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to read audit log at {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to deserialize audit entry from {path}: {source}")]
-    ReadEntry { path: PathBuf, #[source] source: serde_json::Error },
+    ReadEntry {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to write audit entry: {0}")]
     Write(#[from] std::io::Error),
     #[error("failed to serialize/deserialize audit entry: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("audit chain broken at entry {audit_id}: expected hash {expected}, found {found}")]
-    ChainBroken { audit_id: Uuid, expected: String, found: String },
+    ChainBroken {
+        audit_id: Uuid,
+        expected: String,
+        found: String,
+    },
 }
 
 pub trait AuditLog {
@@ -49,13 +65,22 @@ impl FileAuditLog {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|source| AuditLogError::Open { path: path.clone(), source })?;
-        Ok(Self { path, lock: Mutex::new(()) })
+            .map_err(|source| AuditLogError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            path,
+            lock: Mutex::new(()),
+        })
     }
 
     fn last_hash(&self) -> Result<String, AuditLogError> {
         let entries = self.read_all()?;
-        Ok(entries.last().map(|e| e.entry_hash.clone()).unwrap_or_else(|| GENESIS_HASH.to_string()))
+        Ok(entries
+            .last()
+            .map(|e| e.entry_hash.clone())
+            .unwrap_or_else(|| GENESIS_HASH.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -87,10 +112,19 @@ impl AuditLog for FileAuditLog {
         let _guard = self.lock.lock().unwrap();
         let prev_entry_hash = self.last_hash()?;
         let audit_id = Uuid::now_v7();
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         let entry_hash = Self::compute_hash(
-            &prev_entry_hash, audit_id, timestamp, &new_entry.who, &new_entry.what,
-            &new_entry.target, &new_entry.why, new_entry.result,
+            &prev_entry_hash,
+            audit_id,
+            timestamp,
+            &new_entry.who,
+            &new_entry.what,
+            &new_entry.target,
+            &new_entry.why,
+            new_entry.result,
         );
         let entry = AuditEntry {
             audit_id,
@@ -106,23 +140,35 @@ impl AuditLog for FileAuditLog {
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.path)
-            .map_err(|source| AuditLogError::Open { path: self.path.clone(), source })?;
+            .map_err(|source| AuditLogError::Open {
+                path: self.path.clone(),
+                source,
+            })?;
         writeln!(file, "{}", serde_json::to_string(&entry)?)?;
         Ok(entry)
     }
 
     fn read_all(&self) -> Result<Vec<AuditEntry>, AuditLogError> {
-        let file = File::open(&self.path)
-            .map_err(|source| AuditLogError::Open { path: self.path.clone(), source })?;
+        let file = File::open(&self.path).map_err(|source| AuditLogError::Open {
+            path: self.path.clone(),
+            source,
+        })?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
         for line in reader.lines() {
-            let line = line.map_err(|source| AuditLogError::Read { path: self.path.clone(), source })?;
+            let line = line.map_err(|source| AuditLogError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
             if line.trim().is_empty() {
                 continue;
             }
-            entries.push(serde_json::from_str(&line)
-                .map_err(|source| AuditLogError::ReadEntry { path: self.path.clone(), source })?);
+            entries.push(serde_json::from_str(&line).map_err(|source| {
+                AuditLogError::ReadEntry {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?);
         }
         Ok(entries)
     }
@@ -139,8 +185,14 @@ impl AuditLog for FileAuditLog {
                 });
             }
             let recomputed = Self::compute_hash(
-                &entry.prev_entry_hash, entry.audit_id, entry.timestamp, &entry.who,
-                &entry.what, &entry.target, &entry.why, entry.result,
+                &entry.prev_entry_hash,
+                entry.audit_id,
+                entry.timestamp,
+                &entry.who,
+                &entry.what,
+                &entry.target,
+                &entry.why,
+                entry.result,
             );
             if recomputed != entry.entry_hash {
                 return Err(AuditLogError::ChainBroken {
@@ -175,14 +227,18 @@ mod tests {
             target: "agent.yaml".to_string(),
             why: None,
             result: AuditResult::Success,
-        }).unwrap();
+        })
+        .unwrap();
         log.append(NewAuditEntry {
-            who: ActorRef::User { user_id: Uuid::new_v4() },
+            who: ActorRef::User {
+                user_id: Uuid::new_v4(),
+            },
             what: "rule_disable".to_string(),
             target: "rule:suspicious_execution_chain".to_string(),
             why: Some("false positive under investigation".to_string()),
             result: AuditResult::Success,
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(log.verify_chain().is_ok());
         assert_eq!(log.read_all().unwrap().len(), 2);
@@ -197,14 +253,18 @@ mod tests {
             target: "agent.yaml".to_string(),
             why: None,
             result: AuditResult::Success,
-        }).unwrap();
+        })
+        .unwrap();
 
         let path = dir.path().join("audit.jsonl");
         let contents = std::fs::read_to_string(&path).unwrap();
         let tampered = contents.replace("config_reload", "config_wipe");
         std::fs::write(&path, tampered).unwrap();
 
-        assert!(matches!(log.verify_chain(), Err(AuditLogError::ChainBroken { .. })));
+        assert!(matches!(
+            log.verify_chain(),
+            Err(AuditLogError::ChainBroken { .. })
+        ));
     }
 
     #[test]
@@ -222,7 +282,8 @@ mod tests {
             target: "agent.yaml".to_string(),
             why: None,
             result: AuditResult::Success,
-        }).unwrap();
+        })
+        .unwrap();
 
         let path = dir.path().join("audit.jsonl");
         // Corrupt the JSON by truncating it mid-entry
@@ -238,8 +299,11 @@ mod tests {
         // Verify the error message includes the path
         let err_msg = format!("{}", err.unwrap_err());
         let path_str = path.to_string_lossy();
-        assert!(err_msg.contains(&path_str.to_string()),
-                "error message should include path, got: {}", err_msg);
+        assert!(
+            err_msg.contains(&path_str.to_string()),
+            "error message should include path, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -251,7 +315,8 @@ mod tests {
             target: "agent.yaml".to_string(),
             why: None,
             result: AuditResult::Success,
-        }).unwrap();
+        })
+        .unwrap();
 
         let path = dir.path().join("audit.jsonl");
         // Write corrupted JSON to trigger parse error
@@ -259,10 +324,18 @@ mod tests {
 
         let err = log.read_all();
         let is_read_entry_err = matches!(err, Err(AuditLogError::ReadEntry { .. }));
-        assert!(is_read_entry_err, "expected ReadEntry error, got: {:?}", err);
+        assert!(
+            is_read_entry_err,
+            "expected ReadEntry error, got: {:?}",
+            err
+        );
 
         // Verify path is in the error message
-        if let Err(AuditLogError::ReadEntry { path: err_path, source: _ }) = err {
+        if let Err(AuditLogError::ReadEntry {
+            path: err_path,
+            source: _,
+        }) = err
+        {
             assert_eq!(err_path, path, "error should contain the file path");
         } else {
             panic!("expected ReadEntry variant with path");

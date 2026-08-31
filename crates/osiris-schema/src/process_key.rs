@@ -43,7 +43,9 @@ impl<'de> Deserialize<'de> for ProcessKey {
         let s = String::deserialize(deserializer)?;
         let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
         if bytes.len() != 16 {
-            return Err(serde::de::Error::custom("process_key must decode to 16 bytes"));
+            return Err(serde::de::Error::custom(
+                "process_key must decode to 16 bytes",
+            ));
         }
         let mut array = [0u8; 16];
         array.copy_from_slice(&bytes);

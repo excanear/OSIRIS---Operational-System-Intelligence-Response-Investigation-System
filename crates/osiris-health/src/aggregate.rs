@@ -26,12 +26,17 @@ impl HealthAggregator {
     }
 
     pub fn aggregate(&self) -> AgentHealth {
-        let worst = self.sensors.iter()
+        let worst = self
+            .sensors
+            .iter()
             .map(|s| &s.state)
             .max_by_key(|state| state.severity_rank())
             .cloned()
             .unwrap_or(HealthState::Healthy);
-        AgentHealth { state: worst, sensors: self.sensors.clone() }
+        AgentHealth {
+            state: worst,
+            sensors: self.sensors.clone(),
+        }
     }
 }
 
@@ -56,7 +61,9 @@ mod tests {
         });
         agg.record_sensor(SensorHealth {
             sensor_name: "network".into(),
-            state: HealthState::Failed { last_error: "eBPF load failure: verifier rejected program".into() },
+            state: HealthState::Failed {
+                last_error: "eBPF load failure: verifier rejected program".into(),
+            },
             events_processed: 0,
             last_event_at: None,
         });
@@ -69,16 +76,24 @@ mod tests {
     fn re_recording_a_sensor_replaces_its_entry() {
         let mut agg = HealthAggregator::new();
         agg.record_sensor(SensorHealth {
-            sensor_name: "exec".into(), state: HealthState::Healthy,
-            events_processed: 1, last_event_at: Some(1),
+            sensor_name: "exec".into(),
+            state: HealthState::Healthy,
+            events_processed: 1,
+            last_event_at: Some(1),
         });
         agg.record_sensor(SensorHealth {
             sensor_name: "exec".into(),
-            state: HealthState::Degraded { last_error: "queue overflow: dropped 12 events".into() },
-            events_processed: 2, last_event_at: Some(2),
+            state: HealthState::Degraded {
+                last_error: "queue overflow: dropped 12 events".into(),
+            },
+            events_processed: 2,
+            last_event_at: Some(2),
         });
         let health = agg.aggregate();
         assert_eq!(health.sensors.len(), 1);
-        assert!(matches!(health.sensors[0].state, HealthState::Degraded { .. }));
+        assert!(matches!(
+            health.sensors[0].state,
+            HealthState::Degraded { .. }
+        ));
     }
 }

@@ -5,11 +5,23 @@ use uuid::Uuid;
 #[derive(Debug, thiserror::Error)]
 pub enum HostIdentityError {
     #[error("failed to read host_id file at {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to write host_id file at {path}: {source}")]
-    Write { path: PathBuf, #[source] source: std::io::Error },
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("host_id file at {path} does not contain a valid UUID: {source}")]
-    Parse { path: PathBuf, #[source] source: uuid::Error },
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: uuid::Error,
+    },
 }
 
 /// Loads the stable per-installation host_id from disk, generating and
@@ -21,18 +33,26 @@ pub struct HostIdentity;
 impl HostIdentity {
     pub fn load_or_create(path: &Path) -> Result<Uuid, HostIdentityError> {
         if path.exists() {
-            let contents = fs::read_to_string(path)
-                .map_err(|source| HostIdentityError::Read { path: path.to_path_buf(), source })?;
-            Uuid::parse_str(contents.trim())
-                .map_err(|source| HostIdentityError::Parse { path: path.to_path_buf(), source })
+            let contents = fs::read_to_string(path).map_err(|source| HostIdentityError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Uuid::parse_str(contents.trim()).map_err(|source| HostIdentityError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })
         } else {
             let id = Uuid::new_v4();
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|source| HostIdentityError::Write { path: path.to_path_buf(), source })?;
+                fs::create_dir_all(parent).map_err(|source| HostIdentityError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
             }
-            fs::write(path, id.to_string())
-                .map_err(|source| HostIdentityError::Write { path: path.to_path_buf(), source })?;
+            fs::write(path, id.to_string()).map_err(|source| HostIdentityError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
             Ok(id)
         }
     }

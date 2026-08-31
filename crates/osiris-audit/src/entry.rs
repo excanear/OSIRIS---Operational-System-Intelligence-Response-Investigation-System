@@ -10,7 +10,11 @@ pub enum ActorRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AuditResult { Success, Failure, Denied }
+pub enum AuditResult {
+    Success,
+    Failure,
+    Denied,
+}
 
 /// Caller-supplied fields for a new entry; the log fills in audit_id,
 /// timestamp, and the hash chain fields on append (ARCHITECTURE.md §22).
