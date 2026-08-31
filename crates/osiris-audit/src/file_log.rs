@@ -15,6 +15,8 @@ pub const GENESIS_HASH: &str = "000000000000000000000000000000000000000000000000
 pub enum AuditLogError {
     #[error("failed to open audit log at {path}: {source}")]
     Open { path: PathBuf, #[source] source: std::io::Error },
+    #[error("failed to read audit log at {path}: {source}")]
+    Read { path: PathBuf, #[source] source: std::io::Error },
     #[error("failed to write audit entry: {0}")]
     Write(#[from] std::io::Error),
     #[error("failed to serialize/deserialize audit entry: {0}")]
@@ -113,7 +115,7 @@ impl AuditLog for FileAuditLog {
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
         for line in reader.lines() {
-            let line = line?;
+            let line = line.map_err(|source| AuditLogError::Read { path: self.path.clone(), source })?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -206,5 +208,27 @@ mod tests {
     fn empty_log_verifies_trivially() {
         let (_dir, log) = temp_log();
         assert!(log.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn corrupted_line_produces_contextualized_error() {
+        let (dir, log) = temp_log();
+        log.append(NewAuditEntry {
+            who: ActorRef::System,
+            what: "config_reload".to_string(),
+            target: "agent.yaml".to_string(),
+            why: None,
+            result: AuditResult::Success,
+        }).unwrap();
+
+        let path = dir.path().join("audit.jsonl");
+        // Corrupt the JSON by truncating it mid-entry
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let corrupted = contents[..contents.len().saturating_sub(50)].to_string();
+        std::fs::write(&path, corrupted).unwrap();
+
+        // read_all should produce a Serialize error (JSON parse failure)
+        let err = log.read_all();
+        assert!(matches!(err, Err(AuditLogError::Serialize(_))));
     }
 }
