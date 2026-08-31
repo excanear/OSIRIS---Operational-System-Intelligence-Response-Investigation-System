@@ -17,6 +17,8 @@ pub enum AuditLogError {
     Open { path: PathBuf, #[source] source: std::io::Error },
     #[error("failed to read audit log at {path}: {source}")]
     Read { path: PathBuf, #[source] source: std::io::Error },
+    #[error("failed to deserialize audit entry from {path}: {source}")]
+    ReadEntry { path: PathBuf, #[source] source: serde_json::Error },
     #[error("failed to write audit entry: {0}")]
     Write(#[from] std::io::Error),
     #[error("failed to serialize/deserialize audit entry: {0}")]
@@ -119,7 +121,8 @@ impl AuditLog for FileAuditLog {
             if line.trim().is_empty() {
                 continue;
             }
-            entries.push(serde_json::from_str(&line)?);
+            entries.push(serde_json::from_str(&line)
+                .map_err(|source| AuditLogError::ReadEntry { path: self.path.clone(), source })?);
         }
         Ok(entries)
     }
@@ -227,8 +230,42 @@ mod tests {
         let corrupted = contents[..contents.len().saturating_sub(50)].to_string();
         std::fs::write(&path, corrupted).unwrap();
 
-        // read_all should produce a Serialize error (JSON parse failure)
+        // read_all should produce a ReadEntry error with path context (JSON parse failure)
         let err = log.read_all();
-        assert!(matches!(err, Err(AuditLogError::Serialize(_))));
+        let is_read_entry = matches!(err, Err(AuditLogError::ReadEntry { .. }));
+        assert!(is_read_entry, "expected ReadEntry error, got: {:?}", err);
+
+        // Verify the error message includes the path
+        let err_msg = format!("{}", err.unwrap_err());
+        let path_str = path.to_string_lossy();
+        assert!(err_msg.contains(&path_str.to_string()),
+                "error message should include path, got: {}", err_msg);
+    }
+
+    #[test]
+    fn read_entry_error_includes_path_context() {
+        let (dir, log) = temp_log();
+        log.append(NewAuditEntry {
+            who: ActorRef::System,
+            what: "config_reload".to_string(),
+            target: "agent.yaml".to_string(),
+            why: None,
+            result: AuditResult::Success,
+        }).unwrap();
+
+        let path = dir.path().join("audit.jsonl");
+        // Write corrupted JSON to trigger parse error
+        std::fs::write(&path, "invalid json").unwrap();
+
+        let err = log.read_all();
+        let is_read_entry_err = matches!(err, Err(AuditLogError::ReadEntry { .. }));
+        assert!(is_read_entry_err, "expected ReadEntry error, got: {:?}", err);
+
+        // Verify path is in the error message
+        if let Err(AuditLogError::ReadEntry { path: err_path, source: _ }) = err {
+            assert_eq!(err_path, path, "error should contain the file path");
+        } else {
+            panic!("expected ReadEntry variant with path");
+        }
     }
 }
