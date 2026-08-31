@@ -129,10 +129,11 @@ pub struct NamespaceRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CgroupVersion {
     V1,
     V2,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
