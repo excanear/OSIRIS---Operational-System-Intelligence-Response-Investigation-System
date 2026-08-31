@@ -10,6 +10,7 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

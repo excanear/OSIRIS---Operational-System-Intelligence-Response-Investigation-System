@@ -1,3 +1,4 @@
+use osiris_schema::EntityRef;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,7 +23,7 @@ pub enum AuditResult {
 pub struct NewAuditEntry {
     pub who: ActorRef,
     pub what: String,
-    pub target: String,
+    pub target: EntityRef,
     pub why: Option<String>,
     pub result: AuditResult,
 }
@@ -33,7 +34,7 @@ pub struct AuditEntry {
     pub timestamp: u64,
     pub who: ActorRef,
     pub what: String,
-    pub target: String,
+    pub target: EntityRef,
     pub why: Option<String>,
     pub result: AuditResult,
     pub prev_entry_hash: String,

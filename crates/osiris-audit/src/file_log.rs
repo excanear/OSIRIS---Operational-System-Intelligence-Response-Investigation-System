@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use osiris_schema::EntityRef;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -83,6 +84,33 @@ impl FileAuditLog {
             .unwrap_or_else(|| GENESIS_HASH.to_string()))
     }
 
+    /// Hashes `bytes` prefixed with its own length (as a fixed-width
+    /// little-endian u64), so that two different splits of a concatenated
+    /// byte stream (e.g. `what="config_"` + `target="reload"` vs.
+    /// `what="config"` + `target="_reload"`) never hash identically. See
+    /// `compute_hash` for the full rationale.
+    fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    /// Computes the SHA-256 hash for one audit entry, chaining in the
+    /// previous entry's hash.
+    ///
+    /// Every variable-length field is hashed via [`Self::hash_field`],
+    /// which prepends the byte length before the bytes themselves. Without
+    /// this, naively concatenating fields (`prev || who || what || target
+    /// || why || result`) would let an attacker with write access to the
+    /// log shift text across a field boundary — e.g. `what="config_"` +
+    /// `target="reload"` would hash identically to `what="config"` +
+    /// `target="_reload"` — without changing the digest, defeating
+    /// tamper detection.
+    ///
+    /// `why` additionally hashes an explicit 1-byte presence discriminant
+    /// (0 for `None`, 1 for `Some`) before its length-prefixed bytes, so
+    /// that `why: None` and `why: Some("")` — a missing justification vs.
+    /// an empty one for a destructive action, per ARCHITECTURE.md §13/§22
+    /// — are never hash-collidable with each other.
     #[allow(clippy::too_many_arguments)]
     fn compute_hash(
         prev_entry_hash: &str,
@@ -90,19 +118,30 @@ impl FileAuditLog {
         timestamp: u64,
         who: &ActorRef,
         what: &str,
-        target: &str,
+        target: &EntityRef,
         why: &Option<String>,
         result: AuditResult,
     ) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(prev_entry_hash.as_bytes());
+        Self::hash_field(&mut hasher, prev_entry_hash.as_bytes());
         hasher.update(audit_id.as_bytes());
         hasher.update(timestamp.to_le_bytes());
-        hasher.update(serde_json::to_vec(who).unwrap_or_default());
-        hasher.update(what.as_bytes());
-        hasher.update(target.as_bytes());
-        hasher.update(why.clone().unwrap_or_default().as_bytes());
-        hasher.update(serde_json::to_vec(&result).unwrap_or_default());
+        Self::hash_field(&mut hasher, &serde_json::to_vec(who).unwrap_or_default());
+        Self::hash_field(&mut hasher, what.as_bytes());
+        Self::hash_field(&mut hasher, &serde_json::to_vec(target).unwrap_or_default());
+        match why {
+            Some(w) => {
+                hasher.update([1u8]);
+                Self::hash_field(&mut hasher, w.as_bytes());
+            }
+            None => {
+                hasher.update([0u8]);
+            }
+        }
+        Self::hash_field(
+            &mut hasher,
+            &serde_json::to_vec(&result).unwrap_or_default(),
+        );
         hex::encode(hasher.finalize())
     }
 }
@@ -224,7 +263,9 @@ mod tests {
         log.append(NewAuditEntry {
             who: ActorRef::System,
             what: "config_reload".to_string(),
-            target: "agent.yaml".to_string(),
+            target: EntityRef::Domain {
+                name: "agent.yaml".to_string(),
+            },
             why: None,
             result: AuditResult::Success,
         })
@@ -234,7 +275,9 @@ mod tests {
                 user_id: Uuid::new_v4(),
             },
             what: "rule_disable".to_string(),
-            target: "rule:suspicious_execution_chain".to_string(),
+            target: EntityRef::Domain {
+                name: "rule:suspicious_execution_chain".to_string(),
+            },
             why: Some("false positive under investigation".to_string()),
             result: AuditResult::Success,
         })
@@ -250,7 +293,9 @@ mod tests {
         log.append(NewAuditEntry {
             who: ActorRef::System,
             what: "config_reload".to_string(),
-            target: "agent.yaml".to_string(),
+            target: EntityRef::Domain {
+                name: "agent.yaml".to_string(),
+            },
             why: None,
             result: AuditResult::Success,
         })
@@ -279,7 +324,9 @@ mod tests {
         log.append(NewAuditEntry {
             who: ActorRef::System,
             what: "config_reload".to_string(),
-            target: "agent.yaml".to_string(),
+            target: EntityRef::Domain {
+                name: "agent.yaml".to_string(),
+            },
             why: None,
             result: AuditResult::Success,
         })
@@ -312,7 +359,9 @@ mod tests {
         log.append(NewAuditEntry {
             who: ActorRef::System,
             what: "config_reload".to_string(),
-            target: "agent.yaml".to_string(),
+            target: EntityRef::Domain {
+                name: "agent.yaml".to_string(),
+            },
             why: None,
             result: AuditResult::Success,
         })
