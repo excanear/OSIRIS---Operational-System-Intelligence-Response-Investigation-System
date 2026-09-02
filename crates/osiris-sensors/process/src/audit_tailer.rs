@@ -97,4 +97,38 @@ mod tests {
 
         assert_eq!(tailer.poll().unwrap(), vec!["partial now complete".to_string()]);
     }
+
+    #[test]
+    fn restarts_from_zero_after_the_file_is_truncated_by_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+
+        let mut tailer = AuditLogTailer::new(&path);
+        let first = tailer.poll().unwrap();
+        assert_eq!(
+            first,
+            vec!["line one".to_string(), "line two".to_string(), "line three".to_string()]
+        );
+
+        // Simulate log rotation: auditd (or logrotate's copytruncate mode)
+        // truncates the file in place rather than replacing the inode, so
+        // the tracked byte offset now points past the end of the
+        // (shorter) new content.
+        std::fs::write(&path, "fresh line one\n").unwrap();
+
+        let after_rotation = tailer.poll().unwrap();
+        assert_eq!(
+            after_rotation,
+            vec!["fresh line one".to_string()],
+            "post-rotation content must be read from offset 0, not lost or double-read"
+        );
+
+        // A further append keeps working normally from the new offset.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "fresh line two").unwrap();
+
+        let after_append = tailer.poll().unwrap();
+        assert_eq!(after_append, vec!["fresh line two".to_string()]);
+    }
 }

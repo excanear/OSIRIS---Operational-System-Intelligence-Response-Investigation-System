@@ -116,4 +116,29 @@ mod tests {
         let line = SAMPLE_SYSCALL_LINE.replace("exe=\"/usr/bin/curl\" ", "");
         assert!(parse_audit_line(&line).is_none());
     }
+
+    #[test]
+    fn returns_none_for_a_truncated_key_with_no_value() {
+        // A line cut off mid-token: `pid=` with nothing after it (e.g. the
+        // audit daemon's write got clipped by a crash or a partial tail
+        // read landing exactly on a field boundary). tokenize() still
+        // produces a "pid" key mapped to an empty string, so this must
+        // fail cleanly at the `u32` parse (`?` short-circuits to None)
+        // rather than panicking.
+        let line = SAMPLE_SYSCALL_LINE.replace("pid=5678", "pid=");
+        assert!(parse_audit_line(&line).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_an_unterminated_quote() {
+        // A line cut off mid-quoted-value: `comm="curl` with no closing
+        // `"`. tokenize()'s in_quotes flag never flips back off, so every
+        // remaining field on the line (including `exe=`) gets swallowed
+        // into the "comm" token's value instead of being parsed as its
+        // own key=value pair. The required `exe` field is then missing,
+        // so this must fail cleanly via `?` rather than panicking or
+        // producing a garbage exe_path.
+        let line = SAMPLE_SYSCALL_LINE.replace(r#"comm="curl" exe="/usr/bin/curl""#, r#"comm="curl"#);
+        assert!(parse_audit_line(&line).is_none());
+    }
 }
