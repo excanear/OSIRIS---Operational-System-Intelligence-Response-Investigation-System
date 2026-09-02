@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "crates/osiris-sensors/process"]
+members = ["crates/*", "crates/osiris-sensors/process", "generator"]
 exclude = ["crates/osiris-sensors"]
 
 [workspace.package]
