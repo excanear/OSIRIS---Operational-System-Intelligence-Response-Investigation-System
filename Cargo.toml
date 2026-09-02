@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "crates/osiris-sensors/process"]
+exclude = ["crates/osiris-sensors"]
 
 [workspace.package]
 version = "0.1.0"

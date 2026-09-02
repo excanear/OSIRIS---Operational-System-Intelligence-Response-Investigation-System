@@ -400,6 +400,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-sensors-process"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "osiris-sensor-api",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "osiris-storage"
 version = "0.1.0"
 dependencies = [
