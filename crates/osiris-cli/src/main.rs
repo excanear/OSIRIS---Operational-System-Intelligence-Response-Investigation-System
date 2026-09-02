@@ -42,29 +42,37 @@ enum Command {
     Processes { process_key: Option<String> },
 }
 
+/// Sends the request, then treats a non-2xx HTTP status as a failure —
+/// `reqwest::send()` alone only errors on connection/transport failure, not
+/// on 4xx/5xx responses, which would otherwise let a `400`/`404`/`500` print
+/// its body and exit 0 (a broken contract for any script driving this CLI).
+fn get(client: &reqwest::blocking::Client, url: String) -> Result<String, String> {
+    let response = client.get(url).send().map_err(|e| format!("request failed: {}", e))?;
+    let status = response.status();
+    let body = response.text().map_err(|e| format!("request failed: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("request failed: HTTP {}: {}", status, body));
+    }
+    Ok(body)
+}
+
 fn main() {
     let cli = Cli::parse();
     let client = reqwest::blocking::Client::new();
 
     let result = match &cli.command {
-        Command::Status => client
-            .get(format!("{}/status", cli.agent.trim_end_matches('/')))
-            .send()
-            .and_then(|r| r.text()),
-        Command::Health => client
-            .get(format!("{}/api/v1/health", cli.server.trim_end_matches('/')))
-            .send()
-            .and_then(|r| r.text()),
+        Command::Status => get(&client, format!("{}/status", cli.agent.trim_end_matches('/'))),
+        Command::Health => get(&client, format!("{}/api/v1/health", cli.server.trim_end_matches('/'))),
         Command::Events { event_type, since, until, limit } => {
             let url = events_url(&cli.server, event_type, since, until, limit);
-            client.get(url).send().and_then(|r| r.text())
+            get(&client, url)
         }
         Command::Processes { process_key } => {
             let url = match process_key {
                 Some(key) => format!("{}/api/v1/processes/{}", cli.server.trim_end_matches('/'), key),
                 None => format!("{}/api/v1/processes", cli.server.trim_end_matches('/')),
             };
-            client.get(url).send().and_then(|r| r.text())
+            get(&client, url)
         }
     };
 
@@ -82,7 +90,7 @@ fn main() {
             }
         }
         Err(e) => {
-            eprintln!("request failed: {}", e);
+            eprintln!("{}", e);
             std::process::exit(1);
         }
     }
