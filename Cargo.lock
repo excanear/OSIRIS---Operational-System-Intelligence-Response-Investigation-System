@@ -539,6 +539,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "osiris-schema",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-audit"
 version = "0.1.0"
 dependencies = [
@@ -654,6 +669,26 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "osiris-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "osiris-api",
+ "osiris-schema",
+ "osiris-selftelemetry",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
