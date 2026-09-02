@@ -272,6 +272,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-pipeline"
+version = "0.1.0"
+dependencies = [
+ "osiris-config",
+ "osiris-schema",
+ "osiris-sensor-api",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-schema"
 version = "0.1.0"
 dependencies = [
