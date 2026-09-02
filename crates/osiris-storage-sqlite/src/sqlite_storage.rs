@@ -173,14 +173,31 @@ impl Storage for SqliteStorage {
                 }
             }
         };
-        let event_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
-            .unwrap_or(0);
-        let last_write_at: Option<i64> = conn
+        let event_count: i64 = match conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)) {
+            Ok(count) => count,
+            Err(e) => {
+                return StorageHealth {
+                    healthy: false,
+                    event_count: 0,
+                    last_write_at: None,
+                    detail: Some(format!("event count query failed: {e}")),
+                }
+            }
+        };
+        let last_write_at: Option<i64> = match conn
             .query_row("SELECT MAX(timestamp) FROM events", [], |r| r.get(0))
             .optional()
-            .ok()
-            .flatten();
+        {
+            Ok(v) => v.flatten(),
+            Err(e) => {
+                return StorageHealth {
+                    healthy: false,
+                    event_count: event_count as u64,
+                    last_write_at: None,
+                    detail: Some(format!("last write query failed: {e}")),
+                }
+            }
+        };
         StorageHealth {
             healthy: true,
             event_count: event_count as u64,
@@ -288,5 +305,23 @@ mod tests {
         assert!(health.healthy);
         assert_eq!(health.event_count, 1);
         assert_eq!(health.last_write_at, Some(1000));
+    }
+
+    #[test]
+    fn duplicate_event_id_is_ignored_and_reported_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let event = sample_event(100, 1000);
+        storage.write(&event).unwrap();
+
+        // Second write of an event with the same event_id must be ignored by the
+        // INSERT OR IGNORE and reported as failed, not silently duplicated.
+        let report = storage.batch_write(std::slice::from_ref(&event)).unwrap();
+        assert_eq!(report.written_count, 0);
+        assert_eq!(report.failed_count, 1);
+
+        let results = storage.query(&QueryPlan::new()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(storage.health().event_count, 1);
     }
 }
