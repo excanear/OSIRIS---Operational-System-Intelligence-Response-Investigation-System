@@ -1,30 +1,38 @@
-use std::collections::HashMap;
-
 use osiris_schema::{CanonicalEvent, EventType};
 use serde::{Deserialize, Serialize};
 
 /// The Event Bus's five priority lanes (ARCHITECTURE.md §8.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PriorityLane { Critical, High, Normal, Low, Verbose }
 
 /// A configurable event_type -> lane table (ARCHITECTURE.md §7.1 step 5).
+///
+/// Backed by a linear-scan `Vec<(EventType, PriorityLane)>` rather than a
+/// `HashMap`: `EventType` (osiris-schema, Phase 0, frozen) does not derive
+/// `Hash`, and Phase 1 only ever populates one entry (PROCESS_EXEC) here
+/// anyway, so a small `Vec` scan is both sufficient and simpler than a map.
 pub struct PriorityTable {
-    table: HashMap<EventType, PriorityLane>,
+    table: Vec<(EventType, PriorityLane)>,
     default_lane: PriorityLane,
 }
 
 impl Default for PriorityTable {
     fn default() -> Self {
-        let mut table = HashMap::new();
-        table.insert(EventType::ProcessExec, PriorityLane::Normal);
-        Self { table, default_lane: PriorityLane::Normal }
+        Self {
+            table: vec![(EventType::ProcessExec, PriorityLane::Normal)],
+            default_lane: PriorityLane::Normal,
+        }
     }
 }
 
 impl PriorityTable {
     pub fn lane_for(&self, event: &CanonicalEvent) -> PriorityLane {
-        self.table.get(&event.event_type).copied().unwrap_or(self.default_lane)
+        self.table
+            .iter()
+            .find(|(event_type, _)| *event_type == event.event_type)
+            .map(|(_, lane)| *lane)
+            .unwrap_or(self.default_lane)
     }
 }
 
