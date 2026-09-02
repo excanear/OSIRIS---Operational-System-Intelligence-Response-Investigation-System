@@ -15,7 +15,10 @@ pub struct QueryPlan {
 
 impl QueryPlan {
     pub fn new() -> Self {
-        Self { limit: 100, ..Default::default() }
+        Self {
+            limit: 100,
+            ..Default::default()
+        }
     }
 }
 

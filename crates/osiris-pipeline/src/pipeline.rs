@@ -56,8 +56,11 @@ mod tests {
 
     fn test_host() -> HostRef {
         HostRef {
-            host_id: Uuid::new_v4(), hostname: "h".to_string(), distro: "d".to_string(),
-            kernel_version: "k".to_string(), cloud: None,
+            host_id: Uuid::new_v4(),
+            hostname: "h".to_string(),
+            distro: "d".to_string(),
+            kernel_version: "k".to_string(),
+            cloud: None,
         }
     }
 
@@ -65,8 +68,14 @@ mod tests {
     fn end_to_end_pipeline_produces_valid_normal_lane_event() {
         let mut pipeline = Pipeline::new(test_host(), "boot-1".to_string());
         let raw = RawEvent::ProcessExec(ProcessExecRaw {
-            pid: 100, ppid: 1, uid: 0, exe_path: "/bin/bash".to_string(), comm: "bash".to_string(),
-            timestamp_ns: 1_700_000_000_000_000_000, start_time_mono: 1, source: RawEventSource::Synthetic,
+            pid: 100,
+            ppid: 1,
+            uid: 0,
+            exe_path: "/bin/bash".to_string(),
+            comm: "bash".to_string(),
+            timestamp_ns: 1_700_000_000_000_000_000,
+            start_time_mono: 1,
+            source: RawEventSource::Synthetic,
         });
         let result = pipeline.process(raw);
         assert_eq!(result.lane, PriorityLane::Normal);
@@ -78,12 +87,24 @@ mod tests {
     fn second_event_resolves_parent_from_first() {
         let mut pipeline = Pipeline::new(test_host(), "boot-1".to_string());
         let bash = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
-            pid: 100, ppid: 1, uid: 0, exe_path: "/bin/bash".to_string(), comm: "bash".to_string(),
-            timestamp_ns: 1, start_time_mono: 1, source: RawEventSource::Synthetic,
+            pid: 100,
+            ppid: 1,
+            uid: 0,
+            exe_path: "/bin/bash".to_string(),
+            comm: "bash".to_string(),
+            timestamp_ns: 1,
+            start_time_mono: 1,
+            source: RawEventSource::Synthetic,
         }));
         let curl = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
-            pid: 200, ppid: 100, uid: 0, exe_path: "/usr/bin/curl".to_string(), comm: "curl".to_string(),
-            timestamp_ns: 2, start_time_mono: 2, source: RawEventSource::Synthetic,
+            pid: 200,
+            ppid: 100,
+            uid: 0,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: 2,
+            start_time_mono: 2,
+            source: RawEventSource::Synthetic,
         }));
         assert_eq!(
             curl.event.parent_process.unwrap().process_key,

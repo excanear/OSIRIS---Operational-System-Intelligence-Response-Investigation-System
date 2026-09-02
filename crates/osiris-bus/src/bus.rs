@@ -67,7 +67,9 @@ impl EventBus {
     /// Returns the bus (for `enqueue`) together with the five lane
     /// receivers (for `run_drain_loop`) — see the struct doc comment for
     /// why these are returned separately rather than stored together.
-    pub fn new(metrics: Arc<MetricsRegistry>) -> (Self, HashMap<PriorityLane, Receiver<CanonicalEvent>>) {
+    pub fn new(
+        metrics: Arc<MetricsRegistry>,
+    ) -> (Self, HashMap<PriorityLane, Receiver<CanonicalEvent>>) {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
         for lane in LANES {
@@ -86,12 +88,20 @@ impl EventBus {
             // All five lanes are always populated by `new()`; this branch
             // only guards against a future lane being added to
             // `PriorityLane` without a corresponding channel here.
-            self.metrics.counter(&format!("bus.{:?}.dropped_total", item.lane)).increment();
+            self.metrics
+                .counter(&format!("bus.{:?}.dropped_total", item.lane))
+                .increment();
             return;
         };
         match sender.try_send(item.event) {
-            Ok(()) => self.metrics.counter(&format!("bus.{:?}.enqueued_total", item.lane)).increment(),
-            Err(_) => self.metrics.counter(&format!("bus.{:?}.dropped_total", item.lane)).increment(),
+            Ok(()) => self
+                .metrics
+                .counter(&format!("bus.{:?}.enqueued_total", item.lane))
+                .increment(),
+            Err(_) => self
+                .metrics
+                .counter(&format!("bus.{:?}.dropped_total", item.lane))
+                .increment(),
         }
     }
 }
@@ -117,7 +127,9 @@ pub async fn run_drain_loop(
                 match receiver.try_recv() {
                     Ok(event) => {
                         drained_any = true;
-                        metrics.counter(&format!("bus.{:?}.dequeued_total", lane)).increment();
+                        metrics
+                            .counter(&format!("bus.{:?}.dequeued_total", lane))
+                            .increment();
                         let _ = sink.send(event).await;
                     }
                     Err(_) => break,
@@ -143,15 +155,43 @@ mod tests {
     fn sample_event() -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp: 1, monotonic_timestamp: 1,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None,
-            file: None, network: None, dns: None, device: None, service: None, container: None,
-            namespace: None, cgroup: None, kernel: None, source: Source::Synthetic,
-            provider: "test".to_string(), raw_event: None, relationships: vec![], tags: vec![],
-            risk: None, event_data: serde_json::json!({}),
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1,
+            monotonic_timestamp: 1,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -171,10 +211,21 @@ mod tests {
         let sink = InMemorySink::new();
         let sink_dyn: Arc<dyn Sink> = Arc::new(sink.clone());
         let cancellation = CancellationToken::new();
-        let drain_handle = tokio::spawn(run_drain_loop(receivers, sink_dyn, metrics.clone(), cancellation.clone()));
+        let drain_handle = tokio::spawn(run_drain_loop(
+            receivers,
+            sink_dyn,
+            metrics.clone(),
+            cancellation.clone(),
+        ));
 
-        bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Normal });
-        bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Critical });
+        bus.enqueue(PrioritizedEvent {
+            event: sample_event(),
+            lane: PriorityLane::Normal,
+        });
+        bus.enqueue(PrioritizedEvent {
+            event: sample_event(),
+            lane: PriorityLane::Critical,
+        });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancellation.cancel();
@@ -195,11 +246,17 @@ mod tests {
         // capacity (64) worth of events with nothing draining them yet
         // (the receivers are held but never polled in this test).
         for _ in 0..64 {
-            bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Critical });
+            bus.enqueue(PrioritizedEvent {
+                event: sample_event(),
+                lane: PriorityLane::Critical,
+            });
         }
         // The 65th send must be dropped, not block, since nothing is
         // draining the channel in this test.
-        bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Critical });
+        bus.enqueue(PrioritizedEvent {
+            event: sample_event(),
+            lane: PriorityLane::Critical,
+        });
 
         assert_eq!(metrics.counter("bus.Critical.enqueued_total").get(), 64);
         assert_eq!(metrics.counter("bus.Critical.dropped_total").get(), 1);
@@ -228,15 +285,26 @@ mod tests {
         let sink = InMemorySink::new();
         let sink_dyn: Arc<dyn Sink> = Arc::new(sink.clone());
         let cancellation = CancellationToken::new();
-        let drain_handle = tokio::spawn(run_drain_loop(receivers, sink_dyn, metrics.clone(), cancellation.clone()));
+        let drain_handle = tokio::spawn(run_drain_loop(
+            receivers,
+            sink_dyn,
+            metrics.clone(),
+            cancellation.clone(),
+        ));
 
         // 20 Critical events (more than one cycle's weight of 8) plus 3
         // Verbose events, all enqueued before the loop gets to run.
         for _ in 0..20 {
-            bus.enqueue(PrioritizedEvent { event: tagged_event("critical"), lane: PriorityLane::Critical });
+            bus.enqueue(PrioritizedEvent {
+                event: tagged_event("critical"),
+                lane: PriorityLane::Critical,
+            });
         }
         for _ in 0..3 {
-            bus.enqueue(PrioritizedEvent { event: tagged_event("verbose"), lane: PriorityLane::Verbose });
+            bus.enqueue(PrioritizedEvent {
+                event: tagged_event("verbose"),
+                lane: PriorityLane::Verbose,
+            });
         }
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -249,9 +317,13 @@ mod tests {
         assert_eq!(metrics.counter("bus.Critical.dequeued_total").get(), 20);
 
         let has_tag = |e: &CanonicalEvent, tag: &str| e.tags.iter().any(|t| t == tag);
-        let first_verbose_idx = events.iter().position(|e| has_tag(e, "verbose"))
+        let first_verbose_idx = events
+            .iter()
+            .position(|e| has_tag(e, "verbose"))
             .expect("a verbose event was sent and must appear in send order");
-        let last_critical_idx = events.iter().rposition(|e| has_tag(e, "critical"))
+        let last_critical_idx = events
+            .iter()
+            .rposition(|e| has_tag(e, "critical"))
             .expect("a critical event was sent and must appear in send order");
         assert!(
             first_verbose_idx < last_critical_idx,

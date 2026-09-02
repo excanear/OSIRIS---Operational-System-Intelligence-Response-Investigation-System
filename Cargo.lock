@@ -1052,6 +1052,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "osiris-agent",
+ "osiris-api",
+ "osiris-pipeline",
+ "osiris-schema",
+ "osiris-sensor-api",
+ "osiris-server",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-generator"
 version = "0.1.0"
 dependencies = [

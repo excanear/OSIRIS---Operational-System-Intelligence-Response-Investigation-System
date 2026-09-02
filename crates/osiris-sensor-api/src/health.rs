@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 /// this is the richer per-sensor contract every sensor reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SensorState { Starting, Healthy, Degraded, Failed, Stopped }
+pub enum SensorState {
+    Starting,
+    Healthy,
+    Degraded,
+    Failed,
+    Stopped,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorHealth {
@@ -66,7 +72,10 @@ mod tests {
             p99_emit_latency_us: 200,
         };
         let agent_health = h.to_agent_health();
-        assert!(matches!(agent_health.state, osiris_health::HealthState::Degraded { .. }));
+        assert!(matches!(
+            agent_health.state,
+            osiris_health::HealthState::Degraded { .. }
+        ));
     }
 
     #[test]
@@ -81,6 +90,9 @@ mod tests {
             capability_flags: vec![],
             p99_emit_latency_us: 50,
         };
-        assert_eq!(h.to_agent_health().state, osiris_health::HealthState::Healthy);
+        assert_eq!(
+            h.to_agent_health().state,
+            osiris_health::HealthState::Healthy
+        );
     }
 }

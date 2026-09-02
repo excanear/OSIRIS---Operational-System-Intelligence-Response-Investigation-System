@@ -4,7 +4,13 @@ use serde::{Deserialize, Serialize};
 /// The Event Bus's five priority lanes (ARCHITECTURE.md §8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PriorityLane { Critical, High, Normal, Low, Verbose }
+pub enum PriorityLane {
+    Critical,
+    High,
+    Normal,
+    Low,
+    Verbose,
+}
 
 /// A configurable event_type -> lane table (ARCHITECTURE.md §7.1 step 5).
 ///
@@ -50,15 +56,43 @@ mod tests {
     fn exec_event() -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp: 1, monotonic_timestamp: 1,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None,
-            file: None, network: None, dns: None, device: None, service: None, container: None,
-            namespace: None, cgroup: None, kernel: None, source: Source::Synthetic,
-            provider: "test".to_string(), raw_event: None, relationships: vec![], tags: vec![],
-            risk: None, event_data: serde_json::json!({}),
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1,
+            monotonic_timestamp: 1,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 

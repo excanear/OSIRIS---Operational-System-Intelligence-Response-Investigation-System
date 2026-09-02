@@ -36,7 +36,9 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_events_process_key ON events(process_key);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -44,7 +46,9 @@ impl Storage for SqliteStorage {
     fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError> {
         let report = self.batch_write(std::slice::from_ref(event))?;
         if report.failed_count > 0 {
-            return Err(StorageError::Backend("write failed (duplicate event_id?)".to_string()));
+            return Err(StorageError::Backend(
+                "write failed (duplicate event_id?)".to_string(),
+            ));
         }
         Ok(())
     }
@@ -54,12 +58,18 @@ impl Storage for SqliteStorage {
             .conn
             .lock()
             .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
-        let tx = conn.transaction().map_err(|e| StorageError::Backend(e.to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
         let mut report = WriteReport::default();
         for event in events {
-            let raw_json = serde_json::to_string(event).map_err(|e| StorageError::Serialize(e.to_string()))?;
+            let raw_json =
+                serde_json::to_string(event).map_err(|e| StorageError::Serialize(e.to_string()))?;
             let process_key = event.process.as_ref().map(|p| p.process_key.as_hex());
-            let parent_process_key = event.parent_process.as_ref().map(|p| p.process_key.as_hex());
+            let parent_process_key = event
+                .parent_process
+                .as_ref()
+                .map(|p| p.process_key.as_hex());
             let event_type = serde_json::to_string(&event.event_type)
                 .map_err(|e| StorageError::Serialize(e.to_string()))?
                 .trim_matches('"')
@@ -85,7 +95,8 @@ impl Storage for SqliteStorage {
                 report.failed_count += 1;
             }
         }
-        tx.commit().map_err(|e| StorageError::Backend(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
         Ok(report)
     }
 
@@ -121,7 +132,9 @@ impl Storage for SqliteStorage {
         let limit = if plan.limit == 0 { 100 } else { plan.limit };
         sql_params.push(Box::new(limit as i64));
 
-        let mut stmt = conn.prepare(&sql).map_err(|e| StorageError::Backend(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
         let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
             .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
@@ -130,8 +143,8 @@ impl Storage for SqliteStorage {
         let mut events = Vec::new();
         for row in rows {
             let raw_json = row.map_err(|e| StorageError::Backend(e.to_string()))?;
-            let event: CanonicalEvent =
-                serde_json::from_str(&raw_json).map_err(|e| StorageError::Serialize(e.to_string()))?;
+            let event: CanonicalEvent = serde_json::from_str(&raw_json)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
             events.push(event);
         }
         Ok(events)
@@ -157,8 +170,12 @@ impl Storage for SqliteStorage {
             .map_err(|e| StorageError::Backend(e.to_string()))?
             .as_nanos() as u64;
         let cutoff = now_ns.saturating_sub(policy.max_age_secs.saturating_mul(1_000_000_000));
-        let deleted = self.delete(&DeleteCriteria { before_timestamp: cutoff })?;
-        Ok(RetentionReport { deleted_count: deleted })
+        let deleted = self.delete(&DeleteCriteria {
+            before_timestamp: cutoff,
+        })?;
+        Ok(RetentionReport {
+            deleted_count: deleted,
+        })
     }
 
     fn health(&self) -> StorageHealth {
@@ -173,7 +190,8 @@ impl Storage for SqliteStorage {
                 }
             }
         };
-        let event_count: i64 = match conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)) {
+        let event_count: i64 = match conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        {
             Ok(count) => count,
             Err(e) => {
                 return StorageHealth {
@@ -210,25 +228,58 @@ impl Storage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+    };
     use uuid::Uuid;
 
     fn sample_event(pid: u32, timestamp: u64) -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp, monotonic_timestamp: timestamp,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None,
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
             process: Some(ProcessRef {
                 process_key: ProcessKey::new(host_id, "b", pid, timestamp),
-                pid, exe_path: "/bin/x".to_string(), cmdline: vec![], exe_hash: None, start_time_mono: timestamp,
+                pid,
+                exe_path: "/bin/x".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: timestamp,
             }),
-            parent_process: None, thread: None, file: None, network: None, dns: None, device: None,
-            service: None, container: None, namespace: None, cgroup: None, kernel: None,
-            source: Source::Synthetic, provider: "test".to_string(), raw_event: None,
-            relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -259,7 +310,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
         storage
-            .batch_write(&[sample_event(100, 1000), sample_event(200, 5000), sample_event(300, 9000)])
+            .batch_write(&[
+                sample_event(100, 1000),
+                sample_event(200, 5000),
+                sample_event(300, 9000),
+            ])
             .unwrap();
 
         let mut plan = QueryPlan::new();
@@ -289,9 +344,15 @@ mod tests {
     fn delete_removes_events_before_cutoff() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
-        storage.batch_write(&[sample_event(100, 1000), sample_event(200, 9000)]).unwrap();
+        storage
+            .batch_write(&[sample_event(100, 1000), sample_event(200, 9000)])
+            .unwrap();
 
-        let deleted = storage.delete(&DeleteCriteria { before_timestamp: 5000 }).unwrap();
+        let deleted = storage
+            .delete(&DeleteCriteria {
+                before_timestamp: 5000,
+            })
+            .unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(storage.query(&QueryPlan::new()).unwrap().len(), 1);
     }

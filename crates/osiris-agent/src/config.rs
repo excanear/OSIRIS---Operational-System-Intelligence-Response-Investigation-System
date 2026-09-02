@@ -6,7 +6,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config at {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to parse config: {0}")]
     Parse(#[from] serde_yaml::Error),
 }
@@ -33,8 +37,10 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+        let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let config: AgentConfig = serde_yaml::from_str(&contents)?;
         Ok(config)
     }

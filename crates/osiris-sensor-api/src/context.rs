@@ -13,6 +13,9 @@ pub struct SensorContext {
 
 impl SensorContext {
     pub fn new(output: Sender<RawEvent>, cancellation: CancellationToken) -> Self {
-        Self { output, cancellation }
+        Self {
+            output,
+            cancellation,
+        }
     }
 }

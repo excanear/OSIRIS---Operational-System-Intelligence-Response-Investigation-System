@@ -15,7 +15,11 @@ pub struct AuditLogTailer {
 
 impl AuditLogTailer {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), offset: 0, partial: String::new() }
+        Self {
+            path: path.into(),
+            offset: 0,
+            partial: String::new(),
+        }
     }
 
     /// Returns any complete new lines appended to the file since the last
@@ -76,7 +80,10 @@ mod tests {
         let first = tailer.poll().unwrap();
         assert_eq!(first, vec!["line one".to_string(), "line two".to_string()]);
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "line three").unwrap();
 
         let second = tailer.poll().unwrap();
@@ -92,10 +99,16 @@ mod tests {
         let mut tailer = AuditLogTailer::new(&path);
         assert_eq!(tailer.poll().unwrap(), vec!["complete line".to_string()]);
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        write!(file, " now complete\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, " now complete").unwrap();
 
-        assert_eq!(tailer.poll().unwrap(), vec!["partial now complete".to_string()]);
+        assert_eq!(
+            tailer.poll().unwrap(),
+            vec!["partial now complete".to_string()]
+        );
     }
 
     #[test]
@@ -108,7 +121,11 @@ mod tests {
         let first = tailer.poll().unwrap();
         assert_eq!(
             first,
-            vec!["line one".to_string(), "line two".to_string(), "line three".to_string()]
+            vec![
+                "line one".to_string(),
+                "line two".to_string(),
+                "line three".to_string()
+            ]
         );
 
         // Simulate log rotation: auditd (or logrotate's copytruncate mode)
@@ -125,7 +142,10 @@ mod tests {
         );
 
         // A further append keeps working normally from the new offset.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "fresh line two").unwrap();
 
         let after_append = tailer.poll().unwrap();

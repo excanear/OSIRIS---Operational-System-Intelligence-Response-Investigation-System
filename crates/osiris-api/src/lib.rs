@@ -19,7 +19,10 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/health", get(health_handler))
         .route("/api/v1/events", get(events_handler))
         .route("/api/v1/processes", get(processes_handler))
-        .route("/api/v1/processes/:process_key", get(process_detail_handler))
+        .route(
+            "/api/v1/processes/:process_key",
+            get(process_detail_handler),
+        )
         .with_state(storage)
 }
 
@@ -31,7 +34,9 @@ struct ApiHealth {
 }
 
 async fn health_handler(State(storage): State<Arc<dyn Storage>>) -> Json<ApiHealth> {
-    let health = tokio::task::spawn_blocking(move || storage.health()).await.unwrap();
+    let health = tokio::task::spawn_blocking(move || storage.health())
+        .await
+        .unwrap();
     Json(ApiHealth {
         healthy: health.healthy,
         event_count: health.event_count,
@@ -53,8 +58,12 @@ async fn events_handler(
 ) -> Result<Json<Vec<CanonicalEvent>>, (StatusCode, String)> {
     let mut plan = QueryPlan::new();
     if let Some(et) = &q.event_type {
-        let parsed: EventType = serde_json::from_str(&format!("\"{}\"", et))
-            .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid event_type: {}", et)))?;
+        let parsed: EventType = serde_json::from_str(&format!("\"{}\"", et)).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid event_type: {}", et),
+            )
+        })?;
         plan.event_type = Some(parsed);
     }
     plan.since = q.since;
@@ -123,14 +132,20 @@ async fn process_detail_handler(
 
     let process = events
         .iter()
-        .find(|e| e.process.as_ref().map(|p| p.process_key.as_hex()) == Some(process_key_hex.clone()))
+        .find(|e| {
+            e.process.as_ref().map(|p| p.process_key.as_hex()) == Some(process_key_hex.clone())
+        })
         .cloned()
-        .ok_or((StatusCode::NOT_FOUND, format!("process {} not found", process_key_hex)))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("process {} not found", process_key_hex),
+        ))?;
 
     let children: Vec<CanonicalEvent> = events
         .into_iter()
         .filter(|e| {
-            e.parent_process.as_ref().map(|p| p.process_key.as_hex()) == Some(process_key_hex.clone())
+            e.parent_process.as_ref().map(|p| p.process_key.as_hex())
+                == Some(process_key_hex.clone())
         })
         .collect();
 
@@ -140,29 +155,66 @@ async fn process_detail_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        Category, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+    };
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
     fn sample_event(pid: u32, parent_key: Option<ProcessKey>, timestamp: u64) -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp, monotonic_timestamp: timestamp,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None,
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
             process: Some(ProcessRef {
                 process_key: ProcessKey::new(host_id, "b", pid, timestamp),
-                pid, exe_path: "/bin/x".to_string(), cmdline: vec![], exe_hash: None, start_time_mono: timestamp,
+                pid,
+                exe_path: "/bin/x".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: timestamp,
             }),
             parent_process: parent_key.map(|k| ProcessRef {
-                process_key: k, pid: 0, exe_path: String::new(), cmdline: vec![], exe_hash: None, start_time_mono: 0,
+                process_key: k,
+                pid: 0,
+                exe_path: String::new(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 0,
             }),
-            thread: None, file: None, network: None, dns: None, device: None,
-            service: None, container: None, namespace: None, cgroup: None, kernel: None,
-            source: Source::Synthetic, provider: "test".to_string(), raw_event: None,
-            relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -184,8 +236,15 @@ mod tests {
     #[tokio::test]
     async fn events_endpoint_filters_by_time_range() {
         let (_dir, storage) = test_storage();
-        storage.batch_write(&[sample_event(100, None, 1000), sample_event(200, None, 9000)]).unwrap();
-        let query = EventsQuery { event_type: None, since: Some(500), until: Some(5000), limit: None };
+        storage
+            .batch_write(&[sample_event(100, None, 1000), sample_event(200, None, 9000)])
+            .unwrap();
+        let query = EventsQuery {
+            event_type: None,
+            since: Some(500),
+            until: Some(5000),
+            limit: None,
+        };
         let Json(events) = events_handler(State(storage), Query(query)).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].process.as_ref().unwrap().pid, 100);

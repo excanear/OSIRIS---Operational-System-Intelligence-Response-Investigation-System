@@ -110,8 +110,14 @@ mod tests {
     fn synthetic_source_maps_correctly() {
         let host = sample_host();
         let raw = RawEvent::ProcessExec(ProcessExecRaw {
-            pid: 1, ppid: 0, uid: 0, exe_path: "/bin/init".to_string(), comm: "init".to_string(),
-            timestamp_ns: 1, start_time_mono: 1, source: RawEventSource::Synthetic,
+            pid: 1,
+            ppid: 0,
+            uid: 0,
+            exe_path: "/bin/init".to_string(),
+            comm: "init".to_string(),
+            timestamp_ns: 1,
+            start_time_mono: 1,
+            source: RawEventSource::Synthetic,
         });
         let event = normalize(raw, &host, "boot-1");
         assert_eq!(event.source, Source::Synthetic);

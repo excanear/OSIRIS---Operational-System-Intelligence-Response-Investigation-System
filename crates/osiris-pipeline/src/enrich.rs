@@ -7,21 +7,26 @@ use crate::process_resolver::ProcessResolver;
 /// always-available context only — expensive enrichment is server-side
 /// (Phase 1 does not implement server-side enrichment; §7.2's split is
 /// preserved by simply not doing that work yet, not by doing it here).
-pub fn enrich(mut event: CanonicalEvent, boot_id: &str, resolver: &mut ProcessResolver) -> CanonicalEvent {
+pub fn enrich(
+    mut event: CanonicalEvent,
+    boot_id: &str,
+    resolver: &mut ProcessResolver,
+) -> CanonicalEvent {
     event.boot_id = boot_id.to_string();
 
     if let Some(process) = &event.process {
         resolver.record(process.pid, current_ppid(&event), process.process_key);
-        event.parent_process = resolver
-            .resolve_parent(process.pid)
-            .map(|parent_key| osiris_schema::ProcessRef {
-                process_key: parent_key,
-                pid: 0,
-                exe_path: String::new(),
-                cmdline: vec![],
-                exe_hash: None,
-                start_time_mono: 0,
-            });
+        event.parent_process =
+            resolver
+                .resolve_parent(process.pid)
+                .map(|parent_key| osiris_schema::ProcessRef {
+                    process_key: parent_key,
+                    pid: 0,
+                    exe_path: String::new(),
+                    cmdline: vec![],
+                    exe_hash: None,
+                    start_time_mono: 0,
+                });
     }
     event
 }
@@ -38,7 +43,9 @@ fn current_ppid(event: &CanonicalEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+    };
     use uuid::Uuid;
 
     fn bare_event(host_id: uuid::Uuid, pid: u32, ppid: u32) -> CanonicalEvent {
@@ -52,16 +59,40 @@ mod tests {
             event_type: EventType::ProcessExec,
             category: Category::Process,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
             process: Some(ProcessRef {
                 process_key: ProcessKey::new(host_id, "boot-1", pid, 1),
-                pid, exe_path: "/bin/x".to_string(), cmdline: vec![], exe_hash: None, start_time_mono: 1,
+                pid,
+                exe_path: "/bin/x".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 1,
             }),
-            parent_process: None, thread: None, file: None, network: None, dns: None, device: None,
-            service: None, container: None, namespace: None, cgroup: None, kernel: None,
-            source: Source::Synthetic, provider: "test".to_string(), raw_event: None,
-            relationships: vec![], tags: vec![], risk: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
             event_data: serde_json::json!({ "ppid": ppid }),
         }
     }
@@ -80,6 +111,9 @@ mod tests {
         let mut resolver = ProcessResolver::new();
         let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver);
         let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
-        assert_eq!(curl.parent_process.unwrap().process_key, bash.process.unwrap().process_key);
+        assert_eq!(
+            curl.parent_process.unwrap().process_key,
+            bash.process.unwrap().process_key
+        );
     }
 }

@@ -9,7 +9,11 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Error)]
 pub enum SinkError {
     #[error("failed to write to spool file at {path}: {source}")]
-    Write { path: PathBuf, #[source] source: std::io::Error },
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to serialize event: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -41,8 +45,14 @@ impl SpoolFileSink {
             .append(true)
             .open(&path)
             .await
-            .map_err(|source| SinkError::Write { path: path.clone(), source })?;
-        Ok(Self { path, lock: tokio::sync::Mutex::new(()) })
+            .map_err(|source| SinkError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            path,
+            lock: tokio::sync::Mutex::new(()),
+        })
     }
 }
 
@@ -55,13 +65,22 @@ impl Sink for SpoolFileSink {
             .append(true)
             .open(&self.path)
             .await
-            .map_err(|source| SinkError::Write { path: self.path.clone(), source })?;
+            .map_err(|source| SinkError::Write {
+                path: self.path.clone(),
+                source,
+            })?;
         file.write_all(line.as_bytes())
             .await
-            .map_err(|source| SinkError::Write { path: self.path.clone(), source })?;
+            .map_err(|source| SinkError::Write {
+                path: self.path.clone(),
+                source,
+            })?;
         file.write_all(b"\n")
             .await
-            .map_err(|source| SinkError::Write { path: self.path.clone(), source })?;
+            .map_err(|source| SinkError::Write {
+                path: self.path.clone(),
+                source,
+            })?;
         Ok(())
     }
 }
@@ -84,14 +103,20 @@ impl InMemorySink {
         // pushed before the panic — for this test-support struct, reading
         // that is more useful than propagating the poison, so recover
         // rather than unwrap.
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
 #[async_trait]
 impl Sink for InMemorySink {
     async fn send(&self, event: CanonicalEvent) -> Result<(), SinkError> {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
         Ok(())
     }
 }
@@ -105,15 +130,43 @@ mod tests {
     fn sample_event() -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp: 1, monotonic_timestamp: 1,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None,
-            file: None, network: None, dns: None, device: None, service: None, container: None,
-            namespace: None, cgroup: None, kernel: None, source: Source::Synthetic,
-            provider: "test".to_string(), raw_event: None, relationships: vec![], tags: vec![],
-            risk: None, event_data: serde_json::json!({}),
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1,
+            monotonic_timestamp: 1,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 

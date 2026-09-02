@@ -8,4 +8,10 @@ use serde::{Deserialize, Serialize};
 /// phase also defers (Global Constraints #5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AgentLifecycle { Initializing, Running, Degraded, Draining, Stopped }
+pub enum AgentLifecycle {
+    Initializing,
+    Running,
+    Degraded,
+    Draining,
+    Stopped,
+}

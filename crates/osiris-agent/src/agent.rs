@@ -44,7 +44,9 @@ pub struct Agent {
 /// `lock_health()` (a poisoned lock here still holds a fully-formed
 /// `AgentLifecycle`/`Vec<String>`, so recovering is safe).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Agent {
@@ -61,7 +63,10 @@ impl Agent {
             candidate_sensors.push(Box::new(ProcessExecSensor::new(path.clone())));
         }
         if config.enable_synthetic {
-            let base_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            let base_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
             candidate_sensors.push(Box::new(SyntheticSensor::new(exec_chain_scenario(base_ts))));
         }
 
@@ -70,9 +75,14 @@ impl Agent {
         for mut sensor in candidate_sensors {
             let caps = sensor.capabilities();
             if !caps.supported() {
-                let reason = caps.unsupported_reason.unwrap_or_else(|| "unsupported".to_string());
+                let reason = caps
+                    .unsupported_reason
+                    .unwrap_or_else(|| "unsupported".to_string());
                 tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: unsupported on this host");
-                skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
+                skipped.push(SkippedSensor {
+                    name: sensor.name().to_string(),
+                    reason,
+                });
                 continue;
             }
             let ctx = SensorContext::new(raw_tx.clone(), cancellation.clone());
@@ -81,7 +91,10 @@ impl Agent {
                     if let Err(e) = sensor.start().await {
                         let reason = format!("start failed: {e}");
                         tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to start");
-                        skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
+                        skipped.push(SkippedSensor {
+                            name: sensor.name().to_string(),
+                            reason,
+                        });
                         continue;
                     }
                     running_sensors.push(sensor);
@@ -89,7 +102,10 @@ impl Agent {
                 Err(e) => {
                     let reason = e.to_string();
                     tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to initialize");
-                    skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
+                    skipped.push(SkippedSensor {
+                        name: sensor.name().to_string(),
+                        reason,
+                    });
                 }
             }
         }
@@ -98,7 +114,12 @@ impl Agent {
         let metrics = Arc::new(MetricsRegistry::new());
         let (bus, receivers) = EventBus::new(metrics.clone());
         let sink: Arc<dyn Sink> = Arc::new(SpoolFileSink::open(&config.spool_path).await?);
-        tokio::spawn(run_drain_loop(receivers, sink, metrics.clone(), cancellation.clone()));
+        tokio::spawn(run_drain_loop(
+            receivers,
+            sink,
+            metrics.clone(),
+            cancellation.clone(),
+        ));
 
         let bus = Arc::new(bus);
         let mut pipeline = Pipeline::new(host, boot_id);
@@ -134,7 +155,11 @@ impl Agent {
         let sensors = self.sensors.lock().await;
         let sensor_health: Vec<SensorHealth> = sensors.iter().map(|s| s.health()).collect();
         let skipped_sensors = lock(&self.skipped_sensors).clone();
-        AgentStatus { lifecycle, sensors: sensor_health, skipped_sensors }
+        AgentStatus {
+            lifecycle,
+            sensors: sensor_health,
+            skipped_sensors,
+        }
     }
 
     pub fn skipped_sensors(&self) -> Vec<SkippedSensor> {
@@ -151,7 +176,9 @@ impl Agent {
     }
 
     pub async fn serve_status(self: Arc<Self>, addr: SocketAddr) -> Result<(), AgentError> {
-        crate::status::serve_status(self, addr).await.map_err(AgentError::Status)
+        crate::status::serve_status(self, addr)
+            .await
+            .map_err(AgentError::Status)
     }
 }
 
@@ -176,17 +203,26 @@ mod tests {
         let config = AgentConfig {
             audit_log_path: None,
             enable_synthetic: true,
-            spool_path: dir.path().join("spool.ndjson").to_string_lossy().to_string(),
+            spool_path: dir
+                .path()
+                .join("spool.ndjson")
+                .to_string_lossy()
+                .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         };
-        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
         let status = agent.status_snapshot().await;
         assert_eq!(status.lifecycle, AgentLifecycle::Running);
         assert_eq!(status.sensors.len(), 1);
         assert_eq!(status.sensors[0].name, "synthetic_generator");
 
         agent.shutdown().await;
-        assert_eq!(agent.status_snapshot().await.lifecycle, AgentLifecycle::Stopped);
+        assert_eq!(
+            agent.status_snapshot().await.lifecycle,
+            AgentLifecycle::Stopped
+        );
     }
 
     #[tokio::test]
@@ -195,10 +231,16 @@ mod tests {
         let config = AgentConfig {
             audit_log_path: Some(dir.path().join("missing.log").to_string_lossy().to_string()),
             enable_synthetic: false,
-            spool_path: dir.path().join("spool.ndjson").to_string_lossy().to_string(),
+            spool_path: dir
+                .path()
+                .join("spool.ndjson")
+                .to_string_lossy()
+                .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         };
-        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
         let status = agent.status_snapshot().await;
         assert_eq!(status.sensors.len(), 0);
 
@@ -231,7 +273,9 @@ mod tests {
             spool_path: spool_path.to_string_lossy().to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         };
-        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         agent.shutdown().await;

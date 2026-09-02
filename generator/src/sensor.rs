@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use osiris_sensor_api::{
-    ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError,
-    SensorHealth, SensorMetrics, SensorState,
+    ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth,
+    SensorMetrics, SensorState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +32,9 @@ impl Default for HealthState {
 /// mid-update could violate) — matches osiris-sensors-process's "no
 /// unwrap/expect outside tests" discipline for lock results.
 fn lock_health(health: &Mutex<HealthState>) -> MutexGuard<'_, HealthState> {
-    health.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Emits a fixed, deterministic scenario of ProcessExecRaw events through

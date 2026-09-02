@@ -44,7 +44,10 @@ pub fn format_events_table(events: &[CanonicalEvent]) -> String {
             .as_ref()
             .map(|p| (p.pid.to_string(), p.exe_path.clone()))
             .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
-        out.push_str(&format!("{}\t{}\t{}\t{}\n", e.timestamp, event_type, pid, exe));
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            e.timestamp, event_type, pid, exe
+        ));
     }
     out
 }
@@ -52,7 +55,9 @@ pub fn format_events_table(events: &[CanonicalEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -64,7 +69,10 @@ mod tests {
             &None,
             &Some(10),
         );
-        assert_eq!(url, "http://localhost:8080/api/v1/events?event_type=PROCESS_EXEC&limit=10");
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/events?event_type=PROCESS_EXEC&limit=10"
+        );
     }
 
     #[test]
@@ -81,8 +89,17 @@ mod tests {
 
     #[test]
     fn events_url_includes_since_and_until() {
-        let url = events_url("http://localhost:8080", &None, &Some(100), &Some(200), &None);
-        assert_eq!(url, "http://localhost:8080/api/v1/events?since=100&until=200");
+        let url = events_url(
+            "http://localhost:8080",
+            &None,
+            &Some(100),
+            &Some(200),
+            &None,
+        );
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/events?since=100&until=200"
+        );
     }
 
     #[test]
@@ -103,19 +120,50 @@ mod tests {
     fn sample_event(pid: u32, exe_path: &str, timestamp: u64) -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp, monotonic_timestamp: 1,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None,
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: 1,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
             process: Some(ProcessRef {
                 process_key: ProcessKey::new(host_id, "b", pid, 1),
-                pid, exe_path: exe_path.to_string(), cmdline: vec![], exe_hash: None, start_time_mono: 1,
+                pid,
+                exe_path: exe_path.to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 1,
             }),
-            parent_process: None, thread: None, file: None, network: None, dns: None, device: None,
-            service: None, container: None, namespace: None, cgroup: None, kernel: None,
-            source: Source::Synthetic, provider: "test".to_string(), raw_event: None,
-            relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -146,7 +194,10 @@ mod tests {
 
     #[test]
     fn format_events_table_renders_multiple_rows() {
-        let events = vec![sample_event(1, "/bin/a", 100), sample_event(2, "/bin/b", 200)];
+        let events = vec![
+            sample_event(1, "/bin/a", 100),
+            sample_event(2, "/bin/b", 200),
+        ];
         let table = format_events_table(&events);
         assert_eq!(table.lines().count(), 3);
         assert!(table.contains("/bin/a"));

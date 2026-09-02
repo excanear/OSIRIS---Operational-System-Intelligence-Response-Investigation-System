@@ -22,8 +22,10 @@ pub async fn run_ingestion_loop(
             return;
         }
         if let Ok(lines) = tailer.poll() {
-            let events: Vec<CanonicalEvent> =
-                lines.iter().filter_map(|line| serde_json::from_str(line).ok()).collect();
+            let events: Vec<CanonicalEvent> = lines
+                .iter()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
             if !events.is_empty() {
                 let storage = storage.clone();
                 let _ = tokio::task::spawn_blocking(move || storage.batch_write(&events)).await;
@@ -48,15 +50,43 @@ mod tests {
     fn sample_event() -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
-            event_id: Uuid::now_v7(), schema_version: SCHEMA_VERSION.to_string(),
-            host_id, boot_id: "b".to_string(), timestamp: 1000, monotonic_timestamp: 1000,
-            event_type: EventType::ProcessExec, category: Category::Process, severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None,
-            file: None, network: None, dns: None, device: None, service: None, container: None,
-            namespace: None, cgroup: None, kernel: None, source: Source::Synthetic,
-            provider: "test".to_string(), raw_event: None, relationships: vec![], tags: vec![],
-            risk: None, event_data: serde_json::json!({}),
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1000,
+            monotonic_timestamp: 1000,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -65,7 +95,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool_path = dir.path().join("spool.ndjson");
         std::fs::write(&spool_path, "").unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
 
         let handle = tokio::spawn(run_ingestion_loop(
@@ -75,7 +106,10 @@ mod tests {
             cancellation.clone(),
         ));
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&spool_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
         writeln!(file, "{}", serde_json::to_string(&sample_event()).unwrap()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -91,7 +125,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool_path = dir.path().join("spool.ndjson");
         std::fs::write(&spool_path, "").unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
 
         let handle = tokio::spawn(run_ingestion_loop(
@@ -105,7 +140,10 @@ mod tests {
         // well-formed-JSON-but-wrong-shape line; the loop must skip both
         // malformed lines without erroring or panicking, and still ingest
         // the two valid events.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&spool_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
         writeln!(file, "{}", serde_json::to_string(&sample_event()).unwrap()).unwrap();
         writeln!(file, "{{\"event_id\": \"not-cl").unwrap(); // truncated JSON
         writeln!(file, "{{\"unrelated\": \"shape\"}}").unwrap(); // valid JSON, wrong shape

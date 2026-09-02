@@ -12,8 +12,9 @@ use osiris_sensor_api::RawEvent;
 /// production normalize/enrich/validate/prioritize code, not a parallel
 /// simulation.
 fn main() {
-    let host_id = HostIdentity::load_or_create(&std::env::temp_dir().join("osiris-generator-host-id"))
-        .unwrap_or_else(|_| uuid::Uuid::new_v4());
+    let host_id =
+        HostIdentity::load_or_create(&std::env::temp_dir().join("osiris-generator-host-id"))
+            .unwrap_or_else(|_| uuid::Uuid::new_v4());
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())

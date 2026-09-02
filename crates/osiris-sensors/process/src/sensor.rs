@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use osiris_sensor_api::{
-    ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError,
-    SensorHealth, SensorMetrics, SensorState,
+    ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth,
+    SensorMetrics, SensorState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -68,7 +68,9 @@ impl ProcessExecSensor {
 /// mid-update could violate) — keeps this crate's "no unwrap/expect
 /// outside tests" discipline for lock results.
 fn lock_health(health: &Mutex<HealthState>) -> MutexGuard<'_, HealthState> {
-    health.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[async_trait]
@@ -129,7 +131,10 @@ impl Sensor for ProcessExecSensor {
                                 let start_time_mono =
                                     read_process_start_time(raw.pid).unwrap_or(raw.timestamp_ns);
                                 let event_ts = raw.timestamp_ns;
-                                let event = ProcessExecRaw { start_time_mono, ..raw };
+                                let event = ProcessExecRaw {
+                                    start_time_mono,
+                                    ..raw
+                                };
                                 if output.send(RawEvent::ProcessExec(event)).await.is_ok() {
                                     let mut h = lock_health(&health);
                                     h.events_emitted_total += 1;
@@ -235,7 +240,10 @@ mod tests {
         sensor.initialize(ctx).await.unwrap();
         sensor.start().await.unwrap();
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(
             file,
             r#"type=SYSCALL msg=audit(1690000000.123:456): arch=c000003e syscall=59 success=yes exit=0 ppid=1234 pid=5678 auid=1000 uid=1000 gid=1000 euid=1000 suid=1000 fsuid=1000 egid=1000 sgid=1000 fsgid=1000 tty=pts0 ses=1 comm="curl" exe="/usr/bin/curl" key=(null)"#

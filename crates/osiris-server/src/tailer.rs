@@ -16,7 +16,11 @@ pub struct SpoolTailer {
 
 impl SpoolTailer {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), offset: 0, partial: String::new() }
+        Self {
+            path: path.into(),
+            offset: 0,
+            partial: String::new(),
+        }
     }
 
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
@@ -65,7 +69,10 @@ mod tests {
         let mut tailer = SpoolTailer::new(&path);
         assert_eq!(tailer.poll().unwrap(), vec!["{\"a\":1}".to_string()]);
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file, "{{\"a\":2}}").unwrap();
 
         assert_eq!(tailer.poll().unwrap(), vec!["{\"a\":2}".to_string()]);

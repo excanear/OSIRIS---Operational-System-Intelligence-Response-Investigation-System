@@ -26,7 +26,10 @@ pub fn parse_audit_line(line: &str) -> Option<ProcessExecRaw> {
     let uid: u32 = fields.get("uid")?.parse().ok()?;
     let comm = fields.get("comm")?.clone();
     let exe_path = fields.get("exe")?.clone();
-    let timestamp_ns = fields.get("msg").and_then(|m| parse_audit_timestamp_ns(m)).unwrap_or(0);
+    let timestamp_ns = fields
+        .get("msg")
+        .and_then(|m| parse_audit_timestamp_ns(m))
+        .unwrap_or(0);
 
     Some(ProcessExecRaw {
         pid,
@@ -138,7 +141,8 @@ mod tests {
         // own key=value pair. The required `exe` field is then missing,
         // so this must fail cleanly via `?` rather than panicking or
         // producing a garbage exe_path.
-        let line = SAMPLE_SYSCALL_LINE.replace(r#"comm="curl" exe="/usr/bin/curl""#, r#"comm="curl"#);
+        let line =
+            SAMPLE_SYSCALL_LINE.replace(r#"comm="curl" exe="/usr/bin/curl""#, r#"comm="curl"#);
         assert!(parse_audit_line(&line).is_none());
     }
 }
