@@ -85,4 +85,39 @@ mod tests {
         let results = storage.query(&QueryPlan::new()).unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[tokio::test]
+    async fn skips_malformed_lines_and_ingests_valid_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        std::fs::write(&spool_path, "").unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let cancellation = CancellationToken::new();
+
+        let handle = tokio::spawn(run_ingestion_loop(
+            spool_path.clone(),
+            storage.clone(),
+            Duration::from_millis(20),
+            cancellation.clone(),
+        ));
+
+        // Mix valid CanonicalEvent JSON with a truncated line and a
+        // well-formed-JSON-but-wrong-shape line; the loop must skip both
+        // malformed lines without erroring or panicking, and still ingest
+        // the two valid events.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&spool_path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&sample_event()).unwrap()).unwrap();
+        writeln!(file, "{{\"event_id\": \"not-cl").unwrap(); // truncated JSON
+        writeln!(file, "{{\"unrelated\": \"shape\"}}").unwrap(); // valid JSON, wrong shape
+        let mut second_event = sample_event();
+        second_event.timestamp = 2000;
+        writeln!(file, "{}", serde_json::to_string(&second_event).unwrap()).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancellation.cancel();
+        handle.await.unwrap();
+
+        let results = storage.query(&QueryPlan::new()).unwrap();
+        assert_eq!(results.len(), 2);
+    }
 }
