@@ -80,14 +80,18 @@ impl InMemorySink {
     }
 
     pub fn events(&self) -> Vec<CanonicalEvent> {
-        self.events.lock().unwrap().clone()
+        // A poisoned lock still holds a fully-formed Vec of whatever was
+        // pushed before the panic — for this test-support struct, reading
+        // that is more useful than propagating the poison, so recover
+        // rather than unwrap.
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 #[async_trait]
 impl Sink for InMemorySink {
     async fn send(&self, event: CanonicalEvent) -> Result<(), SinkError> {
-        self.events.lock().unwrap().push(event);
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
         Ok(())
     }
 }

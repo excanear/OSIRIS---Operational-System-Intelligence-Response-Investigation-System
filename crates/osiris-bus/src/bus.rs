@@ -155,6 +155,15 @@ mod tests {
         }
     }
 
+    /// Like `sample_event`, but tagged so a test can tell, from
+    /// `InMemorySink::events()`'s send-order recording, which lane an
+    /// event came from.
+    fn tagged_event(tag: &str) -> CanonicalEvent {
+        let mut event = sample_event();
+        event.tags = vec![tag.to_string()];
+        event
+    }
+
     #[tokio::test]
     async fn enqueued_events_reach_the_sink_via_drain_loop() {
         let metrics = Arc::new(MetricsRegistry::new());
@@ -200,6 +209,18 @@ mod tests {
     /// cycle's weight of 8), the Verbose lane must still make progress each
     /// cycle (the starvation guard) rather than being starved outright by
     /// strict priority ordering.
+    ///
+    /// Final counts alone don't distinguish weighted/interleaved draining
+    /// from naive strict-priority draining (drain all of Critical, then
+    /// Verbose) — both reach the same totals once everything's flushed. So
+    /// this test inspects `InMemorySink`'s *send order* (tagging each event
+    /// by originating lane) and asserts the first Verbose event was
+    /// forwarded before the last Critical event: with weight
+    /// Critical=8/Verbose=1, cycle 1 drains 8 Critical then 1 Verbose, so
+    /// Verbose event #1 lands at index 8 while Critical events keep
+    /// arriving through index 21. A strict-priority-only implementation
+    /// would instead forward all 20 Critical events (indices 0..19) before
+    /// any Verbose event (indices 20..22), which fails this assertion.
     #[tokio::test]
     async fn lower_lanes_still_drain_under_sustained_critical_load() {
         let metrics = Arc::new(MetricsRegistry::new());
@@ -212,18 +233,31 @@ mod tests {
         // 20 Critical events (more than one cycle's weight of 8) plus 3
         // Verbose events, all enqueued before the loop gets to run.
         for _ in 0..20 {
-            bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Critical });
+            bus.enqueue(PrioritizedEvent { event: tagged_event("critical"), lane: PriorityLane::Critical });
         }
         for _ in 0..3 {
-            bus.enqueue(PrioritizedEvent { event: sample_event(), lane: PriorityLane::Verbose });
+            bus.enqueue(PrioritizedEvent { event: tagged_event("verbose"), lane: PriorityLane::Verbose });
         }
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         cancellation.cancel();
         drain_handle.await.unwrap();
 
-        assert_eq!(sink.events().len(), 23);
+        let events = sink.events();
+        assert_eq!(events.len(), 23);
         assert_eq!(metrics.counter("bus.Verbose.dequeued_total").get(), 3);
         assert_eq!(metrics.counter("bus.Critical.dequeued_total").get(), 20);
+
+        let has_tag = |e: &CanonicalEvent, tag: &str| e.tags.iter().any(|t| t == tag);
+        let first_verbose_idx = events.iter().position(|e| has_tag(e, "verbose"))
+            .expect("a verbose event was sent and must appear in send order");
+        let last_critical_idx = events.iter().rposition(|e| has_tag(e, "critical"))
+            .expect("a critical event was sent and must appear in send order");
+        assert!(
+            first_verbose_idx < last_critical_idx,
+            "expected interleaved draining (first Verbose event before the last Critical event), \
+             got first_verbose_idx={first_verbose_idx} last_critical_idx={last_critical_idx} — \
+             this would fail under naive strict-priority draining"
+        );
     }
 }
