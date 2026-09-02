@@ -2,7 +2,7 @@ use osiris_schema::{CanonicalEvent, EventType};
 use serde::{Deserialize, Serialize};
 
 /// The Event Bus's five priority lanes (ARCHITECTURE.md §8.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PriorityLane { Critical, High, Normal, Low, Verbose }
 

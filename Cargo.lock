@@ -254,6 +254,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-bus"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "osiris-pipeline",
+ "osiris-schema",
+ "osiris-selftelemetry",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-config"
 version = "0.1.0"
 dependencies = [
