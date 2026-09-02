@@ -1,0 +1,222 @@
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
+use osiris_generator::{exec_chain_scenario, SyntheticSensor};
+use osiris_pipeline::Pipeline;
+use osiris_schema::HostRef;
+use osiris_selftelemetry::MetricsRegistry;
+use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
+use osiris_sensors_process::ProcessExecSensor;
+use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::AgentConfig;
+use crate::lifecycle::AgentLifecycle;
+use crate::status::AgentStatus;
+
+#[derive(Debug, Error)]
+pub enum AgentError {
+    #[error("failed to open spool file: {0}")]
+    Spool(#[from] osiris_bus::SinkError),
+    #[error("failed to bind status endpoint: {0}")]
+    Status(std::io::Error),
+}
+
+/// The Agent Supervisor (ARCHITECTURE.md §3.1/§3.2), Phase 1 scope: starts
+/// every registered sensor whose capabilities() report support, wires
+/// their shared output channel through one Pipeline instance into the
+/// Event Bus, and serves a local status endpoint. Plan Global Constraints
+/// #11: this performs one-shot startup supervision (skip-if-unsupported,
+/// aggregate health) but not runtime crash-restart-with-backoff.
+pub struct Agent {
+    lifecycle: Mutex<AgentLifecycle>,
+    sensors: tokio::sync::Mutex<Vec<Box<dyn Sensor>>>,
+    skipped_sensors: Mutex<Vec<String>>,
+    cancellation: CancellationToken,
+}
+
+/// Locks a `Mutex`, recovering rather than panicking if a prior holder
+/// panicked while holding it — matches the poison-recovery discipline
+/// already established by `osiris-sensors-process` and `osiris-generator`'s
+/// `lock_health()` (a poisoned lock here still holds a fully-formed
+/// `AgentLifecycle`/`Vec<String>`, so recovering is safe).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Agent {
+    pub async fn start(
+        config: AgentConfig,
+        host: HostRef,
+        boot_id: String,
+    ) -> Result<Arc<Self>, AgentError> {
+        let cancellation = CancellationToken::new();
+        let (raw_tx, mut raw_rx) = mpsc::channel(1024);
+
+        let mut candidate_sensors: Vec<Box<dyn Sensor>> = vec![];
+        if let Some(path) = &config.audit_log_path {
+            candidate_sensors.push(Box::new(ProcessExecSensor::new(path.clone())));
+        }
+        if config.enable_synthetic {
+            let base_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            candidate_sensors.push(Box::new(SyntheticSensor::new(exec_chain_scenario(base_ts))));
+        }
+
+        let mut running_sensors: Vec<Box<dyn Sensor>> = vec![];
+        let mut skipped = vec![];
+        for mut sensor in candidate_sensors {
+            let caps = sensor.capabilities();
+            if !caps.supported() {
+                skipped.push(format!(
+                    "{}: {}",
+                    sensor.name(),
+                    caps.unsupported_reason.unwrap_or_else(|| "unsupported".to_string())
+                ));
+                continue;
+            }
+            let ctx = SensorContext::new(raw_tx.clone(), cancellation.clone());
+            match sensor.initialize(ctx).await {
+                Ok(()) => {
+                    if let Err(e) = sensor.start().await {
+                        skipped.push(format!("{}: start failed: {}", sensor.name(), e));
+                        continue;
+                    }
+                    running_sensors.push(sensor);
+                }
+                Err(e) => skipped.push(format!("{}: {}", sensor.name(), e)),
+            }
+        }
+        drop(raw_tx);
+
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (bus, receivers) = EventBus::new(metrics.clone());
+        let sink: Arc<dyn Sink> = Arc::new(SpoolFileSink::open(&config.spool_path).await?);
+        tokio::spawn(run_drain_loop(receivers, sink, metrics.clone(), cancellation.clone()));
+
+        let bus = Arc::new(bus);
+        let mut pipeline = Pipeline::new(host, boot_id);
+        let pipeline_cancellation = cancellation.clone();
+        let pipeline_bus = bus.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_raw = raw_rx.recv() => {
+                        match maybe_raw {
+                            Some(raw) => {
+                                let prioritized = pipeline.process(raw);
+                                pipeline_bus.enqueue(prioritized);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = pipeline_cancellation.cancelled() => break,
+                }
+            }
+        });
+
+        Ok(Arc::new(Self {
+            lifecycle: Mutex::new(AgentLifecycle::Running),
+            sensors: tokio::sync::Mutex::new(running_sensors),
+            skipped_sensors: Mutex::new(skipped),
+            cancellation,
+        }))
+    }
+
+    pub async fn status_snapshot(&self) -> AgentStatus {
+        let lifecycle = *lock(&self.lifecycle);
+        let sensors = self.sensors.lock().await;
+        let sensor_health: Vec<SensorHealth> = sensors.iter().map(|s| s.health()).collect();
+        AgentStatus { lifecycle, sensors: sensor_health }
+    }
+
+    pub fn skipped_sensors(&self) -> Vec<String> {
+        lock(&self.skipped_sensors).clone()
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancellation.cancel();
+        let mut sensors = self.sensors.lock().await;
+        for sensor in sensors.iter_mut() {
+            let _ = sensor.stop().await;
+        }
+        *lock(&self.lifecycle) = AgentLifecycle::Stopped;
+    }
+
+    pub async fn serve_status(self: Arc<Self>, addr: SocketAddr) -> Result<(), AgentError> {
+        crate::status::serve_status(self, addr).await.map_err(AgentError::Status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_host() -> HostRef {
+        HostRef {
+            host_id: Uuid::new_v4(),
+            hostname: "h".to_string(),
+            distro: "d".to_string(),
+            kernel_version: "k".to_string(),
+            cloud: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_with_synthetic_sensor_and_reaches_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            audit_log_path: None,
+            enable_synthetic: true,
+            spool_path: dir.path().join("spool.ndjson").to_string_lossy().to_string(),
+            status_addr: "127.0.0.1:0".to_string(),
+        };
+        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.lifecycle, AgentLifecycle::Running);
+        assert_eq!(status.sensors.len(), 1);
+        assert_eq!(status.sensors[0].name, "synthetic_generator");
+
+        agent.shutdown().await;
+        assert_eq!(agent.status_snapshot().await.lifecycle, AgentLifecycle::Stopped);
+    }
+
+    #[tokio::test]
+    async fn skips_process_exec_sensor_when_audit_log_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            audit_log_path: Some(dir.path().join("missing.log").to_string_lossy().to_string()),
+            enable_synthetic: false,
+            spool_path: dir.path().join("spool.ndjson").to_string_lossy().to_string(),
+            status_addr: "127.0.0.1:0".to_string(),
+        };
+        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 0);
+        assert_eq!(agent.skipped_sensors().len(), 1);
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn synthetic_events_reach_the_spool_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let config = AgentConfig {
+            audit_log_path: None,
+            enable_synthetic: true,
+            spool_path: spool_path.to_string_lossy().to_string(),
+            status_addr: "127.0.0.1:0".to_string(),
+        };
+        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert_eq!(contents.lines().count(), 3);
+        assert!(contents.contains("\"PROCESS_EXEC\""));
+    }
+}
