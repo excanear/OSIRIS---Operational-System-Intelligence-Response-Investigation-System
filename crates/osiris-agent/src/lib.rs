@@ -6,4 +6,4 @@ pub mod status;
 pub use agent::{Agent, AgentError};
 pub use config::AgentConfig;
 pub use lifecycle::AgentLifecycle;
-pub use status::{serve_status, AgentStatus};
+pub use status::{serve_status, AgentStatus, SkippedSensor};

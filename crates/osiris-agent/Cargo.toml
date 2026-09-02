@@ -17,6 +17,7 @@ axum = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
+tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-config = { path = "../osiris-config" }
 osiris-health = { path = "../osiris-health" }

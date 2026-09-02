@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
 use crate::lifecycle::AgentLifecycle;
-use crate::status::AgentStatus;
+use crate::status::{AgentStatus, SkippedSensor};
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -34,7 +34,7 @@ pub enum AgentError {
 pub struct Agent {
     lifecycle: Mutex<AgentLifecycle>,
     sensors: tokio::sync::Mutex<Vec<Box<dyn Sensor>>>,
-    skipped_sensors: Mutex<Vec<String>>,
+    skipped_sensors: Mutex<Vec<SkippedSensor>>,
     cancellation: CancellationToken,
 }
 
@@ -66,27 +66,31 @@ impl Agent {
         }
 
         let mut running_sensors: Vec<Box<dyn Sensor>> = vec![];
-        let mut skipped = vec![];
+        let mut skipped: Vec<SkippedSensor> = vec![];
         for mut sensor in candidate_sensors {
             let caps = sensor.capabilities();
             if !caps.supported() {
-                skipped.push(format!(
-                    "{}: {}",
-                    sensor.name(),
-                    caps.unsupported_reason.unwrap_or_else(|| "unsupported".to_string())
-                ));
+                let reason = caps.unsupported_reason.unwrap_or_else(|| "unsupported".to_string());
+                tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: unsupported on this host");
+                skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
                 continue;
             }
             let ctx = SensorContext::new(raw_tx.clone(), cancellation.clone());
             match sensor.initialize(ctx).await {
                 Ok(()) => {
                     if let Err(e) = sensor.start().await {
-                        skipped.push(format!("{}: start failed: {}", sensor.name(), e));
+                        let reason = format!("start failed: {e}");
+                        tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to start");
+                        skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
                         continue;
                     }
                     running_sensors.push(sensor);
                 }
-                Err(e) => skipped.push(format!("{}: {}", sensor.name(), e)),
+                Err(e) => {
+                    let reason = e.to_string();
+                    tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to initialize");
+                    skipped.push(SkippedSensor { name: sensor.name().to_string(), reason });
+                }
             }
         }
         drop(raw_tx);
@@ -129,10 +133,11 @@ impl Agent {
         let lifecycle = *lock(&self.lifecycle);
         let sensors = self.sensors.lock().await;
         let sensor_health: Vec<SensorHealth> = sensors.iter().map(|s| s.health()).collect();
-        AgentStatus { lifecycle, sensors: sensor_health }
+        let skipped_sensors = lock(&self.skipped_sensors).clone();
+        AgentStatus { lifecycle, sensors: sensor_health, skipped_sensors }
     }
 
-    pub fn skipped_sensors(&self) -> Vec<String> {
+    pub fn skipped_sensors(&self) -> Vec<SkippedSensor> {
         lock(&self.skipped_sensors).clone()
     }
 
@@ -196,7 +201,23 @@ mod tests {
         let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
         let status = agent.status_snapshot().await;
         assert_eq!(status.sensors.len(), 0);
-        assert_eq!(agent.skipped_sensors().len(), 1);
+
+        let skipped = agent.skipped_sensors();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "process_exec");
+        assert!(
+            skipped[0].reason.contains("audit log not found"),
+            "expected the skip reason to explain why, got: {}",
+            skipped[0].reason
+        );
+
+        // The same skip must be surfaced on the status endpoint's response
+        // shape, not just the internal accessor (Global Constraint #11:
+        // "health-visible reason").
+        assert_eq!(status.skipped_sensors.len(), 1);
+        assert_eq!(status.skipped_sensors[0].name, "process_exec");
+        assert_eq!(status.skipped_sensors[0].reason, skipped[0].reason);
+
         agent.shutdown().await;
     }
 

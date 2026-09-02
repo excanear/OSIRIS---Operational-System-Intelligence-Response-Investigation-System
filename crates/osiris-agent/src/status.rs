@@ -10,10 +10,22 @@ use serde::Serialize;
 use crate::agent::Agent;
 use crate::lifecycle::AgentLifecycle;
 
+/// One sensor the Supervisor decided not to start, and why (Global
+/// Constraint #11: "skip unsupported ones with a logged, health-visible
+/// reason — never a silent no-op"). Surfaced on `AgentStatus` so Task 9's
+/// `osiris status` can show it, not just the internal
+/// `Agent::skipped_sensors()` accessor.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedSensor {
+    pub name: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentStatus {
     pub lifecycle: AgentLifecycle,
     pub sensors: Vec<SensorHealth>,
+    pub skipped_sensors: Vec<SkippedSensor>,
 }
 
 /// The Phase 1 substitute for the UDS local control endpoint (plan Global
