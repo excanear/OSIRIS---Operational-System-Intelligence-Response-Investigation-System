@@ -1026,6 +1026,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -1166,6 +1167,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
