@@ -36,6 +36,16 @@ pub struct Agent {
     sensors: tokio::sync::Mutex<Vec<Box<dyn Sensor>>>,
     skipped_sensors: Mutex<Vec<SkippedSensor>>,
     cancellation: CancellationToken,
+    /// JoinHandles for the drain-loop task and the pipeline (raw-event
+    /// consumer) task, retained (rather than discarded, as `tokio::spawn`
+    /// would otherwise let happen) so `shutdown()` can await them and
+    /// guarantee the final drain pass (finding 3) has actually completed —
+    /// and therefore that whatever was queued in the bus lanes / raw
+    /// channel at shutdown time has been flushed to the sink — before
+    /// `shutdown()` returns. `Option` because `JoinHandle` isn't `Clone`
+    /// and shutdown only ever runs once; a `tokio::sync::Mutex` because
+    /// `shutdown` takes `&self`.
+    background_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Locks a `Mutex`, recovering rather than panicking if a prior holder
@@ -114,7 +124,7 @@ impl Agent {
         let metrics = Arc::new(MetricsRegistry::new());
         let (bus, receivers) = EventBus::new(metrics.clone());
         let sink: Arc<dyn Sink> = Arc::new(SpoolFileSink::open(&config.spool_path).await?);
-        tokio::spawn(run_drain_loop(
+        let drain_handle = tokio::spawn(run_drain_loop(
             receivers,
             sink,
             metrics.clone(),
@@ -125,7 +135,7 @@ impl Agent {
         let mut pipeline = Pipeline::new(host, boot_id);
         let pipeline_cancellation = cancellation.clone();
         let pipeline_bus = bus.clone();
-        tokio::spawn(async move {
+        let pipeline_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     maybe_raw = raw_rx.recv() => {
@@ -147,6 +157,7 @@ impl Agent {
             sensors: tokio::sync::Mutex::new(running_sensors),
             skipped_sensors: Mutex::new(skipped),
             cancellation,
+            background_tasks: tokio::sync::Mutex::new(vec![pipeline_handle, drain_handle]),
         }))
     }
 
@@ -172,6 +183,21 @@ impl Agent {
         for sensor in sensors.iter_mut() {
             let _ = sensor.stop().await;
         }
+
+        // Await the pipeline and drain-loop tasks so shutdown genuinely
+        // waits for the final drain (finding 3) to complete before
+        // returning, rather than cancelling and discarding whatever was
+        // still queued in the raw channel / bus lanes. Awaited in spawn
+        // order: the pipeline task first (it stops consuming raw events
+        // and enqueues whatever it already had onto the bus), then the
+        // drain-loop task (whose final_drain pass picks up exactly what
+        // the pipeline just enqueued) — so nothing in flight at shutdown
+        // time is silently dropped.
+        let handles: Vec<_> = self.background_tasks.lock().await.drain(..).collect();
+        for handle in handles {
+            let _ = handle.await;
+        }
+
         *lock(&self.lifecycle) = AgentLifecycle::Stopped;
     }
 
