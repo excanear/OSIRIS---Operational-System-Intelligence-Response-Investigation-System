@@ -30,9 +30,21 @@ impl SensorHealth {
     /// type from osiris-health, per ARCHITECTURE.md §23's health rollup.
     pub fn to_agent_health(&self) -> osiris_health::SensorHealth {
         let state = match self.state {
-            SensorState::Starting | SensorState::Healthy | SensorState::Stopped => {
-                osiris_health::HealthState::Healthy
-            }
+            SensorState::Starting | SensorState::Healthy => osiris_health::HealthState::Healthy,
+            // A stopped sensor's task has ended and it is no longer
+            // emitting events. Phase 1 has no crash-restart (plan Global
+            // Constraints #11), so a stopped sensor stays stopped — that
+            // must be visible on the health rollup rather than reading as
+            // fine (finding 6). Reusing `Degraded` rather than adding a
+            // new osiris-health variant: it's not necessarily a crash
+            // (could be a clean shutdown request), but it is a state a
+            // healthy running agent should surface, not hide.
+            SensorState::Stopped => osiris_health::HealthState::Degraded {
+                last_error: self
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "sensor stopped".to_string()),
+            },
             SensorState::Degraded => osiris_health::HealthState::Degraded {
                 last_error: self
                     .last_error
@@ -72,6 +84,29 @@ mod tests {
             p99_emit_latency_us: 200,
         };
         let agent_health = h.to_agent_health();
+        assert!(matches!(
+            agent_health.state,
+            osiris_health::HealthState::Degraded { .. }
+        ));
+    }
+
+    /// Regression test for finding 6: a stopped sensor (Phase 1 has no
+    /// crash-restart, so "stopped" is exactly the state a sensor whose
+    /// task has ended lands in) must not roll up as Healthy.
+    #[test]
+    fn stopped_state_does_not_roll_up_as_healthy() {
+        let h = SensorHealth {
+            name: "process_exec".to_string(),
+            state: SensorState::Stopped,
+            events_emitted_total: 5,
+            events_dropped_total: 0,
+            last_error: None,
+            last_event_at: Some(1),
+            capability_flags: vec![],
+            p99_emit_latency_us: 50,
+        };
+        let agent_health = h.to_agent_health();
+        assert_ne!(agent_health.state, osiris_health::HealthState::Healthy);
         assert!(matches!(
             agent_health.state,
             osiris_health::HealthState::Degraded { .. }
