@@ -15,13 +15,23 @@ pub fn enrich(
     event.boot_id = boot_id.to_string();
 
     if let Some(process) = &event.process {
-        resolver.record(process.pid, current_ppid(&event), process.process_key);
+        let ppid = current_ppid(&event);
+        resolver.record(process.pid, ppid, process.process_key);
         event.parent_process =
             resolver
                 .resolve_parent(process.pid)
                 .map(|parent_key| osiris_schema::ProcessRef {
                     process_key: parent_key,
-                    pid: 0,
+                    // The real ppid (finding 5) — not the placeholder 0
+                    // that was indistinguishable from a genuine pid 0
+                    // once persisted and served over /api/v1/events.
+                    pid: ppid,
+                    // ProcessResolver's cache (by_pid) only stores
+                    // (ProcessKey, ppid), not exe_path, so there is no
+                    // cheap cached value to populate this from without
+                    // adding a new lookup mechanism (out of scope for
+                    // this fix) — leave it empty, an honest "unknown"
+                    // rather than paired with a wrong pid.
                     exe_path: String::new(),
                     cmdline: vec![],
                     exe_hash: None,
@@ -115,5 +125,20 @@ mod tests {
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
         );
+    }
+
+    /// Regression test for finding 5: `parent_process.pid` must be the
+    /// real ppid, not the placeholder `0` (which, once persisted and
+    /// served over /api/v1/events, is indistinguishable from a genuine
+    /// pid 0).
+    #[test]
+    fn parent_process_pid_is_the_real_ppid_not_a_placeholder_zero() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let _bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
+
+        let parent = curl.parent_process.expect("parent must resolve");
+        assert_eq!(parent.pid, 100, "must be the real ppid, not 0");
     }
 }
