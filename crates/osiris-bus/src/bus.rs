@@ -116,6 +116,7 @@ pub async fn run_drain_loop(
 ) {
     loop {
         if cancellation.is_cancelled() {
+            final_drain(&mut receivers, &sink, &metrics).await;
             return;
         }
         let mut drained_any = false;
@@ -130,7 +131,16 @@ pub async fn run_drain_loop(
                         metrics
                             .counter(&format!("bus.{:?}.dequeued_total", lane))
                             .increment();
-                        let _ = sink.send(event).await;
+                        if let Err(err) = sink.send(event).await {
+                            metrics
+                                .counter(&format!("bus.{:?}.sink_error_total", lane))
+                                .increment();
+                            tracing::error!(
+                                lane = ?lane,
+                                error = %err,
+                                "failed to forward drained event to sink; event is lost"
+                            );
+                        }
                     }
                     Err(_) => break,
                 }
@@ -139,7 +149,42 @@ pub async fn run_drain_loop(
         if !drained_any {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-                _ = cancellation.cancelled() => return,
+                _ = cancellation.cancelled() => {
+                    final_drain(&mut receivers, &sink, &metrics).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One best-effort, non-blocking drain pass over every lane, run once on
+/// shutdown (finding 3): flushes whatever is already queued in the bus
+/// lanes so it reaches the sink instead of being silently discarded when
+/// `run_drain_loop` returns. Never waits for new items to arrive — only
+/// drains what is already sitting in each channel's buffer.
+async fn final_drain(
+    receivers: &mut HashMap<PriorityLane, Receiver<CanonicalEvent>>,
+    sink: &Arc<dyn Sink>,
+    metrics: &Arc<MetricsRegistry>,
+) {
+    for lane in LANES {
+        let Some(receiver) = receivers.get_mut(&lane) else {
+            continue;
+        };
+        while let Ok(event) = receiver.try_recv() {
+            metrics
+                .counter(&format!("bus.{:?}.dequeued_total", lane))
+                .increment();
+            if let Err(err) = sink.send(event).await {
+                metrics
+                    .counter(&format!("bus.{:?}.sink_error_total", lane))
+                    .increment();
+                tracing::error!(
+                    lane = ?lane,
+                    error = %err,
+                    "failed to forward event to sink during final shutdown drain; event is lost"
+                );
             }
         }
     }
@@ -331,5 +376,54 @@ mod tests {
              got first_verbose_idx={first_verbose_idx} last_critical_idx={last_critical_idx} — \
              this would fail under naive strict-priority draining"
         );
+    }
+
+    /// Regression test for finding 3: events already queued in the bus
+    /// lanes when cancellation fires must still reach the sink via a final
+    /// drain pass, not be silently discarded. This deliberately cancels
+    /// the token *before* `run_drain_loop` is even spawned, so the very
+    /// first `cancellation.is_cancelled()` check at the top of the loop is
+    /// already true — guaranteeing (not just probabilistically exercising)
+    /// that the only way these events reach the sink is via the final
+    /// drain pass run on the cancelled-at-top-of-loop path, not via any
+    /// normal drain cycle.
+    #[tokio::test]
+    async fn events_queued_before_cancellation_are_flushed_by_final_drain() {
+        let metrics = Arc::new(MetricsRegistry::new());
+        let (bus, receivers) = EventBus::new(metrics.clone());
+        let sink = InMemorySink::new();
+        let sink_dyn: Arc<dyn Sink> = Arc::new(sink.clone());
+        let cancellation = CancellationToken::new();
+
+        for _ in 0..5 {
+            bus.enqueue(PrioritizedEvent {
+                event: sample_event(),
+                lane: PriorityLane::Normal,
+            });
+        }
+        bus.enqueue(PrioritizedEvent {
+            event: sample_event(),
+            lane: PriorityLane::Critical,
+        });
+
+        // Cancel before the drain loop ever runs a single iteration.
+        cancellation.cancel();
+
+        let drain_handle = tokio::spawn(run_drain_loop(
+            receivers,
+            sink_dyn,
+            metrics.clone(),
+            cancellation,
+        ));
+        drain_handle.await.unwrap();
+
+        assert_eq!(
+            sink.events().len(),
+            6,
+            "events queued before cancellation must still be flushed by the final drain pass, \
+             not silently dropped when run_drain_loop returns"
+        );
+        assert_eq!(metrics.counter("bus.Normal.dequeued_total").get(), 5);
+        assert_eq!(metrics.counter("bus.Critical.dequeued_total").get(), 1);
     }
 }

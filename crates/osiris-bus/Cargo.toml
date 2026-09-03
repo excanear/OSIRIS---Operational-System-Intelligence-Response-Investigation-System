@@ -9,6 +9,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-pipeline = { path = "../osiris-pipeline" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }

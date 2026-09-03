@@ -21,14 +21,38 @@ pub async fn run_ingestion_loop(
         if cancellation.is_cancelled() {
             return;
         }
-        if let Ok(lines) = tailer.poll() {
-            let events: Vec<CanonicalEvent> = lines
-                .iter()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-            if !events.is_empty() {
-                let storage = storage.clone();
-                let _ = tokio::task::spawn_blocking(move || storage.batch_write(&events)).await;
+        match tailer.poll() {
+            Ok(lines) => {
+                let events: Vec<CanonicalEvent> = lines
+                    .iter()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                if !events.is_empty() {
+                    let storage = storage.clone();
+                    let event_count = events.len();
+                    match tokio::task::spawn_blocking(move || storage.batch_write(&events)).await {
+                        Ok(Ok(_report)) => {}
+                        Ok(Err(storage_err)) => {
+                            tracing::error!(
+                                error = %storage_err,
+                                event_count,
+                                "batch_write failed; tailer offset already advanced past these events \
+                                 — they are permanently lost"
+                            );
+                        }
+                        Err(join_err) => {
+                            tracing::error!(
+                                error = %join_err,
+                                event_count,
+                                "batch_write task panicked or was cancelled; tailer offset already \
+                                 advanced past these events — they are permanently lost"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(io_err) => {
+                tracing::error!(error = %io_err, "spool tailer poll failed; events since last successful poll may be lost");
             }
         }
         tokio::select! {
