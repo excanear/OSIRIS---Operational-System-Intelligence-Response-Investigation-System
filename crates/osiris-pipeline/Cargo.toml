@@ -1,0 +1,12 @@
+[package]
+name = "osiris-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-sensor-api = { path = "../osiris-sensor-api" }
+osiris-config = { path = "../osiris-config" }

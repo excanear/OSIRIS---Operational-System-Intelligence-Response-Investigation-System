@@ -1,0 +1,14 @@
+[package]
+name = "osiris-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

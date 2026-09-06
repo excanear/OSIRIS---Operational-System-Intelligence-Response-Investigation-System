@@ -1,0 +1,24 @@
+[package]
+name = "osiris-e2e-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-agent = { path = "../osiris-agent" }
+osiris-server = { path = "../osiris-server" }
+osiris-api = { path = "../osiris-api" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+osiris-pipeline = { path = "../osiris-pipeline" }
+osiris-sensor-api = { path = "../osiris-sensor-api" }

@@ -1,0 +1,12 @@
+[package]
+name = "osiris-sensor-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+osiris-health = { path = "../osiris-health" }

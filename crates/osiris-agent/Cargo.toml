@@ -1,0 +1,32 @@
+[package]
+name = "osiris-agent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "osirisd"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+hostname = { workspace = true }
+tracing = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-config = { path = "../osiris-config" }
+osiris-health = { path = "../osiris-health" }
+osiris-selftelemetry = { path = "../osiris-selftelemetry" }
+osiris-sensor-api = { path = "../osiris-sensor-api" }
+osiris-pipeline = { path = "../osiris-pipeline" }
+osiris-bus = { path = "../osiris-bus" }
+osiris-sensors-process = { path = "../osiris-sensors/process" }
+osiris-generator = { path = "../../generator" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

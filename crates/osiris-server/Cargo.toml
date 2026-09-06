@@ -1,0 +1,27 @@
+[package]
+name = "osiris-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "osiris-server"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+osiris-api = { path = "../osiris-api" }
+osiris-selftelemetry = { path = "../osiris-selftelemetry" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

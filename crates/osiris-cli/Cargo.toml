@@ -1,0 +1,17 @@
+[package]
+name = "osiris-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "osiris"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+
+[dev-dependencies]
+uuid = { workspace = true }

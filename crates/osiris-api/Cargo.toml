@@ -1,0 +1,17 @@
+[package]
+name = "osiris-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+
+[dev-dependencies]
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+tempfile = { workspace = true }
+uuid = { workspace = true }
