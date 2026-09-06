@@ -58,6 +58,18 @@ pub struct FileRef {
     pub path: String,
     pub previous_path: Option<String>,
     pub inode: Option<u64>,
+    /// The filesystem holding this file, as OSIRIS's own lossless encoding
+    /// `((major as u64) << 32) | (minor as u64)` of the device's major:minor
+    /// pair (see `crate::file_identity::encode_device_id`). Deliberately NOT
+    /// the kernel's `dev_t` bit layout — the audit `PATH` record prints
+    /// `dev=MAJ:MIN` in hex, and re-deriving glibc's scattered `dev_t`
+    /// packing from it would add a lossy step for no gain. Together with
+    /// `inode` and the event's `host_id` this forms the file identity
+    /// ARCHITECTURE.md §9.4 already requires of `EntityRef::File`; the field
+    /// is `#[serde(default)]` so JSON written before this field existed
+    /// still deserializes (no Phase 1 event ever populated `file`).
+    #[serde(default)]
+    pub device_id: Option<u64>,
     pub size: Option<u64>,
     pub mode: Option<u32>,
     pub owner_uid: Option<u32>,
