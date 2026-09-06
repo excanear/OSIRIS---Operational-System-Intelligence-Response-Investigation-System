@@ -1074,6 +1074,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-fileutil"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "osiris-generator"
 version = "0.1.0"
 dependencies = [
@@ -1116,6 +1123,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
  "uuid",
 ]
 
@@ -1144,6 +1152,7 @@ name = "osiris-sensors-process"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "osiris-fileutil",
  "osiris-sensor-api",
  "tempfile",
  "tokio",
@@ -1156,6 +1165,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "osiris-api",
+ "osiris-fileutil",
  "osiris-schema",
  "osiris-selftelemetry",
  "osiris-storage",

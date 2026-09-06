@@ -1,0 +1,9 @@
+[package]
+name = "osiris-fileutil"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use osiris_fileutil::{parse_audit_msg_id, tokenize};
 use osiris_sensor_api::{ProcessExecRaw, RawEventSource};
 
 /// execve/execveat syscall numbers on x86_64 — the only syscalls this
@@ -28,7 +27,8 @@ pub fn parse_audit_line(line: &str) -> Option<ProcessExecRaw> {
     let exe_path = fields.get("exe")?.clone();
     let timestamp_ns = fields
         .get("msg")
-        .and_then(|m| parse_audit_timestamp_ns(m))
+        .and_then(|m| parse_audit_msg_id(m))
+        .map(|id| id.timestamp_ns)
         .unwrap_or(0);
 
     Some(ProcessExecRaw {
@@ -41,48 +41,6 @@ pub fn parse_audit_line(line: &str) -> Option<ProcessExecRaw> {
         start_time_mono: timestamp_ns,
         source: RawEventSource::Audit,
     })
-}
-
-/// Tokenizes an audit log line into key=value pairs, honoring double-quoted
-/// values (auditd's own quoting convention for fields like `comm="curl"`).
-fn tokenize(line: &str) -> HashMap<String, String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for c in line.chars() {
-        if c == '"' {
-            in_quotes = !in_quotes;
-            current.push(c);
-        } else if c.is_whitespace() && !in_quotes {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(c);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-        .into_iter()
-        .filter_map(|t| {
-            let mut parts = t.splitn(2, '=');
-            let key = parts.next()?.to_string();
-            let value = parts.next().unwrap_or("").trim_matches('"').to_string();
-            Some((key, value))
-        })
-        .collect()
-}
-
-/// Parses `audit(1690000000.123:456):` into nanoseconds since the epoch.
-fn parse_audit_timestamp_ns(msg: &str) -> Option<u64> {
-    let inner = msg.strip_prefix("audit(")?;
-    let (ts_part, _) = inner.split_once(':')?;
-    let (secs, millis) = ts_part.split_once('.')?;
-    let secs: u64 = secs.parse().ok()?;
-    let millis: u64 = millis.parse().ok()?;
-    Some(secs * 1_000_000_000 + millis * 1_000_000)
 }
 
 #[cfg(test)]

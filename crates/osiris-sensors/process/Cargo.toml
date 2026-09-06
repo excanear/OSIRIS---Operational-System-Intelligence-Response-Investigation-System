@@ -8,6 +8,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 osiris-sensor-api = { path = "../../osiris-sensor-api" }
+osiris-fileutil = { path = "../../osiris-fileutil" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

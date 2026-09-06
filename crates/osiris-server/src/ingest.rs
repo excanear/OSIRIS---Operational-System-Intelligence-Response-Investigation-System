@@ -5,7 +5,7 @@ use osiris_schema::CanonicalEvent;
 use osiris_storage::Storage;
 use tokio_util::sync::CancellationToken;
 
-use crate::tailer::SpoolTailer;
+use osiris_fileutil::LineTailer;
 
 /// Tails the Agent's spool file and ingests each new line into Storage —
 /// the Phase 1 substitute for the UDS Agent→Server transport's server-side
@@ -16,7 +16,7 @@ pub async fn run_ingestion_loop(
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
-    let mut tailer = SpoolTailer::new(spool_path);
+    let mut tailer = LineTailer::new(spool_path);
     loop {
         if cancellation.is_cancelled() {
             return;

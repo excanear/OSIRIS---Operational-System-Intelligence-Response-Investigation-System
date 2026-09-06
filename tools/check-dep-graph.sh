@@ -2,8 +2,10 @@
 # Enforces ARCHITECTURE.md §27's privilege-boundary dependency rules:
 # osiris-sensors/*, osiris-ebpf, osiris-kernel must never reach osiris-server
 # or osiris-api; osiris-storage-*, osiris-detect, osiris-correlate,
-# osiris-risk must never reach osiris-agent; osiris-schema must not depend
-# on any other OSIRIS-internal crate. Crates that don't exist yet in the
+# osiris-risk must never reach osiris-agent; osiris-schema and osiris-fileutil
+# must not depend on any other OSIRIS-internal crate (osiris-fileutil sits
+# below both the privileged Agent side and the unprivileged Server side, so
+# it must stay a leaf). Crates that don't exist yet in the
 # workspace are skipped so this script keeps working unmodified as later
 # phases add them.
 set -euo pipefail
@@ -47,6 +49,7 @@ check_forbidden() {
 }
 
 check_no_internal_deps osiris-schema
+check_no_internal_deps osiris-fileutil
 check_forbidden osiris-server osiris-sensors osiris-ebpf osiris-kernel
 check_forbidden osiris-api osiris-sensors osiris-ebpf osiris-kernel
 check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiris-risk

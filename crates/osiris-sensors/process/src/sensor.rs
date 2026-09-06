@@ -10,8 +10,8 @@ use osiris_sensor_api::{
 use tokio_util::sync::CancellationToken;
 
 use crate::audit_line::parse_audit_line;
-use crate::audit_tailer::AuditLogTailer;
 use crate::proc_stat::read_process_start_time;
+use osiris_fileutil::LineTailer;
 
 struct HealthState {
     state: SensorState,
@@ -118,7 +118,7 @@ impl Sensor for ProcessExecSensor {
         let health = self.health.clone();
 
         let handle = tokio::spawn(async move {
-            let mut tailer = AuditLogTailer::new(path);
+            let mut tailer = LineTailer::new(path);
             loop {
                 if cancellation.is_cancelled() {
                     lock_health(&health).state = SensorState::Stopped;

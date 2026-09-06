@@ -3,17 +3,23 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 /// Tails a growing text file by tracking a byte offset, returning any
-/// complete new lines since the last poll (buffering a trailing partial
-/// line for the next call). Pure std::fs — no OS-specific API, so this
-/// works identically on Linux (tailing a real auditd log) and on any dev
-/// machine (tailing a fixture file in tests) — plan Global Constraints #2.
-pub struct AuditLogTailer {
+/// complete new lines since the last poll and buffering a trailing partial
+/// line for the next call. Pure `std::fs` — no OS-specific API — so this
+/// behaves identically tailing a real `/var/log/audit/audit.log` on Linux
+/// and a fixture file in a test on any platform.
+///
+/// This is the single shared implementation behind the Server's spool
+/// ingestion, the Process/Exec sensor's audit backend, and the Filesystem
+/// sensor's audit backend. Phase 1 shipped two copies of it and had to fix
+/// the same read-race bug in both; this crate exists so that cannot recur
+/// (Phase 2 plan Global Constraints #3).
+pub struct LineTailer {
     path: PathBuf,
     offset: u64,
     partial: String,
 }
 
-impl AuditLogTailer {
+impl LineTailer {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -22,9 +28,9 @@ impl AuditLogTailer {
         }
     }
 
-    /// Returns any complete new lines appended to the file since the last
-    /// call. Returns an empty Vec (not an error) if the file doesn't exist
-    /// yet or hasn't grown — the sensor treats "no new lines" as normal.
+    /// Returns any complete new lines appended since the last call. Returns
+    /// an empty `Vec` (not an error) if the file doesn't exist yet or hasn't
+    /// grown — callers treat "no new lines" as normal.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
         let mut file = match File::open(&self.path) {
             Ok(f) => f,
@@ -74,7 +80,7 @@ mod tests {
     #[test]
     fn returns_empty_when_file_does_not_exist() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tailer = AuditLogTailer::new(dir.path().join("missing.log"));
+        let mut tailer = LineTailer::new(dir.path().join("missing.log"));
         assert_eq!(tailer.poll().unwrap(), Vec::<String>::new());
     }
 
@@ -84,7 +90,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "line one\nline two\n").unwrap();
 
-        let mut tailer = AuditLogTailer::new(&path);
+        let mut tailer = LineTailer::new(&path);
         let first = tailer.poll().unwrap();
         assert_eq!(first, vec!["line one".to_string(), "line two".to_string()]);
 
@@ -104,7 +110,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "complete line\npartial").unwrap();
 
-        let mut tailer = AuditLogTailer::new(&path);
+        let mut tailer = LineTailer::new(&path);
         assert_eq!(tailer.poll().unwrap(), vec!["complete line".to_string()]);
 
         let mut file = std::fs::OpenOptions::new()
@@ -125,7 +131,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
 
-        let mut tailer = AuditLogTailer::new(&path);
+        let mut tailer = LineTailer::new(&path);
         let first = tailer.poll().unwrap();
         assert_eq!(
             first,
@@ -186,7 +192,7 @@ mod tests {
             }
         });
 
-        let mut tailer = AuditLogTailer::new(&path);
+        let mut tailer = LineTailer::new(&path);
         let mut seen: Vec<u64> = Vec::new();
         for _ in 0..2000 {
             for line in tailer.poll().unwrap() {
@@ -218,5 +224,23 @@ mod tests {
         // order with no duplicates and no gaps introduced by corruption.
         assert_eq!(seen, (0..seen.len() as u64).collect::<Vec<_>>());
         assert_eq!(seen.len(), 500, "must observe every line the writer sent");
+    }
+
+    #[test]
+    fn returns_new_ndjson_lines_across_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+
+        let mut tailer = LineTailer::new(&path);
+        assert_eq!(tailer.poll().unwrap(), vec!["{\"a\":1}".to_string()]);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{{\"a\":2}}").unwrap();
+
+        assert_eq!(tailer.poll().unwrap(), vec!["{\"a\":2}".to_string()]);
     }
 }

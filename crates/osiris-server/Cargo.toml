@@ -21,6 +21,7 @@ osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
 osiris-api = { path = "../osiris-api" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }
+osiris-fileutil = { path = "../osiris-fileutil" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
