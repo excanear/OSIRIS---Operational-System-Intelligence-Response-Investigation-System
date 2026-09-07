@@ -172,15 +172,150 @@ pub struct DnsEventRaw {
     pub source: RawEventSource,
 }
 
+/// The four session-lifecycle operations this phase emits — ARCHITECTURE.md
+/// §9.3's whole `IDENTITY:` taxonomy row. Each maps 1:1 onto one standard
+/// auditd record type (Phase 4a plan Global Constraints #3):
+/// `Login` <- `type=USER_LOGIN`, `Logout` <- `type=USER_LOGOUT`,
+/// `SessionStart` <- `type=USER_START` (PAM session_open),
+/// `SessionEnd` <- `type=USER_END` (PAM session_close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityOperation {
+    Login,
+    Logout,
+    SessionStart,
+    SessionEnd,
+}
+
+/// The three privilege transitions this phase emits (Phase 4a plan Global
+/// Constraints #3). `UidChange` <- `type=SYSCALL syscall=105` (`setuid(2)`
+/// on x86_64), `GidChange` <- `type=SYSCALL syscall=106` (`setgid(2)`),
+/// `Sudo` <- `type=USER_CMD`. `setresuid`/`setresgid`/`capset` are
+/// deliberately not parsed this phase — see the plan's Global Constraint #3
+/// for why, and note that adding them is a `match`-arm change here plus one
+/// in the sensor's parser, not a redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrivilegeOperation {
+    UidChange,
+    GidChange,
+    Sudo,
+}
+
+/// A session-lifecycle record, parsed from one auditd `USER_*` line.
+///
+/// Unlike `FileEventRaw`, this is assembled from a *single* record, not a
+/// correlated group — but that record has two nested layers: outer
+/// `key=value` pairs plus a single-quoted `msg='...'` sub-record. The
+/// sensor's parser splits those before tokenizing (Phase 4a plan Global
+/// Constraint #9); by the time this struct exists, both layers are merged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEventRaw {
+    pub operation: IdentityOperation,
+    /// The kernel audit session id, from the record's `ses=` field, kept as
+    /// a string rather than an integer: it is an opaque correlation handle
+    /// (§9.2's `SessionRef.session_id` is a string), auditd prints
+    /// `ses=4294967295` for "no session", and a future non-audit backend
+    /// (systemd-logind, utmp) may not produce integers at all.
+    pub session_id: String,
+    /// The pid that performed the login — `sshd`, `login`, `su`, etc. This
+    /// is the process the Pipeline's `SessionResolver` roots the session's
+    /// pid subtree at (plan Global Constraint #5).
+    pub pid: u32,
+    /// The record's own `uid=` — the uid of the *authenticating* process
+    /// (usually 0 for sshd), not necessarily the user who logged in. The
+    /// user who logged in is `auid`/`username`.
+    pub uid: u32,
+    /// The audit login uid, from `auid=`. `None` when the record omits it
+    /// or prints the unset sentinel.
+    pub auid: Option<u32>,
+    /// From the nested `msg='... acct="alice" ...'`. `None` when absent —
+    /// `USER_LOGIN` often carries `id=<uid>` instead of `acct=`.
+    pub username: Option<String>,
+    /// From the nested `terminal=`. `None` when the record printed `?`.
+    pub terminal: Option<String>,
+    /// From the nested `addr=`. `None` when the record printed `?` (a local
+    /// console login has no remote address) — never the literal `"?"`.
+    pub remote_addr: Option<String>,
+    /// The authenticating program's file stem, derived from the nested
+    /// `exe=` (e.g. `"sshd"`, `"login"`, `"su"`). This is what lands in
+    /// §9.2's `SessionRef.auth_method`. `None` when `exe=` is absent.
+    pub auth_method: Option<String>,
+    /// From the nested `res=`: `res=success` -> true, anything else ->
+    /// false. A failed login is still a real, storable event.
+    pub success: bool,
+    /// From the nested `exe=`, full path. Empty string when absent.
+    pub exe_path: String,
+    /// The basename of `exe_path` — `USER_*` records carry no `comm=`, so
+    /// unlike `SYSCALL` records this is derived, not observed.
+    pub comm: String,
+    /// Wall-clock nanoseconds, UTC, from the audit event header.
+    pub timestamp_ns: u64,
+    /// The originating audit event's serial, retained for provenance so an
+    /// operator can find the exact record in the source log.
+    pub audit_serial: Option<u64>,
+    pub source: RawEventSource,
+}
+
+/// A privilege-transition record.
+///
+/// `UidChange`/`GidChange` come from `type=SYSCALL` records, which carry
+/// `gid=`/`euid=`/`egid=` — so those three are `Some` for them. `Sudo`
+/// comes from `type=USER_CMD`, which carries only `uid=`/`auid=`/`ses=`, so
+/// they are `None` there and the Normalize stage tags the resulting event
+/// `USER_REF_PARTIAL` (plan Global Constraint #6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivilegeEventRaw {
+    pub operation: PrivilegeOperation,
+    pub pid: u32,
+    /// `0` for `Sudo`: `USER_CMD` records carry no `ppid=`. The Enrich
+    /// stage treats ppid 0 as "no parent to inherit a session from", the
+    /// same convention `normalize`'s existing `current_ppid` helper already
+    /// uses for events whose `event_data` has no `ppid`.
+    pub ppid: u32,
+    /// The acting (real) uid *before* the transition.
+    pub uid: u32,
+    pub gid: Option<u32>,
+    pub euid: Option<u32>,
+    pub egid: Option<u32>,
+    pub auid: Option<u32>,
+    /// From `ses=`. `None` when the record omits it.
+    pub session_id: Option<String>,
+    /// The acting user's name when the record reports one. Always `None`
+    /// for `SYSCALL`-derived records (audit does not resolve names).
+    pub username: Option<String>,
+    /// The uid being switched **to**, decoded from the `SYSCALL` record's
+    /// `a0=` (setuid's first argument, lowercase hex). `None` for `Sudo`
+    /// (plan Global Constraint #9: `USER_CMD` does not reliably report the
+    /// target account) and `None` when `a0` decodes to `0xffffffff`, which
+    /// is `(uid_t)-1`, i.e. "leave unchanged".
+    pub target_uid: Option<u32>,
+    /// The gid being switched **to**, decoded from `setgid`'s `a0=`. Same
+    /// `-1` handling as `target_uid`. Always `None` for `UidChange`/`Sudo`.
+    pub target_gid: Option<u32>,
+    /// The command sudo was asked to run, hex-decoded from `USER_CMD`'s
+    /// `cmd=` field. `None` for `SYSCALL`-derived records.
+    pub command: Option<String>,
+    /// `SYSCALL`'s `success=yes` or `USER_CMD`'s nested `res=success`.
+    pub success: bool,
+    pub exe_path: String,
+    /// From `SYSCALL`'s `comm=`; the basename of `exe_path` for `Sudo`.
+    pub comm: String,
+    pub timestamp_ns: u64,
+    pub audit_serial: Option<u64>,
+    pub source: RawEventSource,
+}
+
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
 /// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 added
-/// File; Phase 3 adds Network and Dns.
+/// File; Phase 3 added Network and Dns; Phase 4a adds Identity and
+/// Privilege.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     ProcessExec(ProcessExecRaw),
     File(FileEventRaw),
     Network(NetworkEventRaw),
     Dns(DnsEventRaw),
+    Identity(IdentityEventRaw),
+    Privilege(PrivilegeEventRaw),
 }
 
 impl RawEvent {
@@ -193,6 +328,8 @@ impl RawEvent {
             RawEvent::File(f) => f.timestamp_ns,
             RawEvent::Network(n) => n.timestamp_ns,
             RawEvent::Dns(d) => d.timestamp_ns,
+            RawEvent::Identity(i) => i.timestamp_ns,
+            RawEvent::Privilege(p) => p.timestamp_ns,
         }
     }
 }
@@ -345,5 +482,124 @@ mod tests {
             RawEvent::Network(n) => assert_eq!(n.pid, None),
             other => panic!("expected RawEvent::Network, got {other:?}"),
         }
+    }
+
+    fn identity_raw() -> IdentityEventRaw {
+        IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: "3".to_string(),
+            pid: 1200,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some("198.51.100.10".to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 1_690_000_000_123_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    fn privilege_raw() -> PrivilegeEventRaw {
+        PrivilegeEventRaw {
+            operation: PrivilegeOperation::UidChange,
+            pid: 1400,
+            ppid: 1300,
+            uid: 1000,
+            gid: Some(1000),
+            euid: Some(1000),
+            egid: Some(1000),
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            username: None,
+            target_uid: Some(0),
+            target_gid: None,
+            command: None,
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: 1_690_000_005_000_000_000,
+            audit_serial: Some(470),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    #[test]
+    fn identity_raw_round_trips_through_json() {
+        let raw = RawEvent::Identity(identity_raw());
+        let json = serde_json::to_string(&raw).unwrap();
+        let back: RawEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RawEvent::Identity(i) => {
+                assert_eq!(i.operation, IdentityOperation::Login);
+                assert_eq!(i.session_id, "3");
+                assert_eq!(i.remote_addr.as_deref(), Some("198.51.100.10"));
+                assert_eq!(i.auid, Some(1000));
+            }
+            other => panic!("expected RawEvent::Identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn privilege_raw_round_trips_through_json() {
+        let raw = RawEvent::Privilege(privilege_raw());
+        let json = serde_json::to_string(&raw).unwrap();
+        let back: RawEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RawEvent::Privilege(p) => {
+                assert_eq!(p.operation, PrivilegeOperation::UidChange);
+                assert_eq!(p.target_uid, Some(0));
+                assert_eq!(p.session_id.as_deref(), Some("3"));
+                assert_eq!(p.euid, Some(1000));
+            }
+            other => panic!("expected RawEvent::Privilege, got {other:?}"),
+        }
+    }
+
+    /// A local console login has no remote address and a sudo record often
+    /// reports no target account (Global Constraint #9) — both must
+    /// round-trip as `None`, never as a placeholder string.
+    #[test]
+    fn absent_optional_fields_round_trip_as_none() {
+        let mut identity = identity_raw();
+        identity.remote_addr = None;
+        identity.username = None;
+        let json = serde_json::to_string(&RawEvent::Identity(identity)).unwrap();
+        match serde_json::from_str::<RawEvent>(&json).unwrap() {
+            RawEvent::Identity(i) => {
+                assert_eq!(i.remote_addr, None);
+                assert_eq!(i.username, None);
+            }
+            other => panic!("expected RawEvent::Identity, got {other:?}"),
+        }
+
+        let mut privilege = privilege_raw();
+        privilege.operation = PrivilegeOperation::Sudo;
+        privilege.target_uid = None;
+        privilege.command = Some("/usr/bin/whoami".to_string());
+        let json = serde_json::to_string(&RawEvent::Privilege(privilege)).unwrap();
+        match serde_json::from_str::<RawEvent>(&json).unwrap() {
+            RawEvent::Privilege(p) => {
+                assert_eq!(p.target_uid, None);
+                assert_eq!(p.command.as_deref(), Some("/usr/bin/whoami"));
+            }
+            other => panic!("expected RawEvent::Privilege, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_accessor_works_for_identity_and_privilege_variants() {
+        assert_eq!(
+            RawEvent::Identity(identity_raw()).timestamp_ns(),
+            1_690_000_000_123_000_000
+        );
+        assert_eq!(
+            RawEvent::Privilege(privilege_raw()).timestamp_ns(),
+            1_690_000_005_000_000_000
+        );
     }
 }

@@ -10,7 +10,8 @@ pub use context::SensorContext;
 pub use error::SensorError;
 pub use health::{SensorHealth, SensorState};
 pub use raw_event::{
-    DnsEventRaw, FileEventRaw, FileOperation, NetworkDirection, NetworkEventRaw,
-    NetworkOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
+    NetworkDirection, NetworkEventRaw, NetworkOperation, PrivilegeEventRaw, PrivilegeOperation,
+    ProcessExecRaw, RawEvent, RawEventSource,
 };
 pub use sensor::{Sensor, SensorMetrics};
