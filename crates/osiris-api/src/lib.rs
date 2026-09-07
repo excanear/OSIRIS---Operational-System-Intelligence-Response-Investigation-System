@@ -203,6 +203,15 @@ async fn file_story_handler(
         ));
     }
 
+    if let Some(file_id) = &q.file_id {
+        if FileIdentity::parse_key(file_id).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid file_id: {}", file_id),
+            ));
+        }
+    }
+
     let (events, alerts) = tokio::task::spawn_blocking(move || {
         let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
         let mut identities: HashSet<FileIdentity> = HashSet::new();
@@ -527,6 +536,22 @@ mod tests {
         .await;
         let err = result.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_story_returns_400_when_file_id_is_malformed() {
+        let (_dir, storage) = test_storage();
+        let result = file_story_handler(
+            State(storage),
+            Query(FileStoryQuery {
+                path: None,
+                file_id: Some("not-a-valid-key".to_string()),
+            }),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("invalid file_id"));
     }
 
     #[tokio::test]
