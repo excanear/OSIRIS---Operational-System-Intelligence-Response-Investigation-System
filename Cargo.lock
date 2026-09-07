@@ -1076,6 +1076,7 @@ dependencies = [
  "axum",
  "osiris-agent",
  "osiris-api",
+ "osiris-detect",
  "osiris-pipeline",
  "osiris-schema",
  "osiris-sensor-api",
