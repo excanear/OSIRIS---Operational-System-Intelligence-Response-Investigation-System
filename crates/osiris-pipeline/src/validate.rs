@@ -5,6 +5,7 @@ use osiris_schema::CanonicalEvent;
 /// operator can see what's malformed rather than have a silent gap.
 /// Returns true if the event was valid (no tag added).
 pub fn validate(event: &mut CanonicalEvent) -> bool {
+    use osiris_schema::EventType::{FileCreate, FileDelete, FileRename, FileWrite};
     let mut valid = true;
     if event.host_id.is_nil() {
         valid = false;
@@ -14,6 +15,31 @@ pub fn validate(event: &mut CanonicalEvent) -> bool {
     }
     if event.event_type == osiris_schema::EventType::ProcessExec && event.process.is_none() {
         valid = false;
+    }
+    if matches!(
+        event.event_type,
+        FileCreate | FileWrite | FileDelete | FileRename
+    ) {
+        // A file event with no path names nothing — it cannot be stored,
+        // queried by a File Story, or explained in an alert.
+        let has_path = event
+            .file
+            .as_ref()
+            .map(|f| !f.path.trim().is_empty())
+            .unwrap_or(false);
+        if !has_path {
+            valid = false;
+        }
+        if event.event_type == FileRename
+            && event
+                .file
+                .as_ref()
+                .and_then(|f| f.previous_path.as_deref())
+                .map(|p| p.trim().is_empty())
+                .unwrap_or(true)
+        {
+            valid = false;
+        }
     }
     if !valid {
         event.tags.push("INVALID".to_string());
@@ -96,6 +122,70 @@ mod tests {
     fn nil_host_id_is_invalid() {
         let mut event = valid_event();
         event.host_id = Uuid::nil();
+        assert!(!validate(&mut event));
+    }
+
+    fn valid_file_event(event_type: EventType) -> CanonicalEvent {
+        let mut event = valid_event();
+        event.event_type = event_type;
+        event.category = Category::File;
+        event.file = Some(osiris_schema::FileRef {
+            path: "/var/www/html/shell.php".to_string(),
+            previous_path: if event_type == EventType::FileRename {
+                Some("/var/www/html/.shell.php.tmp".to_string())
+            } else {
+                None
+            },
+            inode: Some(131075),
+            device_id: Some(osiris_schema::encode_device_id(8, 1)),
+            size: None,
+            mode: None,
+            owner_uid: None,
+            owner_gid: None,
+            hash: None,
+        });
+        event
+    }
+
+    #[test]
+    fn well_formed_file_events_of_every_type_validate() {
+        for event_type in [
+            EventType::FileCreate,
+            EventType::FileWrite,
+            EventType::FileDelete,
+            EventType::FileRename,
+        ] {
+            let mut event = valid_file_event(event_type);
+            assert!(validate(&mut event), "{event_type:?} should be valid");
+            assert!(!event.tags.contains(&"INVALID".to_string()));
+        }
+    }
+
+    #[test]
+    fn file_event_without_a_file_ref_is_invalid_but_still_forwarded() {
+        let mut event = valid_file_event(EventType::FileCreate);
+        event.file = None;
+        assert!(!validate(&mut event));
+        assert!(event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn file_event_with_an_empty_path_is_invalid() {
+        let mut event = valid_file_event(EventType::FileWrite);
+        if let Some(file) = event.file.as_mut() {
+            file.path = "   ".to_string();
+        }
+        assert!(!validate(&mut event));
+    }
+
+    /// A FILE_RENAME with no `previous_path` carries no information about
+    /// where the file moved from, which is the entire point of the type.
+    #[test]
+    fn file_rename_without_a_previous_path_is_invalid() {
+        let mut event = valid_file_event(EventType::FileRename);
+        if let Some(file) = event.file.as_mut() {
+            file.previous_path = None;
+        }
         assert!(!validate(&mut event));
     }
 }

@@ -186,6 +186,9 @@ mod tests {
                 .expect("channel closed");
             match raw_event {
                 RawEvent::ProcessExec(raw) => pids.push(raw.pid),
+                other => panic!(
+                    "exec_chain_scenario must only produce ProcessExec events, got {other:?}"
+                ),
             }
         }
         assert_eq!(pids, vec![100, 200, 300]);

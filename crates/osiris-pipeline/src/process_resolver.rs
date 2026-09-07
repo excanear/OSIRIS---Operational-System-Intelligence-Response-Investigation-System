@@ -34,6 +34,24 @@ impl ProcessResolver {
         let (_, ppid) = self.by_pid.get(&pid)?;
         self.by_pid.get(ppid).map(|(key, _)| *key)
     }
+
+    /// Resolves a pid to the `process_key` minted by its own PROCESS_EXEC
+    /// event. Non-process events (file now, network/dns later) use this to
+    /// replace the provisional key their Normalize stage assigned, so every
+    /// event attributed to one process shares one identity.
+    pub fn resolve(&self, pid: u32) -> Option<ProcessKey> {
+        self.by_pid.get(&pid).map(|(key, _)| *key)
+    }
+
+    /// Resolves a pid's parent, returning both the parent's `process_key`
+    /// and the parent's own pid. Returns `None` unless *both* the process
+    /// and its parent were observed — the caller leaves `parent_process`
+    /// unset rather than guessing.
+    pub fn parent_of(&self, pid: u32) -> Option<(ProcessKey, u32)> {
+        let (_, ppid) = self.by_pid.get(&pid)?;
+        let (parent_key, _) = self.by_pid.get(ppid)?;
+        Some((*parent_key, *ppid))
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +79,35 @@ mod tests {
         resolver.record(200, 999, curl_key);
 
         assert_eq!(resolver.resolve_parent(200), None);
+    }
+
+    #[test]
+    fn resolves_a_pids_own_key() {
+        let mut resolver = ProcessResolver::new();
+        let host_id = Uuid::new_v4();
+        let curl_key = ProcessKey::new(host_id, "boot-1", 300, 3);
+        resolver.record(300, 200, curl_key);
+        assert_eq!(resolver.resolve(300), Some(curl_key));
+        assert_eq!(resolver.resolve(999), None);
+    }
+
+    #[test]
+    fn parent_of_returns_both_the_parents_key_and_its_pid() {
+        let mut resolver = ProcessResolver::new();
+        let host_id = Uuid::new_v4();
+        let bash_key = ProcessKey::new(host_id, "boot-1", 200, 2);
+        let curl_key = ProcessKey::new(host_id, "boot-1", 300, 3);
+        resolver.record(200, 100, bash_key);
+        resolver.record(300, 200, curl_key);
+        assert_eq!(resolver.parent_of(300), Some((bash_key, 200)));
+    }
+
+    #[test]
+    fn parent_of_returns_none_when_the_parent_was_never_observed() {
+        let mut resolver = ProcessResolver::new();
+        let host_id = Uuid::new_v4();
+        let curl_key = ProcessKey::new(host_id, "boot-1", 300, 3);
+        resolver.record(300, 200, curl_key);
+        assert_eq!(resolver.parent_of(300), None);
     }
 }

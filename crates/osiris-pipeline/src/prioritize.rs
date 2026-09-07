@@ -16,8 +16,8 @@ pub enum PriorityLane {
 ///
 /// Backed by a linear-scan `Vec<(EventType, PriorityLane)>` rather than a
 /// `HashMap`: `EventType` (osiris-schema, Phase 0, frozen) does not derive
-/// `Hash`, and Phase 1 only ever populates one entry (PROCESS_EXEC) here
-/// anyway, so a small `Vec` scan is both sufficient and simpler than a map.
+/// `Hash`, and this table holds five entries as of Phase 2, so a small
+/// `Vec` scan is still both sufficient and simpler than a map.
 pub struct PriorityTable {
     table: Vec<(EventType, PriorityLane)>,
     default_lane: PriorityLane,
@@ -26,7 +26,15 @@ pub struct PriorityTable {
 impl Default for PriorityTable {
     fn default() -> Self {
         Self {
-            table: vec![(EventType::ProcessExec, PriorityLane::Normal)],
+            table: vec![
+                (EventType::ProcessExec, PriorityLane::Normal),
+                (EventType::FileCreate, PriorityLane::Normal),
+                (EventType::FileDelete, PriorityLane::Normal),
+                (EventType::FileRename, PriorityLane::Normal),
+                // See the lane rationale in the tests: FILE_WRITE is the one
+                // high-volume type this phase emits.
+                (EventType::FileWrite, PriorityLane::Low),
+            ],
             default_lane: PriorityLane::Normal,
         }
     }
@@ -103,9 +111,28 @@ mod tests {
     }
 
     #[test]
+    fn file_event_types_map_to_their_configured_lanes() {
+        let table = PriorityTable::default();
+        for (event_type, expected) in [
+            (EventType::FileCreate, PriorityLane::Normal),
+            (EventType::FileDelete, PriorityLane::Normal),
+            (EventType::FileRename, PriorityLane::Normal),
+            // FILE_WRITE is the highest-volume file event by a wide margin
+            // (every write to a watched path), so it gets a lane that can be
+            // shed first under pressure — §8.1's whole reason for lanes.
+            (EventType::FileWrite, PriorityLane::Low),
+        ] {
+            let mut event = exec_event();
+            event.event_type = event_type;
+            assert_eq!(prioritize(&event, &table), expected, "{event_type:?}");
+        }
+    }
+
+    #[test]
     fn unmapped_event_type_falls_back_to_default_lane() {
         let mut event = exec_event();
-        event.event_type = EventType::FileCreate;
+        // NETWORK_CONNECT arrives in Phase 3; until then it is unmapped.
+        event.event_type = EventType::NetworkConnect;
         let table = PriorityTable::default();
         assert_eq!(prioritize(&event, &table), PriorityLane::Normal);
     }

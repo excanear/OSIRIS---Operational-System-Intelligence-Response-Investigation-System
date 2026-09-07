@@ -259,6 +259,9 @@ mod tests {
                 assert_eq!(raw.pid, 5678);
                 assert_eq!(raw.exe_path, "/usr/bin/curl");
             }
+            other => panic!(
+                "the Process/Exec sensor must only emit ProcessExec events, got {other:?}"
+            ),
         }
 
         sensor.stop().await.unwrap();

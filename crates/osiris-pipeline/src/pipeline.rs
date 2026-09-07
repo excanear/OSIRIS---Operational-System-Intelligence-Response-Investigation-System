@@ -111,4 +111,61 @@ mod tests {
             bash.event.process.unwrap().process_key
         );
     }
+
+    /// The whole Normalize -> Enrich -> Validate -> Prioritize path for a
+    /// file event that follows its own process's exec — the shape every
+    /// real trace has.
+    #[test]
+    fn file_event_following_its_process_exec_is_fully_resolved_and_valid() {
+        use osiris_sensor_api::{FileEventRaw, FileOperation};
+        let host = test_host();
+        let mut pipeline = Pipeline::new(host.clone(), "boot-1".to_string());
+
+        let curl = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: 1_000,
+            start_time_mono: 1_000,
+            source: RawEventSource::Synthetic,
+        }));
+
+        let write = pipeline.process(RawEvent::File(FileEventRaw {
+            operation: FileOperation::Write,
+            path: "/var/www/html/shell.php".to_string(),
+            previous_path: None,
+            inode: Some(131075),
+            device_id: Some(osiris_schema::encode_device_id(8, 1)),
+            mode: Some(0o100644),
+            owner_uid: Some(33),
+            owner_gid: Some(33),
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: 2_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }));
+
+        assert_eq!(write.lane, PriorityLane::Low);
+        assert!(!write.event.tags.contains(&"INVALID".to_string()));
+        assert!(!write
+            .event
+            .tags
+            .contains(&"PROCESS_KEY_PROVISIONAL".to_string()));
+        assert_eq!(
+            write.event.process.as_ref().unwrap().process_key,
+            curl.event.process.as_ref().unwrap().process_key,
+            "the file event must be attributed to the same process entity as its exec"
+        );
+        assert_eq!(write.event.relationships.len(), 1);
+        assert_eq!(
+            write.event.file.as_ref().unwrap().path,
+            "/var/www/html/shell.php"
+        );
+    }
 }

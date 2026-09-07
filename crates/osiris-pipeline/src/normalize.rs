@@ -1,10 +1,10 @@
 use uuid::Uuid;
 
 use osiris_schema::{
-    CanonicalEvent, Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source,
-    SCHEMA_VERSION,
+    CanonicalEvent, Category, EventType, FileRef, HostRef, ProcessKey, ProcessRef, Severity,
+    Source, SCHEMA_VERSION,
 };
-use osiris_sensor_api::{ProcessExecRaw, RawEvent, RawEventSource};
+use osiris_sensor_api::{FileEventRaw, FileOperation, ProcessExecRaw, RawEvent, RawEventSource};
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
 /// `boot_id` is threaded in here (not left to the Enrich stage) because
@@ -16,6 +16,7 @@ use osiris_sensor_api::{ProcessExecRaw, RawEvent, RawEventSource};
 pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent {
     match raw {
         RawEvent::ProcessExec(p) => normalize_process_exec(p, host, boot_id),
+        RawEvent::File(f) => normalize_file_event(f, host, boot_id),
     }
 }
 
@@ -71,6 +72,84 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
     }
 }
 
+fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> CanonicalEvent {
+    let source = match raw.source {
+        RawEventSource::Audit => Source::Audit,
+        RawEventSource::Synthetic => Source::Synthetic,
+    };
+    let provider = match raw.source {
+        RawEventSource::Audit => "filesystem_sensor/audit",
+        RawEventSource::Synthetic => "filesystem_sensor/synthetic",
+    };
+    let event_type = match raw.operation {
+        FileOperation::Create => EventType::FileCreate,
+        FileOperation::Write => EventType::FileWrite,
+        FileOperation::Delete => EventType::FileDelete,
+        FileOperation::Rename => EventType::FileRename,
+    };
+    // Provisional identity, replaced by the Enrich stage's ProcessResolver
+    // lookup whenever this pid's PROCESS_EXEC has been seen. `0` is used
+    // rather than the event timestamp so the placeholder is obviously not a
+    // real start time, and so two file events from the same process hash to
+    // one provisional key instead of one key per event.
+    let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, 0);
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category: Category::File,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: None,
+        session: None,
+        process: Some(ProcessRef {
+            process_key,
+            pid: raw.pid,
+            exe_path: raw.exe_path,
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 0,
+        }),
+        parent_process: None,
+        thread: None,
+        file: Some(FileRef {
+            path: raw.path,
+            previous_path: raw.previous_path,
+            inode: raw.inode,
+            device_id: raw.device_id,
+            size: None,
+            mode: raw.mode,
+            owner_uid: raw.owner_uid,
+            owner_gid: raw.owner_gid,
+            hash: None,
+        }),
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source,
+        provider: provider.to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags: vec![],
+        risk: None,
+        event_data: serde_json::json!({
+            "comm": raw.comm,
+            "ppid": raw.ppid,
+            "uid": raw.uid,
+            "audit_serial": raw.audit_serial,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +201,116 @@ mod tests {
         let event = normalize(raw, &host, "boot-1");
         assert_eq!(event.source, Source::Synthetic);
         assert_eq!(event.provider, "process_exec_sensor/synthetic");
+    }
+
+    fn file_raw(operation: osiris_sensor_api::FileOperation) -> osiris_sensor_api::FileEventRaw {
+        osiris_sensor_api::FileEventRaw {
+            operation,
+            path: "/var/www/html/shell.php".to_string(),
+            previous_path: None,
+            inode: Some(131075),
+            device_id: Some(osiris_schema::encode_device_id(8, 1)),
+            mode: Some(0o100644),
+            owner_uid: Some(33),
+            owner_gid: Some(33),
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: 1_690_000_000_123_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    #[test]
+    fn file_operations_map_to_the_matching_event_type_and_file_category() {
+        use osiris_sensor_api::FileOperation;
+        let host = sample_host();
+        for (operation, expected) in [
+            (FileOperation::Create, EventType::FileCreate),
+            (FileOperation::Write, EventType::FileWrite),
+            (FileOperation::Delete, EventType::FileDelete),
+            (FileOperation::Rename, EventType::FileRename),
+        ] {
+            let event = normalize(RawEvent::File(file_raw(operation)), &host, "boot-1");
+            assert_eq!(event.event_type, expected);
+            assert_eq!(event.category, Category::File);
+        }
+    }
+
+    #[test]
+    fn file_event_carries_a_complete_file_ref() {
+        use osiris_sensor_api::FileOperation;
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::File(file_raw(FileOperation::Create)),
+            &host,
+            "boot-1",
+        );
+        let file = event.file.expect("file events must carry a FileRef");
+        assert_eq!(file.path, "/var/www/html/shell.php");
+        assert_eq!(file.inode, Some(131075));
+        assert_eq!(file.device_id, Some(osiris_schema::encode_device_id(8, 1)));
+        assert_eq!(file.owner_uid, Some(33));
+        assert_eq!(event.provider, "filesystem_sensor/audit");
+        assert_eq!(event.source, Source::Audit);
+    }
+
+    #[test]
+    fn rename_carries_the_previous_path() {
+        use osiris_sensor_api::FileOperation;
+        let host = sample_host();
+        let mut raw = file_raw(FileOperation::Rename);
+        raw.previous_path = Some("/var/www/html/.shell.php.tmp".to_string());
+        let event = normalize(RawEvent::File(raw), &host, "boot-1");
+        assert_eq!(
+            event.file.unwrap().previous_path.as_deref(),
+            Some("/var/www/html/.shell.php.tmp")
+        );
+    }
+
+    /// The acting process's identity is minted by its PROCESS_EXEC event,
+    /// the only record carrying the real start time that `process_key`
+    /// hashes. A file event has no access to that, so normalize
+    /// deliberately mints a *provisional* key (start_time 0) which the
+    /// Enrich stage replaces with the authoritative one. Hashing the file
+    /// event's own timestamp in here instead would silently produce a
+    /// different key for the same process.
+    #[test]
+    fn file_event_process_key_is_provisional_with_a_zero_start_time() {
+        use osiris_sensor_api::FileOperation;
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::File(file_raw(FileOperation::Write)),
+            &host,
+            "boot-1",
+        );
+        let process = event
+            .process
+            .expect("file events must name the acting process");
+        assert_eq!(process.pid, 300);
+        assert_eq!(process.exe_path, "/usr/bin/curl");
+        assert_eq!(process.start_time_mono, 0);
+        assert_eq!(
+            process.process_key,
+            ProcessKey::new(host.host_id, "boot-1", 300, 0)
+        );
+    }
+
+    /// §9.4 says relationships are computed once, at *enrichment* time —
+    /// normalize must not pre-populate an edge whose `from` cites the
+    /// provisional key it is about to have overwritten.
+    #[test]
+    fn normalize_does_not_yet_attach_relationships() {
+        use osiris_sensor_api::FileOperation;
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::File(file_raw(FileOperation::Create)),
+            &host,
+            "boot-1",
+        );
+        assert!(event.relationships.is_empty());
     }
 }

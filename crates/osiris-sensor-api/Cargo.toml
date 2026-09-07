@@ -10,3 +10,6 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 osiris-health = { path = "../osiris-health" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

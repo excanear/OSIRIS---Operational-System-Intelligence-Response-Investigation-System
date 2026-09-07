@@ -9,5 +9,5 @@ pub use capabilities::SensorCapabilities;
 pub use context::SensorContext;
 pub use error::SensorError;
 pub use health::{SensorHealth, SensorState};
-pub use raw_event::{ProcessExecRaw, RawEvent, RawEventSource};
+pub use raw_event::{FileEventRaw, FileOperation, ProcessExecRaw, RawEvent, RawEventSource};
 pub use sensor::{Sensor, SensorMetrics};

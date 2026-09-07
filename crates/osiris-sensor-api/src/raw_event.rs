@@ -27,10 +27,132 @@ pub struct ProcessExecRaw {
     pub source: RawEventSource,
 }
 
+/// The four filesystem operations this phase emits — ARCHITECTURE.md §6's
+/// Filesystem STANDARD row ("create/delete/rename on watched paths") plus
+/// write, which the audit backend yields from the same PATH records. No
+/// read, permission, owner, or attribute operations: those are §6's
+/// DETAILED/FORENSIC rungs (Phase 2 plan Global Constraints #5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOperation {
+    Create,
+    Write,
+    Delete,
+    Rename,
+}
+
+/// A filesystem operation record. Unlike `ProcessExecRaw` this is assembled
+/// from *several* correlated audit records (one `type=SYSCALL` supplying the
+/// acting process fields, one `type=PATH` supplying the file fields, and
+/// optionally one `type=CWD` used to absolutize a relative path), so every
+/// field here is already joined and absolute by the time a sensor emits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEventRaw {
+    pub operation: FileOperation,
+    /// Absolute path. For `Rename` this is the *destination* path.
+    pub path: String,
+    /// Only set for `Rename`: the source path the file moved from.
+    pub previous_path: Option<String>,
+    /// Inode and device of the file itself. `None` when the backend could
+    /// not report them (an audit PATH record omits them for some
+    /// `nametype=UNKNOWN` items) — the pipeline then emits no entity-graph
+    /// edge rather than inventing an identity.
+    pub inode: Option<u64>,
+    /// See `osiris_schema::encode_device_id` for the encoding.
+    pub device_id: Option<u64>,
+    pub mode: Option<u32>,
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+    /// The acting process, from the group's `type=SYSCALL` record.
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub exe_path: String,
+    pub comm: String,
+    /// Wall-clock nanoseconds, UTC, from the audit event header.
+    pub timestamp_ns: u64,
+    /// The originating audit event's serial, retained for provenance so an
+    /// operator can find the exact record group in the source log.
+    pub audit_serial: Option<u64>,
+    pub source: RawEventSource,
+}
+
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
-/// step 1, "Collect"). Phase 1 scopes this to Process/Exec only; later
-/// phases add File/Network/Dns/... variants.
+/// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 adds
+/// File. Later phases add Network/Dns/... variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     ProcessExec(ProcessExecRaw),
+    File(FileEventRaw),
+}
+
+impl RawEvent {
+    /// The originating backend's wall-clock timestamp, regardless of
+    /// variant — used by sensors for their `last_event_at` health field
+    /// without matching on the variant at every call site.
+    pub fn timestamp_ns(&self) -> u64 {
+        match self {
+            RawEvent::ProcessExec(p) => p.timestamp_ns,
+            RawEvent::File(f) => f.timestamp_ns,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_raw() -> FileEventRaw {
+        FileEventRaw {
+            operation: FileOperation::Create,
+            path: "/var/www/html/shell.php".to_string(),
+            previous_path: None,
+            inode: Some(131075),
+            device_id: Some((8u64 << 32) | 1),
+            mode: Some(0o100644),
+            owner_uid: Some(33),
+            owner_gid: Some(33),
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: 1_690_000_000_123_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    #[test]
+    fn file_raw_round_trips_through_json() {
+        let raw = RawEvent::File(file_raw());
+        let json = serde_json::to_string(&raw).unwrap();
+        let back: RawEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RawEvent::File(f) => {
+                assert_eq!(f.path, "/var/www/html/shell.php");
+                assert_eq!(f.operation, FileOperation::Create);
+                assert_eq!(f.inode, Some(131075));
+            }
+            other => panic!("expected RawEvent::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_accessor_works_for_both_variants() {
+        assert_eq!(
+            RawEvent::File(file_raw()).timestamp_ns(),
+            1_690_000_000_123_000_000
+        );
+        let exec = RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 1,
+            ppid: 0,
+            uid: 0,
+            exe_path: "/bin/init".to_string(),
+            comm: "init".to_string(),
+            timestamp_ns: 42,
+            start_time_mono: 42,
+            source: RawEventSource::Synthetic,
+        });
+        assert_eq!(exec.timestamp_ns(), 42);
+    }
 }
