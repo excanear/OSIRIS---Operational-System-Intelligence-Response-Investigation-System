@@ -1180,6 +1180,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-sensors-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "osiris-sensor-api",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "osiris-sensors-process"
 version = "0.1.0"
 dependencies = [
