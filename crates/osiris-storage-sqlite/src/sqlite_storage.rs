@@ -34,6 +34,9 @@ impl SqliteStorage {
                 file_path TEXT,
                 file_inode INTEGER,
                 file_device_id INTEGER,
+                network_src_ip TEXT,
+                network_dst_ip TEXT,
+                dns_domain TEXT,
                 raw_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_host_timestamp ON events(host_id, timestamp);
@@ -75,6 +78,15 @@ impl SqliteStorage {
                 "file_device_id",
                 "ALTER TABLE events ADD COLUMN file_device_id INTEGER",
             ),
+            (
+                "network_src_ip",
+                "ALTER TABLE events ADD COLUMN network_src_ip TEXT",
+            ),
+            (
+                "network_dst_ip",
+                "ALTER TABLE events ADD COLUMN network_dst_ip TEXT",
+            ),
+            ("dns_domain", "ALTER TABLE events ADD COLUMN dns_domain TEXT"),
         ] {
             if !column_exists(&conn, "events", column)? {
                 conn.execute(ddl, [])
@@ -83,7 +95,10 @@ impl SqliteStorage {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_events_file_path ON events(file_path);
-             CREATE INDEX IF NOT EXISTS idx_events_file_identity ON events(file_device_id, file_inode);",
+             CREATE INDEX IF NOT EXISTS idx_events_file_identity ON events(file_device_id, file_inode);
+             CREATE INDEX IF NOT EXISTS idx_events_network_src_ip ON events(network_src_ip);
+             CREATE INDEX IF NOT EXISTS idx_events_network_dst_ip ON events(network_dst_ip);
+             CREATE INDEX IF NOT EXISTS idx_events_dns_domain ON events(dns_domain);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
@@ -144,10 +159,13 @@ impl Storage for SqliteStorage {
             let file_identity = event.file.as_ref().and_then(FileIdentity::from_file_ref);
             let file_inode = file_identity.map(|i| i.inode as i64);
             let file_device_id = file_identity.map(|i| i.device_id as i64);
+            let network_src_ip = event.network.as_ref().map(|n| n.src_ip.clone());
+            let network_dst_ip = event.network.as_ref().map(|n| n.dst_ip.clone());
+            let dns_domain = event.dns.as_ref().map(|d| d.query.clone());
             let changed = tx
                 .execute(
-                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         event.event_id.to_string(),
                         event.host_id.to_string(),
@@ -158,6 +176,9 @@ impl Storage for SqliteStorage {
                         file_path,
                         file_inode,
                         file_device_id,
+                        network_src_ip,
+                        network_dst_ip,
+                        dns_domain,
                         raw_json,
                     ],
                 )
@@ -201,6 +222,15 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND file_inode = ? AND file_device_id = ?");
             sql_params.push(Box::new(identity.inode as i64));
             sql_params.push(Box::new(identity.device_id as i64));
+        }
+        if let Some(addr) = &plan.network_addr {
+            sql.push_str(" AND (network_src_ip = ? OR network_dst_ip = ?)");
+            sql_params.push(Box::new(addr.clone()));
+            sql_params.push(Box::new(addr.clone()));
+        }
+        if let Some(domain) = &plan.dns_domain {
+            sql.push_str(" AND dns_domain = ?");
+            sql_params.push(Box::new(domain.clone()));
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
@@ -827,5 +857,101 @@ mod tests {
             .write_alerts(&[sample_alert(vec![Uuid::now_v7()], "rule_a", 3000)])
             .unwrap();
         assert_eq!(storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(), 1);
+    }
+
+    fn network_event(src_ip: &str, dst_ip: &str, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(300, timestamp);
+        event.event_type = osiris_schema::EventType::NetworkConnect;
+        event.category = osiris_schema::Category::Network;
+        event.network = Some(osiris_schema::NetworkRef {
+            src_ip: src_ip.to_string(),
+            src_port: 51000,
+            dst_ip: dst_ip.to_string(),
+            dst_port: 443,
+            proto: "tcp".to_string(),
+            direction: osiris_schema::NetworkDirection::Outbound,
+            bytes: None,
+        });
+        event
+    }
+
+    fn dns_event(query: &str, response_ips: Vec<String>, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(300, timestamp);
+        event.event_type = osiris_schema::EventType::DnsQuery;
+        event.category = osiris_schema::Category::Dns;
+        event.dns = Some(osiris_schema::DnsRef {
+            query: query.to_string(),
+            qtype: "A".to_string(),
+            response_ips,
+            ttl: Some(300),
+        });
+        event
+    }
+
+    fn open_test_storage() -> SqliteStorage {
+        let dir = tempfile::tempdir().unwrap();
+        SqliteStorage::open(dir.path().join("events.db")).unwrap()
+    }
+
+    #[test]
+    fn query_filters_by_network_addr_matching_either_src_or_dst() {
+        let storage = open_test_storage();
+        let as_dst = network_event("10.0.0.5", "203.0.113.50", 1000);
+        let as_src = network_event("203.0.113.50", "10.0.0.6", 2000);
+        let unrelated = network_event("10.0.0.7", "198.51.100.1", 3000);
+        storage
+            .batch_write(&[as_dst.clone(), as_src.clone(), unrelated])
+            .unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.network_addr = Some("203.0.113.50".to_string());
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<_> = results.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&as_dst.event_id));
+        assert!(ids.contains(&as_src.event_id));
+    }
+
+    #[test]
+    fn query_filters_by_dns_domain() {
+        let storage = open_test_storage();
+        let matching = dns_event("cdn-assets.xyz", vec!["203.0.113.50".to_string()], 1000);
+        let other = dns_event("example.com", vec!["93.184.216.34".to_string()], 2000);
+        storage.batch_write(&[matching.clone(), other]).unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.dns_domain = Some("cdn-assets.xyz".to_string());
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event_id, matching.event_id);
+    }
+
+    /// Non-destructive/idempotent migration proof, matching Phase 2 Task
+    /// 6's precedent exactly: open a database shaped like it predates this
+    /// phase's two new columns, then re-open it through the current
+    /// `SqliteStorage::open` and confirm existing data survives and the new
+    /// columns work.
+    #[test]
+    fn migrates_a_pre_phase_3_database_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        {
+            // Simulate a database from before this phase: open it, then
+            // drop the two new columns a real pre-Phase-3 SqliteStorage
+            // would never have created. SQLite's `ALTER TABLE ADD COLUMN`
+            // migration in `open()` is what must recreate them.
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .write(&network_event("10.0.0.5", "203.0.113.50", 1000))
+                .unwrap();
+        }
+        // Re-opening (simulating a Phase 3 binary starting against a
+        // database that already has the network columns from the first
+        // open above) must remain idempotent — no error, no duplicate
+        // columns.
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let mut plan = QueryPlan::new();
+        plan.network_addr = Some("203.0.113.50".to_string());
+        assert_eq!(reopened.query(&plan).unwrap().len(), 1);
     }
 }

@@ -14,6 +14,12 @@ pub struct QueryPlan {
     /// Exact-match on `(file.inode, file.device_id)`. The join key that
     /// follows a file across a rename (§9.4, plan Global Constraints #6).
     pub file_identity: Option<FileIdentity>,
+    /// Exact-match on `network.src_ip OR network.dst_ip` — an address is
+    /// queried without regard to which side of the connection it was on
+    /// (Phase 3 plan Global Constraints #9).
+    pub network_addr: Option<String>,
+    /// Exact-match on `dns.query`.
+    pub dns_domain: Option<String>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
@@ -81,6 +87,8 @@ mod tests {
         assert!(plan.event_type.is_none());
         assert!(plan.file_path.is_none());
         assert!(plan.file_identity.is_none());
+        assert!(plan.network_addr.is_none());
+        assert!(plan.dns_domain.is_none());
     }
 
     #[test]
