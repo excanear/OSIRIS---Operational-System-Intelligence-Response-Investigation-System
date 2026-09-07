@@ -37,6 +37,8 @@ impl SqliteStorage {
                 network_src_ip TEXT,
                 network_dst_ip TEXT,
                 dns_domain TEXT,
+                session_id TEXT,
+                user_uid INTEGER,
                 raw_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_host_timestamp ON events(host_id, timestamp);
@@ -79,6 +81,13 @@ impl SqliteStorage {
         // even if a pre-Phase-3 row's `raw_json` happened to contain
         // relevant data. This has no practical impact today since no
         // pre-Phase-3 database can actually contain network/DNS events.
+        //
+        // Phase 4a adds `session_id` and `user_uid` the same way. As with
+        // every earlier phase's columns, pre-existing rows are not
+        // backfilled — they read back NULL. That has no practical impact:
+        // no database created before Phase 4a can contain an event with a
+        // populated `session` or `user`, because nothing populated either
+        // field until this phase's pipeline changes.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
@@ -95,6 +104,8 @@ impl SqliteStorage {
                 "ALTER TABLE events ADD COLUMN network_dst_ip TEXT",
             ),
             ("dns_domain", "ALTER TABLE events ADD COLUMN dns_domain TEXT"),
+            ("session_id", "ALTER TABLE events ADD COLUMN session_id TEXT"),
+            ("user_uid", "ALTER TABLE events ADD COLUMN user_uid INTEGER"),
         ] {
             if !column_exists(&conn, "events", column)? {
                 conn.execute(ddl, [])
@@ -106,7 +117,9 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS idx_events_file_identity ON events(file_device_id, file_inode);
              CREATE INDEX IF NOT EXISTS idx_events_network_src_ip ON events(network_src_ip);
              CREATE INDEX IF NOT EXISTS idx_events_network_dst_ip ON events(network_dst_ip);
-             CREATE INDEX IF NOT EXISTS idx_events_dns_domain ON events(dns_domain);",
+             CREATE INDEX IF NOT EXISTS idx_events_dns_domain ON events(dns_domain);
+             CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+             CREATE INDEX IF NOT EXISTS idx_events_user_uid ON events(user_uid);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
@@ -170,10 +183,15 @@ impl Storage for SqliteStorage {
             let network_src_ip = event.network.as_ref().map(|n| n.src_ip.clone());
             let network_dst_ip = event.network.as_ref().map(|n| n.dst_ip.clone());
             let dns_domain = event.dns.as_ref().map(|d| d.query.clone());
+            let session_id = event.session.as_ref().map(|s| s.session_id.clone());
+            // i64 because SQLite has no unsigned integer type; a uid is at
+            // most u32::MAX, so this widening is always lossless — the same
+            // cast the file inode/device columns already use.
+            let user_uid = event.user.as_ref().map(|u| u.uid as i64);
             let changed = tx
                 .execute(
-                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         event.event_id.to_string(),
                         event.host_id.to_string(),
@@ -187,6 +205,8 @@ impl Storage for SqliteStorage {
                         network_src_ip,
                         network_dst_ip,
                         dns_domain,
+                        session_id,
+                        user_uid,
                         raw_json,
                     ],
                 )
@@ -239,6 +259,14 @@ impl Storage for SqliteStorage {
         if let Some(domain) = &plan.dns_domain {
             sql.push_str(" AND dns_domain = ?");
             sql_params.push(Box::new(domain.clone()));
+        }
+        if let Some(session_id) = &plan.session_id {
+            sql.push_str(" AND session_id = ?");
+            sql_params.push(Box::new(session_id.clone()));
+        }
+        if let Some(uid) = plan.user_uid {
+            sql.push_str(" AND user_uid = ?");
+            sql_params.push(Box::new(uid as i64));
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
@@ -1022,5 +1050,247 @@ mod tests {
             1,
             "filtering must still work after idempotent re-open"
         );
+    }
+
+    fn identity_event(
+        event_type: osiris_schema::EventType,
+        session_id: &str,
+        uid: u32,
+        remote_addr: Option<&str>,
+        timestamp: u64,
+    ) -> CanonicalEvent {
+        let mut event = sample_event(300, timestamp);
+        event.event_type = event_type;
+        event.category = event_type.category();
+        event.session = Some(osiris_schema::SessionRef {
+            session_id: session_id.to_string(),
+            tty: Some("/dev/pts/0".to_string()),
+            remote_addr: remote_addr.map(str::to_string),
+            auth_method: Some("sshd".to_string()),
+        });
+        event.user = Some(osiris_schema::UserRef {
+            uid,
+            gid: uid,
+            euid: uid,
+            egid: uid,
+            username: Some("alice".to_string()),
+            loginuid: Some(1000),
+        });
+        event
+    }
+
+    #[test]
+    fn query_filters_by_session_id_across_every_category() {
+        let storage = open_test_storage();
+        // The point of the session filter: one id returns the whole
+        // multi-category chain, not just the identity events.
+        let login = identity_event(
+            osiris_schema::EventType::SessionLogin,
+            "3",
+            0,
+            Some("198.51.100.10"),
+            1000,
+        );
+        let escalation = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            2000,
+        );
+        let mut exec = identity_event(
+            osiris_schema::EventType::ProcessExec,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            3000,
+        );
+        exec.category = osiris_schema::Category::Process;
+        let other_session = identity_event(
+            osiris_schema::EventType::SessionLogin,
+            "4",
+            0,
+            None,
+            4000,
+        );
+        // An event that predates any session attribution at all.
+        let unattributed = sample_event(900, 5000);
+        storage
+            .batch_write(&[
+                login.clone(),
+                escalation.clone(),
+                exec.clone(),
+                other_session,
+                unattributed,
+            ])
+            .unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.session_id = Some("3".to_string());
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 3);
+        let ids: Vec<_> = results.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&login.event_id));
+        assert!(ids.contains(&escalation.event_id));
+        assert!(ids.contains(&exec.event_id));
+        // Storage returns rows time-ordered (ORDER BY timestamp ASC).
+        assert_eq!(results[0].event_id, login.event_id);
+        assert_eq!(results[2].event_id, exec.event_id);
+    }
+
+    #[test]
+    fn query_filters_by_user_uid() {
+        let storage = open_test_storage();
+        let root = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "3",
+            0,
+            Some("198.51.100.10"),
+            1000,
+        );
+        let alice = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            2000,
+        );
+        storage.batch_write(&[root.clone(), alice.clone()]).unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.user_uid = Some(0);
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event_id, root.event_id);
+
+        // uid 0 must not be confused with "no user at all": an event whose
+        // `user` is None writes NULL, and NULL never equals 0 in SQL.
+        storage.write(&sample_event(901, 3000)).unwrap();
+        assert_eq!(storage.query(&plan).unwrap().len(), 1);
+    }
+
+    /// The two filters compose (the Identity Story never needs this today,
+    /// but the SQL builder must not special-case one over the other).
+    #[test]
+    fn the_session_and_uid_filters_compose() {
+        let storage = open_test_storage();
+        let alice_in_3 = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "3",
+            1000,
+            None,
+            1000,
+        );
+        let root_in_3 = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "3",
+            0,
+            None,
+            2000,
+        );
+        let alice_in_4 = identity_event(
+            osiris_schema::EventType::PrivilegeUidChange,
+            "4",
+            1000,
+            None,
+            3000,
+        );
+        storage
+            .batch_write(&[alice_in_3.clone(), root_in_3, alice_in_4])
+            .unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.session_id = Some("3".to_string());
+        plan.user_uid = Some(1000);
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event_id, alice_in_3.event_id);
+    }
+
+    /// Non-destructive/idempotent migration proof, matching Phase 2 Task 6's
+    /// and Phase 3 Task 4's precedent exactly: open a database shaped like it
+    /// predates this phase's two new columns, re-open it through the current
+    /// `SqliteStorage::open`, and confirm existing data survives, the guarded
+    /// ADD COLUMN migration runs, and the new filters work afterwards.
+    #[test]
+    fn migrates_a_pre_phase_4_database_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let pre_phase_4_event = sample_event(300, 1000);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // A Phase 3 schema: file and network/DNS columns, no identity
+            // columns.
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    file_path TEXT,
+                    file_inode INTEGER,
+                    file_device_id INTEGER,
+                    network_src_ip TEXT,
+                    network_dst_ip TEXT,
+                    dns_domain TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    pre_phase_4_event.event_id.to_string(),
+                    pre_phase_4_event.host_id.to_string(),
+                    pre_phase_4_event.timestamp as i64,
+                    "PROCESS_EXEC",
+                    serde_json::to_string(&pre_phase_4_event).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.query(&QueryPlan::new()).unwrap().len(),
+            1,
+            "the pre-existing row must survive migration"
+        );
+
+        let login = identity_event(
+            osiris_schema::EventType::SessionLogin,
+            "3",
+            0,
+            Some("198.51.100.10"),
+            2000,
+        );
+        reopened.write(&login).unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.session_id = Some("3".to_string());
+        assert_eq!(
+            reopened.query(&plan).unwrap().len(),
+            1,
+            "the migrated session_id column must exist and filter correctly"
+        );
+        let mut plan = QueryPlan::new();
+        plan.user_uid = Some(0);
+        assert_eq!(
+            reopened.query(&plan).unwrap().len(),
+            1,
+            "the migrated user_uid column must exist and filter correctly"
+        );
+
+        // Idempotency: a second open must neither error nor duplicate a
+        // column, and everything must still be there and still filterable.
+        let reopened_again = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened_again.query(&QueryPlan::new()).unwrap().len(), 2);
+        let mut plan = QueryPlan::new();
+        plan.session_id = Some("3".to_string());
+        assert_eq!(reopened_again.query(&plan).unwrap().len(), 1);
     }
 }

@@ -20,6 +20,18 @@ pub struct QueryPlan {
     pub network_addr: Option<String>,
     /// Exact-match on `dns.query`.
     pub dns_domain: Option<String>,
+    /// Exact-match on `session.session_id`. Because the Enrich stage
+    /// attaches the session to every descendant event of a login (Phase 4a
+    /// plan Global Constraint #5), this one filter returns the whole
+    /// multi-category story for a session — identity, process, privilege,
+    /// file and network alike — which is what the Identity Story's
+    /// `session_id` form composes.
+    pub session_id: Option<String>,
+    /// Exact-match on `user.uid`. Deliberately NOT expanded to "every
+    /// session this user opened": that fan-out is unbounded for a
+    /// long-lived service account and needs §12.3's query planner, which is
+    /// Phase 7 (Phase 4a plan Global Constraint #10).
+    pub user_uid: Option<u32>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
@@ -89,6 +101,13 @@ mod tests {
         assert!(plan.file_identity.is_none());
         assert!(plan.network_addr.is_none());
         assert!(plan.dns_domain.is_none());
+    }
+
+    #[test]
+    fn new_query_plan_defaults_the_identity_filters_to_none_too() {
+        let plan = QueryPlan::new();
+        assert!(plan.session_id.is_none());
+        assert!(plan.user_uid.is_none());
     }
 
     #[test]
