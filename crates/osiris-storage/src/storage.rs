@@ -1,7 +1,9 @@
-use osiris_schema::CanonicalEvent;
+use osiris_schema::{Alert, CanonicalEvent};
 use thiserror::Error;
 
-use crate::plan::{DeleteCriteria, QueryPlan, RetentionPolicy, RetentionReport, WriteReport};
+use crate::plan::{
+    AlertQueryPlan, DeleteCriteria, QueryPlan, RetentionPolicy, RetentionReport, WriteReport,
+};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -34,4 +36,10 @@ pub trait Storage: Send + Sync {
     fn delete(&self, criteria: &DeleteCriteria) -> Result<u64, StorageError>;
     fn retention_apply(&self, policy: &RetentionPolicy) -> Result<RetentionReport, StorageError>;
     fn health(&self) -> StorageHealth;
+
+    /// Persists detection results. Alerts are append-only apart from their
+    /// `status` field (ARCHITECTURE.md §12.7); a re-written `alert_id` is
+    /// ignored and counted as failed, matching `batch_write`'s semantics.
+    fn write_alerts(&self, alerts: &[Alert]) -> Result<WriteReport, StorageError>;
+    fn query_alerts(&self, plan: &AlertQueryPlan) -> Result<Vec<Alert>, StorageError>;
 }

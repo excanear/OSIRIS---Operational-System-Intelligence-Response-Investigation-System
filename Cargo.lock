@@ -1203,6 +1203,7 @@ dependencies = [
  "osiris-schema",
  "serde",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
