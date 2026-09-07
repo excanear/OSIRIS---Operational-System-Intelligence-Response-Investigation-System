@@ -111,13 +111,13 @@ pub fn parse_record(line: &str) -> Option<(AuditMsgId, AuditRecord)> {
                 .cloned(),
         }),
         Some("PATH") => {
-            let name = fields.get("name")?;
+            let name = decode_untrusted_string(line, "name", fields.get("name")?);
             if name.is_empty() || name == "(null)" {
                 return None;
             }
             AuditRecord::Path(PathRecord {
                 item: fields.get("item").and_then(|v| v.parse().ok()).unwrap_or(0),
-                name: name.clone(),
+                name,
                 inode: fields.get("inode").and_then(|v| v.parse().ok()),
                 device_id: fields.get("dev").and_then(|v| parse_dev(v)),
                 mode: fields
@@ -128,7 +128,7 @@ pub fn parse_record(line: &str) -> Option<(AuditMsgId, AuditRecord)> {
                 nametype: parse_nametype(fields.get("nametype").map(String::as_str)),
             })
         }
-        Some("CWD") => AuditRecord::Cwd(fields.get("cwd")?.clone()),
+        Some("CWD") => AuditRecord::Cwd(decode_untrusted_string(line, "cwd", fields.get("cwd")?)),
         _ => AuditRecord::Other,
     };
     Some((id, record))
@@ -144,6 +144,48 @@ fn parse_nametype(raw: Option<&str>) -> NameType {
         // kernel adds: unrecognised is never guessed at.
         _ => NameType::Unknown,
     }
+}
+
+/// The kernel logs a string via `audit_log_untrustedstring`: any value
+/// containing a byte outside printable-ASCII-minus-quote (`0x21..=0x7e`,
+/// excluding `"`) — a space, control character, or embedded quote — comes
+/// out **unquoted, as uppercase hex** instead of the usual `key="value"`
+/// form. `name=` and `cwd=` (paths) are exactly the fields this sensor
+/// reads that carry attacker- or user-controlled bytes, so a filename with
+/// a space (`shell copy.php`) is logged as
+/// `name=7368656C6C20636F70792E706870`, not `name="shell copy.php"`.
+/// Passing that hex blob straight through would silently corrupt every
+/// such path rather than failing loudly, so it is decoded here before
+/// `FileEventRaw.path`/`previous_path` are ever built.
+///
+/// `tokenize` already strips quotes from a quoted value, so the
+/// quoted/unquoted distinction can't be read back off its output — a
+/// legitimately quoted, all-hex-digit name (`name="deadbeef"`, a real if
+/// unusual filename) must not be mistaken for an encoded one. This checks
+/// the raw line for the literal `key="` marker instead of guessing from
+/// the value's shape.
+fn decode_untrusted_string(line: &str, key: &str, raw_value: &str) -> String {
+    if line.contains(&format!("{key}=\"")) {
+        return raw_value.to_string();
+    }
+    decode_hex(raw_value).unwrap_or_else(|| raw_value.to_string())
+}
+
+/// Hex-decodes an unquoted `audit_log_untrustedstring` value. Returns
+/// `None` for anything that isn't a well-formed even-length hex string —
+/// including the ordinary case of a short unquoted token like `(null)` —
+/// so the caller falls back to the raw value unchanged rather than
+/// mangling it.
+fn decode_hex(raw: &str) -> Option<String> {
+    if raw.len() < 2 || raw.len() % 2 != 0 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.as_bytes().chunks_exact(2) {
+        let hex_pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(hex_pair, 16).ok()?);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Decodes an audit PATH record's `dev=MAJ:MIN` field. Both halves are
@@ -216,6 +258,47 @@ mod tests {
             AuditRecord::Path(p) => {
                 assert_eq!(p.device_id, Some(osiris_schema::encode_device_id(253, 0)))
             }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    /// The kernel does not quote a name containing a space (or any other
+    /// byte outside printable-ASCII-minus-quote); it logs it unquoted, as
+    /// uppercase hex instead: `audit_log_untrustedstring` on
+    /// `/var/www/html/shell 2.php` yields
+    /// `name=2F7661722F7777772F68746D6C2F7368656C6C20322E706870`. That must
+    /// decode back to the real path, not flow into `FileEventRaw.path` as
+    /// an unmatchable hex blob.
+    #[test]
+    fn decodes_a_hex_encoded_name_containing_a_space() {
+        let line = PATH_DELETE.replace(
+            r#"name="/tmp/foo""#,
+            "name=2F7661722F7777772F68746D6C2F7368656C6C20322E706870",
+        );
+        match parse_record(&line).expect("must parse").1 {
+            AuditRecord::Path(p) => assert_eq!(p.name, "/var/www/html/shell 2.php"),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    /// Same encoding applies to `type=CWD`'s `cwd=` field.
+    #[test]
+    fn decodes_a_hex_encoded_cwd_containing_a_space() {
+        let line = CWD_LINE.replace(r#"cwd="/home/user""#, "cwd=2F686F6D652F7573206572");
+        match parse_record(&line).expect("must parse").1 {
+            AuditRecord::Cwd(cwd) => assert_eq!(cwd, "/home/us er"),
+            other => panic!("expected Cwd, got {other:?}"),
+        }
+    }
+
+    /// A legitimately quoted, all-hex-digit name must not be mistaken for
+    /// an encoded one just because its characters happen to all be hex
+    /// digits — the quoted form is never hex-encoded by the kernel.
+    #[test]
+    fn a_quoted_all_hex_digit_name_is_left_alone() {
+        let line = PATH_DELETE.replace(r#"name="/tmp/foo""#, r#"name="deadbeef""#);
+        match parse_record(&line).expect("must parse").1 {
+            AuditRecord::Path(p) => assert_eq!(p.name, "deadbeef"),
             other => panic!("expected Path, got {other:?}"),
         }
     }

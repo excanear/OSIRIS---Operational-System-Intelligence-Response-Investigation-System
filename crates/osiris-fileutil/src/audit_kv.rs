@@ -15,13 +15,26 @@ pub struct AuditMsgId {
 
 /// Tokenizes one auditd record line into `key=value` pairs, honoring
 /// auditd's double-quoting convention for values that may contain spaces
-/// (`comm="curl"`, `name="/tmp/two words.txt"`).
+/// (`comm="curl"`, `exe="/usr/bin/curl"`).
 ///
 /// Malformed input is handled by producing something a caller can reject,
 /// never by panicking: a truncated `pid=` yields an empty value (which
 /// fails the caller's `parse()`), and an unterminated quote swallows the
 /// rest of the line into that one value (so the caller's required fields
 /// come back missing).
+///
+/// This function only tokenizes — it does not know or care whether a value
+/// is real quoted text. In practice the kernel's `audit_log_untrustedstring`
+/// helper only ever *quotes* a string when every byte in it is printable
+/// ASCII other than `"` (`0x21..=0x7e` minus the quote); a string containing
+/// a space, control character, or embedded quote (a filename with a space
+/// in it, say) is logged **unquoted, as uppercase hex** instead — e.g.
+/// `name=2F746D702F666F6F20626172` rather than `name="/tmp/foo bar"`. This
+/// tokenizer does not hex-decode such values (it has no way to know which
+/// fields might need it, and some callers — a raw `key=` audit rule tag,
+/// say — never do); that decoding is the caller's job for whichever fields
+/// carry untrusted strings (see `osiris_sensors_fs::audit_record::
+/// parse_record`'s handling of `name=`/`cwd=`).
 pub fn tokenize(line: &str) -> HashMap<String, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -84,14 +97,35 @@ mod tests {
         assert_eq!(fields.get("exe").map(String::as_str), Some("/usr/bin/curl"));
     }
 
+    /// Exercises the tokenizer's generic quote-handling mechanic — some
+    /// fields (`comm=`, `exe=`, `key=`) are legitimately quoted and may
+    /// contain no bytes needing escaping. This is NOT how the kernel emits
+    /// a `name=`/`cwd=` path containing a space: `audit_log_untrustedstring`
+    /// only quotes a value when every byte is printable ASCII other than
+    /// `"`; a space makes it log unquoted, uppercase hex instead (see
+    /// `tokenize`'s doc comment). Decoding that hex form is exercised in
+    /// `osiris_sensors_fs::audit_record`'s tests, not here.
     #[test]
     fn tokenizes_a_quoted_value_containing_spaces_as_one_token() {
-        let fields = tokenize(r#"type=PATH name="/tmp/two words.txt" nametype=CREATE"#);
+        let fields = tokenize(r#"type=SYSCALL comm="my command" nametype=CREATE"#);
         assert_eq!(
-            fields.get("name").map(String::as_str),
-            Some("/tmp/two words.txt")
+            fields.get("comm").map(String::as_str),
+            Some("my command")
         );
         assert_eq!(fields.get("nametype").map(String::as_str), Some("CREATE"));
+    }
+
+    /// The tokenizer itself does no hex-decoding — an unquoted
+    /// `audit_log_untrustedstring` value (uppercase hex for
+    /// `/tmp/foo bar`) comes back exactly as printed, for the caller to
+    /// decode.
+    #[test]
+    fn does_not_hex_decode_an_unquoted_untrusted_string_value() {
+        let fields = tokenize("type=PATH name=2F746D702F666F6F20626172 nametype=CREATE");
+        assert_eq!(
+            fields.get("name").map(String::as_str),
+            Some("2F746D702F666F6F20626172")
+        );
     }
 
     #[test]

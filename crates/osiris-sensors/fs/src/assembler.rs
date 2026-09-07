@@ -13,7 +13,12 @@ struct PendingGroup {
     syscall: Option<SyscallRecord>,
     cwd: Option<String>,
     paths: Vec<PathRecord>,
-    first_seen: Instant,
+    /// Refreshed on every `offer()` that lands in this group — `tick`
+    /// measures idle time *since the last record*, not since the group was
+    /// opened, so a group whose records straddle more than
+    /// `completion_timeout` is never released mid-assembly just because a
+    /// later record hasn't arrived yet.
+    last_seen: Instant,
 }
 
 /// Groups an auditd log's records into complete kernel audit events and
@@ -59,8 +64,9 @@ impl AuditEventAssembler {
             syscall: None,
             cwd: None,
             paths: Vec::new(),
-            first_seen: now,
+            last_seen: now,
         });
+        group.last_seen = now;
         match record {
             AuditRecord::Syscall(s) => group.syscall = Some(s),
             AuditRecord::Cwd(cwd) => group.cwd = Some(cwd),
@@ -76,12 +82,15 @@ impl AuditEventAssembler {
 
     /// Releases the open group once it has gone `completion_timeout`
     /// without a new record — the only way the final event in a quiet log
-    /// ever gets reported.
+    /// ever gets reported. Measured from the group's *last* record, not its
+    /// first, so a group whose assembly happens to straddle more than
+    /// `completion_timeout` (a slow write burst, a busy host) is not
+    /// released out from under still-arriving records.
     pub fn tick(&mut self, now: Instant) -> Vec<FileEventRaw> {
         let expired = self
             .pending
             .as_ref()
-            .map(|g| now.duration_since(g.first_seen) >= self.completion_timeout)
+            .map(|g| now.duration_since(g.last_seen) >= self.completion_timeout)
             .unwrap_or(false);
         if expired {
             self.take_pending()
@@ -148,6 +157,21 @@ pub fn group_to_file_events(
                 // syscall could modify contents. Read-only opens produce
                 // NORMAL items too, and this phase emits no read events
                 // (§6's Filesystem STANDARD row).
+                //
+                // KNOWN LIMITATION: nothing here inspects the syscall's
+                // open-flags argument, so a NORMAL item on a `SyscallClass::
+                // Write` syscall (open/openat/openat2/creat/truncate/
+                // ftruncate) always becomes FILE_WRITE, even for a
+                // read-only open (`O_RDONLY`, no `O_CREAT`). This is a hard
+                // dependency on the operator's audit watch rule being
+                // configured with write-only permissions (`-F perm=wa`, as
+                // documented on `FilesystemSensor`) rather than `-F
+                // perm=rwxa` — a rule that also audits reads (or another
+                // subsystem's overlapping rule) will cause false FILE_WRITE
+                // telemetry for what were actually read-only opens.
+                // Parsing `a1`/`a2` to check `O_WRONLY`/`O_RDWR`/`O_CREAT`
+                // would remove this dependency but is out of this task's
+                // scope.
                 NameType::Normal if class == SyscallClass::Write => FileOperation::Write,
                 _ => return None,
             };
@@ -230,6 +254,20 @@ fn build_event(
 /// relative path must be joined to the group's `type=CWD` record. A
 /// relative path with no CWD record is returned unchanged rather than
 /// guessed at — downstream it is still a real, if less useful, observation.
+///
+/// KNOWN LIMITATION: this always resolves a relative `name=` against the
+/// *process's* working directory (the group's `type=CWD` record). That is
+/// correct for a plain `open`/`unlink`/`rename`/etc., but a `*at()` syscall
+/// (`openat`, `unlinkat`, `renameat`, `renameat2`, `mkdirat`) resolves its
+/// relative name against the directory named by its `dirfd` argument when
+/// that argument isn't the sentinel `AT_FDCWD` (`-100`) — and audit's
+/// `type=PATH` records give no way to recover what directory a real dirfd
+/// pointed to. A caller like `rm -rf` (which uses `fts`, and so
+/// `unlinkat(dirfd, name, …)` with a real dirfd) can therefore produce a
+/// `FileEventRaw.path` that is confidently absolute but wrong. The file's
+/// `inode`/`device_id` identity is unaffected (it comes straight from the
+/// kernel's own PATH record, not from this resolution), so a File Story
+/// join on identity still works even when the path string doesn't.
 fn absolutize(name: &str, cwd: Option<&str>) -> String {
     if name.starts_with('/') {
         return name.to_string();
@@ -448,6 +486,39 @@ mod tests {
         assert_eq!(emitted[0].path, "/tmp/last");
         // Released once and once only.
         assert!(assembler.tick(start + Duration::from_secs(10)).is_empty());
+    }
+
+    /// `tick` must measure idle time since the group's *last* record, not
+    /// since it was opened. A rename or multi-item group whose records are
+    /// spread more than `completion_timeout` apart (a slow write burst, a
+    /// busy host) must not be released out from under a record that is
+    /// still on its way — that would silently truncate the group (e.g. a
+    /// rename losing its CREATE item and downgrading to nothing at all).
+    #[test]
+    fn a_group_is_not_released_while_records_keep_arriving_before_the_timeout_elapses() {
+        let mut assembler = AuditEventAssembler::new(Duration::from_millis(100));
+        let start = Instant::now();
+        assembler.offer(&syscall_line(500, 87, "rm", "/usr/bin/rm"), start);
+
+        // A second record for the same group arrives just before the
+        // timeout would have elapsed since the FIRST record.
+        let second_record_at = start + Duration::from_millis(90);
+        assert!(assembler.tick(second_record_at).is_empty());
+        assembler.offer(&path_line(500, 0, "/tmp/x", 1, "DELETE"), second_record_at);
+
+        // Total elapsed time since group creation (130ms) now exceeds the
+        // 100ms timeout, but only 40ms have passed since the last record —
+        // the group must survive this tick.
+        assert!(
+            assembler.tick(start + Duration::from_millis(130)).is_empty(),
+            "must track idle time since the last record, not since the group was created"
+        );
+
+        // Only once 100ms have actually elapsed with no further record does
+        // the group release.
+        let emitted = assembler.tick(second_record_at + Duration::from_millis(100));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].path, "/tmp/x");
     }
 
     #[test]

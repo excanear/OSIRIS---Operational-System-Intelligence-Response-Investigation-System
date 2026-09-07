@@ -49,6 +49,16 @@ pub enum FileOperation {
 pub struct FileEventRaw {
     pub operation: FileOperation,
     /// Absolute path. For `Rename` this is the *destination* path.
+    ///
+    /// KNOWN LIMITATION (audit backend): a relative `name=` from a `*at()`
+    /// syscall (`openat`, `unlinkat`, `renameat`, ...) called with a real
+    /// (non-`AT_FDCWD`) dirfd is resolved against the group's process-CWD
+    /// record, not the directory the dirfd actually named — audit's
+    /// `type=PATH` records don't carry enough information to recover that
+    /// directory. This can produce a confidently absolute but wrong path
+    /// (see `osiris_sensors_fs::assembler::absolutize`'s doc comment). The
+    /// `inode`/`device_id` identity below is unaffected, so identity-based
+    /// joins (File Story) remain correct even when `path` isn't.
     pub path: String,
     /// Only set for `Rename`: the source path the file moved from.
     pub previous_path: Option<String>,
