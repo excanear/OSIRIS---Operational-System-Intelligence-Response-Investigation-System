@@ -17,6 +17,9 @@ pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent
     match raw {
         RawEvent::ProcessExec(p) => normalize_process_exec(p, host, boot_id),
         RawEvent::File(f) => normalize_file_event(f, host, boot_id),
+        other => panic!(
+            "the Normalize stage must only handle ProcessExec and File events, got {other:?}"
+        ),
     }
 }
 
