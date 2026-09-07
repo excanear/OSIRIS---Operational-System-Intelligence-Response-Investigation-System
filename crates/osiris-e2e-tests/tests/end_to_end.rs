@@ -4,7 +4,7 @@ use std::time::Duration;
 use osiris_agent::{Agent, AgentConfig};
 use osiris_api::build_router;
 use osiris_detect::DetectionEngine;
-use osiris_schema::HostRef;
+use osiris_schema::{EntityRef, EventType, HostRef, Relation};
 use osiris_server::run_ingestion_loop;
 use osiris_storage::{QueryPlan, Storage};
 use osiris_storage_sqlite::SqliteStorage;
@@ -457,6 +457,65 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
         );
     }
 
+    // 2b. Global Constraint #8's actual Entity Graph edges: this is checked
+    //     directly on `event.relationships` (populated once at enrichment,
+    //     ARCHITECTURE.md §9.4), not inferred from the Network Story join
+    //     below (which proves Global Constraint #9's separate string-match
+    //     logic and would pass even if these edges did not exist at all).
+    let connect_event = events
+        .iter()
+        .find(|e| e.event_type == EventType::NetworkConnect)
+        .expect("NETWORK_CONNECT event must be present");
+    let connect_to_edges: Vec<_> = connect_event
+        .relationships
+        .iter()
+        .filter(|r| r.relation == Relation::ConnectedTo)
+        .collect();
+    assert_eq!(
+        connect_to_edges.len(),
+        1,
+        "NETWORK_CONNECT must carry exactly one CONNECTED_TO edge"
+    );
+    match &connect_to_edges[0].to {
+        EntityRef::Ip { addr } => assert_eq!(addr, "203.0.113.50"),
+        other => panic!("CONNECTED_TO edge must target an Ip entity, got {:?}", other),
+    }
+
+    let close_event = events
+        .iter()
+        .find(|e| e.event_type == EventType::NetworkClose)
+        .expect("NETWORK_CLOSE event must be present");
+    assert!(
+        !close_event
+            .relationships
+            .iter()
+            .any(|r| r.relation == Relation::ConnectedTo),
+        "NETWORK_CLOSE must NOT carry a CONNECTED_TO edge — it would duplicate the one \
+         already attached to NETWORK_CONNECT"
+    );
+
+    let dns_event = events
+        .iter()
+        .find(|e| e.event_type == EventType::DnsQuery)
+        .expect("DNS_QUERY event must be present");
+    let resolved_to_edges: Vec<_> = dns_event
+        .relationships
+        .iter()
+        .filter(|r| r.relation == Relation::ResolvedTo)
+        .collect();
+    assert_eq!(
+        resolved_to_edges.len(),
+        1,
+        "DNS_QUERY must carry exactly one RESOLVED_TO edge (one resolved IP)"
+    );
+    match (&resolved_to_edges[0].from, &resolved_to_edges[0].to) {
+        (EntityRef::Domain { name }, EntityRef::Ip { addr }) => {
+            assert_eq!(name, "cdn-assets.xyz");
+            assert_eq!(addr, "203.0.113.50");
+        }
+        other => panic!("RESOLVED_TO edge must be Domain -> Ip, got {:?}", other),
+    }
+
     // 3. Timeline: both DNS and NETWORK categories appear, correctly
     //    time-ordered alongside PROCESS, in one GET /api/v1/events response.
     let app = build_router(storage.clone());
@@ -525,8 +584,10 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
 
     // 5. Network Story by domain: the DNS event plus both network events
     //    that touch its resolved address (cdn-assets.xyz -> 203.0.113.50),
-    //    proving Global Constraint #8's RESOLVED_TO/CONNECTED_TO edges and
-    //    Global Constraint #9's domain-form composition, over real HTTP.
+    //    proving Global Constraint #9's domain-form join (dns.response_ips
+    //    string-matched against network_addr), over real HTTP. This is
+    //    independent of the Entity Graph edges themselves — those are
+    //    proven directly on `event.relationships` in step 2b above.
     let story: serde_json::Value = client
         .get(format!(
             "http://{}/api/v1/network/story?domain=cdn-assets.xyz",
