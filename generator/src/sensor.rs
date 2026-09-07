@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use osiris_sensor_api::{
-    ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth,
-    SensorMetrics, SensorState,
+    RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth, SensorMetrics,
+    SensorState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -37,13 +37,13 @@ fn lock_health(health: &Mutex<HealthState>) -> MutexGuard<'_, HealthState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Emits a fixed, deterministic scenario of ProcessExecRaw events through
-/// the real Sensor/Pipeline/Bus path — ARCHITECTURE.md §15's requirement
-/// that the generator exercise production code, not a parallel simulation.
-/// Emits the whole scenario once (spaced by `emit_interval`), then goes
-/// idle rather than looping — deterministic and test-friendly.
+/// Emits a fixed, deterministic scenario of `RawEvent`s (process and file
+/// alike) through the real Sensor/Pipeline/Bus path — ARCHITECTURE.md §15's
+/// requirement that the generator exercise production code, not a parallel
+/// simulation. Emits the whole scenario once (spaced by `emit_interval`),
+/// then goes idle rather than looping — deterministic and test-friendly.
 pub struct SyntheticSensor {
-    scenario: Vec<ProcessExecRaw>,
+    scenario: Vec<RawEvent>,
     emit_interval: Duration,
     cancellation: Option<CancellationToken>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -51,7 +51,7 @@ pub struct SyntheticSensor {
 }
 
 impl SyntheticSensor {
-    pub fn new(scenario: Vec<ProcessExecRaw>) -> Self {
+    pub fn new(scenario: Vec<RawEvent>) -> Self {
         Self {
             scenario,
             emit_interval: Duration::from_millis(10),
@@ -98,8 +98,8 @@ impl Sensor for SyntheticSensor {
                     lock_health(&health).state = SensorState::Stopped;
                     return;
                 }
-                let ts = raw.timestamp_ns;
-                if output.send(RawEvent::ProcessExec(raw)).await.is_ok() {
+                let ts = raw.timestamp_ns();
+                if output.send(raw).await.is_ok() {
                     let mut h = lock_health(&health);
                     h.events_emitted_total += 1;
                     h.last_event_at = Some(ts);
@@ -201,5 +201,35 @@ mod tests {
     fn always_available_regardless_of_host() {
         let sensor = SyntheticSensor::new(vec![]);
         assert!(sensor.capabilities().supported());
+    }
+
+    #[tokio::test]
+    async fn emits_file_events_from_a_mixed_scenario() {
+        use crate::scenarios::{web_shell_drop_scenario, WEB_SHELL_TEMP_PATH};
+        let mut sensor = SyntheticSensor::new(web_shell_drop_scenario(1000))
+            .with_emit_interval(Duration::from_millis(1));
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancellation = CancellationToken::new();
+        sensor
+            .initialize(SensorContext::new(tx, cancellation.clone()))
+            .await
+            .unwrap();
+        sensor.start().await.unwrap();
+
+        let mut file_paths = vec![];
+        for _ in 0..7 {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out")
+                .expect("channel closed");
+            if let RawEvent::File(f) = event {
+                file_paths.push(f.path);
+            }
+        }
+        assert_eq!(file_paths.len(), 4);
+        assert_eq!(file_paths[0], WEB_SHELL_TEMP_PATH);
+
+        sensor.stop().await.unwrap();
+        assert_eq!(sensor.health().events_emitted_total, 7);
     }
 }

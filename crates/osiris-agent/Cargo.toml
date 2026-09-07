@@ -26,6 +26,7 @@ osiris-sensor-api = { path = "../osiris-sensor-api" }
 osiris-pipeline = { path = "../osiris-pipeline" }
 osiris-bus = { path = "../osiris-bus" }
 osiris-sensors-process = { path = "../osiris-sensors/process" }
+osiris-sensors-fs = { path = "../osiris-sensors/fs" }
 osiris-generator = { path = "../../generator" }
 
 [dev-dependencies]

@@ -54,7 +54,7 @@ impl FileIdentity {
 
 /// Encodes a device's major:minor pair (as printed by an audit `PATH`
 /// record's `dev=MAJ:MIN` field, in hex) into `FileRef::device_id`.
-pub fn encode_device_id(major: u32, minor: u32) -> u64 {
+pub const fn encode_device_id(major: u32, minor: u32) -> u64 {
     ((major as u64) << 32) | (minor as u64)
 }
 

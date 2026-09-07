@@ -38,7 +38,9 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
 
     let agent_config = AgentConfig {
         audit_log_path: None,
+        fs_audit_log_path: None,
         enable_synthetic: true,
+        synthetic_scenario: None,
         spool_path: spool_path.to_string_lossy().to_string(),
         status_addr: "127.0.0.1:0".to_string(),
     };

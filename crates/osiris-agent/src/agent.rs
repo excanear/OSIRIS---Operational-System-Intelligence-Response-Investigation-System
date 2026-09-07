@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
-use osiris_generator::{exec_chain_scenario, SyntheticSensor};
+use osiris_generator::{exec_chain_scenario, web_shell_drop_scenario, SyntheticSensor};
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
 use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
+use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_process::ProcessExecSensor;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -25,7 +26,7 @@ pub enum AgentError {
     Status(std::io::Error),
 }
 
-/// The Agent Supervisor (ARCHITECTURE.md §3.1/§3.2), Phase 1 scope: starts
+/// The Agent Supervisor (ARCHITECTURE.md §3.1/§3.2), Phase 1/2 scope: starts
 /// every registered sensor whose capabilities() report support, wires
 /// their shared output channel through one Pipeline instance into the
 /// Event Bus, and serves a local status endpoint. Plan Global Constraints
@@ -72,12 +73,26 @@ impl Agent {
         if let Some(path) = &config.audit_log_path {
             candidate_sensors.push(Box::new(ProcessExecSensor::new(path.clone())));
         }
+        if let Some(path) = &config.fs_audit_log_path {
+            candidate_sensors.push(Box::new(FilesystemSensor::new(path.clone())));
+        }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_nanos() as u64;
-            candidate_sensors.push(Box::new(SyntheticSensor::new(exec_chain_scenario(base_ts))));
+            let scenario = match config.synthetic_scenario.as_deref() {
+                Some("web_shell_drop") => web_shell_drop_scenario(base_ts),
+                Some("exec_chain") | None => exec_chain_scenario(base_ts),
+                Some(other) => {
+                    tracing::warn!(
+                        scenario = other,
+                        "unknown synthetic_scenario; falling back to exec_chain"
+                    );
+                    exec_chain_scenario(base_ts)
+                }
+            };
+            candidate_sensors.push(Box::new(SyntheticSensor::new(scenario)));
         }
 
         let mut running_sensors: Vec<Box<dyn Sensor>> = vec![];
@@ -223,19 +238,26 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn starts_with_synthetic_sensor_and_reaches_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = AgentConfig {
+    fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
+        AgentConfig {
             audit_log_path: None,
-            enable_synthetic: true,
+            fs_audit_log_path: None,
+            enable_synthetic: false,
+            synthetic_scenario: None,
             spool_path: dir
                 .path()
                 .join("spool.ndjson")
                 .to_string_lossy()
                 .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_with_synthetic_sensor_and_reaches_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
             .unwrap();
@@ -254,16 +276,8 @@ mod tests {
     #[tokio::test]
     async fn skips_process_exec_sensor_when_audit_log_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let config = AgentConfig {
-            audit_log_path: Some(dir.path().join("missing.log").to_string_lossy().to_string()),
-            enable_synthetic: false,
-            spool_path: dir
-                .path()
-                .join("spool.ndjson")
-                .to_string_lossy()
-                .to_string(),
-            status_addr: "127.0.0.1:0".to_string(),
-        };
+        let mut config = base_config(&dir);
+        config.audit_log_path = Some(dir.path().join("missing.log").to_string_lossy().to_string());
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
             .unwrap();
@@ -293,12 +307,8 @@ mod tests {
     async fn synthetic_events_reach_the_spool_file() {
         let dir = tempfile::tempdir().unwrap();
         let spool_path = dir.path().join("spool.ndjson");
-        let config = AgentConfig {
-            audit_log_path: None,
-            enable_synthetic: true,
-            spool_path: spool_path.to_string_lossy().to_string(),
-            status_addr: "127.0.0.1:0".to_string(),
-        };
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
             .unwrap();
@@ -309,5 +319,83 @@ mod tests {
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
         assert_eq!(contents.lines().count(), 3);
         assert!(contents.contains("\"PROCESS_EXEC\""));
+    }
+
+    #[tokio::test]
+    async fn starts_the_filesystem_sensor_when_an_fs_audit_log_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs_log = dir.path().join("fs-audit.log");
+        std::fs::write(&fs_log, "").unwrap();
+        let mut config = base_config(&dir);
+        config.fs_audit_log_path = Some(fs_log.to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 1);
+        assert_eq!(status.sensors[0].name, "filesystem");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn skips_the_filesystem_sensor_with_a_visible_reason_when_its_log_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.fs_audit_log_path =
+            Some(dir.path().join("missing.log").to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 0);
+        assert_eq!(status.skipped_sensors.len(), 1);
+        assert_eq!(status.skipped_sensors[0].name, "filesystem");
+        assert!(status.skipped_sensors[0]
+            .reason
+            .contains("audit log not found"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_web_shell_drop_scenario_reaches_the_spool_file_with_file_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("web_shell_drop".to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert_eq!(contents.lines().count(), 7);
+        assert!(contents.contains("\"PROCESS_EXEC\""));
+        assert!(contents.contains("\"FILE_CREATE\""));
+        assert!(contents.contains("\"FILE_WRITE\""));
+        assert!(contents.contains("\"FILE_RENAME\""));
+        assert!(contents.contains("/var/www/html/shell.php"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scenario_name_falls_back_to_the_exec_chain_rather_than_starting_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("nonsense".to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert_eq!(contents.lines().count(), 3);
     }
 }
