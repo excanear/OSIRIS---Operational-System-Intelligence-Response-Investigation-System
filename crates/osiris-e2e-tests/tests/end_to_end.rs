@@ -376,6 +376,221 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     assert_eq!(parsed.as_array().unwrap().len(), 7);
 }
 
+/// Phase 3's full vertical slice: the network-beacon scenario (sshd -> bash
+/// -> curl, then curl resolves a suspicious-TLD domain and connects to the
+/// resolved address before the connection closes) flows through the real
+/// Agent, Server (ingest + detection + storage), and HTTP API. Verifies
+/// Timeline interleaving of the DNS/Network categories, PROCESS_KEY_PROVISIONAL
+/// absence, the shipped DNS rule firing on a real ingested event, and
+/// Network Story's domain-to-connection join (and its disclosed
+/// IP-form asymmetry) over real HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        enable_synthetic: true,
+        synthetic_scenario: Some("network_beacon".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+
+    // The real shipped rules directory — now two rules (Phase 2's web-root
+    // rule plus Phase 3's DNS rule) loaded the same way osiris-server's
+    // main.rs does.
+    let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+    let detection_engine = Arc::new(DetectionEngine::load_from_dir(&rules_dir).unwrap());
+    assert!(detection_engine.rule_count() >= 2);
+
+    let ingestion_cancellation = CancellationToken::new();
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        detection_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // 6-event scenario, 1ms apart, plus a 50ms ingestion poll interval —
+    // comfortably generous, matching Phase 2's precedent budget for a
+    // similarly-sized scenario.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    // 1. Storage directly: all 6 events landed (3 exec + 1 DNS + 2 network).
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    assert_eq!(events.len(), 6, "expected sshd, bash, curl, 1 DNS query, connect, close");
+
+    // 2. PROCESS_KEY_PROVISIONAL must be absent from the DNS and network
+    //    events: curl (pid 300) already executed earlier in this same
+    //    scenario, so ProcessResolver must have resolved its real
+    //    process_key.
+    let non_process_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.dns.is_some() || e.network.is_some())
+        .collect();
+    assert_eq!(non_process_events.len(), 3, "1 DNS + 2 network events");
+    for event in &non_process_events {
+        assert!(
+            !event.tags.iter().any(|t| t == "PROCESS_KEY_PROVISIONAL"),
+            "event {:?} must not carry PROCESS_KEY_PROVISIONAL — curl already executed earlier",
+            event.event_id
+        );
+    }
+
+    // 3. Timeline: both DNS and NETWORK categories appear, correctly
+    //    time-ordered alongside PROCESS, in one GET /api/v1/events response.
+    let app = build_router(storage.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let min_ts = events.iter().map(|e| e.timestamp).min().unwrap();
+    let max_ts = events.iter().map(|e| e.timestamp).max().unwrap();
+    let timeline: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/events?since={}&until={}",
+            addr,
+            min_ts - 1,
+            max_ts + 1
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let timeline_events = timeline.as_array().unwrap();
+    assert_eq!(timeline_events.len(), 6);
+    let timestamps: Vec<u64> = timeline_events
+        .iter()
+        .map(|e| e["timestamp"].as_u64().unwrap())
+        .collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort();
+    assert_eq!(timestamps, sorted, "events must come back in timestamp order");
+    let categories: std::collections::HashSet<_> = timeline_events
+        .iter()
+        .map(|e| e["category"].as_str().unwrap().to_string())
+        .collect();
+    assert!(categories.contains("PROCESS") && categories.contains("DNS") && categories.contains("NETWORK"));
+
+    // 4. The shipped DNS rule fired: GET /api/v1/alerts must show
+    //    dns_query_to_suspicious_tld, citing the DNS_QUERY event.
+    let alerts: serde_json::Value = client
+        .get(format!("http://{}/api/v1/alerts", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alerts_array = alerts.as_array().unwrap();
+    assert!(
+        !alerts_array.is_empty(),
+        "the shipped dns_query_to_suspicious_tld rule must have fired on curl's query to \
+         cdn-assets.xyz"
+    );
+    assert!(alerts_array
+        .iter()
+        .all(|a| a["rule_id"].as_str().unwrap() == "dns_query_to_suspicious_tld"));
+    for alert in alerts_array {
+        let reasons = alert["reasons"].as_array().unwrap();
+        assert!(!reasons.is_empty());
+        assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+    }
+
+    // 5. Network Story by domain: the DNS event plus both network events
+    //    that touch its resolved address (cdn-assets.xyz -> 203.0.113.50),
+    //    proving Global Constraint #8's RESOLVED_TO/CONNECTED_TO edges and
+    //    Global Constraint #9's domain-form composition, over real HTTP.
+    let story: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/network/story?domain=cdn-assets.xyz",
+            addr
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let story_events = story["events"].as_array().unwrap();
+    assert_eq!(
+        story_events.len(),
+        3,
+        "domain-form Network Story must include the DNS query plus both network events \
+         touching its resolved address"
+    );
+    let story_categories: std::collections::HashSet<_> = story_events
+        .iter()
+        .map(|e| e["category"].as_str().unwrap().to_string())
+        .collect();
+    assert!(story_categories.contains("DNS") && story_categories.contains("NETWORK"));
+    let story_alerts = story["alerts"].as_array().unwrap();
+    assert!(!story_alerts.is_empty());
+
+    // 6. Network Story by IP alone: only the two network events — the
+    //    disclosed asymmetry from Global Constraint #9 (no reverse
+    //    DNS-answer lookup from an IP alone).
+    let ip_story: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/network/story?ip=203.0.113.50",
+            addr
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ip_story_events = ip_story["events"].as_array().unwrap();
+    assert_eq!(
+        ip_story_events.len(),
+        2,
+        "IP-form Network Story must NOT include the resolving DNS event — Global \
+         Constraint #9's disclosed asymmetry"
+    );
+    assert!(ip_story_events
+        .iter()
+        .all(|e| e["category"].as_str().unwrap() == "NETWORK"));
+
+    // 7. The real CLI binary still works against this richer dataset
+    //    (regression check).
+    let cli_binary = cli_binary_path();
+    let output = std::process::Command::new(&cli_binary)
+        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 6);
+}
+
 /// Minimal ad-hoc percent-encoding for the one query-string value this test
 /// needs to send (a `/`-containing path) — not a general URL encoder.
 /// `reqwest` does not percent-encode a raw string interpolated into a
