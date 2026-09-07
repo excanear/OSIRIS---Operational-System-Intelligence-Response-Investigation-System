@@ -97,10 +97,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, S
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| StorageError::Backend(e.to_string()))?;
-    let mut rows = stmt
+    let rows = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|e| StorageError::Backend(e.to_string()))?;
-    while let Some(name) = rows.next() {
+    for name in rows {
         if name.map_err(|e| StorageError::Backend(e.to_string()))? == column {
             return Ok(true);
         }
