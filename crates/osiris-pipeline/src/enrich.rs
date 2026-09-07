@@ -1,4 +1,4 @@
-﻿use osiris_schema::{
+use osiris_schema::{
     CanonicalEvent, Category, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessRef,
     Relation, SessionRef,
 };
@@ -130,15 +130,16 @@ fn attach_session_relationship(event: &mut CanonicalEvent) {
 }
 
 /// Writes the §9.4 `Process -EXECUTED_AS-> User` edge (plan Global
-/// Constraint #8). Requires a real uid transition: a target uid that is
-/// present *and different from* the acting uid. `PRIVILEGE_GID_CHANGE`
-/// never produces one (`EntityRef::User` is keyed by uid; there is no
-/// group entity, and encoding a gid there would corrupt the graph), and
-/// `PRIVILEGE_SUDO` produces one only if the backend did report a target
-/// uid — auditd's `USER_CMD` usually does not (plan Global Constraint #9),
-/// and an edge citing an invented target is worse than no edge.
+/// Constraint #8). Attached on `PRIVILEGE_UID_CHANGE` only, and even then
+/// only for a real uid transition: a target uid that is present *and
+/// different from* the acting uid. Explicitly never attached on
+/// `PRIVILEGE_GID_CHANGE` (`EntityRef::User` is keyed by uid; there is no
+/// group entity, and encoding a gid there would corrupt the graph) or on
+/// `PRIVILEGE_SUDO` — auditd's `USER_CMD` record does not reliably carry
+/// the target account across distributions (plan Global Constraint #8),
+/// so even a populated `target_uid` on a sudo event must not mint an edge.
 fn attach_executed_as_relationship(event: &mut CanonicalEvent) {
-    if event.event_type == EventType::PrivilegeGidChange {
+    if event.event_type != EventType::PrivilegeUidChange {
         return;
     }
     let Some(process) = event.process.as_ref() else {
@@ -932,6 +933,23 @@ mod tests {
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
         let mut event = privilege_event(host_id, 300, 200, 1000, None);
+        event.event_type = EventType::PrivilegeSudo;
+        let event = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        assert!(event
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::ExecutedAs));
+    }
+
+    /// GC#8: EXECUTED_AS is attached on PRIVILEGE_UID_CHANGE only, never on
+    /// PRIVILEGE_SUDO, even if a backend happens to populate target_uid on a
+    /// sudo record (auditd's USER_CMD does not reliably carry it).
+    #[test]
+    fn a_privilege_sudo_event_with_a_target_uid_gains_no_executed_as_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut event = privilege_event(host_id, 300, 200, 1000, Some(0));
         event.event_type = EventType::PrivilegeSudo;
         let event = enrich(event, "boot-1", &mut resolver, &mut sessions);
         assert!(event
