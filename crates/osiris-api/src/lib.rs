@@ -25,6 +25,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         )
         .route("/api/v1/alerts", get(alerts_handler))
         .route("/api/v1/files/story", get(file_story_handler))
+        .route("/api/v1/network/story", get(network_story_handler))
         .with_state(storage)
 }
 
@@ -268,6 +269,93 @@ async fn file_story_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(FileStory { events, alerts }))
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkStoryQuery {
+    ip: Option<String>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NetworkStory {
+    events: Vec<CanonicalEvent>,
+    alerts: Vec<Alert>,
+}
+
+/// Composed query implementing Phase 3 plan Global Constraints #9: the
+/// domain form resolves DNS events for that domain, unions in every network
+/// event touching any of their resolved addresses; the IP form matches
+/// network events directly and does not reverse-resolve to the DNS side —
+/// a deliberate, disclosed asymmetry (see the constraint's full reasoning).
+async fn network_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<NetworkStoryQuery>,
+) -> Result<Json<NetworkStory>, (StatusCode, String)> {
+    if q.ip.is_none() && q.domain.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide ip or domain".to_string(),
+        ));
+    }
+
+    let (events, alerts) = tokio::task::spawn_blocking(move || {
+        let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
+
+        if let Some(domain) = &q.domain {
+            let mut plan = QueryPlan::new();
+            plan.dns_domain = Some(domain.clone());
+            plan.limit = 10_000;
+            let dns_events = storage.query(&plan)?;
+
+            let mut resolved_ips: HashSet<String> = HashSet::new();
+            for e in &dns_events {
+                if let Some(dns) = &e.dns {
+                    resolved_ips.extend(dns.response_ips.iter().cloned());
+                }
+            }
+            for e in dns_events {
+                events_by_id.insert(e.event_id, e);
+            }
+            for ip in &resolved_ips {
+                let mut plan = QueryPlan::new();
+                plan.network_addr = Some(ip.clone());
+                plan.limit = 10_000;
+                for e in storage.query(&plan)? {
+                    events_by_id.insert(e.event_id, e);
+                }
+            }
+        }
+
+        if let Some(ip) = &q.ip {
+            let mut plan = QueryPlan::new();
+            plan.network_addr = Some(ip.clone());
+            plan.limit = 10_000;
+            for e in storage.query(&plan)? {
+                events_by_id.insert(e.event_id, e);
+            }
+        }
+
+        let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
+        events.sort_by(|a, b| (a.timestamp, a.event_id).cmp(&(b.timestamp, b.event_id)));
+
+        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        let alerts = if evidence_ids.is_empty() {
+            vec![]
+        } else {
+            let mut alert_plan = AlertQueryPlan::new();
+            alert_plan.evidence_event_ids = evidence_ids;
+            alert_plan.limit = 10_000;
+            storage.query_alerts(&alert_plan)?
+        };
+
+        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(NetworkStory { events, alerts }))
 }
 
 #[cfg(test)]
@@ -636,5 +724,199 @@ mod tests {
         let ids: Vec<Uuid> = story.events.iter().map(|e| e.event_id).collect();
         assert!(ids.contains(&created.event_id));
         assert!(ids.contains(&renamed.event_id));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn network_event(
+        event_type: EventType,
+        src_ip: &str,
+        dst_ip: &str,
+        timestamp: u64,
+    ) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type,
+            category: Category::Network,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: Some(osiris_schema::NetworkRef {
+                src_ip: src_ip.to_string(),
+                src_port: 51000,
+                dst_ip: dst_ip.to_string(),
+                dst_port: 443,
+                proto: "tcp".to_string(),
+                direction: osiris_schema::NetworkDirection::Outbound,
+                bytes: None,
+            }),
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    fn dns_event(query: &str, response_ips: Vec<String>, timestamp: u64) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::DnsQuery,
+            category: Category::Dns,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: Some(osiris_schema::DnsRef {
+                query: query.to_string(),
+                qtype: "A".to_string(),
+                response_ips,
+                ttl: Some(300),
+            }),
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn network_story_returns_400_when_neither_param_given() {
+        let (_dir, storage) = test_storage();
+        let result = network_story_handler(
+            State(storage),
+            Query(NetworkStoryQuery { ip: None, domain: None }),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn network_story_by_ip_returns_matching_events_and_citing_alerts() {
+        let (_dir, storage) = test_storage();
+        let connect = network_event(EventType::NetworkConnect, "10.0.0.5", "203.0.113.50", 1000);
+        let close = network_event(EventType::NetworkClose, "10.0.0.5", "203.0.113.50", 2000);
+        let unrelated = network_event(EventType::NetworkConnect, "10.0.0.7", "198.51.100.1", 500);
+        storage
+            .batch_write(&[connect.clone(), close.clone(), unrelated])
+            .unwrap();
+        let alert = sample_alert("dns_query_to_suspicious_tld", vec![connect.event_id], 1000);
+        storage.write_alerts(&[alert]).unwrap();
+
+        let Json(story) = network_story_handler(
+            State(storage),
+            Query(NetworkStoryQuery {
+                ip: Some("203.0.113.50".to_string()),
+                domain: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 2);
+        assert_eq!(story.events[0].event_id, connect.event_id);
+        assert_eq!(story.events[1].event_id, close.event_id);
+        assert_eq!(story.alerts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn network_story_by_domain_follows_the_resolved_ip_to_its_connections() {
+        let (_dir, storage) = test_storage();
+        let dns = dns_event("cdn-assets.xyz", vec!["203.0.113.50".to_string()], 1000);
+        let connect = network_event(EventType::NetworkConnect, "10.0.0.5", "203.0.113.50", 2000);
+        let unrelated_dns = dns_event("example.com", vec!["93.184.216.34".to_string()], 500);
+        storage
+            .batch_write(&[dns.clone(), connect.clone(), unrelated_dns])
+            .unwrap();
+
+        let Json(story) = network_story_handler(
+            State(storage),
+            Query(NetworkStoryQuery {
+                ip: None,
+                domain: Some("cdn-assets.xyz".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 2);
+        let ids: Vec<Uuid> = story.events.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&dns.event_id));
+        assert!(ids.contains(&connect.event_id));
+    }
+
+    /// Global Constraint #9's disclosed asymmetry: querying by IP alone
+    /// does not reverse-resolve to the DNS event that produced it.
+    #[tokio::test]
+    async fn network_story_by_ip_alone_does_not_include_the_resolving_dns_event() {
+        let (_dir, storage) = test_storage();
+        let dns = dns_event("cdn-assets.xyz", vec!["203.0.113.50".to_string()], 1000);
+        let connect = network_event(EventType::NetworkConnect, "10.0.0.5", "203.0.113.50", 2000);
+        storage.batch_write(&[dns, connect.clone()]).unwrap();
+
+        let Json(story) = network_story_handler(
+            State(storage),
+            Query(NetworkStoryQuery {
+                ip: Some("203.0.113.50".to_string()),
+                domain: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 1);
+        assert_eq!(story.events[0].event_id, connect.event_id);
     }
 }
