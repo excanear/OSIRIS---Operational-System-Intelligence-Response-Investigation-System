@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
 use osiris_api::build_router;
+use osiris_detect::DetectionEngine;
 use osiris_schema::HostRef;
 use osiris_server::run_ingestion_loop;
 use osiris_storage::{QueryPlan, Storage};
@@ -53,6 +54,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
+        Arc::new(DetectionEngine::new(vec![])),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));

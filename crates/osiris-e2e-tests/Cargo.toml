@@ -22,3 +22,4 @@ osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
 osiris-pipeline = { path = "../osiris-pipeline" }
 osiris-sensor-api = { path = "../osiris-sensor-api" }
+osiris-detect = { path = "../osiris-detect" }
