@@ -928,30 +928,91 @@ mod tests {
 
     /// Non-destructive/idempotent migration proof, matching Phase 2 Task
     /// 6's precedent exactly: open a database shaped like it predates this
-    /// phase's two new columns, then re-open it through the current
+    /// phase's three new columns, then re-open it through the current
     /// `SqliteStorage::open` and confirm existing data survives and the new
-    /// columns work.
+    /// columns' guarded ADD COLUMN migration runs, and new filtering works.
     #[test]
     fn migrates_a_pre_phase_3_database_without_data_loss() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("events.db");
+
+        // Recreate a Phase 2 schema (has file columns but not network/DNS).
+        let pre_phase_3_network_event = network_event("10.0.0.5", "203.0.113.50", 1000);
         {
-            // Simulate a database from before this phase: open it, then
-            // drop the two new columns a real pre-Phase-3 SqliteStorage
-            // would never have created. SQLite's `ALTER TABLE ADD COLUMN`
-            // migration in `open()` is what must recreate them.
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            storage
-                .write(&network_event("10.0.0.5", "203.0.113.50", 1000))
-                .unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    file_path TEXT,
+                    file_inode INTEGER,
+                    file_device_id INTEGER,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    pre_phase_3_network_event.event_id.to_string(),
+                    pre_phase_3_network_event.host_id.to_string(),
+                    pre_phase_3_network_event.timestamp as i64,
+                    "NETWORK_CONNECT",
+                    pre_phase_3_network_event.process.as_ref().map(|p| p.process_key.as_hex()),
+                    pre_phase_3_network_event.parent_process.as_ref().map(|p| p.process_key.as_hex()),
+                    None::<String>,
+                    None::<i64>,
+                    None::<i64>,
+                    serde_json::to_string(&pre_phase_3_network_event).unwrap(),
+                ],
+            )
+            .unwrap();
         }
-        // Re-opening (simulating a Phase 3 binary starting against a
-        // database that already has the network columns from the first
-        // open above) must remain idempotent — no error, no duplicate
-        // columns.
+
+        // Re-open via SqliteStorage::open, which must run the guarded
+        // ALTER TABLE ADD COLUMN migrations for network_src_ip, network_dst_ip, dns_domain.
         let reopened = SqliteStorage::open(&db_path).unwrap();
+
+        // Pre-existing row must survive (proves no data loss during migration).
+        let all_events = reopened.query(&QueryPlan::new()).unwrap();
+        assert_eq!(all_events.len(), 1, "the pre-existing row must survive migration");
+
+        // The new columns must now exist and work: the guarded
+        // ALTER TABLE ADD COLUMN path must have run. Prove this by writing a
+        // new event after migration and verifying the new filter works on it.
+        let new_event = network_event("192.168.1.1", "8.8.8.8", 2000);
+        reopened.write(&new_event).unwrap();
+
+        // Query the new event by its network address (proves columns exist).
         let mut plan = QueryPlan::new();
-        plan.network_addr = Some("203.0.113.50".to_string());
-        assert_eq!(reopened.query(&plan).unwrap().len(), 1);
+        plan.network_addr = Some("8.8.8.8".to_string());
+        let network_results = reopened.query(&plan).unwrap();
+        assert_eq!(
+            network_results.len(),
+            1,
+            "the migrated network_src_ip/network_dst_ip columns must exist and filter correctly"
+        );
+        assert_eq!(network_results[0].event_id, new_event.event_id);
+
+        // Also verify idempotency: re-open the same database and confirm
+        // the second open doesn't error or duplicate columns.
+        let reopened_again = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened_again.query(&QueryPlan::new()).unwrap().len(),
+            2,
+            "all events (pre- and post-migration) must survive a second open"
+        );
+        let mut plan = QueryPlan::new();
+        plan.network_addr = Some("8.8.8.8".to_string());
+        assert_eq!(
+            reopened_again.query(&plan).unwrap().len(),
+            1,
+            "filtering must still work after idempotent re-open"
+        );
     }
 }
