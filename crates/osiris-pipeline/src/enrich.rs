@@ -1,13 +1,15 @@
-use osiris_schema::{
+﻿use osiris_schema::{
     CanonicalEvent, Category, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessRef,
-    Relation,
+    Relation, SessionRef,
 };
 
 use crate::process_resolver::ProcessResolver;
+use crate::session_resolver::{SessionRecord, SessionResolver};
 
 /// Enrich (local) stage (ARCHITECTURE.md §7.1 step 3): attach host/boot
-/// identity, resolve process identity via the Process Resolver, and compute
-/// the entity-graph edges §9.4 requires be written once here rather than
+/// identity, resolve process identity via the Process Resolver, attach
+/// session identity via the Session Resolver (§26 step 3), and compute the
+/// entity-graph edges §9.4 requires be written once here rather than
 /// re-derived by every consumer. Cheap, always-available context only —
 /// expensive enrichment is server-side (§7.2's split is preserved by simply
 /// not doing that work yet, not by doing it here).
@@ -15,6 +17,7 @@ pub fn enrich(
     mut event: CanonicalEvent,
     boot_id: &str,
     resolver: &mut ProcessResolver,
+    sessions: &mut SessionResolver,
 ) -> CanonicalEvent {
     event.boot_id = boot_id.to_string();
 
@@ -29,14 +32,142 @@ pub fn enrich(
         _ => enrich_non_process_event(&mut event, resolver),
     }
 
+    attach_session(&mut event, sessions);
+
     match event.category {
         Category::File => attach_file_relationship(&mut event),
         Category::Network => attach_network_relationship(&mut event),
         Category::Dns => attach_dns_relationships(&mut event),
+        Category::Process => attach_session_relationship(&mut event),
+        Category::Privilege => attach_executed_as_relationship(&mut event),
         _ => {}
     }
 
     event
+}
+
+/// §26 step 3's session linkage, in both directions:
+///
+/// * An IDENTITY event is the *source* of session identity — Normalize
+///   already populated its `session`/`user` from the record itself, so here
+///   it only teaches (or un-teaches) the resolver.
+/// * Every other event *consumes* it: its pid, or its parent's pid, may
+///   belong to a known session, in which case the full `SessionRef` is
+///   attached. When neither does, `session` is left exactly as Normalize
+///   produced it — `None` for most categories, and the minimal
+///   `ses=`-derived ref for privilege events (plan Global Constraint #5:
+///   never a guessed session id).
+fn attach_session(event: &mut CanonicalEvent, sessions: &mut SessionResolver) {
+    if event.category == Category::Identity {
+        let (Some(session), Some(process)) = (event.session.clone(), event.process.as_ref())
+        else {
+            return;
+        };
+        match event.event_type {
+            EventType::SessionLogin | EventType::SessionCreate => {
+                sessions.record_login(
+                    process.pid,
+                    SessionRecord {
+                        session_id: session.session_id.clone(),
+                        uid: event.user.as_ref().map(|u| u.uid).unwrap_or(0),
+                        username: event.user.as_ref().and_then(|u| u.username.clone()),
+                        tty: session.tty.clone(),
+                        remote_addr: session.remote_addr.clone(),
+                        auth_method: session.auth_method.clone(),
+                    },
+                );
+            }
+            EventType::SessionLogout | EventType::SessionTerminate => {
+                sessions.forget(&session.session_id);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let Some(pid) = event.process.as_ref().map(|p| p.pid) else {
+        return;
+    };
+    let ppid = current_ppid(event);
+    let Some(session_id) = sessions.attach(pid, ppid) else {
+        return;
+    };
+    let Some(record) = sessions.record_for(&session_id) else {
+        return;
+    };
+    event.session = Some(SessionRef {
+        session_id: record.session_id.clone(),
+        tty: record.tty.clone(),
+        remote_addr: record.remote_addr.clone(),
+        auth_method: record.auth_method.clone(),
+    });
+}
+
+/// Writes the §9.4 `Process -TRIGGERED_BY_SESSION-> Session` edge (plan
+/// Global Constraint #8). Only on `PROCESS_EXEC`: every later event from
+/// that process carries the same session, so repeating the edge on each of
+/// them would write one fact hundreds of times per session — the same
+/// duplicate-fact reasoning that keeps `CONNECTED_TO` off `NETWORK_CLOSE`.
+fn attach_session_relationship(event: &mut CanonicalEvent) {
+    if event.event_type != EventType::ProcessExec {
+        return;
+    }
+    let (Some(process), Some(session)) = (event.process.as_ref(), event.session.as_ref()) else {
+        return;
+    };
+    let edge = EntityRelationship {
+        from: EntityRef::Process {
+            process_key: process.process_key,
+        },
+        to: EntityRef::Session {
+            session_id: session.session_id.clone(),
+        },
+        relation: Relation::TriggeredBySession,
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+    };
+    event.relationships.push(edge);
+}
+
+/// Writes the §9.4 `Process -EXECUTED_AS-> User` edge (plan Global
+/// Constraint #8). Requires a real uid transition: a target uid that is
+/// present *and different from* the acting uid. `PRIVILEGE_GID_CHANGE`
+/// never produces one (`EntityRef::User` is keyed by uid; there is no
+/// group entity, and encoding a gid there would corrupt the graph), and
+/// `PRIVILEGE_SUDO` produces one only if the backend did report a target
+/// uid — auditd's `USER_CMD` usually does not (plan Global Constraint #9),
+/// and an edge citing an invented target is worse than no edge.
+fn attach_executed_as_relationship(event: &mut CanonicalEvent) {
+    if event.event_type == EventType::PrivilegeGidChange {
+        return;
+    }
+    let Some(process) = event.process.as_ref() else {
+        return;
+    };
+    let Some(target_uid) = event
+        .event_data
+        .get("target_uid")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    if event.user.as_ref().map(|u| u.uid) == Some(target_uid) {
+        return;
+    }
+    let edge = EntityRelationship {
+        from: EntityRef::Process {
+            process_key: process.process_key,
+        },
+        to: EntityRef::User {
+            host_id: event.host_id,
+            uid: target_uid,
+        },
+        relation: Relation::ExecutedAs,
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+    };
+    event.relationships.push(edge);
 }
 
 fn enrich_process_event(event: &mut CanonicalEvent, resolver: &mut ProcessResolver) {
@@ -244,7 +375,8 @@ mod tests {
     fn attaches_boot_id() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let event = enrich(bare_event(host_id, 100, 1), "boot-xyz", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let event = enrich(bare_event(host_id, 100, 1), "boot-xyz", &mut resolver, &mut sessions);
         assert_eq!(event.boot_id, "boot-xyz");
     }
 
@@ -252,8 +384,9 @@ mod tests {
     fn resolves_parent_process_when_parent_already_seen() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
         assert_eq!(
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
@@ -268,8 +401,9 @@ mod tests {
     fn parent_process_pid_is_the_real_ppid_not_a_placeholder_zero() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let _bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let _bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
 
         let parent = curl.parent_process.expect("parent must resolve");
         assert_eq!(parent.pid, 100, "must be the real ppid, not 0");
@@ -306,13 +440,15 @@ mod tests {
     fn file_event_adopts_the_authoritative_process_key_from_the_exec_event() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let file_event = enrich(
             bare_file_event(host_id, 300, 200, 131075),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert_eq!(
             file_event.process.unwrap().process_key,
@@ -328,10 +464,12 @@ mod tests {
     fn file_event_for_an_unseen_pid_is_tagged_provisional_rather_than_guessing() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
         let file_event = enrich(
             bare_file_event(host_id, 777, 1, 131075),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert!(file_event
             .tags
@@ -342,13 +480,15 @@ mod tests {
     fn file_event_resolves_its_parent_process_from_the_resolver() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
-        let _curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let _curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
 
         let file_event = enrich(
             bare_file_event(host_id, 300, 200, 131075),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         let parent = file_event.parent_process.expect("parent must resolve");
         assert_eq!(parent.process_key, bash.process.unwrap().process_key);
@@ -362,13 +502,15 @@ mod tests {
     fn file_event_gains_a_process_wrote_file_entity_edge() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let file_event = enrich(
             bare_file_event(host_id, 300, 200, 131075),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert_eq!(file_event.relationships.len(), 1);
         let edge = &file_event.relationships[0];
@@ -396,11 +538,12 @@ mod tests {
     fn file_event_without_a_usable_identity_gets_no_edge_rather_than_a_fabricated_one() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
         let mut event = bare_file_event(host_id, 300, 200, 131075);
         if let Some(file) = event.file.as_mut() {
             file.inode = None;
         }
-        let enriched = enrich(event, "boot-1", &mut resolver);
+        let enriched = enrich(event, "boot-1", &mut resolver, &mut sessions);
         assert!(enriched.relationships.is_empty());
     }
 
@@ -411,8 +554,9 @@ mod tests {
     fn process_events_still_record_and_resolve_exactly_as_before() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
         assert_eq!(
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
@@ -451,13 +595,15 @@ mod tests {
     fn network_event_gains_a_process_connected_to_ip_entity_edge() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let net_event = enrich(
             bare_network_event(host_id, Some(300), "203.0.113.50"),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert_eq!(net_event.relationships.len(), 1);
         let edge = &net_event.relationships[0];
@@ -478,10 +624,12 @@ mod tests {
     fn network_event_with_no_pid_gets_no_edge_rather_than_a_fabricated_one() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
         let net_event = enrich(
             bare_network_event(host_id, None, "203.0.113.50"),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert!(net_event.relationships.is_empty());
         assert!(net_event.process.is_none());
@@ -491,10 +639,11 @@ mod tests {
     fn network_close_event_gets_no_connected_to_edge() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let _curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let _curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
         let mut event = bare_network_event(host_id, Some(300), "203.0.113.50");
         event.event_type = EventType::NetworkClose;
-        let closed = enrich(event, "boot-1", &mut resolver);
+        let closed = enrich(event, "boot-1", &mut resolver, &mut sessions);
         assert!(
             closed.relationships.is_empty(),
             "the opening event already carries the edge; close must not duplicate it"
@@ -526,6 +675,7 @@ mod tests {
     fn dns_event_gains_one_resolved_to_edge_per_response_ip() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
         let dns_event = enrich(
             bare_dns_event(
                 host_id,
@@ -534,6 +684,7 @@ mod tests {
             ),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert_eq!(dns_event.relationships.len(), 2);
         for (edge, expected_ip) in dns_event
@@ -559,10 +710,12 @@ mod tests {
     fn dns_event_with_no_response_ips_gets_no_edges() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
         let dns_event = enrich(
             bare_dns_event(host_id, Some(300), vec![]),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert!(dns_event.relationships.is_empty());
     }
@@ -574,15 +727,235 @@ mod tests {
     fn dns_event_resolves_its_authoritative_process_key() {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut sessions = SessionResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let dns_event = enrich(
             bare_dns_event(host_id, Some(300), vec!["203.0.113.50".to_string()]),
             "boot-1",
             &mut resolver,
+            &mut sessions,
         );
         assert_eq!(dns_event.process.unwrap().process_key, authoritative);
         assert!(!dns_event.tags.contains(&"PROCESS_KEY_PROVISIONAL".to_string()));
+    }
+
+    use crate::session_resolver::SessionResolver;
+    use osiris_schema::{SessionRef, UserRef};
+
+    fn login_event(host_id: uuid::Uuid, pid: u32) -> CanonicalEvent {
+        let mut event = bare_event(host_id, pid, 1);
+        event.event_type = EventType::SessionLogin;
+        event.category = Category::Identity;
+        event.session = Some(SessionRef {
+            session_id: "3".to_string(),
+            tty: Some("/dev/pts/0".to_string()),
+            remote_addr: Some("198.51.100.10".to_string()),
+            auth_method: Some("sshd".to_string()),
+        });
+        event.user = Some(UserRef {
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            username: Some("alice".to_string()),
+            loginuid: Some(1000),
+        });
+        event
+    }
+
+    fn privilege_event(
+        host_id: uuid::Uuid,
+        pid: u32,
+        ppid: u32,
+        acting_uid: u32,
+        target_uid: Option<u32>,
+    ) -> CanonicalEvent {
+        let mut event = bare_event(host_id, pid, ppid);
+        event.event_type = EventType::PrivilegeUidChange;
+        event.category = Category::Privilege;
+        event.user = Some(UserRef {
+            uid: acting_uid,
+            gid: acting_uid,
+            euid: acting_uid,
+            egid: acting_uid,
+            username: None,
+            loginuid: Some(1000),
+        });
+        event.event_data = serde_json::json!({ "ppid": ppid, "target_uid": target_uid });
+        event
+    }
+
+    #[test]
+    fn a_process_execed_inside_a_session_inherits_that_session() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+
+        let _sshd = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+
+        for (name, event) in [("bash", &bash), ("curl", &curl)] {
+            let session = event
+                .session
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must inherit the SSH session"));
+            assert_eq!(session.session_id, "3");
+            assert_eq!(session.remote_addr.as_deref(), Some("198.51.100.10"));
+            assert_eq!(session.auth_method.as_deref(), Some("sshd"));
+        }
+    }
+
+    #[test]
+    fn a_process_outside_any_session_gets_no_session_rather_than_a_guess() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions);
+        assert!(cron.session.is_none());
+    }
+
+    /// ARCHITECTURE.md §9.4 + plan Global Constraint #8: the edge is
+    /// written once, on the PROCESS_EXEC event, and cites the authoritative
+    /// process key.
+    #[test]
+    fn a_process_exec_inside_a_session_gains_a_triggered_by_session_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+
+        let edges: Vec<_> = bash
+            .relationships
+            .iter()
+            .filter(|r| r.relation == Relation::TriggeredBySession)
+            .collect();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].event_id, bash.event_id);
+        match (&edges[0].from, &edges[0].to) {
+            (
+                osiris_schema::EntityRef::Process { process_key },
+                osiris_schema::EntityRef::Session { session_id },
+            ) => {
+                assert_eq!(*process_key, bash.process.as_ref().unwrap().process_key);
+                assert_eq!(session_id, "3");
+            }
+            other => panic!("expected a Process -> Session edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_process_exec_outside_a_session_gains_no_triggered_by_session_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions);
+        assert!(cron
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::TriggeredBySession));
+    }
+
+    #[test]
+    fn a_real_uid_escalation_gains_an_executed_as_edge_to_the_target_user() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let sudo = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let escalation = enrich(
+            privilege_event(host_id, 300, 200, 1000, Some(0)),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+        );
+
+        let edges: Vec<_> = escalation
+            .relationships
+            .iter()
+            .filter(|r| r.relation == Relation::ExecutedAs)
+            .collect();
+        assert_eq!(edges.len(), 1);
+        match (&edges[0].from, &edges[0].to) {
+            (
+                osiris_schema::EntityRef::Process { process_key },
+                osiris_schema::EntityRef::User {
+                    host_id: edge_host,
+                    uid,
+                },
+            ) => {
+                assert_eq!(*process_key, sudo.process.as_ref().unwrap().process_key);
+                assert_eq!(*edge_host, host_id);
+                assert_eq!(*uid, 0);
+            }
+            other => panic!("expected a Process -> User edge, got {other:?}"),
+        }
+        // The privilege event also inherits the session, which is what
+        // makes Task 6's rule able to require a remote session.
+        assert_eq!(
+            escalation.session.as_ref().unwrap().remote_addr.as_deref(),
+            Some("198.51.100.10")
+        );
+    }
+
+    /// setuid(getuid()) is a no-op, not a privilege transition — minting an
+    /// edge for it would fill the graph with self-loops (plan Global
+    /// Constraint #8).
+    #[test]
+    fn a_uid_change_to_the_same_uid_gains_no_executed_as_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let event = enrich(
+            privilege_event(host_id, 300, 200, 1000, Some(1000)),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+        );
+        assert!(event
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::ExecutedAs));
+    }
+
+    /// A sudo record with no reported target account (plan Global
+    /// Constraint #9) must produce no edge rather than an invented one.
+    #[test]
+    fn a_privilege_event_without_a_target_uid_gains_no_executed_as_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut event = privilege_event(host_id, 300, 200, 1000, None);
+        event.event_type = EventType::PrivilegeSudo;
+        let event = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        assert!(event
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::ExecutedAs));
+    }
+
+    /// Logout ends the session: a process that execs afterwards must not be
+    /// attributed to it.
+    #[test]
+    fn a_logout_stops_further_processes_being_attributed_to_the_session() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        assert!(bash.session.is_some());
+
+        let mut logout = login_event(host_id, 100);
+        logout.event_type = EventType::SessionLogout;
+        let _logout = enrich(logout, "boot-1", &mut resolver, &mut sessions);
+
+        let after = enrich(bare_event(host_id, 400, 100), "boot-1", &mut resolver, &mut sessions);
+        assert!(after.session.is_none());
     }
 }

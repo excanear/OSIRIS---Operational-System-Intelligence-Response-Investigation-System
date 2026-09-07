@@ -2,11 +2,12 @@ use uuid::Uuid;
 
 use osiris_schema::{
     CanonicalEvent, Category, DnsRef, EventType, FileRef, HostRef, NetworkDirection, NetworkRef,
-    ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+    ProcessKey, ProcessRef, SessionRef, Severity, Source, UserRef, SCHEMA_VERSION,
 };
 use osiris_sensor_api::{
-    DnsEventRaw, FileEventRaw, FileOperation, NetworkDirection as RawNetworkDirection,
-    NetworkEventRaw, NetworkOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
+    NetworkDirection as RawNetworkDirection, NetworkEventRaw, NetworkOperation, PrivilegeEventRaw,
+    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
 };
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
@@ -22,6 +23,8 @@ pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent
         RawEvent::File(f) => normalize_file_event(f, host, boot_id),
         RawEvent::Network(n) => normalize_network_event(n, host, boot_id),
         RawEvent::Dns(d) => normalize_dns_event(d, host, boot_id),
+        RawEvent::Identity(i) => normalize_identity_event(i, host, boot_id),
+        RawEvent::Privilege(p) => normalize_privilege_event(p, host, boot_id),
     }
 }
 
@@ -315,6 +318,212 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
         tags: vec![],
         risk: None,
         event_data: serde_json::json!({ "comm": raw.comm, "uid": raw.uid }),
+    }
+}
+
+/// Builds a §9.2 `UserRef` from what the backend actually reported.
+///
+/// `UserRef`'s `gid`/`euid`/`egid` are non-optional in the frozen schema
+/// (Phase 0), but auditd's `USER_*` records report only `uid=`. Rather than
+/// widen a frozen schema type for one call site (Phase 2's standing
+/// precedent), the missing three are mirrored from `uid` and the caller is
+/// told so via the returned `bool`, which becomes the `USER_REF_PARTIAL`
+/// tag (Phase 4a plan Global Constraint #6). Nothing downstream may treat
+/// those three as observed values on a tagged event.
+pub fn build_user_ref(
+    uid: u32,
+    gid: Option<u32>,
+    euid: Option<u32>,
+    egid: Option<u32>,
+    username: Option<String>,
+    loginuid: Option<u32>,
+) -> (UserRef, bool) {
+    let partial = gid.is_none() || euid.is_none() || egid.is_none();
+    (
+        UserRef {
+            uid,
+            gid: gid.unwrap_or(uid),
+            euid: euid.unwrap_or(uid),
+            egid: egid.unwrap_or(uid),
+            username,
+            loginuid,
+        },
+        partial,
+    )
+}
+
+/// ARCHITECTURE.md §4.3 has no "Privilege" sensor row — privilege
+/// telemetry is emitted by whichever sensor observes the transition, which
+/// for this codebase is the Identity sensor's audit backend (it already
+/// tails the log carrying `SYSCALL` and `USER_CMD` records). Both identity
+/// and privilege events therefore name that one sensor in `provider`
+/// (Phase 4a plan Global Constraint #4); this is deliberate, not a
+/// copy-paste error.
+fn identity_provider(source: RawEventSource) -> &'static str {
+    match source {
+        RawEventSource::Audit => "identity_sensor/audit",
+        RawEventSource::Synthetic => "identity_sensor/synthetic",
+        // No identity/privilege backend uses procfs polling in this
+        // codebase (the `/proc/<pid>/loginuid` path from §4.3 is a lookup,
+        // not an event source — plan Global Constraint #2); handled for
+        // match exhaustiveness only.
+        RawEventSource::Procfs => "identity_sensor/procfs",
+    }
+}
+
+fn schema_source(source: RawEventSource) -> Source {
+    match source {
+        RawEventSource::Audit => Source::Audit,
+        RawEventSource::Synthetic => Source::Synthetic,
+        RawEventSource::Procfs => Source::Procfs,
+    }
+}
+
+fn normalize_identity_event(
+    raw: IdentityEventRaw,
+    host: &HostRef,
+    boot_id: &str,
+) -> CanonicalEvent {
+    let event_type = match raw.operation {
+        IdentityOperation::Login => EventType::SessionLogin,
+        IdentityOperation::Logout => EventType::SessionLogout,
+        IdentityOperation::SessionStart => EventType::SessionCreate,
+        IdentityOperation::SessionEnd => EventType::SessionTerminate,
+    };
+    let (user, partial) = build_user_ref(
+        raw.uid,
+        None,
+        None,
+        None,
+        raw.username.clone(),
+        raw.auid,
+    );
+    let mut tags = Vec::new();
+    if partial {
+        tags.push("USER_REF_PARTIAL".to_string());
+    }
+    let process = provisional_process(Some(raw.pid), &raw.exe_path, host.host_id, boot_id);
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category: Category::Identity,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: Some(user),
+        session: Some(SessionRef {
+            session_id: raw.session_id,
+            tty: raw.terminal,
+            remote_addr: raw.remote_addr,
+            auth_method: raw.auth_method,
+        }),
+        process,
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: identity_provider(raw.source).to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags,
+        risk: None,
+        event_data: serde_json::json!({
+            "comm": raw.comm,
+            "auid": raw.auid,
+            "success": raw.success,
+            "audit_serial": raw.audit_serial,
+        }),
+    }
+}
+
+fn normalize_privilege_event(
+    raw: PrivilegeEventRaw,
+    host: &HostRef,
+    boot_id: &str,
+) -> CanonicalEvent {
+    let event_type = match raw.operation {
+        PrivilegeOperation::UidChange => EventType::PrivilegeUidChange,
+        PrivilegeOperation::GidChange => EventType::PrivilegeGidChange,
+        PrivilegeOperation::Sudo => EventType::PrivilegeSudo,
+    };
+    let (user, partial) = build_user_ref(
+        raw.uid,
+        raw.gid,
+        raw.euid,
+        raw.egid,
+        raw.username.clone(),
+        raw.auid,
+    );
+    let mut tags = Vec::new();
+    if partial {
+        tags.push("USER_REF_PARTIAL".to_string());
+    }
+    // A minimal SessionRef from the record's own `ses=`. The Enrich stage
+    // replaces it with the fuller record (tty/remote_addr/auth_method) when
+    // that session's login was observed; leaving it minimal here means a
+    // privilege event is still session-attributed even if the login
+    // happened before the Agent started.
+    let session = raw.session_id.clone().map(|session_id| SessionRef {
+        session_id,
+        tty: None,
+        remote_addr: None,
+        auth_method: None,
+    });
+    let process = provisional_process(Some(raw.pid), &raw.exe_path, host.host_id, boot_id);
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category: Category::Privilege,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: Some(user),
+        session,
+        process,
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: identity_provider(raw.source).to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags,
+        risk: None,
+        event_data: serde_json::json!({
+            "comm": raw.comm,
+            "ppid": raw.ppid,
+            "uid": raw.uid,
+            "auid": raw.auid,
+            "target_uid": raw.target_uid,
+            "target_gid": raw.target_gid,
+            "command": raw.command,
+            "success": raw.success,
+            "audit_serial": raw.audit_serial,
+        }),
     }
 }
 
@@ -628,5 +837,186 @@ mod tests {
         let event = normalize(RawEvent::Dns(dns_raw(None)), &host, "boot-1");
         assert!(event.process.is_none());
         assert!(event.dns.is_some());
+    }
+
+    fn identity_raw(operation: osiris_sensor_api::IdentityOperation) -> RawEvent {
+        RawEvent::Identity(osiris_sensor_api::IdentityEventRaw {
+            operation,
+            session_id: "3".to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some("198.51.100.10".to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 1_690_000_000_123_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Audit,
+        })
+    }
+
+    #[test]
+    fn identity_operations_map_to_the_matching_event_type_and_identity_category() {
+        use osiris_sensor_api::IdentityOperation;
+        let host = sample_host();
+        for (operation, expected) in [
+            (IdentityOperation::Login, EventType::SessionLogin),
+            (IdentityOperation::Logout, EventType::SessionLogout),
+            (IdentityOperation::SessionStart, EventType::SessionCreate),
+            (IdentityOperation::SessionEnd, EventType::SessionTerminate),
+        ] {
+            let event = normalize(identity_raw(operation), &host, "boot-1");
+            assert_eq!(event.event_type, expected);
+            assert_eq!(event.category, Category::Identity);
+            assert_eq!(event.source, Source::Audit);
+            assert_eq!(event.provider, "identity_sensor/audit");
+        }
+    }
+
+    #[test]
+    fn identity_event_populates_session_and_user_refs() {
+        use osiris_sensor_api::IdentityOperation;
+        let host = sample_host();
+        let event = normalize(identity_raw(IdentityOperation::Login), &host, "boot-1");
+
+        let session = event.session.as_ref().expect("session must be populated");
+        assert_eq!(session.session_id, "3");
+        assert_eq!(session.tty.as_deref(), Some("/dev/pts/0"));
+        assert_eq!(session.remote_addr.as_deref(), Some("198.51.100.10"));
+        assert_eq!(session.auth_method.as_deref(), Some("sshd"));
+
+        let user = event.user.as_ref().expect("user must be populated");
+        assert_eq!(user.uid, 0);
+        assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.loginuid, Some(1000));
+
+        // A USER_* record reports no gid/euid/egid, so those are mirrored
+        // from uid and the event is tagged (plan Global Constraint #6).
+        assert_eq!((user.gid, user.euid, user.egid), (0, 0, 0));
+        assert!(event.tags.contains(&"USER_REF_PARTIAL".to_string()));
+
+        // The login process itself is still an actor with a pid.
+        assert_eq!(event.process.as_ref().unwrap().pid, 100);
+        assert_eq!(event.process.as_ref().unwrap().exe_path, "/usr/sbin/sshd");
+    }
+
+    fn privilege_raw(
+        operation: osiris_sensor_api::PrivilegeOperation,
+        target_uid: Option<u32>,
+        target_gid: Option<u32>,
+    ) -> RawEvent {
+        RawEvent::Privilege(osiris_sensor_api::PrivilegeEventRaw {
+            operation,
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            gid: Some(1000),
+            euid: Some(1000),
+            egid: Some(1000),
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            username: None,
+            target_uid,
+            target_gid,
+            command: None,
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: 1_690_000_005_000_000_000,
+            audit_serial: Some(470),
+            source: RawEventSource::Audit,
+        })
+    }
+
+    #[test]
+    fn privilege_operations_map_to_the_matching_event_type_and_privilege_category() {
+        use osiris_sensor_api::PrivilegeOperation;
+        let host = sample_host();
+        for (operation, expected) in [
+            (PrivilegeOperation::UidChange, EventType::PrivilegeUidChange),
+            (PrivilegeOperation::GidChange, EventType::PrivilegeGidChange),
+            (PrivilegeOperation::Sudo, EventType::PrivilegeSudo),
+        ] {
+            let event = normalize(privilege_raw(operation, Some(0), None), &host, "boot-1");
+            assert_eq!(event.event_type, expected);
+            assert_eq!(event.category, Category::Privilege);
+            assert_eq!(event.provider, "identity_sensor/audit");
+        }
+    }
+
+    /// A SYSCALL-derived privilege record reports gid/euid/egid for real,
+    /// so it must NOT be tagged partial — that tag is reserved for the
+    /// USER_* records that genuinely cannot report them.
+    #[test]
+    fn syscall_derived_privilege_event_has_a_complete_user_ref_and_no_partial_tag() {
+        use osiris_sensor_api::PrivilegeOperation;
+        let host = sample_host();
+        let event = normalize(
+            privilege_raw(PrivilegeOperation::UidChange, Some(0), None),
+            &host,
+            "boot-1",
+        );
+        let user = event.user.as_ref().expect("user must be populated");
+        assert_eq!((user.uid, user.gid, user.euid, user.egid), (1000, 1000, 1000, 1000));
+        assert!(!event.tags.contains(&"USER_REF_PARTIAL".to_string()));
+        assert_eq!(event.event_data["target_uid"], serde_json::json!(0));
+        assert_eq!(event.event_data["ppid"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn a_sudo_record_without_gid_fields_is_tagged_partial() {
+        use osiris_sensor_api::{PrivilegeEventRaw, PrivilegeOperation};
+        let host = sample_host();
+        let raw = RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::Sudo,
+            pid: 300,
+            ppid: 0,
+            uid: 1000,
+            gid: None,
+            euid: None,
+            egid: None,
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            username: None,
+            target_uid: None,
+            target_gid: None,
+            command: Some("/usr/bin/whoami".to_string()),
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: 1_690_000_004_000_000_000,
+            audit_serial: Some(469),
+            source: RawEventSource::Audit,
+        });
+        let event = normalize(raw, &host, "boot-1");
+        assert_eq!(event.event_type, EventType::PrivilegeSudo);
+        assert!(event.tags.contains(&"USER_REF_PARTIAL".to_string()));
+        assert_eq!(
+            event.event_data["command"],
+            serde_json::json!("/usr/bin/whoami")
+        );
+        assert!(event.event_data["target_uid"].is_null());
+    }
+
+    /// The session id a privilege record carries is enough to populate a
+    /// minimal `SessionRef` right at Normalize time; Enrich later replaces
+    /// it with the fuller record (tty/remote_addr/auth_method) when the
+    /// session's login was observed.
+    #[test]
+    fn privilege_event_carries_a_minimal_session_ref_from_its_own_ses_field() {
+        use osiris_sensor_api::PrivilegeOperation;
+        let host = sample_host();
+        let event = normalize(
+            privilege_raw(PrivilegeOperation::UidChange, Some(0), None),
+            &host,
+            "boot-1",
+        );
+        let session = event.session.as_ref().expect("session must be populated");
+        assert_eq!(session.session_id, "3");
+        assert_eq!(session.remote_addr, None);
     }
 }

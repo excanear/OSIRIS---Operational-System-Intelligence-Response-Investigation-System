@@ -69,6 +69,36 @@ pub fn validate(event: &mut CanonicalEvent) -> bool {
             valid = false;
         }
     }
+    if matches!(
+        event.event_type,
+        osiris_schema::EventType::SessionLogin
+            | osiris_schema::EventType::SessionLogout
+            | osiris_schema::EventType::SessionCreate
+            | osiris_schema::EventType::SessionTerminate
+    ) {
+        // A session event with no session id names nothing — nothing can
+        // be correlated to it, and the Identity Story cannot find it.
+        let has_session = event
+            .session
+            .as_ref()
+            .map(|s| !s.session_id.trim().is_empty())
+            .unwrap_or(false);
+        if !has_session {
+            valid = false;
+        }
+    }
+    if matches!(
+        event.event_type,
+        osiris_schema::EventType::PrivilegeUidChange
+            | osiris_schema::EventType::PrivilegeGidChange
+            | osiris_schema::EventType::PrivilegeSudo
+    ) {
+        // A privilege transition with no actor and no acting user cannot be
+        // attributed, explained in an alert, or joined to anything.
+        if event.process.is_none() || event.user.is_none() {
+            valid = false;
+        }
+    }
     if !valid {
         event.tags.push("INVALID".to_string());
     }
@@ -311,5 +341,81 @@ mod tests {
             dns.response_ips = vec![];
         }
         assert!(validate(&mut event));
+    }
+
+    fn identity_event() -> CanonicalEvent {
+        let mut event = valid_event();
+        event.event_type = EventType::SessionLogin;
+        event.category = Category::Identity;
+        event.session = Some(osiris_schema::SessionRef {
+            session_id: "3".to_string(),
+            tty: None,
+            remote_addr: None,
+            auth_method: None,
+        });
+        event
+    }
+
+    #[test]
+    fn an_identity_event_with_a_session_id_is_valid() {
+        let mut event = identity_event();
+        assert!(validate(&mut event));
+        assert!(!event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn an_identity_event_without_a_session_is_invalid_but_still_forwarded() {
+        let mut event = identity_event();
+        event.session = None;
+        assert!(!validate(&mut event));
+        assert!(event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn an_identity_event_with_a_blank_session_id_is_invalid() {
+        let mut event = identity_event();
+        event.session = Some(osiris_schema::SessionRef {
+            session_id: "   ".to_string(),
+            tty: None,
+            remote_addr: None,
+            auth_method: None,
+        });
+        assert!(!validate(&mut event));
+    }
+
+    fn privilege_event() -> CanonicalEvent {
+        let mut event = valid_event();
+        event.event_type = EventType::PrivilegeUidChange;
+        event.category = Category::Privilege;
+        event.user = Some(osiris_schema::UserRef {
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            username: None,
+            loginuid: Some(1000),
+        });
+        event
+    }
+
+    #[test]
+    fn a_privilege_event_with_an_actor_and_a_user_is_valid() {
+        let mut event = privilege_event();
+        assert!(validate(&mut event));
+    }
+
+    #[test]
+    fn a_privilege_event_without_a_user_is_invalid() {
+        let mut event = privilege_event();
+        event.user = None;
+        assert!(!validate(&mut event));
+        assert!(event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn a_privilege_event_without_a_process_is_invalid() {
+        let mut event = privilege_event();
+        event.process = None;
+        assert!(!validate(&mut event));
     }
 }

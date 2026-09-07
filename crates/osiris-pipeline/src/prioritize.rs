@@ -45,6 +45,22 @@ impl Default for PriorityTable {
                 // need shedding first under bus pressure.
                 (EventType::NetworkClose, PriorityLane::Low),
                 (EventType::DnsQuery, PriorityLane::Normal),
+                (EventType::SessionLogin, PriorityLane::Normal),
+                (EventType::SessionLogout, PriorityLane::Normal),
+                (EventType::SessionCreate, PriorityLane::Normal),
+                (EventType::SessionTerminate, PriorityLane::Normal),
+                // A uid transition and a sudo invocation are the two
+                // events in this phase that most directly answer "did
+                // someone gain privilege" — §8.1's HIGH lane exists for
+                // exactly this, and both are far rarer than the ambient
+                // exec/file/network stream, so promoting them costs the
+                // lower lanes nothing.
+                (EventType::PrivilegeUidChange, PriorityLane::High),
+                (EventType::PrivilegeSudo, PriorityLane::High),
+                // A gid transition stays Normal: daemons setgid at startup
+                // as a matter of routine, so it is not the rare, decisive
+                // signal the two above are.
+                (EventType::PrivilegeGidChange, PriorityLane::Normal),
             ],
             default_lane: PriorityLane::Normal,
         }
@@ -162,5 +178,41 @@ mod tests {
             event.event_type = event_type;
             assert_eq!(prioritize(&event, &table), expected, "{event_type:?}");
         }
+    }
+
+    #[test]
+    fn identity_events_take_the_normal_lane() {
+        let table = PriorityTable::default();
+        for event_type in [
+            EventType::SessionLogin,
+            EventType::SessionLogout,
+            EventType::SessionCreate,
+            EventType::SessionTerminate,
+        ] {
+            let mut event = exec_event();
+            event.event_type = event_type;
+            assert_eq!(table.lane_for(&event), PriorityLane::Normal);
+        }
+    }
+
+    /// ARCHITECTURE.md §26 step 3's own example of a HIGH-lane assignment
+    /// is "an event that matters more than the ambient stream". A uid
+    /// transition and a sudo invocation are exactly that; a gid transition
+    /// is not — daemons setgid at startup as a matter of routine.
+    #[test]
+    fn uid_changes_and_sudo_take_the_high_lane_but_gid_changes_do_not() {
+        let table = PriorityTable::default();
+
+        let mut uid_change = exec_event();
+        uid_change.event_type = EventType::PrivilegeUidChange;
+        assert_eq!(table.lane_for(&uid_change), PriorityLane::High);
+
+        let mut sudo = exec_event();
+        sudo.event_type = EventType::PrivilegeSudo;
+        assert_eq!(table.lane_for(&sudo), PriorityLane::High);
+
+        let mut gid_change = exec_event();
+        gid_change.event_type = EventType::PrivilegeGidChange;
+        assert_eq!(table.lane_for(&gid_change), PriorityLane::Normal);
     }
 }

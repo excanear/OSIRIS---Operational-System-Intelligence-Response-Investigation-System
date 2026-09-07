@@ -5,6 +5,7 @@ use crate::enrich::enrich;
 use crate::normalize::normalize;
 use crate::prioritize::{prioritize, PriorityLane, PriorityTable};
 use crate::process_resolver::ProcessResolver;
+use crate::session_resolver::SessionResolver;
 use crate::validate::validate;
 
 /// A CanonicalEvent tagged with the lane it was assigned (what Task 3's
@@ -23,6 +24,7 @@ pub struct Pipeline {
     host: HostRef,
     boot_id: String,
     resolver: ProcessResolver,
+    sessions: SessionResolver,
     priority_table: PriorityTable,
 }
 
@@ -32,6 +34,7 @@ impl Pipeline {
             host,
             boot_id,
             resolver: ProcessResolver::new(),
+            sessions: SessionResolver::new(),
             priority_table: PriorityTable::default(),
         }
     }
@@ -41,7 +44,7 @@ impl Pipeline {
     /// dropped — the caller always gets a PrioritizedEvent back.
     pub fn process(&mut self, raw: RawEvent) -> PrioritizedEvent {
         let event = normalize(raw, &self.host, &self.boot_id);
-        let mut event = enrich(event, &self.boot_id, &mut self.resolver);
+        let mut event = enrich(event, &self.boot_id, &mut self.resolver, &mut self.sessions);
         validate(&mut event);
         let lane = prioritize(&event, &self.priority_table);
         PrioritizedEvent { event, lane }
@@ -167,5 +170,108 @@ mod tests {
             write.event.file.as_ref().unwrap().path,
             "/var/www/html/shell.php"
         );
+    }
+
+    /// The whole Normalize -> Enrich -> Validate -> Prioritize path for
+    /// ARCHITECTURE.md §26's opening: a login, a shell inside it, and a
+    /// privilege escalation inside that shell — the shape this phase
+    /// exists to make work.
+    #[test]
+    fn a_login_then_shell_then_escalation_is_fully_session_attributed() {
+        use osiris_sensor_api::{
+            IdentityEventRaw, IdentityOperation, PrivilegeEventRaw, PrivilegeOperation,
+        };
+        let host = test_host();
+        let mut pipeline = Pipeline::new(host.clone(), "boot-1".to_string());
+
+        let sshd = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 100,
+            ppid: 1,
+            uid: 0,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 1_000,
+            start_time_mono: 1_000,
+            source: RawEventSource::Synthetic,
+        }));
+        assert!(sshd.event.session.is_none(), "no login observed yet");
+
+        let login = pipeline.process(RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: "3".to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some("198.51.100.10".to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 2_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }));
+        assert_eq!(login.lane, PriorityLane::Normal);
+        assert!(!login.event.tags.contains(&"INVALID".to_string()));
+
+        let bash = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 200,
+            ppid: 100,
+            uid: 1000,
+            exe_path: "/bin/bash".to_string(),
+            comm: "bash".to_string(),
+            timestamp_ns: 3_000,
+            start_time_mono: 3_000,
+            source: RawEventSource::Synthetic,
+        }));
+        assert_eq!(bash.event.session.as_ref().unwrap().session_id, "3");
+        assert!(bash
+            .event
+            .relationships
+            .iter()
+            .any(|r| r.relation == osiris_schema::Relation::TriggeredBySession));
+
+        let escalation = pipeline.process(RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::UidChange,
+            pid: 200,
+            ppid: 100,
+            uid: 1000,
+            gid: Some(1000),
+            euid: Some(1000),
+            egid: Some(1000),
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            username: None,
+            target_uid: Some(0),
+            target_gid: None,
+            command: None,
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: 4_000,
+            audit_serial: Some(470),
+            source: RawEventSource::Synthetic,
+        }));
+        assert_eq!(escalation.lane, PriorityLane::High);
+        assert!(!escalation.event.tags.contains(&"INVALID".to_string()));
+        assert_eq!(
+            escalation
+                .event
+                .session
+                .as_ref()
+                .unwrap()
+                .remote_addr
+                .as_deref(),
+            Some("198.51.100.10"),
+            "the escalation must carry the SSH session's remote address, which is \
+             what makes Task 6's rule expressible"
+        );
+        assert!(escalation
+            .event
+            .relationships
+            .iter()
+            .any(|r| r.relation == osiris_schema::Relation::ExecutedAs));
     }
 }
