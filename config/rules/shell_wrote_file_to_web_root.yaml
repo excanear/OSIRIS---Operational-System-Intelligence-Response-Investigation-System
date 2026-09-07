@@ -1,0 +1,23 @@
+# Detects the classic web-shell drop: a shell or download tool writing a
+# file into a web-served directory. The web server itself writes there
+# constantly (uploads, caches, sessions), so the actor condition is what
+# makes this specific rather than noisy — matching ARCHITECTURE.md §11.2's
+# requirement that every reason be specific, not a generic template.
+#
+# MITRE ATT&CK: T1505.003 (Server Software Component: Web Shell).
+id: shell_wrote_file_to_web_root
+version: 1
+severity: HIGH
+match:
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "A file was created or written on disk"
+  - field: file.path
+    op: starts_with
+    value: "/var/www/"
+    reason: "The file was written inside the web-served directory /var/www/"
+  - field: process.exe_path
+    op: in
+    value: ["/bin/sh", "/bin/bash", "/usr/bin/curl", "/usr/bin/wget"]
+    reason: "The writing process is an interactive shell or download tool, not the web server"
