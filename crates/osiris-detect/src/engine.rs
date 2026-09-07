@@ -387,4 +387,96 @@ match:
             ))
             .is_empty());
     }
+
+    fn dns_event(query: &str, exe_path: &str) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1_700_000_000_000_000_000,
+            monotonic_timestamp: 1,
+            event_type: EventType::DnsQuery,
+            category: EventType::DnsQuery.category(),
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: Some(ProcessRef {
+                process_key: ProcessKey::new(host_id, "b", 300, 1),
+                pid: 300,
+                exe_path: exe_path.to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 1,
+            }),
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: Some(osiris_schema::DnsRef {
+                query: query.to_string(),
+                qtype: "A".to_string(),
+                response_ips: vec!["203.0.113.50".to_string()],
+                ttl: Some(300),
+            }),
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    /// The repository's own shipped rule must load and behave — this is the
+    /// CI-enforced half of §11.1's "every rule ships with a fixture that
+    /// must trigger it, and a negative fixture that must not," proving
+    /// this phase's dns.*/process.* fields work through the engine
+    /// unmodified (Phase 3 plan Global Constraints #12).
+    #[test]
+    fn the_shipped_dns_suspicious_tld_rule_loads_and_fires_on_its_positive_fixture_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/dns_query_to_suspicious_tld.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("shipped rule must exist at {}: {e}", path.display()));
+        let engine = DetectionEngine::new(vec![
+            crate::rule::Rule::from_yaml_str(&yaml, "dns_query_to_suspicious_tld.yaml").unwrap()
+        ]);
+        let alerts = engine.evaluate(&dns_event("cdn-assets.xyz", "/usr/bin/curl"));
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "dns_query_to_suspicious_tld");
+
+        assert!(engine
+            .evaluate(&dns_event("example.com", "/usr/bin/curl"))
+            .is_empty());
+    }
+
+    /// The rule loaded alongside the Phase 2 rule (via `load_from_dir`) must
+    /// not cross-fire on the other rule's positive fixture — proves the two
+    /// shipped rules stay independent as `config/rules/` grows.
+    #[test]
+    fn both_shipped_rules_load_together_without_cross_firing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        assert_eq!(engine.rule_count(), 2);
+
+        let dns_alerts = engine.evaluate(&dns_event("cdn-assets.xyz", "/usr/bin/curl"));
+        assert_eq!(dns_alerts.len(), 1);
+        assert_eq!(dns_alerts[0].rule_id(), "dns_query_to_suspicious_tld");
+    }
 }

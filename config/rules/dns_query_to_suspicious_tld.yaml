@@ -1,0 +1,25 @@
+# Detects a DNS query for a domain under a TLD commonly abused for
+# short-lived, disposable malicious infrastructure (cheap bulk registration,
+# minimal registrar vetting) when the querying process is a shell or
+# download tool rather than a browser or the system resolver's usual
+# callers — the same "actor matters, not just the artifact" shape as
+# Phase 2's shell_wrote_file_to_web_root rule, which is what keeps this
+# specific rather than noisy (ARCHITECTURE.md §11.2).
+#
+# MITRE ATT&CK: T1071.004 (Application Layer Protocol: DNS).
+id: dns_query_to_suspicious_tld
+version: 1
+severity: MEDIUM
+match:
+  - field: event_type
+    op: eq
+    value: "DNS_QUERY"
+    reason: "A DNS query was resolved"
+  - field: dns.query
+    op: ends_with
+    value: ".xyz"
+    reason: "The queried domain is under a TLD commonly abused for disposable malicious infrastructure (.xyz)"
+  - field: process.exe_path
+    op: in
+    value: ["/bin/sh", "/bin/bash", "/usr/bin/curl", "/usr/bin/wget"]
+    reason: "The querying process is an interactive shell or download tool, not a browser or the system resolver"
