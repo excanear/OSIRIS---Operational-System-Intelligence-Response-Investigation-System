@@ -3,12 +3,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
-use osiris_generator::{exec_chain_scenario, web_shell_drop_scenario, SyntheticSensor};
+use osiris_generator::{
+    exec_chain_scenario, network_beacon_scenario, web_shell_drop_scenario, SyntheticSensor,
+};
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
 use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
 use osiris_sensors_fs::FilesystemSensor;
+use osiris_sensors_net::NetworkSensor;
 use osiris_sensors_process::ProcessExecSensor;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -76,6 +79,9 @@ impl Agent {
         if let Some(path) = &config.fs_audit_log_path {
             candidate_sensors.push(Box::new(FilesystemSensor::new(path.clone())));
         }
+        if let Some(proc_root) = &config.network_proc_root {
+            candidate_sensors.push(Box::new(NetworkSensor::new(proc_root.clone())));
+        }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -83,6 +89,7 @@ impl Agent {
                 .as_nanos() as u64;
             let scenario = match config.synthetic_scenario.as_deref() {
                 Some("web_shell_drop") => web_shell_drop_scenario(base_ts),
+                Some("network_beacon") => network_beacon_scenario(base_ts),
                 Some("exec_chain") | None => exec_chain_scenario(base_ts),
                 Some(other) => {
                     tracing::warn!(
@@ -242,6 +249,7 @@ mod tests {
         AgentConfig {
             audit_log_path: None,
             fs_audit_log_path: None,
+            network_proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
             spool_path: dir
@@ -397,5 +405,67 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
         assert_eq!(contents.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn starts_the_network_sensor_when_a_proc_root_with_net_tcp_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc_root = dir.path().join("fakeproc");
+        std::fs::create_dir_all(proc_root.join("net")).unwrap();
+        std::fs::write(
+            proc_root.join("net").join("tcp"),
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        )
+        .unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root = Some(proc_root.to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 1);
+        assert_eq!(status.sensors[0].name, "network");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn skips_the_network_sensor_with_a_visible_reason_when_net_tcp_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root =
+            Some(dir.path().join("no-such-proc").to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 0);
+        assert_eq!(status.skipped_sensors.len(), 1);
+        assert_eq!(status.skipped_sensors[0].name, "network");
+        assert!(status.skipped_sensors[0].reason.contains("net/tcp not found"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_network_beacon_scenario_reaches_the_spool_file_with_dns_and_network_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("network_beacon".to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert_eq!(contents.lines().count(), 6);
+        assert!(contents.contains("\"DNS_QUERY\""));
+        assert!(contents.contains("\"NETWORK_CONNECT\""));
+        assert!(contents.contains("\"NETWORK_CLOSE\""));
+        assert!(contents.contains("cdn-assets.xyz"));
     }
 }

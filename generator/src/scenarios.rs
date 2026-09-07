@@ -1,5 +1,8 @@
 use osiris_schema::encode_device_id;
-use osiris_sensor_api::{FileEventRaw, FileOperation, ProcessExecRaw, RawEvent, RawEventSource};
+use osiris_sensor_api::{
+    DnsEventRaw, FileEventRaw, FileOperation, NetworkDirection, NetworkEventRaw,
+    NetworkOperation, ProcessExecRaw, RawEvent, RawEventSource,
+};
 
 /// The identity the staged payload keeps across create -> write -> rename.
 pub const WEB_SHELL_INODE: u64 = 200_001;
@@ -10,6 +13,13 @@ pub const WEB_SHELL_FINAL_PATH: &str = "/var/www/html/shell.php";
 /// The benign control file: same actor family, ordinary destination.
 pub const BENIGN_NOTES_PATH: &str = "/home/user/notes.txt";
 const BENIGN_NOTES_INODE: u64 = 300_777;
+
+/// A suspicious TLD chosen to satisfy Task 6's shipped detection rule —
+/// this scenario is both the DNS/Network pipeline's fixture and the rule's
+/// positive fixture, the same dual role `web_shell_drop_scenario` plays for
+/// Task 6/7 (now Task 6) of Phase 2.
+pub const BEACON_DOMAIN: &str = "cdn-assets.xyz";
+pub const BEACON_IP: &str = "203.0.113.50";
 
 /// A minimal process/exec scenario mirroring ARCHITECTURE.md §26's worked
 /// trace (sshd -> bash -> curl). Timestamps are relative nanoseconds
@@ -79,6 +89,63 @@ pub fn web_shell_drop_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
             "bash",
             base_ts_ns + 6_000_000,
         ),
+    ]
+}
+
+/// §26's exec chain continued into DNS and the network: curl (pid 300)
+/// resolves a suspicious-TLD domain, connects to the resolved address, then
+/// the connection closes. Mirrors `web_shell_drop_scenario`'s shape: same
+/// exec chain, a plausible actor, and identity that stays consistent across
+/// events (the DNS response IP and the connection's remote address match,
+/// per Phase 3 plan Global Constraints #8's `RESOLVED_TO`/`CONNECTED_TO`
+/// edges) so Network Story assembly has something real to join.
+pub fn network_beacon_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
+    vec![
+        exec(100, 1, "/usr/sbin/sshd", "sshd", base_ts_ns),
+        exec(200, 100, "/bin/bash", "bash", base_ts_ns + 1_000_000),
+        exec(300, 200, "/usr/bin/curl", "curl", base_ts_ns + 2_000_000),
+        RawEvent::Dns(DnsEventRaw {
+            query: BEACON_DOMAIN.to_string(),
+            qtype: "A".to_string(),
+            response_ips: vec![BEACON_IP.to_string()],
+            ttl: Some(300),
+            pid: Some(300),
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: base_ts_ns + 3_000_000,
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Network(NetworkEventRaw {
+            operation: NetworkOperation::Connect,
+            local_addr: "10.0.0.5".to_string(),
+            local_port: 51000,
+            remote_addr: BEACON_IP.to_string(),
+            remote_port: 443,
+            proto: "tcp".to_string(),
+            direction: NetworkDirection::Outbound,
+            pid: Some(300),
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: base_ts_ns + 4_000_000,
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Network(NetworkEventRaw {
+            operation: NetworkOperation::Close,
+            local_addr: "10.0.0.5".to_string(),
+            local_port: 51000,
+            remote_addr: BEACON_IP.to_string(),
+            remote_port: 443,
+            proto: "tcp".to_string(),
+            direction: NetworkDirection::Outbound,
+            pid: Some(300),
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: base_ts_ns + 5_000_000,
+            source: RawEventSource::Synthetic,
+        }),
     ]
 }
 
@@ -224,5 +291,69 @@ mod tests {
             assert_eq!(file.device_id, Some(WEB_SHELL_DEVICE_ID));
         }
         assert_ne!(files[3].inode, Some(WEB_SHELL_INODE));
+    }
+
+    fn network_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::NetworkEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Network(n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dns_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::DnsEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Dns(d) => Some(d),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn network_beacon_scenario_has_the_full_exec_then_dns_then_network_chain() {
+        let scenario = network_beacon_scenario(1000);
+        assert_eq!(scenario.len(), 6);
+
+        let execs = exec_events(&scenario);
+        assert_eq!(execs.len(), 3);
+        assert_eq!(execs[2].exe_path, "/usr/bin/curl");
+        assert_eq!(execs[2].pid, 300);
+
+        let dns = dns_raw_events(&scenario);
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0].query, BEACON_DOMAIN);
+        assert_eq!(dns[0].response_ips, vec![BEACON_IP.to_string()]);
+        assert_eq!(dns[0].pid, Some(300));
+
+        let net = network_raw_events(&scenario);
+        assert_eq!(net.len(), 2);
+        assert_eq!(net[0].operation, osiris_sensor_api::NetworkOperation::Connect);
+        assert_eq!(net[0].remote_addr, BEACON_IP);
+        assert_eq!(net[0].pid, Some(300));
+        assert_eq!(net[1].operation, osiris_sensor_api::NetworkOperation::Close);
+        assert_eq!(net[1].remote_addr, BEACON_IP);
+    }
+
+    #[test]
+    fn network_beacon_scenario_is_strictly_time_ordered() {
+        let scenario = network_beacon_scenario(1000);
+        for pair in scenario.windows(2) {
+            assert!(pair[0].timestamp_ns() < pair[1].timestamp_ns());
+        }
+    }
+
+    /// The DNS query resolves to the same IP the connect/close events cite
+    /// — this is precisely what lets Task 7's Network Story follow the
+    /// domain to its connections via `RESOLVED_TO`.
+    #[test]
+    fn the_beacons_resolved_ip_matches_its_connections_remote_address() {
+        let scenario = network_beacon_scenario(1000);
+        let dns = dns_raw_events(&scenario);
+        let net = network_raw_events(&scenario);
+        assert_eq!(dns[0].response_ips[0], net[0].remote_addr);
     }
 }

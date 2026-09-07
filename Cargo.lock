@@ -974,6 +974,7 @@ dependencies = [
  "osiris-selftelemetry",
  "osiris-sensor-api",
  "osiris-sensors-fs",
+ "osiris-sensors-net",
  "osiris-sensors-process",
  "serde",
  "serde_yaml",

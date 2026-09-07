@@ -32,12 +32,19 @@ pub struct AgentConfig {
     /// records the other consumes). Skipped, never silently, if absent.
     #[serde(default)]
     pub fs_audit_log_path: Option<String>,
+    /// Directory to poll for `/proc/net/tcp`-style Network sensor input
+    /// (a real deployment points this at `/proc`). If absent or its
+    /// `net/tcp` file doesn't exist, that sensor is skipped
+    /// (capabilities()-driven, never silently).
+    #[serde(default)]
+    pub network_proc_root: Option<String>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
     /// Which canned scenario the synthetic sensor emits: `"exec_chain"`
-    /// (default, Phase 1's sshd->bash->curl) or `"web_shell_drop"` (that
-    /// chain continued into the filesystem). Ignored unless
+    /// (default, Phase 1's sshd->bash->curl), `"web_shell_drop"` (that
+    /// chain continued into the filesystem), or `"network_beacon"` (that
+    /// chain continued into DNS and network). Ignored unless
     /// `enable_synthetic` is true.
     #[serde(default)]
     pub synthetic_scenario: Option<String>,
@@ -90,6 +97,7 @@ mod tests {
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.fs_audit_log_path.is_none());
         assert!(config.synthetic_scenario.is_none());
+        assert!(config.network_proc_root.is_none());
     }
 
     #[test]
