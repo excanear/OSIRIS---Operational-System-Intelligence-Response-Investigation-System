@@ -1,5 +1,6 @@
 use osiris_schema::{
-    CanonicalEvent, Category, EntityRef, EntityRelationship, FileIdentity, ProcessRef, Relation,
+    CanonicalEvent, Category, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessRef,
+    Relation,
 };
 
 use crate::process_resolver::ProcessResolver;
@@ -28,8 +29,11 @@ pub fn enrich(
         _ => enrich_non_process_event(&mut event, resolver),
     }
 
-    if event.category == Category::File {
-        attach_file_relationship(&mut event);
+    match event.category {
+        Category::File => attach_file_relationship(&mut event),
+        Category::Network => attach_network_relationship(&mut event),
+        Category::Dns => attach_dns_relationships(&mut event),
+        _ => {}
     }
 
     event
@@ -110,6 +114,63 @@ fn attach_file_relationship(event: &mut CanonicalEvent) {
         timestamp: event.timestamp,
     };
     event.relationships.push(edge);
+}
+
+/// Writes the §9.4 `Process -CONNECTED_TO-> Ip` edge (Phase 3 plan Global
+/// Constraints #8). Only on the connection's *opening* event
+/// (`NETWORK_CONNECT`/`NETWORK_ACCEPT`) — `NETWORK_CLOSE` would duplicate
+/// the same fact. No edge when the sensor could not attribute a process
+/// (Global Constraint #5) — an edge citing a fabricated process is worse
+/// than no edge, the same reasoning `attach_file_relationship` already
+/// applies to file identity.
+fn attach_network_relationship(event: &mut CanonicalEvent) {
+    if event.event_type == EventType::NetworkClose {
+        return;
+    }
+    let (Some(process), Some(network)) = (event.process.as_ref(), event.network.as_ref()) else {
+        return;
+    };
+    let remote_ip = match network.direction {
+        osiris_schema::NetworkDirection::Outbound => &network.dst_ip,
+        osiris_schema::NetworkDirection::Inbound => &network.src_ip,
+    };
+    let edge = EntityRelationship {
+        from: EntityRef::Process {
+            process_key: process.process_key,
+        },
+        to: EntityRef::Ip {
+            addr: remote_ip.clone(),
+        },
+        relation: Relation::ConnectedTo,
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+    };
+    event.relationships.push(edge);
+}
+
+/// Writes one §9.4 `Domain -RESOLVED_TO-> Ip` edge per resolved address
+/// (Phase 3 plan Global Constraints #8) — a query resolving to three IPs
+/// produces three edges, all citing the same `event_id`. No
+/// `Process -> Domain` edge: the frozen `Relation` enum has no fitting
+/// variant, and this phase does not extend it (Phase 2 precedent: solve it
+/// in the consuming crate or defer, never widen a frozen schema type for
+/// one call site).
+fn attach_dns_relationships(event: &mut CanonicalEvent) {
+    let Some(dns) = event.dns.clone() else {
+        return;
+    };
+    for ip in &dns.response_ips {
+        let edge = EntityRelationship {
+            from: EntityRef::Domain {
+                name: dns.query.clone(),
+            },
+            to: EntityRef::Ip { addr: ip.clone() },
+            relation: Relation::ResolvedTo,
+            event_id: event.event_id,
+            timestamp: event.timestamp,
+        };
+        event.relationships.push(edge);
+    }
 }
 
 fn current_ppid(event: &CanonicalEvent) -> u32 {
@@ -356,5 +417,172 @@ mod tests {
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
         );
+    }
+
+    fn bare_network_event(
+        host_id: uuid::Uuid,
+        pid: Option<u32>,
+        remote_ip: &str,
+    ) -> CanonicalEvent {
+        let mut event = bare_event(host_id, pid.unwrap_or(0), 0);
+        event.event_type = EventType::NetworkConnect;
+        event.category = Category::Network;
+        event.process = pid.map(|p| ProcessRef {
+            process_key: ProcessKey::new(host_id, "boot-1", p, 0),
+            pid: p,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 0,
+        });
+        event.network = Some(osiris_schema::NetworkRef {
+            src_ip: "10.0.0.5".to_string(),
+            src_port: 51000,
+            dst_ip: remote_ip.to_string(),
+            dst_port: 443,
+            proto: "tcp".to_string(),
+            direction: osiris_schema::NetworkDirection::Outbound,
+            bytes: None,
+        });
+        event
+    }
+
+    #[test]
+    fn network_event_gains_a_process_connected_to_ip_entity_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let authoritative = curl_exec.process.unwrap().process_key;
+
+        let net_event = enrich(
+            bare_network_event(host_id, Some(300), "203.0.113.50"),
+            "boot-1",
+            &mut resolver,
+        );
+        assert_eq!(net_event.relationships.len(), 1);
+        let edge = &net_event.relationships[0];
+        assert_eq!(edge.relation, Relation::ConnectedTo);
+        match (&edge.from, &edge.to) {
+            (
+                osiris_schema::EntityRef::Process { process_key },
+                osiris_schema::EntityRef::Ip { addr },
+            ) => {
+                assert_eq!(*process_key, authoritative);
+                assert_eq!(addr, "203.0.113.50");
+            }
+            other => panic!("expected a Process -> Ip edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_event_with_no_pid_gets_no_edge_rather_than_a_fabricated_one() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let net_event = enrich(
+            bare_network_event(host_id, None, "203.0.113.50"),
+            "boot-1",
+            &mut resolver,
+        );
+        assert!(net_event.relationships.is_empty());
+        assert!(net_event.process.is_none());
+    }
+
+    #[test]
+    fn network_close_event_gets_no_connected_to_edge() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let _curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let mut event = bare_network_event(host_id, Some(300), "203.0.113.50");
+        event.event_type = EventType::NetworkClose;
+        let closed = enrich(event, "boot-1", &mut resolver);
+        assert!(
+            closed.relationships.is_empty(),
+            "the opening event already carries the edge; close must not duplicate it"
+        );
+    }
+
+    fn bare_dns_event(host_id: uuid::Uuid, pid: Option<u32>, response_ips: Vec<String>) -> CanonicalEvent {
+        let mut event = bare_event(host_id, pid.unwrap_or(0), 0);
+        event.event_type = EventType::DnsQuery;
+        event.category = Category::Dns;
+        event.process = pid.map(|p| ProcessRef {
+            process_key: ProcessKey::new(host_id, "boot-1", p, 0),
+            pid: p,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 0,
+        });
+        event.dns = Some(osiris_schema::DnsRef {
+            query: "cdn-assets.xyz".to_string(),
+            qtype: "A".to_string(),
+            response_ips,
+            ttl: Some(300),
+        });
+        event
+    }
+
+    #[test]
+    fn dns_event_gains_one_resolved_to_edge_per_response_ip() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let dns_event = enrich(
+            bare_dns_event(
+                host_id,
+                Some(300),
+                vec!["203.0.113.50".to_string(), "203.0.113.51".to_string()],
+            ),
+            "boot-1",
+            &mut resolver,
+        );
+        assert_eq!(dns_event.relationships.len(), 2);
+        for (edge, expected_ip) in dns_event
+            .relationships
+            .iter()
+            .zip(["203.0.113.50", "203.0.113.51"])
+        {
+            assert_eq!(edge.relation, Relation::ResolvedTo);
+            match (&edge.from, &edge.to) {
+                (
+                    osiris_schema::EntityRef::Domain { name },
+                    osiris_schema::EntityRef::Ip { addr },
+                ) => {
+                    assert_eq!(name, "cdn-assets.xyz");
+                    assert_eq!(addr, expected_ip);
+                }
+                other => panic!("expected a Domain -> Ip edge, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dns_event_with_no_response_ips_gets_no_edges() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let dns_event = enrich(
+            bare_dns_event(host_id, Some(300), vec![]),
+            "boot-1",
+            &mut resolver,
+        );
+        assert!(dns_event.relationships.is_empty());
+    }
+
+    /// DNS's process resolution reuses the exact same non-process path
+    /// file/network events already exercise — this pins that reuse rather
+    /// than re-deriving a parallel code path.
+    #[test]
+    fn dns_event_resolves_its_authoritative_process_key() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver);
+        let authoritative = curl_exec.process.unwrap().process_key;
+
+        let dns_event = enrich(
+            bare_dns_event(host_id, Some(300), vec!["203.0.113.50".to_string()]),
+            "boot-1",
+            &mut resolver,
+        );
+        assert_eq!(dns_event.process.unwrap().process_key, authoritative);
+        assert!(!dns_event.tags.contains(&"PROCESS_KEY_PROVISIONAL".to_string()));
     }
 }

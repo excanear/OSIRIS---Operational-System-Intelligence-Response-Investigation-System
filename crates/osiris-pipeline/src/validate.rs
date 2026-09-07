@@ -5,7 +5,10 @@ use osiris_schema::CanonicalEvent;
 /// operator can see what's malformed rather than have a silent gap.
 /// Returns true if the event was valid (no tag added).
 pub fn validate(event: &mut CanonicalEvent) -> bool {
-    use osiris_schema::EventType::{FileCreate, FileDelete, FileRename, FileWrite};
+    use osiris_schema::EventType::{
+        DnsQuery, FileCreate, FileDelete, FileRename, FileWrite, NetworkAccept, NetworkClose,
+        NetworkConnect,
+    };
     let mut valid = true;
     if event.host_id.is_nil() {
         valid = false;
@@ -38,6 +41,31 @@ pub fn validate(event: &mut CanonicalEvent) -> bool {
                 .map(|p| p.trim().is_empty())
                 .unwrap_or(true)
         {
+            valid = false;
+        }
+    }
+    if matches!(
+        event.event_type,
+        NetworkConnect | NetworkAccept | NetworkClose
+    ) {
+        // A network event with no remote address names no connection — it
+        // cannot be queried by a Network Story or explained in an alert.
+        let has_remote = event
+            .network
+            .as_ref()
+            .map(|n| !n.dst_ip.trim().is_empty() && !n.src_ip.trim().is_empty())
+            .unwrap_or(false);
+        if !has_remote {
+            valid = false;
+        }
+    }
+    if event.event_type == DnsQuery {
+        let has_query = event
+            .dns
+            .as_ref()
+            .map(|d| !d.query.trim().is_empty())
+            .unwrap_or(false);
+        if !has_query {
             valid = false;
         }
     }
@@ -187,5 +215,101 @@ mod tests {
             file.previous_path = None;
         }
         assert!(!validate(&mut event));
+    }
+
+    fn valid_network_event() -> CanonicalEvent {
+        let mut event = valid_event();
+        event.event_type = EventType::NetworkConnect;
+        event.category = Category::Network;
+        event.process = None;
+        event.network = Some(osiris_schema::NetworkRef {
+            src_ip: "10.0.0.5".to_string(),
+            src_port: 51000,
+            dst_ip: "203.0.113.50".to_string(),
+            dst_port: 443,
+            proto: "tcp".to_string(),
+            direction: osiris_schema::NetworkDirection::Outbound,
+            bytes: None,
+        });
+        event
+    }
+
+    #[test]
+    fn well_formed_network_events_of_every_type_validate() {
+        for event_type in [
+            EventType::NetworkConnect,
+            EventType::NetworkAccept,
+            EventType::NetworkClose,
+        ] {
+            let mut event = valid_network_event();
+            event.event_type = event_type;
+            assert!(validate(&mut event), "{event_type:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn network_event_without_a_network_ref_is_invalid_but_still_forwarded() {
+        let mut event = valid_network_event();
+        event.network = None;
+        assert!(!validate(&mut event));
+        assert!(event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn network_event_with_an_empty_remote_address_is_invalid() {
+        let mut event = valid_network_event();
+        if let Some(net) = event.network.as_mut() {
+            net.dst_ip = "   ".to_string();
+        }
+        assert!(!validate(&mut event));
+    }
+
+    fn valid_dns_event() -> CanonicalEvent {
+        let mut event = valid_event();
+        event.event_type = EventType::DnsQuery;
+        event.category = Category::Dns;
+        event.process = None;
+        event.dns = Some(osiris_schema::DnsRef {
+            query: "cdn-assets.xyz".to_string(),
+            qtype: "A".to_string(),
+            response_ips: vec!["203.0.113.50".to_string()],
+            ttl: Some(300),
+        });
+        event
+    }
+
+    #[test]
+    fn well_formed_dns_query_validates() {
+        let mut event = valid_dns_event();
+        assert!(validate(&mut event));
+    }
+
+    #[test]
+    fn dns_query_without_a_dns_ref_is_invalid_but_still_forwarded() {
+        let mut event = valid_dns_event();
+        event.dns = None;
+        assert!(!validate(&mut event));
+        assert!(event.tags.contains(&"INVALID".to_string()));
+    }
+
+    #[test]
+    fn dns_query_with_an_empty_query_string_is_invalid() {
+        let mut event = valid_dns_event();
+        if let Some(dns) = event.dns.as_mut() {
+            dns.query = "".to_string();
+        }
+        assert!(!validate(&mut event));
+    }
+
+    /// An unresolved query (NXDOMAIN/timeout) is still a valid, storable
+    /// event — empty `response_ips` is itself sometimes the signal, not a
+    /// malformed record (Task 1's `DnsEventRaw` doc comment).
+    #[test]
+    fn dns_query_with_no_response_ips_is_still_valid() {
+        let mut event = valid_dns_event();
+        if let Some(dns) = event.dns.as_mut() {
+            dns.response_ips = vec![];
+        }
+        assert!(validate(&mut event));
     }
 }

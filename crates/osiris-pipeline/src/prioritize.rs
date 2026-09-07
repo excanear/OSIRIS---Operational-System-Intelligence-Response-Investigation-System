@@ -34,6 +34,17 @@ impl Default for PriorityTable {
                 // See the lane rationale in the tests: FILE_WRITE is the one
                 // high-volume type this phase emits.
                 (EventType::FileWrite, PriorityLane::Low),
+                (EventType::NetworkConnect, PriorityLane::Normal),
+                (EventType::NetworkAccept, PriorityLane::Normal),
+                // NETWORK_CLOSE is the highest-volume network event by the
+                // same reasoning FILE_WRITE got a low lane in Phase 2: every
+                // connection produces at most one open event but exactly
+                // one close (barring a still-open connection at shutdown),
+                // and short-lived connections churn faster than sustained
+                // ones open new ones — closes are the type most likely to
+                // need shedding first under bus pressure.
+                (EventType::NetworkClose, PriorityLane::Low),
+                (EventType::DnsQuery, PriorityLane::Normal),
             ],
             default_lane: PriorityLane::Normal,
         }
@@ -131,9 +142,25 @@ mod tests {
     #[test]
     fn unmapped_event_type_falls_back_to_default_lane() {
         let mut event = exec_event();
-        // NETWORK_CONNECT arrives in Phase 3; until then it is unmapped.
-        event.event_type = EventType::NetworkConnect;
+        // No Phase 3+ sensor emits SOCKET_LISTEN yet (Phase 3 plan Global
+        // Constraints #3) — it stays unmapped until whichever phase adds it.
+        event.event_type = EventType::SocketListen;
         let table = PriorityTable::default();
         assert_eq!(prioritize(&event, &table), PriorityLane::Normal);
+    }
+
+    #[test]
+    fn network_and_dns_event_types_map_to_their_configured_lanes() {
+        let table = PriorityTable::default();
+        for (event_type, expected) in [
+            (EventType::NetworkConnect, PriorityLane::Normal),
+            (EventType::NetworkAccept, PriorityLane::Normal),
+            (EventType::NetworkClose, PriorityLane::Low),
+            (EventType::DnsQuery, PriorityLane::Normal),
+        ] {
+            let mut event = exec_event();
+            event.event_type = event_type;
+            assert_eq!(prioritize(&event, &table), expected, "{event_type:?}");
+        }
     }
 }
