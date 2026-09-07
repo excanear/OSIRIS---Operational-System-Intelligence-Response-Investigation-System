@@ -71,6 +71,14 @@ impl SqliteStorage {
         // explicitly. Adding a nullable column to SQLite is an O(1)
         // metadata-only operation, and existing rows read back as NULL —
         // correct, since no Phase 1 event ever populated `file`.
+        //
+        // The same loop also adds Phase 3's three network/DNS columns
+        // (`network_src_ip`, `network_dst_ip`, `dns_domain`) for a database
+        // created before this phase. As with the file columns above, these
+        // are not backfilled on pre-existing rows — they read back as NULL
+        // even if a pre-Phase-3 row's `raw_json` happened to contain
+        // relevant data. This has no practical impact today since no
+        // pre-Phase-3 database can actually contain network/DNS events.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),

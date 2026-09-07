@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum RawEventSource {
     Audit,
     Synthetic,
+    /// Sampled from `/proc` (e.g. `/proc/net/tcp` polling), not from Linux
+    /// audit — carries no audit serial and no guarantee of catching every
+    /// transition between poll ticks.
+    Procfs,
 }
 
 /// A Process/Exec creation record at MINIMAL telemetry (ARCHITECTURE.md §6:
@@ -169,8 +173,8 @@ pub struct DnsEventRaw {
 }
 
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
-/// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 adds
-/// File. Later phases add Network/Dns/... variants.
+/// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 added
+/// File; Phase 3 adds Network and Dns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     ProcessExec(ProcessExecRaw),

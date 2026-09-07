@@ -35,6 +35,18 @@ struct ConnRecord {
 /// points it at `/proc`; tests point it at a tempdir fixture — the same
 /// "the real path is configurable, defaults sensible for real deployment"
 /// pattern Phase 1/2 established for the audit log path.
+///
+/// KNOWN LIMITATION (startup baseline burst): `previous` starts empty, so
+/// the very first `poll()` call after construction (agent startup or
+/// restart) treats every currently-ESTABLISHED connection already present
+/// in `/proc/net/tcp` as brand new, emitting a `NETWORK_CONNECT`/
+/// `NETWORK_ACCEPT` event for each with `timestamp_ns` set to the current
+/// poll tick — not the connection's actual (unknown) start time, which may
+/// have been hours or days earlier. An agent restart therefore produces a
+/// burst of open events for pre-existing connections whose timestamps do
+/// not reflect when the connection actually opened. This mirrors
+/// `LineTailer`'s offset-0 replay behavior from earlier phases (a known,
+/// previously-accepted limitation class in this codebase).
 pub struct NetworkPoller {
     proc_root: PathBuf,
     previous: HashMap<ConnTuple, ConnRecord>,
@@ -111,7 +123,7 @@ impl NetworkPoller {
                 exe_path: exe_path.clone(),
                 comm: comm.clone(),
                 timestamp_ns: now_ns,
-                source: RawEventSource::Audit,
+                source: RawEventSource::Procfs,
             });
             self.previous.insert(
                 tuple.clone(),
@@ -147,7 +159,7 @@ impl NetworkPoller {
                 exe_path: record.exe_path,
                 comm: record.comm,
                 timestamp_ns: now_ns,
-                source: RawEventSource::Audit,
+                source: RawEventSource::Procfs,
             });
         }
 

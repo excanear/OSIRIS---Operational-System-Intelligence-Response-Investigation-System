@@ -250,7 +250,7 @@ async fn file_story_handler(
         }
 
         let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
-        events.sort_by(|a, b| (a.timestamp, a.event_id).cmp(&(b.timestamp, b.event_id)));
+        events.sort_by_key(|a| (a.timestamp, a.event_id));
 
         let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
         let alerts = if evidence_ids.is_empty() {
@@ -337,7 +337,7 @@ async fn network_story_handler(
         }
 
         let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
-        events.sort_by(|a, b| (a.timestamp, a.event_id).cmp(&(b.timestamp, b.event_id)));
+        events.sort_by_key(|a| (a.timestamp, a.event_id));
 
         let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
         let alerts = if evidence_ids.is_empty() {
@@ -726,7 +726,6 @@ mod tests {
         assert!(ids.contains(&renamed.event_id));
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn network_event(
         event_type: EventType,
         src_ip: &str,

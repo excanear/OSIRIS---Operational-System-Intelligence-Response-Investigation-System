@@ -29,10 +29,14 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
+        // No process/exec backend uses procfs polling in this codebase;
+        // handled for match exhaustiveness only.
+        RawEventSource::Procfs => Source::Procfs,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "process_exec_sensor/audit",
         RawEventSource::Synthetic => "process_exec_sensor/synthetic",
+        RawEventSource::Procfs => "process_exec_sensor/procfs",
     };
     let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, raw.start_time_mono);
     CanonicalEvent {
@@ -81,10 +85,14 @@ fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> Can
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
+        // No filesystem backend uses procfs polling in this codebase;
+        // handled for match exhaustiveness only.
+        RawEventSource::Procfs => Source::Procfs,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "filesystem_sensor/audit",
         RawEventSource::Synthetic => "filesystem_sensor/synthetic",
+        RawEventSource::Procfs => "filesystem_sensor/procfs",
     };
     let event_type = match raw.operation {
         FileOperation::Create => EventType::FileCreate,
@@ -180,10 +188,12 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
+        RawEventSource::Procfs => Source::Procfs,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "network_sensor/audit",
         RawEventSource::Synthetic => "network_sensor/synthetic",
+        RawEventSource::Procfs => "network_sensor/procfs",
     };
     let event_type = match raw.operation {
         NetworkOperation::Connect => EventType::NetworkConnect,
@@ -255,10 +265,17 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
+        // No live DNS sensor ships this phase (Phase 3 plan Global
+        // Constraint #6); this branch is unreachable today. A future DNS
+        // backend is more likely pcap/eBPF than audit-based, so this
+        // provider string is intentionally backend-neutral rather than
+        // implying an audit-based DNS sensor exists.
+        RawEventSource::Procfs => Source::Procfs,
     };
     let provider = match raw.source {
-        RawEventSource::Audit => "dns_sensor/audit",
+        RawEventSource::Audit => "dns_sensor/unknown",
         RawEventSource::Synthetic => "dns_sensor/synthetic",
+        RawEventSource::Procfs => "dns_sensor/unknown",
     };
     let process = provisional_process(raw.pid, &raw.exe_path, host.host_id, boot_id);
     CanonicalEvent {
@@ -591,7 +608,7 @@ mod tests {
         let event = normalize(RawEvent::Dns(dns_raw(Some(300))), &host, "boot-1");
         assert_eq!(event.event_type, EventType::DnsQuery);
         assert_eq!(event.category, Category::Dns);
-        assert_eq!(event.provider, "dns_sensor/audit");
+        assert_eq!(event.provider, "dns_sensor/unknown");
     }
 
     #[test]

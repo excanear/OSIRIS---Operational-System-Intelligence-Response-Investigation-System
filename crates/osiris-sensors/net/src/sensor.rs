@@ -77,10 +77,14 @@ impl Sensor for NetworkSensor {
 
     fn capabilities(&self) -> SensorCapabilities {
         if self.proc_root.join("net").join("tcp").exists() {
+            // `audit_fallback` specifically means "the real Linux Audit
+            // backend is available" (see SensorCapabilities's doc comment)
+            // — this sensor is a `/proc/net/tcp` poller, not audit-based,
+            // so it reports `always_available` instead.
             SensorCapabilities {
                 ebpf: false,
-                audit_fallback: true,
-                always_available: false,
+                audit_fallback: false,
+                always_available: true,
                 unsupported_reason: None,
             }
         } else {
@@ -106,7 +110,7 @@ impl Sensor for NetworkSensor {
             lock_health(&self.health).last_error = Some(reason.clone());
             return Err(SensorError::Unsupported(reason));
         }
-        lock_health(&self.health).capability_flags = vec!["audit_fallback".to_string()];
+        lock_health(&self.health).capability_flags = vec!["always_available".to_string()];
 
         let proc_root = self.proc_root.clone();
         let poll_interval = self.poll_interval;

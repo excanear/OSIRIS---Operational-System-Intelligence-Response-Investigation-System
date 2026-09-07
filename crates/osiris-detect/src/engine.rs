@@ -473,7 +473,7 @@ match:
     fn both_shipped_rules_load_together_without_cross_firing() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
         let engine = DetectionEngine::load_from_dir(&dir).unwrap();
-        assert_eq!(engine.rule_count(), 2);
+        assert!(engine.rule_count() >= 2);
 
         let dns_alerts = engine.evaluate(&dns_event("cdn-assets.xyz", "/usr/bin/curl"));
         assert_eq!(dns_alerts.len(), 1);

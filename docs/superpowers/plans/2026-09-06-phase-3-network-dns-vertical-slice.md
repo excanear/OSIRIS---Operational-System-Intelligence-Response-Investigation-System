@@ -47,7 +47,7 @@ The development environment is unchanged from Phase 1/2: Windows, no Linux kerne
 
 15. **`osiris-storage` gains two `QueryPlan` filters and `SqliteStorage` gains two indexed columns; no schema migration risk beyond what Phase 2 already established the pattern for.** `network_addr: Option<String>` (matches `network.src_ip OR network.dst_ip`) and `dns_domain: Option<String>` (matches `dns.query`). Both are additive nullable columns on the existing `events` table via the same guarded `ALTER TABLE ADD COLUMN` migration Phase 2's Task 6 used for `file_path`/`file_inode`/`file_device_id` — non-destructive and idempotent against a database created by any earlier phase.
 
-None of these decisions touch the `CanonicalEvent` envelope's existing fields, the `EventType`/`Category`/`Severity`/`Source`/`Relation`/`EntityRef` enums (all already sufficient per Global Constraint #7), or the dependency-graph privilege boundary (§27), which this plan extends with two new checks (Task 3) but never relaxes.
+None of these decisions touch the `CanonicalEvent` envelope's existing fields, the `EventType`/`Category`/`Severity`/`Source`/`Relation`/`EntityRef` enums (all already sufficient per Global Constraint #7), or the dependency-graph privilege boundary (§27), which this plan extends with one new check (Task 3) but never relaxes.
 
 **New workspace-wide facts this phase establishes** (binding on every task):
 - Workspace `members` gains `"crates/osiris-sensors/net"` (matching the explicit-path convention `crates/osiris-sensors/fs` and `crates/osiris-sensors/process` already use, since `crates/osiris-sensors` is in `exclude`).
