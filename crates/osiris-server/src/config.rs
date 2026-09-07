@@ -20,6 +20,7 @@ pub struct ServerConfig {
     pub db_path: String,
     pub spool_path: String,
     pub listen_addr: String,
+    pub rules_dir: String,
 }
 
 impl ServerConfig {
@@ -42,7 +43,7 @@ mod tests {
         let path = dir.path().join("server.yaml");
         std::fs::write(
             &path,
-            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\n",
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\n",
         )
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();

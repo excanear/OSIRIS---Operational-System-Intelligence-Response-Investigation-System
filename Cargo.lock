@@ -1196,6 +1196,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "osiris-api",
+ "osiris-detect",
  "osiris-fileutil",
  "osiris-schema",
  "osiris-selftelemetry",

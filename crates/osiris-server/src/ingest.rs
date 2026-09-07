@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use osiris_detect::DetectionEngine;
 use osiris_schema::CanonicalEvent;
 use osiris_storage::Storage;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,7 @@ use osiris_fileutil::LineTailer;
 pub async fn run_ingestion_loop(
     spool_path: impl Into<std::path::PathBuf>,
     storage: Arc<dyn Storage>,
+    detection_engine: Arc<DetectionEngine>,
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
@@ -29,14 +31,26 @@ pub async fn run_ingestion_loop(
                     .collect();
                 if !events.is_empty() {
                     let storage = storage.clone();
+                    let detection_engine = detection_engine.clone();
                     let event_count = events.len();
-                    match tokio::task::spawn_blocking(move || storage.batch_write(&events)).await {
+                    match tokio::task::spawn_blocking(move || {
+                        Ok::<_, osiris_storage::StorageError>({
+                            let report = storage.batch_write(&events)?;
+                            let alerts = detection_engine.evaluate_batch(&events);
+                            if !alerts.is_empty() {
+                                storage.write_alerts(&alerts)?;
+                            }
+                            report
+                        })
+                    })
+                    .await
+                    {
                         Ok(Ok(_report)) => {}
                         Ok(Err(storage_err)) => {
                             tracing::error!(
                                 error = %storage_err,
                                 event_count,
-                                "batch_write failed; tailer offset already advanced past these events \
+                                "batch_write or write_alerts failed; tailer offset already advanced past these events \
                                  — they are permanently lost"
                             );
                         }
@@ -65,8 +79,11 @@ pub async fn run_ingestion_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, EventType, HostRef, Severity, Source, SCHEMA_VERSION};
-    use osiris_storage::QueryPlan;
+    use osiris_schema::{
+        encode_device_id, Category, EventType, FileRef, HostRef, ProcessKey, ProcessRef,
+        Severity, Source, SCHEMA_VERSION,
+    };
+    use osiris_storage::{AlertQueryPlan, QueryPlan};
     use osiris_storage_sqlite::SqliteStorage;
     use std::io::Write;
     use uuid::Uuid;
@@ -122,10 +139,12 @@ mod tests {
         let storage: Arc<dyn Storage> =
             Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
 
         let handle = tokio::spawn(run_ingestion_loop(
             spool_path.clone(),
             storage.clone(),
+            detection_engine,
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -152,10 +171,12 @@ mod tests {
         let storage: Arc<dyn Storage> =
             Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
 
         let handle = tokio::spawn(run_ingestion_loop(
             spool_path.clone(),
             storage.clone(),
+            detection_engine,
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -181,5 +202,123 @@ mod tests {
 
         let results = storage.query(&QueryPlan::new()).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    fn web_root_shell_event() -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp: 1_700_000_000_000_000_000,
+            monotonic_timestamp: 1,
+            event_type: EventType::FileCreate,
+            category: Category::File,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: Some(ProcessRef {
+                process_key: ProcessKey::new(host_id, "b", 300, 1),
+                pid: 300,
+                exe_path: "/usr/bin/curl".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 1,
+            }),
+            parent_process: None,
+            thread: None,
+            file: Some(FileRef {
+                path: "/var/www/html/shell.php".to_string(),
+                previous_path: None,
+                inode: Some(1),
+                device_id: Some(encode_device_id(8, 1)),
+                size: None,
+                mode: None,
+                owner_uid: None,
+                owner_gid: None,
+                hash: None,
+            }),
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    const WEB_ROOT_RULE: &str = r#"
+id: shell_wrote_file_to_web_root
+version: 1
+severity: HIGH
+match:
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "A file was created or written on disk"
+  - field: file.path
+    op: starts_with
+    value: "/var/www/"
+    reason: "The file was written inside the web-served directory /var/www/"
+  - field: process.exe_path
+    op: in
+    value: ["/bin/sh", "/bin/bash", "/usr/bin/curl", "/usr/bin/wget"]
+    reason: "The writing process is an interactive shell or download tool, not the web server"
+"#;
+
+    #[tokio::test]
+    async fn alerts_are_evaluated_and_persisted_end_to_end_through_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        std::fs::write(&spool_path, "").unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let cancellation = CancellationToken::new();
+        let rule = osiris_detect::Rule::from_yaml_str(WEB_ROOT_RULE, "test.yaml").unwrap();
+        let detection_engine = Arc::new(DetectionEngine::new(vec![rule]));
+
+        let handle = tokio::spawn(run_ingestion_loop(
+            spool_path.clone(),
+            storage.clone(),
+            detection_engine,
+            Duration::from_millis(20),
+            cancellation.clone(),
+        ));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&web_root_shell_event()).unwrap()
+        )
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancellation.cancel();
+        handle.await.unwrap();
+
+        let alerts = storage.query_alerts(&AlertQueryPlan::new()).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "shell_wrote_file_to_web_root");
     }
 }

@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use osiris_schema::{CanonicalEvent, EventType};
-use osiris_storage::{QueryPlan, Storage};
+use osiris_schema::{Alert, CanonicalEvent, EventType, FileIdentity};
+use osiris_storage::{AlertQueryPlan, QueryPlan, Storage};
 use serde::{Deserialize, Serialize};
 
 /// The Phase 1 API surface (ARCHITECTURE.md §14.2, narrowed to `/events`,
@@ -23,6 +23,8 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
             "/api/v1/processes/:process_key",
             get(process_detail_handler),
         )
+        .route("/api/v1/alerts", get(alerts_handler))
+        .route("/api/v1/files/story", get(file_story_handler))
         .with_state(storage)
 }
 
@@ -152,11 +154,119 @@ async fn process_detail_handler(
     Ok(Json(ProcessDetail { process, children }))
 }
 
+#[derive(Debug, Deserialize)]
+struct AlertsQuery {
+    rule_id: Option<String>,
+    since: Option<u64>,
+    until: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn alerts_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<AlertsQuery>,
+) -> Result<Json<Vec<Alert>>, (StatusCode, String)> {
+    let mut plan = AlertQueryPlan::new();
+    plan.rule_id = q.rule_id;
+    plan.since = q.since;
+    plan.until = q.until;
+    if let Some(limit) = q.limit {
+        plan.limit = limit;
+    }
+    let alerts = tokio::task::spawn_blocking(move || storage.query_alerts(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(alerts))
+}
+
+#[derive(Debug, Deserialize)]
+struct FileStoryQuery {
+    path: Option<String>,
+    file_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileStory {
+    events: Vec<CanonicalEvent>,
+    alerts: Vec<Alert>,
+}
+
+async fn file_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<FileStoryQuery>,
+) -> Result<Json<FileStory>, (StatusCode, String)> {
+    if q.path.is_none() && q.file_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide path or file_id".to_string(),
+        ));
+    }
+
+    let (events, alerts) = tokio::task::spawn_blocking(move || {
+        let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
+        let mut identities: HashSet<FileIdentity> = HashSet::new();
+
+        if let Some(file_id) = &q.file_id {
+            if let Some(identity) = FileIdentity::parse_key(file_id) {
+                identities.insert(identity);
+            }
+        }
+
+        if let Some(path) = &q.path {
+            let mut plan = QueryPlan::new();
+            plan.file_path = Some(path.clone());
+            plan.limit = 10_000;
+            let path_events = storage.query(&plan)?;
+            for e in &path_events {
+                if let Some(file) = &e.file {
+                    if let Some(id) = FileIdentity::from_file_ref(file) {
+                        identities.insert(id);
+                    }
+                }
+            }
+            for e in path_events {
+                events_by_id.insert(e.event_id, e);
+            }
+        }
+
+        for identity in &identities {
+            let mut plan = QueryPlan::new();
+            plan.file_identity = Some(*identity);
+            plan.limit = 10_000;
+            for e in storage.query(&plan)? {
+                events_by_id.insert(e.event_id, e);
+            }
+        }
+
+        let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
+        events.sort_by(|a, b| (a.timestamp, a.event_id).cmp(&(b.timestamp, b.event_id)));
+
+        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        let alerts = if evidence_ids.is_empty() {
+            vec![]
+        } else {
+            let mut alert_plan = AlertQueryPlan::new();
+            alert_plan.evidence_event_ids = evidence_ids;
+            alert_plan.limit = 10_000;
+            storage.query_alerts(&alert_plan)?
+        };
+
+        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(FileStory { events, alerts }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use osiris_schema::{
-        Category, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
+        encode_device_id, Category, FileRef, HostRef, ProcessKey, ProcessRef, Severity, Source,
+        SCHEMA_VERSION,
     };
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
@@ -216,6 +326,80 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn file_event(
+        event_type: EventType,
+        path: &str,
+        inode: u64,
+        device_id: u64,
+        timestamp: u64,
+    ) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type,
+            category: Category::File,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: Some(FileRef {
+                path: path.to_string(),
+                previous_path: None,
+                inode: Some(inode),
+                device_id: Some(device_id),
+                size: None,
+                mode: None,
+                owner_uid: None,
+                owner_gid: None,
+                hash: None,
+            }),
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    fn sample_alert(rule_id: &str, evidence: Vec<Uuid>, timestamp: u64) -> Alert {
+        Alert::new(
+            rule_id,
+            1,
+            "0".repeat(64),
+            Severity::High,
+            timestamp,
+            Uuid::new_v4(),
+            vec!["because".to_string()],
+            evidence,
+        )
+        .unwrap()
     }
 
     fn test_storage() -> (tempfile::TempDir, Arc<dyn Storage>) {
@@ -282,5 +466,150 @@ mod tests {
         let unknown_key = ProcessKey::new(host_id, "b", 999, 999);
         let result = process_detail_handler(State(storage), Path(unknown_key.as_hex())).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn alerts_endpoint_returns_persisted_alerts() {
+        let (_dir, storage) = test_storage();
+        let alert = sample_alert("rule_a", vec![Uuid::now_v7()], 1000);
+        storage.write_alerts(&[alert]).unwrap();
+
+        let Json(alerts) = alerts_handler(
+            State(storage),
+            Query(AlertsQuery {
+                rule_id: None,
+                since: None,
+                until: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "rule_a");
+    }
+
+    #[tokio::test]
+    async fn alerts_endpoint_filters_by_rule_id() {
+        let (_dir, storage) = test_storage();
+        storage
+            .write_alerts(&[
+                sample_alert("rule_a", vec![Uuid::now_v7()], 1000),
+                sample_alert("rule_b", vec![Uuid::now_v7()], 2000),
+            ])
+            .unwrap();
+
+        let Json(alerts) = alerts_handler(
+            State(storage),
+            Query(AlertsQuery {
+                rule_id: Some("rule_a".to_string()),
+                since: None,
+                until: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "rule_a");
+    }
+
+    #[tokio::test]
+    async fn file_story_returns_400_when_neither_param_given() {
+        let (_dir, storage) = test_storage();
+        let result = file_story_handler(
+            State(storage),
+            Query(FileStoryQuery {
+                path: None,
+                file_id: None,
+            }),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_story_by_path_returns_events_and_citing_alerts() {
+        let (_dir, storage) = test_storage();
+        let device_id = encode_device_id(8, 1);
+        let e1 = file_event(EventType::FileCreate, "/var/www/html/a.php", 1, device_id, 1000);
+        let e2 = file_event(EventType::FileWrite, "/var/www/html/a.php", 1, device_id, 2000);
+        let unrelated = sample_event(999, None, 500); // process event, must not appear
+        storage
+            .batch_write(&[e1.clone(), e2.clone(), unrelated])
+            .unwrap();
+
+        let alert = sample_alert("rule_a", vec![e1.event_id], 1000);
+        storage.write_alerts(&[alert]).unwrap();
+
+        let Json(story) = file_story_handler(
+            State(storage),
+            Query(FileStoryQuery {
+                path: Some("/var/www/html/a.php".to_string()),
+                file_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 2);
+        assert_eq!(story.events[0].event_id, e1.event_id);
+        assert_eq!(story.events[1].event_id, e2.event_id);
+        assert_eq!(story.alerts.len(), 1);
+        assert_eq!(story.alerts[0].rule_id(), "rule_a");
+    }
+
+    #[tokio::test]
+    async fn file_story_by_path_follows_a_rename_via_identity() {
+        let (_dir, storage) = test_storage();
+        let device_id = encode_device_id(8, 1);
+        let created = file_event(EventType::FileCreate, "/tmp/a.txt", 42, device_id, 1000);
+        let renamed = file_event(EventType::FileRename, "/tmp/b.txt", 42, device_id, 2000);
+        storage
+            .batch_write(&[created.clone(), renamed.clone()])
+            .unwrap();
+
+        let Json(story) = file_story_handler(
+            State(storage),
+            Query(FileStoryQuery {
+                path: Some("/tmp/a.txt".to_string()),
+                file_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 2);
+        let ids: Vec<Uuid> = story.events.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&created.event_id));
+        assert!(ids.contains(&renamed.event_id));
+    }
+
+    #[tokio::test]
+    async fn file_story_by_file_id_works_without_a_path() {
+        let (_dir, storage) = test_storage();
+        let device_id = encode_device_id(8, 1);
+        let created = file_event(EventType::FileCreate, "/tmp/a.txt", 42, device_id, 1000);
+        let renamed = file_event(EventType::FileRename, "/tmp/b.txt", 42, device_id, 2000);
+        storage
+            .batch_write(&[created.clone(), renamed.clone()])
+            .unwrap();
+
+        let identity = FileIdentity::new(42, device_id);
+        let Json(story) = file_story_handler(
+            State(storage),
+            Query(FileStoryQuery {
+                path: None,
+                file_id: Some(identity.as_key()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 2);
+        let ids: Vec<Uuid> = story.events.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&created.event_id));
+        assert!(ids.contains(&renamed.event_id));
     }
 }

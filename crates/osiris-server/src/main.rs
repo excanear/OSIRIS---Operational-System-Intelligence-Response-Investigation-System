@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_api::build_router;
+use osiris_detect::DetectionEngine;
 use osiris_server::{run_ingestion_loop, ServerConfig};
 use osiris_storage::Storage;
 use osiris_storage_sqlite::SqliteStorage;
@@ -34,12 +35,21 @@ async fn main() {
         }
     };
 
+    let detection_engine = match DetectionEngine::load_from_dir(Path::new(&config.rules_dir)) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            eprintln!("failed to load detection rules from {}: {}", config.rules_dir, e);
+            std::process::exit(1);
+        }
+    };
+
     let cancellation = CancellationToken::new();
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
     tokio::spawn(run_ingestion_loop(
         spool_path,
         ingest_storage,
+        detection_engine,
         Duration::from_millis(200),
         cancellation.clone(),
     ));
