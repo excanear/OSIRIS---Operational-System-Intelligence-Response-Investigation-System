@@ -26,6 +26,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/alerts", get(alerts_handler))
         .route("/api/v1/files/story", get(file_story_handler))
         .route("/api/v1/network/story", get(network_story_handler))
+        .route("/api/v1/identity/story", get(identity_story_handler))
         .with_state(storage)
 }
 
@@ -356,6 +357,87 @@ async fn network_story_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(NetworkStory { events, alerts }))
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityStoryQuery {
+    session_id: Option<String>,
+    uid: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct IdentityStory {
+    events: Vec<CanonicalEvent>,
+    alerts: Vec<Alert>,
+}
+
+/// Composed query implementing Phase 4a plan Global Constraint #10, and
+/// ARCHITECTURE.md §12.1's `*_story` shape — the same `{ events, alerts }`
+/// response `FileStory` and `NetworkStory` already return, so one Console
+/// renderer serves all three.
+///
+/// The two lookup forms are deliberately asymmetric:
+///
+/// * **`session_id`** returns every stored event carrying that session.
+///   Because the Enrich stage attaches the session to every descendant of
+///   the login (plan Global Constraint #5), that single filter returns the
+///   genuinely multi-category chain §29's Phase 4 line calls for —
+///   identity, process, privilege, file and network together — without any
+///   graph walk. No Correlation Engine is involved; this is one indexed
+///   column (plan Global Constraint #12).
+/// * **`uid`** returns every stored event whose acting user is that uid. It
+///   does NOT expand to "and everything in every session that user opened":
+///   that second-pass fan-out is unbounded for a long-lived service
+///   account, and §12.3's planner that could express it cheaply is Phase 7.
+///   Every returned event carries its own session id, so the analyst who
+///   wants the session view takes that one extra step deliberately.
+///
+/// Both may be given at once, in which case they intersect (they are two
+/// `AND` clauses of one `QueryPlan`), which is what the single query below
+/// gives for free.
+async fn identity_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<IdentityStoryQuery>,
+) -> Result<Json<IdentityStory>, (StatusCode, String)> {
+    if q.session_id.is_none() && q.uid.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide session_id or uid".to_string(),
+        ));
+    }
+
+    let (events, alerts) = tokio::task::spawn_blocking(move || {
+        // Unlike the File and Network stories, this needs no union across
+        // several queries: one indexed filter already selects the whole
+        // chain, so there is no de-duplication step to perform and the
+        // storage layer's own ORDER BY timestamp is the ordering.
+        let mut plan = QueryPlan::new();
+        plan.session_id = q.session_id.clone();
+        plan.user_uid = q.uid;
+        plan.limit = 10_000;
+        let mut events = storage.query(&plan)?;
+        // Storage already orders by timestamp; the secondary event_id key
+        // makes the order total for same-timestamp events, matching the
+        // File and Network stories exactly.
+        events.sort_by_key(|e| (e.timestamp, e.event_id));
+
+        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        let alerts = if evidence_ids.is_empty() {
+            vec![]
+        } else {
+            let mut alert_plan = AlertQueryPlan::new();
+            alert_plan.evidence_event_ids = evidence_ids;
+            alert_plan.limit = 10_000;
+            storage.query_alerts(&alert_plan)?
+        };
+
+        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(IdentityStory { events, alerts }))
 }
 
 #[cfg(test)]
@@ -917,5 +999,267 @@ mod tests {
 
         assert_eq!(story.events.len(), 1);
         assert_eq!(story.events[0].event_id, connect.event_id);
+    }
+
+    fn session_event(
+        event_type: EventType,
+        session_id: &str,
+        uid: u32,
+        remote_addr: Option<&str>,
+        timestamp: u64,
+    ) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type,
+            category: event_type.category(),
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: Some(osiris_schema::UserRef {
+                uid,
+                gid: uid,
+                euid: uid,
+                egid: uid,
+                username: Some("alice".to_string()),
+                loginuid: Some(1000),
+            }),
+            session: Some(osiris_schema::SessionRef {
+                session_id: session_id.to_string(),
+                tty: Some("/dev/pts/0".to_string()),
+                remote_addr: remote_addr.map(str::to_string),
+                auth_method: Some("sshd".to_string()),
+            }),
+            process: Some(ProcessRef {
+                process_key: ProcessKey::new(host_id, "b", 300, timestamp),
+                pid: 300,
+                exe_path: "/usr/bin/sudo".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: timestamp,
+            }),
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_story_returns_400_when_neither_param_given() {
+        let (_dir, storage) = test_storage();
+        let result = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: None,
+                uid: None,
+            }),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Global Constraint #10's session form: because Enrich attaches the
+    /// session to every descendant event, one session id returns the whole
+    /// multi-category chain, time-ordered, plus every citing alert.
+    #[tokio::test]
+    async fn identity_story_by_session_returns_the_whole_multi_category_chain() {
+        let (_dir, storage) = test_storage();
+        let login = session_event(EventType::SessionLogin, "3", 0, Some("198.51.100.10"), 1000);
+        let exec = session_event(EventType::ProcessExec, "3", 1000, Some("198.51.100.10"), 2000);
+        let escalation = session_event(
+            EventType::PrivilegeUidChange,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            3000,
+        );
+        let other_session = session_event(EventType::SessionLogin, "4", 0, None, 4000);
+        storage
+            .batch_write(&[
+                login.clone(),
+                exec.clone(),
+                escalation.clone(),
+                other_session,
+            ])
+            .unwrap();
+        storage
+            .write_alerts(&[sample_alert(
+                "privilege_escalation_to_root_in_remote_session",
+                vec![escalation.event_id],
+                3000,
+            )])
+            .unwrap();
+
+        let Json(story) = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: Some("3".to_string()),
+                uid: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 3);
+        assert_eq!(story.events[0].event_id, login.event_id);
+        assert_eq!(story.events[1].event_id, exec.event_id);
+        assert_eq!(story.events[2].event_id, escalation.event_id);
+        let categories: std::collections::HashSet<_> =
+            story.events.iter().map(|e| e.category).collect();
+        assert!(categories.contains(&Category::Identity));
+        assert!(categories.contains(&Category::Process));
+        assert!(categories.contains(&Category::Privilege));
+        assert_eq!(story.alerts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_story_by_uid_returns_that_users_events_and_citing_alerts() {
+        let (_dir, storage) = test_storage();
+        let root_event = session_event(
+            EventType::PrivilegeUidChange,
+            "3",
+            0,
+            Some("198.51.100.10"),
+            1000,
+        );
+        let alice_event = session_event(
+            EventType::PrivilegeUidChange,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            2000,
+        );
+        storage
+            .batch_write(&[root_event.clone(), alice_event])
+            .unwrap();
+        storage
+            .write_alerts(&[sample_alert("some_rule", vec![root_event.event_id], 1000)])
+            .unwrap();
+
+        let Json(story) = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: None,
+                uid: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(story.events.len(), 1);
+        assert_eq!(story.events[0].event_id, root_event.event_id);
+        assert_eq!(story.alerts.len(), 1);
+    }
+
+    /// Global Constraint #10's disclosed asymmetry: the uid form does NOT
+    /// fan out to every event of every session that user opened. The
+    /// analyst who wants that starts from the session id, which every
+    /// returned event carries.
+    #[tokio::test]
+    async fn identity_story_by_uid_does_not_expand_to_the_whole_session() {
+        let (_dir, storage) = test_storage();
+        // uid 0 logged in; a uid-1000 process then ran in that same session.
+        let login_as_root = session_event(
+            EventType::SessionLogin,
+            "3",
+            0,
+            Some("198.51.100.10"),
+            1000,
+        );
+        let alice_exec =
+            session_event(EventType::ProcessExec, "3", 1000, Some("198.51.100.10"), 2000);
+        storage
+            .batch_write(&[login_as_root.clone(), alice_exec])
+            .unwrap();
+
+        let Json(story) = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: None,
+                uid: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            story.events.len(),
+            1,
+            "the uid form must not fan out into the session's other events"
+        );
+        assert_eq!(story.events[0].event_id, login_as_root.event_id);
+        // ...and the session id is right there on it, so the analyst can
+        // take the next step themselves.
+        assert_eq!(
+            story.events[0].session.as_ref().unwrap().session_id,
+            "3"
+        );
+    }
+
+    /// Both forms together intersect rather than union — the same
+    /// composition rule every other filter pair in QueryPlan follows.
+    #[tokio::test]
+    async fn identity_story_with_both_params_intersects_them() {
+        let (_dir, storage) = test_storage();
+        let alice_in_3 = session_event(EventType::ProcessExec, "3", 1000, None, 1000);
+        let root_in_3 = session_event(EventType::ProcessExec, "3", 0, None, 2000);
+        let alice_in_4 = session_event(EventType::ProcessExec, "4", 1000, None, 3000);
+        storage
+            .batch_write(&[alice_in_3.clone(), root_in_3, alice_in_4])
+            .unwrap();
+
+        let Json(story) = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: Some("3".to_string()),
+                uid: Some(1000),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(story.events.len(), 1);
+        assert_eq!(story.events[0].event_id, alice_in_3.event_id);
+    }
+
+    #[tokio::test]
+    async fn identity_story_returns_an_empty_story_rather_than_404_for_an_unknown_session() {
+        let (_dir, storage) = test_storage();
+        let Json(story) = identity_story_handler(
+            State(storage),
+            Query(IdentityStoryQuery {
+                session_id: Some("does-not-exist".to_string()),
+                uid: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(story.events.is_empty());
+        assert!(story.alerts.is_empty());
     }
 }
