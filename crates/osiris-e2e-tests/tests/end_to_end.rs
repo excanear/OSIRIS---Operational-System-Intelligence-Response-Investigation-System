@@ -991,9 +991,13 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
 
     // 9. Identity Story by uid: Global Constraint #10's disclosed
     //    asymmetry — the uid form does not fan out to the whole session.
-    //    uid 0 acted on the login, the logout and the outbound connection
-    //    (which the escalated process made as root); it did not act on the
-    //    uid-1000 events.
+    //    `user` is only populated on Identity/Privilege events today (see
+    //    `normalize.rs`'s `normalize_network_event`, which never sets it),
+    //    and of this scenario's Identity/Privilege events only the login
+    //    and logout carry uid 0 — sshd authenticates as root for both. The
+    //    sudo and uid-change Privilege events carry uid 1000 (the actor,
+    //    alice, not the euid=0 she escalated to), and the file/network
+    //    events carry no `user` at all. So exactly 2 events come back.
     let uid_story: serde_json::Value = client
         .get(format!("http://{}/api/v1/identity/story?uid=0", addr))
         .send()
@@ -1003,10 +1007,12 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
         .await
         .unwrap();
     let uid_story_events = uid_story["events"].as_array().unwrap();
-    assert!(
-        uid_story_events.len() < story_events.len(),
+    assert_eq!(
+        uid_story_events.len(),
+        2,
         "the uid form must NOT expand to every event in the sessions that user opened \
-         — Global Constraint #10's disclosed asymmetry"
+         — Global Constraint #10's disclosed asymmetry — and must return exactly the \
+         login and logout, the only two events that carry uid 0"
     );
     assert!(uid_story_events
         .iter()

@@ -240,7 +240,13 @@ pub struct IdentityEventRaw {
     /// §9.2's `SessionRef.auth_method`. `None` when `exe=` is absent.
     pub auth_method: Option<String>,
     /// From the nested `res=`: `res=success` -> true, anything else ->
-    /// false. A failed login is still a real, storable event.
+    /// false. A `USER_LOGIN` failure that still carries a real (non-sentinel)
+    /// `ses=` is a real, storable event with `success: false` — but the
+    /// common case, a login PAM never opened a session for, prints auditd's
+    /// `(unsigned)-1` "no session" sentinel in `ses=` and is dropped
+    /// upstream by the session-required gate before `success` is ever read,
+    /// same as any other session-less `USER_*` record (Global Constraint
+    /// #9's disclosed drop).
     pub success: bool,
     /// From the nested `exe=`, full path. Empty string when absent.
     pub exe_path: String,

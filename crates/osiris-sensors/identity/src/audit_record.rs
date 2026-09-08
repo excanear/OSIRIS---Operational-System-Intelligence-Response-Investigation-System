@@ -61,7 +61,16 @@ pub fn split_record(line: &str) -> Option<RecordParts> {
     let (outer_text, inner_text) = match body.find("msg='") {
         Some(start) => {
             let after = &body[start + 5..];
-            match after.find('\'') {
+            // Close on the LAST `'` in the remainder, not the first. Every
+            // real auditd `USER_*` record puts the nested `msg='…'`
+            // sub-record last, so its closing quote is the final `'` on the
+            // line. Closing on the first `'` instead would let an embedded
+            // quote inside an inner field (e.g. `acct="o'brien"`) truncate
+            // the inner record early and splice the genuine remainder back
+            // into the trusted `outer` layer, where a forged `ses=`/`uid=`/
+            // `pid=` could shadow the real one via `tokenize`'s last-wins
+            // `HashMap` semantics.
+            match after.rfind('\'') {
                 Some(close) => {
                     let mut outer = String::with_capacity(body.len());
                     outer.push_str(&body[..start]);
@@ -388,6 +397,25 @@ mod tests {
         assert!(split_record("type=USER_LOGIN pid=1200").is_none());
     }
 
+    /// An embedded `'` inside an inner field (e.g. `acct="o'brien"`) must
+    /// not let the splitter close the nested `msg='...'` sub-record early
+    /// and splice the genuine remainder — including a forged `ses=` placed
+    /// after that stray quote — back into the trusted outer layer. Closing
+    /// on the LAST `'` on the line, not the first one found after `msg='`,
+    /// is what prevents that: this fixture would leak `ses=9999` into
+    /// `outer` (and let it shadow the real `ses=3` via `tokenize`'s
+    /// last-wins `HashMap`) under the old first-quote-closes logic.
+    #[test]
+    fn an_embedded_quote_in_an_inner_field_does_not_leak_a_forged_key_into_outer() {
+        let line = r#"type=USER_START msg=audit(1690000000.130:457): pid=1200 uid=0 auid=1000 ses=3 msg='op=PAM:session_open grantors=pam_selinux,pam_loginuid,pam_keyinit acct="o'brien" exe="/usr/sbin/sshd" hostname=198.51.100.10 addr=198.51.100.10 terminal=/dev/pts/0 res=success ses=9999'"#;
+        let parts = split_record(line).expect("must split");
+        // The real ses=3 (from the outer header body) must be what a
+        // lookup returns — the forged ses=9999 embedded after the stray
+        // apostrophe must never reach the outer layer or shadow it.
+        assert_eq!(parts.outer.get("ses").map(String::as_str), Some("3"));
+        assert_eq!(parts.get("ses"), Some("3"));
+    }
+
     // --- Identity records ---
 
     #[test]
@@ -459,16 +487,19 @@ mod tests {
         }
     }
 
+    /// A real failed login carries auditd's `(unsigned)-1` "no session"
+    /// sentinel (`ses=4294967295`), not a real session id — PAM never opens
+    /// a session for a login it is about to fail. Such a record is dropped
+    /// by the session-required gate before `success` is ever read, so
+    /// `success: false` for `USER_LOGIN` is unreachable on real input using
+    /// a fixture that (like the old version of this test) keeps a valid
+    /// `ses=3`, which auditd would never actually emit for a failure.
     #[test]
-    fn a_failed_login_is_still_emitted_with_success_false() {
-        let failed = USER_LOGIN.replace("res=success", "res=failed");
-        match parse_record(&failed).expect("must parse") {
-            IdentityRecord::Identity(i) => {
-                assert_eq!(i.operation, IdentityOperation::Login);
-                assert!(!i.success);
-            }
-            other => panic!("expected an Identity record, got {other:?}"),
-        }
+    fn a_failed_login_with_no_session_is_dropped() {
+        let failed = USER_LOGIN
+            .replace("res=success", "res=failed")
+            .replace("ses=3", "ses=4294967295");
+        assert!(parse_record(&failed).is_none());
     }
 
     /// `ses=4294967295` is auditd's `(unsigned)-1` sentinel for "no audit

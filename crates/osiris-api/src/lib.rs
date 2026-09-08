@@ -1130,8 +1130,7 @@ mod tests {
         assert_eq!(story.events[0].event_id, login.event_id);
         assert_eq!(story.events[1].event_id, exec.event_id);
         assert_eq!(story.events[2].event_id, escalation.event_id);
-        let categories: std::collections::HashSet<_> =
-            story.events.iter().map(|e| e.category).collect();
+        let categories: Vec<Category> = story.events.iter().map(|e| e.category).collect();
         assert!(categories.contains(&Category::Identity));
         assert!(categories.contains(&Category::Process));
         assert!(categories.contains(&Category::Privilege));
