@@ -28,7 +28,9 @@ osiris-bus = { path = "../osiris-bus" }
 osiris-sensors-process = { path = "../osiris-sensors/process" }
 osiris-sensors-fs = { path = "../osiris-sensors/fs" }
 osiris-sensors-net = { path = "../osiris-sensors/net" }
+osiris-sensors-identity = { path = "../osiris-sensors/identity" }
 osiris-generator = { path = "../../generator" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }

@@ -1,7 +1,8 @@
 use osiris_schema::encode_device_id;
 use osiris_sensor_api::{
-    DnsEventRaw, FileEventRaw, FileOperation, NetworkDirection, NetworkEventRaw,
-    NetworkOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
+    NetworkDirection, NetworkEventRaw, NetworkOperation, PrivilegeEventRaw, PrivilegeOperation,
+    ProcessExecRaw, RawEvent, RawEventSource,
 };
 
 /// The identity the staged payload keeps across create -> write -> rename.
@@ -20,6 +21,20 @@ const BENIGN_NOTES_INODE: u64 = 300_777;
 /// Task 6/7 (now Task 6) of Phase 2.
 pub const BEACON_DOMAIN: &str = "cdn-assets.xyz";
 pub const BEACON_IP: &str = "203.0.113.50";
+
+/// The audit session id the whole Phase 4a chain hangs off. A string, not
+/// an integer, because §9.2's `SessionRef.session_id` is one.
+pub const SSH_SESSION_ID: &str = "3";
+/// The address the session was opened from — what makes Task 6's rule
+/// able to say "a remote session" rather than "any escalation".
+pub const SSH_REMOTE_ADDR: &str = "198.51.100.10";
+/// What the escalated process writes: the canonical post-escalation
+/// persistence touch, and a FILE-category event under the same session.
+pub const ROOT_KEYS_PATH: &str = "/root/.ssh/authorized_keys";
+const ROOT_KEYS_INODE: u64 = 400_555;
+/// Where it then connects — a NETWORK-category event under the same
+/// session, completing §26's identity->process->file->network chain.
+pub const ESCALATION_C2_IP: &str = "203.0.113.77";
 
 /// A minimal process/exec scenario mirroring ARCHITECTURE.md §26's worked
 /// trace (sshd -> bash -> curl). Timestamps are relative nanoseconds
@@ -149,6 +164,138 @@ pub fn network_beacon_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
     ]
 }
 
+/// ARCHITECTURE.md §26's worked trace from its true first step: sshd
+/// accepts a remote connection, audit records the login, a shell runs
+/// inside that session, sudo escalates it to root, and the escalated
+/// process writes root's authorized_keys and then calls out to a remote
+/// address. Nine events spanning all five categories this codebase can
+/// produce, every one of them under session id `SSH_SESSION_ID` once the
+/// Enrich stage's `SessionResolver` has propagated it (Phase 4a plan
+/// Global Constraint #5).
+///
+/// The logout is deliberately last: `SESSION_LOGOUT` prunes the session
+/// from the resolver, so an earlier placement would leave every subsequent
+/// event unattributed — which is correct behaviour, and exactly why the
+/// ordering matters here.
+pub fn ssh_sudo_escalation_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
+    vec![
+        exec(100, 1, "/usr/sbin/sshd", "sshd", base_ts_ns),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            // sshd authenticates as root; the user who logged in is `auid`.
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 1_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }),
+        exec(200, 100, "/bin/bash", "bash", base_ts_ns + 2_000_000),
+        exec(300, 200, "/usr/bin/sudo", "sudo", base_ts_ns + 3_000_000),
+        RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::Sudo,
+            pid: 300,
+            // USER_CMD carries no ppid — 0 is the "no parent reported"
+            // convention, and the resolver still attributes this event
+            // because pid 300 is already a known session member from its
+            // own exec above.
+            ppid: 0,
+            uid: 1000,
+            gid: None,
+            euid: None,
+            egid: None,
+            auid: Some(1000),
+            session_id: Some(SSH_SESSION_ID.to_string()),
+            username: None,
+            // Global Constraint #9: USER_CMD does not reliably report the
+            // target account, so the synthetic record does not invent one
+            // either — the generator must produce records the real sensor
+            // could actually have produced.
+            target_uid: None,
+            target_gid: None,
+            command: Some("/usr/bin/tee /root/.ssh/authorized_keys".to_string()),
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: base_ts_ns + 4_000_000,
+            audit_serial: Some(469),
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::UidChange,
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            gid: Some(1000),
+            euid: Some(0),
+            egid: Some(1000),
+            auid: Some(1000),
+            session_id: Some(SSH_SESSION_ID.to_string()),
+            username: None,
+            target_uid: Some(0),
+            target_gid: None,
+            command: None,
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: base_ts_ns + 5_000_000,
+            audit_serial: Some(470),
+            source: RawEventSource::Synthetic,
+        }),
+        file_event(
+            FileOperation::Write,
+            ROOT_KEYS_PATH,
+            None,
+            ROOT_KEYS_INODE,
+            300,
+            200,
+            "/usr/bin/sudo",
+            "sudo",
+            base_ts_ns + 6_000_000,
+        ),
+        RawEvent::Network(NetworkEventRaw {
+            operation: NetworkOperation::Connect,
+            local_addr: "10.0.0.5".to_string(),
+            local_port: 51001,
+            remote_addr: ESCALATION_C2_IP.to_string(),
+            remote_port: 443,
+            proto: "tcp".to_string(),
+            direction: NetworkDirection::Outbound,
+            pid: Some(300),
+            uid: 0,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: base_ts_ns + 7_000_000,
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Logout,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 8_000_000,
+            audit_serial: Some(513),
+            source: RawEventSource::Synthetic,
+        }),
+    ]
+}
+
 fn exec(pid: u32, ppid: u32, exe_path: &str, comm: &str, timestamp_ns: u64) -> RawEvent {
     RawEvent::ProcessExec(ProcessExecRaw {
         pid,
@@ -232,7 +379,11 @@ mod tests {
 
     #[test]
     fn every_scenario_is_strictly_time_ordered() {
-        for scenario in [exec_chain_scenario(1000), web_shell_drop_scenario(1000)] {
+        for scenario in [
+            exec_chain_scenario(1000),
+            web_shell_drop_scenario(1000),
+            ssh_sudo_escalation_scenario(1000),
+        ] {
             for pair in scenario.windows(2) {
                 assert!(
                     pair[0].timestamp_ns() < pair[1].timestamp_ns(),
@@ -355,5 +506,96 @@ mod tests {
         let dns = dns_raw_events(&scenario);
         let net = network_raw_events(&scenario);
         assert_eq!(dns[0].response_ips[0], net[0].remote_addr);
+    }
+
+    fn identity_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::IdentityEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Identity(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn privilege_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::PrivilegeEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Privilege(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ARCHITECTURE.md §26's worked trace, now from its actual first step:
+    /// sshd accepts a connection, PAM/audit records the session, a shell
+    /// runs inside it, sudo escalates to root, and the escalated process
+    /// then touches the filesystem and the network — so the resulting
+    /// stored chain spans IDENTITY, PROCESS, PRIVILEGE, FILE and NETWORK,
+    /// all under one session id.
+    #[test]
+    fn ssh_sudo_escalation_scenario_spans_all_five_categories_under_one_session() {
+        let scenario = ssh_sudo_escalation_scenario(1_000_000_000);
+        assert_eq!(scenario.len(), 9);
+
+        let identity = identity_raw_events(&scenario);
+        assert_eq!(identity.len(), 2, "one login, one logout");
+        assert_eq!(identity[0].operation, osiris_sensor_api::IdentityOperation::Login);
+        assert_eq!(identity[0].session_id, SSH_SESSION_ID);
+        assert_eq!(identity[0].remote_addr.as_deref(), Some(SSH_REMOTE_ADDR));
+        assert_eq!(identity[0].auth_method.as_deref(), Some("sshd"));
+        assert_eq!(identity[0].pid, 100, "the login is rooted at sshd's pid");
+        assert_eq!(
+            identity[1].operation,
+            osiris_sensor_api::IdentityOperation::Logout
+        );
+
+        assert_eq!(exec_events(&scenario).len(), 3, "sshd, bash, sudo");
+
+        let privilege = privilege_raw_events(&scenario);
+        assert_eq!(privilege.len(), 2, "one sudo invocation, one uid change");
+        assert_eq!(privilege[0].operation, osiris_sensor_api::PrivilegeOperation::Sudo);
+        assert_eq!(privilege[1].operation, osiris_sensor_api::PrivilegeOperation::UidChange);
+        assert_eq!(privilege[1].uid, 1000);
+        assert_eq!(privilege[1].target_uid, Some(0), "escalation to root");
+
+        assert_eq!(file_events(&scenario).len(), 1);
+        assert_eq!(file_events(&scenario)[0].path, ROOT_KEYS_PATH);
+        assert_eq!(network_raw_events(&scenario).len(), 1);
+        assert_eq!(network_raw_events(&scenario)[0].remote_addr, ESCALATION_C2_IP);
+    }
+
+    /// The escalating process must be a descendant of the login's pid, or
+    /// the Enrich stage's ppid-inheritance chain cannot reach it and the
+    /// whole phase's correlation silently produces nothing.
+    #[test]
+    fn every_post_login_actor_descends_from_the_logins_pid() {
+        let scenario = ssh_sudo_escalation_scenario(1_000_000_000);
+        let execs = exec_events(&scenario);
+        assert_eq!((execs[0].pid, execs[0].ppid), (100, 1), "sshd");
+        assert_eq!((execs[1].pid, execs[1].ppid), (200, 100), "bash under sshd");
+        assert_eq!((execs[2].pid, execs[2].ppid), (300, 200), "sudo under bash");
+
+        let escalation = privilege_raw_events(&scenario)[1];
+        assert_eq!((escalation.pid, escalation.ppid), (300, 200));
+        // The file and network events name pid 300, which by then is a
+        // known session member via its own exec.
+        assert_eq!(file_events(&scenario)[0].pid, 300);
+        assert_eq!(network_raw_events(&scenario)[0].pid, Some(300));
+    }
+
+    /// The logout is last, so it cannot prune the session before the events
+    /// that must inherit it are processed.
+    #[test]
+    fn ssh_sudo_escalation_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
+        let scenario = ssh_sudo_escalation_scenario(1_000_000_000);
+        let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(timestamps, sorted);
+        assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
+        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout));
     }
 }

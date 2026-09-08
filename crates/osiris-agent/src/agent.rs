@@ -4,13 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
 use osiris_generator::{
-    exec_chain_scenario, network_beacon_scenario, web_shell_drop_scenario, SyntheticSensor,
+    exec_chain_scenario, network_beacon_scenario, ssh_sudo_escalation_scenario,
+    web_shell_drop_scenario, SyntheticSensor,
 };
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
 use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
 use osiris_sensors_fs::FilesystemSensor;
+use osiris_sensors_identity::IdentitySensor;
 use osiris_sensors_net::NetworkSensor;
 use osiris_sensors_process::ProcessExecSensor;
 use thiserror::Error;
@@ -82,6 +84,9 @@ impl Agent {
         if let Some(proc_root) = &config.network_proc_root {
             candidate_sensors.push(Box::new(NetworkSensor::new(proc_root.clone())));
         }
+        if let Some(path) = &config.identity_audit_log_path {
+            candidate_sensors.push(Box::new(IdentitySensor::new(path.clone())));
+        }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -90,6 +95,7 @@ impl Agent {
             let scenario = match config.synthetic_scenario.as_deref() {
                 Some("web_shell_drop") => web_shell_drop_scenario(base_ts),
                 Some("network_beacon") => network_beacon_scenario(base_ts),
+                Some("ssh_sudo_escalation") => ssh_sudo_escalation_scenario(base_ts),
                 Some("exec_chain") | None => exec_chain_scenario(base_ts),
                 Some(other) => {
                     tracing::warn!(
@@ -250,6 +256,7 @@ mod tests {
             audit_log_path: None,
             fs_audit_log_path: None,
             network_proc_root: None,
+            identity_audit_log_path: None,
             enable_synthetic: false,
             synthetic_scenario: None,
             spool_path: dir
@@ -467,5 +474,74 @@ mod tests {
         assert!(contents.contains("\"NETWORK_CONNECT\""));
         assert!(contents.contains("\"NETWORK_CLOSE\""));
         assert!(contents.contains("cdn-assets.xyz"));
+    }
+
+    #[tokio::test]
+    async fn the_identity_sensor_is_skipped_with_a_reason_when_its_log_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = false;
+        config.identity_audit_log_path =
+            Some(dir.path().join("missing.log").to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let skipped = agent.skipped_sensors();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "identity");
+        assert!(skipped[0].reason.contains("audit log not found"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_identity_sensor_starts_when_its_log_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity_log = dir.path().join("identity-audit.log");
+        std::fs::write(&identity_log, "").unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = false;
+        config.identity_audit_log_path =
+            Some(identity_log.to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert_eq!(status.sensors.len(), 1);
+        assert_eq!(status.sensors[0].name, "identity");
+        assert!(status.skipped_sensors.is_empty());
+        agent.shutdown().await;
+    }
+
+    /// The scenario selector must reach the new scenario; an unknown name
+    /// still falls back to exec_chain with a warning, unchanged.
+    #[tokio::test]
+    async fn the_ssh_sudo_escalation_scenario_is_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("ssh_sudo_escalation".to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        agent.shutdown().await;
+
+        let spool = std::fs::read_to_string(dir.path().join("spool.ndjson")).unwrap();
+        let lines: Vec<&str> = spool.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 9, "all nine scenario events must reach the spool");
+        let categories: std::collections::HashSet<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["category"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        for expected in ["IDENTITY", "PROCESS", "PRIVILEGE", "FILE", "NETWORK"] {
+            assert!(categories.contains(expected), "missing category {expected}");
+        }
     }
 }

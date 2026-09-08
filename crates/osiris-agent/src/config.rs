@@ -38,14 +38,26 @@ pub struct AgentConfig {
     /// (capabilities()-driven, never silently).
     #[serde(default)]
     pub network_proc_root: Option<String>,
+    /// Path to a Linux auditd-style log file for the Identity sensor's
+    /// audit backend, carrying `USER_*`, `USER_CMD` and `setuid`/`setgid`
+    /// `SYSCALL` records (Phase 4a plan Global Constraints #2/#4). A
+    /// separate key from `audit_log_path`/`fs_audit_log_path` so an
+    /// operator can point each sensor at its own rule-scoped log; pointing
+    /// several of them at the same file is equally valid, because each
+    /// sensor ignores the records the others consume. Skipped, never
+    /// silently, if absent or non-existent.
+    #[serde(default)]
+    pub identity_audit_log_path: Option<String>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
     /// Which canned scenario the synthetic sensor emits: `"exec_chain"`
     /// (default, Phase 1's sshd->bash->curl), `"web_shell_drop"` (that
-    /// chain continued into the filesystem), or `"network_beacon"` (that
-    /// chain continued into DNS and network). Ignored unless
-    /// `enable_synthetic` is true.
+    /// chain continued into the filesystem), `"network_beacon"` (that
+    /// chain continued into DNS and network), or `"ssh_sudo_escalation"`
+    /// (§26's trace from its first step: login, shell, sudo escalation,
+    /// file write, outbound connection). Ignored unless `enable_synthetic`
+    /// is true.
     #[serde(default)]
     pub synthetic_scenario: Option<String>,
     /// Path to the NDJSON spool file (plan Global Constraints #3).
@@ -98,6 +110,36 @@ mod tests {
         assert!(config.fs_audit_log_path.is_none());
         assert!(config.synthetic_scenario.is_none());
         assert!(config.network_proc_root.is_none());
+    }
+
+    #[test]
+    fn the_new_phase_4a_field_defaults_to_none_so_earlier_configs_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: true\nspool_path: /tmp/spool.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.identity_audit_log_path.is_none());
+    }
+
+    #[test]
+    fn loads_an_identity_audit_log_path_when_one_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: false\nidentity_audit_log_path: /var/log/audit/audit.log\n\
+             spool_path: /tmp/spool.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert_eq!(
+            config.identity_audit_log_path.as_deref(),
+            Some("/var/log/audit/audit.log")
+        );
     }
 
     #[test]
