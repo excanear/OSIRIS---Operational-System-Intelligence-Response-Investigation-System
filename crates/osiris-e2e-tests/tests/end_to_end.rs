@@ -655,6 +655,376 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     assert_eq!(parsed.as_array().unwrap().len(), 6);
 }
 
+/// Phase 4a's full vertical slice, and ARCHITECTURE.md §26's worked trace
+/// from its true first step: sshd accepts a remote connection, audit
+/// records the login, a shell runs inside that session, sudo escalates it
+/// to root, and the escalated process writes root's authorized_keys and
+/// calls out to a remote address — all through the real Agent (Sensor →
+/// Pipeline → Bus → spool), the real Server (spool tailer → SqliteStorage →
+/// DetectionEngine → alert persistence) and the real HTTP API.
+///
+/// Verifies, in order: every event landed; the session propagated from the
+/// login down the whole process tree into the privilege, file and network
+/// events (plan Global Constraint #5); both §9.4 entity edges are present
+/// on exactly the right events and absent everywhere else (Global
+/// Constraint #8), asserted on `event.relationships` directly rather than
+/// inferred from the Story join; USER_REF_PARTIAL is applied only where
+/// auditd genuinely cannot report gid/euid/egid (Global Constraint #6);
+/// the shipped escalation rule fired and the other two did not; and the
+/// Identity Story returns the full multi-category chain over real HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        enable_synthetic: true,
+        synthetic_scenario: Some("ssh_sudo_escalation".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+
+    // The real shipped rules directory — now three rules, loaded exactly
+    // the way osiris-server's main.rs loads them.
+    let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+    let detection_engine = Arc::new(DetectionEngine::load_from_dir(&rules_dir).unwrap());
+    assert!(detection_engine.rule_count() >= 3);
+
+    let ingestion_cancellation = CancellationToken::new();
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        detection_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // 9-event scenario, 1ms apart, plus a 50ms ingestion poll interval —
+    // the same generous budget Phase 2 and Phase 3 used for comparable
+    // scenario sizes.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    // 1. Storage directly: all 9 events landed, across all five categories.
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    assert_eq!(
+        events.len(),
+        9,
+        "expected sshd/bash/sudo execs, login, sudo, uid change, file write, connect, logout"
+    );
+
+    // 2. Session propagation (Global Constraint #5): every event after the
+    //    login carries the SSH session — including the file and network
+    //    events, which is what makes the chain multi-category under one id.
+    //    The sshd exec that preceded the login does NOT, and must not be
+    //    retro-attributed.
+    let sshd_exec = events
+        .iter()
+        .find(|e| {
+            e.event_type == EventType::ProcessExec
+                && e.process.as_ref().map(|p| p.pid) == Some(100)
+        })
+        .expect("the sshd exec must be present");
+    assert!(
+        sshd_exec.session.is_none(),
+        "the exec that preceded the login must not be retro-attributed to it"
+    );
+
+    for event in &events {
+        // Skip the pre-login exec checked above.
+        if event.event_id == sshd_exec.event_id {
+            continue;
+        }
+        let session = event
+            .session
+            .as_ref()
+            .unwrap_or_else(|| panic!("{:?} must carry the session", event.event_type));
+        assert_eq!(session.session_id, "3");
+        assert_eq!(
+            session.remote_addr.as_deref(),
+            Some("198.51.100.10"),
+            "{:?} must carry the login's remote address, not just its id",
+            event.event_type
+        );
+        assert_eq!(session.auth_method.as_deref(), Some("sshd"));
+    }
+
+    // 3. The two §9.4 entity edges (Global Constraint #8), asserted on
+    //    event.relationships directly — a Story join would pass even if
+    //    these did not exist.
+    let bash_exec = events
+        .iter()
+        .find(|e| {
+            e.event_type == EventType::ProcessExec
+                && e.process.as_ref().map(|p| p.pid) == Some(200)
+        })
+        .expect("the bash exec must be present");
+    let triggered: Vec<_> = bash_exec
+        .relationships
+        .iter()
+        .filter(|r| r.relation == Relation::TriggeredBySession)
+        .collect();
+    assert_eq!(
+        triggered.len(),
+        1,
+        "a PROCESS_EXEC inside a session must carry exactly one TRIGGERED_BY_SESSION edge"
+    );
+    match (&triggered[0].from, &triggered[0].to) {
+        (EntityRef::Process { process_key }, EntityRef::Session { session_id }) => {
+            assert_eq!(*process_key, bash_exec.process.as_ref().unwrap().process_key);
+            assert_eq!(session_id, "3");
+        }
+        other => panic!("TRIGGERED_BY_SESSION must be Process -> Session, got {:?}", other),
+    }
+
+    let escalation = events
+        .iter()
+        .find(|e| e.event_type == EventType::PrivilegeUidChange)
+        .expect("the PRIVILEGE_UID_CHANGE event must be present");
+    let executed_as: Vec<_> = escalation
+        .relationships
+        .iter()
+        .filter(|r| r.relation == Relation::ExecutedAs)
+        .collect();
+    assert_eq!(
+        executed_as.len(),
+        1,
+        "a real uid transition must carry exactly one EXECUTED_AS edge"
+    );
+    match &executed_as[0].to {
+        EntityRef::User { uid, .. } => assert_eq!(*uid, 0, "the edge must target root"),
+        other => panic!("EXECUTED_AS must target a User entity, got {:?}", other),
+    }
+
+    // ...and nowhere else. The sudo event names no target account (Global
+    // Constraint #9), so it mints no EXECUTED_AS; the file and network
+    // events carry the session but not a duplicate TRIGGERED_BY_SESSION.
+    let sudo_event = events
+        .iter()
+        .find(|e| e.event_type == EventType::PrivilegeSudo)
+        .expect("the PRIVILEGE_SUDO event must be present");
+    assert!(
+        sudo_event
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::ExecutedAs),
+        "a USER_CMD-derived sudo event must not invent a target account"
+    );
+    for event in events.iter().filter(|e| {
+        matches!(
+            e.event_type,
+            EventType::FileWrite | EventType::NetworkConnect | EventType::PrivilegeUidChange
+        )
+    }) {
+        assert!(
+            event
+                .relationships
+                .iter()
+                .all(|r| r.relation != Relation::TriggeredBySession),
+            "TRIGGERED_BY_SESSION belongs on PROCESS_EXEC only — repeating it on \
+             every later event of a session writes one fact hundreds of times"
+        );
+    }
+
+    // 4. Provenance tags (Global Constraints #4/#6): the sudo event is
+    //    tagged partial because USER_CMD reports no gid/euid/egid; the
+    //    SYSCALL-derived escalation is NOT, because it reports them for
+    //    real. Both name the one Identity sensor in `provider`.
+    assert!(
+        sudo_event.tags.iter().any(|t| t == "USER_REF_PARTIAL"),
+        "a USER_CMD-derived event must be tagged partial, not silently mirrored"
+    );
+    assert!(
+        !escalation.tags.iter().any(|t| t == "USER_REF_PARTIAL"),
+        "a SYSCALL-derived event reports gid/euid/egid for real and must not be tagged"
+    );
+    for event in [sudo_event, escalation] {
+        assert!(
+            event.provider.starts_with("identity_sensor/"),
+            "§4.3 has no Privilege sensor row: privilege events name the Identity \
+            sensor in `provider` (got {:?})",
+            event.provider
+        );
+    }
+    assert!(
+        !events.iter().any(|e| e.tags.iter().any(|t| t == "INVALID")),
+        "no event in this scenario may fail validation"
+    );
+
+    // 5. Storage's own new filters work on real ingested rows (Task 4).
+    let mut plan = QueryPlan::new();
+    plan.session_id = Some("3".to_string());
+    assert_eq!(
+        storage.query(&plan).unwrap().len(),
+        8,
+        "every event except the pre-login sshd exec belongs to session 3"
+    );
+
+    // 6. Over real HTTP: Timeline interleaving of all five categories.
+    let app = build_router(storage.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let min_ts = events.iter().map(|e| e.timestamp).min().unwrap();
+    let max_ts = events.iter().map(|e| e.timestamp).max().unwrap();
+    let timeline: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/events?since={}&until={}",
+            addr,
+            min_ts - 1,
+            max_ts + 1
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let timeline_events = timeline.as_array().unwrap();
+    assert_eq!(timeline_events.len(), 9);
+    let timestamps: Vec<u64> = timeline_events
+        .iter()
+        .map(|e| e["timestamp"].as_u64().unwrap())
+        .collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort();
+    assert_eq!(timestamps, sorted, "events must come back in timestamp order");
+    let categories: std::collections::HashSet<_> = timeline_events
+        .iter()
+        .map(|e| e["category"].as_str().unwrap().to_string())
+        .collect();
+    for expected in ["IDENTITY", "PROCESS", "PRIVILEGE", "FILE", "NETWORK"] {
+        assert!(
+            categories.contains(expected),
+            "§29's Phase 4 line requires a genuinely multi-category chain; missing {expected}"
+        );
+    }
+
+    // 7. The shipped escalation rule fired — and only it. The file write
+    //    is to /root/.ssh, not /var/www, and the connection is to a bare IP
+    //    with no DNS query, so Phase 2's and Phase 3's rules must stay
+    //    silent on this scenario.
+    let alerts: serde_json::Value = client
+        .get(format!("http://{}/api/v1/alerts", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alerts_array = alerts.as_array().unwrap();
+    assert_eq!(
+        alerts_array.len(),
+        1,
+        "exactly one alert: the escalation rule, not the web-root or DNS rules"
+    );
+    assert_eq!(
+        alerts_array[0]["rule_id"].as_str().unwrap(),
+        "privilege_escalation_to_root_in_remote_session"
+    );
+    let reasons = alerts_array[0]["reasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), 3);
+    assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+    // §11.1: the alert cites the exact rule revision that fired.
+    assert_eq!(
+        alerts_array[0]["rule_content_hash"].as_str().unwrap().len(),
+        64
+    );
+    // ...and it cites the escalation event as its evidence.
+    let evidence: Vec<&str> = alerts_array[0]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(evidence.contains(&escalation.event_id.to_string().as_str()));
+
+    // 8. Identity Story by session over real HTTP: the whole
+    //    identity->process->privilege->file->network chain plus the citing
+    //    alert, in one response (Global Constraint #10's session form).
+    let story: serde_json::Value = client
+        .get(format!("http://{}/api/v1/identity/story?session_id=3", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let story_events = story["events"].as_array().unwrap();
+    assert_eq!(
+        story_events.len(),
+        8,
+        "the session story must contain every event of the session"
+    );
+    let story_categories: std::collections::HashSet<_> = story_events
+        .iter()
+        .map(|e| e["category"].as_str().unwrap().to_string())
+        .collect();
+    for expected in ["IDENTITY", "PROCESS", "PRIVILEGE", "FILE", "NETWORK"] {
+        assert!(story_categories.contains(expected), "story missing {expected}");
+    }
+    assert_eq!(story["alerts"].as_array().unwrap().len(), 1);
+
+    // 9. Identity Story by uid: Global Constraint #10's disclosed
+    //    asymmetry — the uid form does not fan out to the whole session.
+    //    uid 0 acted on the login, the logout and the outbound connection
+    //    (which the escalated process made as root); it did not act on the
+    //    uid-1000 events.
+    let uid_story: serde_json::Value = client
+        .get(format!("http://{}/api/v1/identity/story?uid=0", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uid_story_events = uid_story["events"].as_array().unwrap();
+    assert!(
+        uid_story_events.len() < story_events.len(),
+        "the uid form must NOT expand to every event in the sessions that user opened \
+         — Global Constraint #10's disclosed asymmetry"
+    );
+    assert!(uid_story_events
+        .iter()
+        .all(|e| e["user"]["uid"].as_u64() == Some(0)));
+
+    // 10. The real CLI binary still works against this richer dataset
+    //     (regression check, unchanged from Phase 2/3).
+    let cli_binary = cli_binary_path();
+    let output = std::process::Command::new(&cli_binary)
+        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 9);
+}
+
 /// Minimal ad-hoc percent-encoding for the one query-string value this test
 /// needs to send (a `/`-containing path) — not a general URL encoder.
 /// `reqwest` does not percent-encode a raw string interpolated into a

@@ -286,7 +286,7 @@ fn decode_untrusted_string(line: &str, key: &str, raw_value: &str) -> String {
 }
 
 fn decode_hex(raw: &str) -> Option<String> {
-    if raw.len() < 2 || raw.len() % 2 != 0 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if raw.len() < 2 || !raw.len().is_multiple_of(2) || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
