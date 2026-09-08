@@ -479,4 +479,157 @@ match:
         assert_eq!(dns_alerts.len(), 1);
         assert_eq!(dns_alerts[0].rule_id(), "dns_query_to_suspicious_tld");
     }
+
+    fn escalation_event(
+        event_type: EventType,
+        target_uid: Option<u32>,
+        remote_addr: Option<&str>,
+    ) -> CanonicalEvent {
+        let host_id = Uuid::new_v4();
+        let mut event = event(event_type, "/unused", "/usr/bin/sudo");
+        event.host_id = host_id;
+        event.category = event_type.category();
+        event.file = None;
+        event.user = Some(osiris_schema::UserRef {
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            username: Some("alice".to_string()),
+            loginuid: Some(1000),
+        });
+        event.session = Some(osiris_schema::SessionRef {
+            session_id: "3".to_string(),
+            tty: Some("/dev/pts/0".to_string()),
+            remote_addr: remote_addr.map(str::to_string),
+            auth_method: Some("sshd".to_string()),
+        });
+        event.event_data = serde_json::json!({
+            "comm": "sudo",
+            "ppid": 200,
+            "uid": 1000,
+            "target_uid": target_uid,
+            "target_gid": serde_json::Value::Null,
+            "success": true,
+        });
+        event
+    }
+
+    #[test]
+    fn the_shipped_privilege_escalation_rule_loads_and_fires_on_its_positive_fixture_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/privilege_escalation_to_root_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let engine = DetectionEngine::new(vec![Rule::from_yaml_str(
+            &yaml,
+            "privilege_escalation_to_root_in_remote_session.yaml",
+        )
+        .expect("the shipped rule must parse")]);
+
+        // Positive: a real escalation to root inside an SSH session.
+        let alerts = engine.evaluate(&escalation_event(
+            EventType::PrivilegeUidChange,
+            Some(0),
+            Some("198.51.100.10"),
+        ));
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "privilege_escalation_to_root_in_remote_session");
+        assert_eq!(alerts[0].severity(), Severity::High);
+        // §11.2's structural requirement: one specific explanation per
+        // matched condition, none of them blank or generic.
+        let reasons = alerts[0].reasons();
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons.iter().all(|r| !r.trim().is_empty()));
+        assert!(reasons.iter().any(|r| r.contains("root")));
+        assert!(reasons.iter().any(|r| r.contains("remote")));
+    }
+
+    /// The negative the whole rule turns on: the same escalation, from a
+    /// local console session with no remote address, must NOT fire. This is
+    /// what stops the rule alerting on every `sudo` a sysadmin runs at the
+    /// keyboard — and it works because `field_value` maps a null
+    /// `session.remote_addr` to `None` and `evaluate_rule` short-circuits.
+    #[test]
+    fn the_privilege_escalation_rule_does_not_fire_on_a_local_escalation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/privilege_escalation_to_root_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![
+            Rule::from_yaml_str(&yaml, "privilege_escalation.yaml").unwrap()
+        ]);
+
+        // No remote address at all (a tty1 login).
+        assert!(engine
+            .evaluate(&escalation_event(EventType::PrivilegeUidChange, Some(0), None))
+            .is_empty());
+
+        // No session whatsoever (a daemon escalating outside any login).
+        let mut sessionless = escalation_event(EventType::PrivilegeUidChange, Some(0), None);
+        sessionless.session = None;
+        assert!(engine.evaluate(&sessionless).is_empty());
+    }
+
+    #[test]
+    fn the_privilege_escalation_rule_does_not_fire_on_a_non_root_or_non_uid_transition() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/privilege_escalation_to_root_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![
+            Rule::from_yaml_str(&yaml, "privilege_escalation.yaml").unwrap()
+        ]);
+
+        // Escalating to a non-root account is not this rule's concern.
+        assert!(engine
+            .evaluate(&escalation_event(
+                EventType::PrivilegeUidChange,
+                Some(48),
+                Some("198.51.100.10")
+            ))
+            .is_empty());
+
+        // A gid change to gid 0 is not a uid escalation, and Task 2 never
+        // puts a target_uid on one.
+        assert!(engine
+            .evaluate(&escalation_event(
+                EventType::PrivilegeGidChange,
+                None,
+                Some("198.51.100.10")
+            ))
+            .is_empty());
+
+        // A sudo invocation carries no reliable target account (Global
+        // Constraint #9), so `event_data.target_uid` is null and the rule
+        // must not fire on it — the rule detects the transition, not the
+        // intent to make one.
+        assert!(engine
+            .evaluate(&escalation_event(
+                EventType::PrivilegeSudo,
+                None,
+                Some("198.51.100.10")
+            ))
+            .is_empty());
+    }
+
+    /// All three shipped rules must load together and stay independent as
+    /// `config/rules/` grows — the same guard Phase 3 added for two.
+    #[test]
+    fn all_three_shipped_rules_load_together_without_cross_firing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        assert!(engine.rule_count() >= 3);
+
+        let alerts = engine.evaluate(&escalation_event(
+            EventType::PrivilegeUidChange,
+            Some(0),
+            Some("198.51.100.10"),
+        ));
+        assert_eq!(
+            alerts.len(),
+            1,
+            "an escalation event must fire exactly the escalation rule — neither the \
+             web-root file rule nor the DNS rule"
+        );
+        assert_eq!(alerts[0].rule_id(), "privilege_escalation_to_root_in_remote_session");
+    }
 }

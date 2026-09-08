@@ -1,0 +1,43 @@
+# Detects a process gaining root inside a session that was opened from a
+# remote address — the SSH-session-to-root escalation ARCHITECTURE.md §26's
+# worked trace opens with, and the shape Phase 4a exists to make
+# expressible. Neither half is suspicious alone: escalation to root happens
+# on every host constantly (every `sudo` at a local console, every
+# daemon dropping and regaining privilege), and remote sessions are
+# ordinary. It is the conjunction — a remotely-authenticated session that
+# becomes root — that is worth an analyst's attention, which is the same
+# "actor plus artifact, not artifact alone" shape that keeps Phase 2's
+# shell_wrote_file_to_web_root and Phase 3's dns_query_to_suspicious_tld
+# specific rather than noisy (ARCHITECTURE.md §11.2).
+#
+# The `session.remote_addr` condition is written as `ne ""` deliberately:
+# the operator set has no existence test, but `eval::field_value` maps a
+# missing-or-null field to None and `engine::evaluate_rule` treats that as a
+# non-match, so `ne ""` matches exactly when the field is present and
+# non-empty. A local console login (auditd prints `addr=?`, which the
+# Identity sensor maps to None) therefore cannot match this rule.
+#
+# This rule reads `event_data.target_uid`, which only PRIVILEGE_UID_CHANGE
+# carries: PRIVILEGE_GID_CHANGE reports target_gid instead, and
+# PRIVILEGE_SUDO reports no target at all because auditd's USER_CMD record
+# does not reliably name one (Phase 4a plan Global Constraint #9). Both are
+# therefore non-matches by construction, not by an extra exclusion clause.
+#
+# MITRE ATT&CK: T1548.003 (Abuse Elevation Control Mechanism: Sudo and Sudo
+# Caching), reached over T1021.004 (Remote Services: SSH).
+id: privilege_escalation_to_root_in_remote_session
+version: 1
+severity: HIGH
+match:
+  - field: event_type
+    op: eq
+    value: "PRIVILEGE_UID_CHANGE"
+    reason: "A process changed its real uid via setuid(2), a completed privilege transition rather than an attempt"
+  - field: event_data.target_uid
+    op: eq
+    value: 0
+    reason: "The uid it transitioned to is 0 (root), so the process now holds full administrative privilege"
+  - field: session.remote_addr
+    op: ne
+    value: ""
+    reason: "The escalating process belongs to a session opened from a remote network address (an SSH login), not a local console or an unattributed system service"
