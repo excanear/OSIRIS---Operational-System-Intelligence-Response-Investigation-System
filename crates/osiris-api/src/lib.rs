@@ -27,6 +27,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/files/story", get(file_story_handler))
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
+        .route("/api/v1/systemd/story", get(systemd_story_handler))
         .with_state(storage)
 }
 
@@ -438,6 +439,62 @@ async fn identity_story_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(IdentityStory { events, alerts }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemdStoryQuery {
+    unit_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemdStory {
+    events: Vec<CanonicalEvent>,
+    alerts: Vec<Alert>,
+}
+
+/// Composed query implementing this phase's Global Constraint #12 and
+/// ARCHITECTURE.md §12.1's `*_story` shape. One `unit_name` filter returns
+/// a unit's whole observed history regardless of which sensor produced
+/// which part of it — Task 4's Normalize populates `service.unit_name`
+/// identically for the audit-backed Systemd sensor's `SERVICE_START`/`STOP`
+/// events and for Persistence Monitor's unit-*file*-lifecycle events
+/// (`SERVICE_CREATE`/`MODIFY`/`DELETE`, `TIMER_CREATE`/`MODIFY`), so this
+/// one indexed column already spans both without a union query.
+async fn systemd_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<SystemdStoryQuery>,
+) -> Result<Json<SystemdStory>, (StatusCode, String)> {
+    if q.unit_name.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide unit_name".to_string(),
+        ));
+    }
+
+    let (events, alerts) = tokio::task::spawn_blocking(move || {
+        let mut plan = QueryPlan::new();
+        plan.unit_name = q.unit_name.clone();
+        plan.limit = 10_000;
+        let mut events = storage.query(&plan)?;
+        events.sort_by_key(|e| (e.timestamp, e.event_id));
+
+        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        let alerts = if evidence_ids.is_empty() {
+            vec![]
+        } else {
+            let mut alert_plan = AlertQueryPlan::new();
+            alert_plan.evidence_event_ids = evidence_ids;
+            alert_plan.limit = 10_000;
+            storage.query_alerts(&alert_plan)?
+        };
+
+        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(SystemdStory { events, alerts }))
 }
 
 #[cfg(test)]
@@ -1254,6 +1311,67 @@ mod tests {
             Query(IdentityStoryQuery {
                 session_id: Some("does-not-exist".to_string()),
                 uid: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(story.events.is_empty());
+        assert!(story.alerts.is_empty());
+    }
+
+    fn systemd_event(unit_name: &str, event_type: EventType, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(700, None, timestamp);
+        event.category = Category::Systemd;
+        event.event_type = event_type;
+        event.service = Some(osiris_schema::ServiceRef {
+            unit_name: unit_name.to_string(),
+            unit_type: "service".to_string(),
+            action: "start".to_string(),
+        });
+        event
+    }
+
+    #[tokio::test]
+    async fn systemd_story_returns_400_when_unit_name_is_missing() {
+        let (_dir, storage) = test_storage();
+        let result = systemd_story_handler(State(storage), Query(SystemdStoryQuery { unit_name: None }))
+            .await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn systemd_story_returns_every_event_for_the_named_unit() {
+        let (_dir, storage) = test_storage();
+        let start = systemd_event("backdoor.service", EventType::ServiceStart, 1000);
+        let stop = systemd_event("backdoor.service", EventType::ServiceStop, 2000);
+        let other_unit = systemd_event("sshd.service", EventType::ServiceStart, 3000);
+        storage
+            .batch_write(&[start.clone(), stop.clone(), other_unit])
+            .unwrap();
+
+        let Json(story) = systemd_story_handler(
+            State(storage),
+            Query(SystemdStoryQuery {
+                unit_name: Some("backdoor.service".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(story.events.len(), 2);
+        let ids: Vec<_> = story.events.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&start.event_id));
+        assert!(ids.contains(&stop.event_id));
+    }
+
+    #[tokio::test]
+    async fn systemd_story_returns_an_empty_story_rather_than_404_for_an_unknown_unit() {
+        let (_dir, storage) = test_storage();
+        let Json(story) = systemd_story_handler(
+            State(storage),
+            Query(SystemdStoryQuery {
+                unit_name: Some("does-not-exist.service".to_string()),
             }),
         )
         .await
