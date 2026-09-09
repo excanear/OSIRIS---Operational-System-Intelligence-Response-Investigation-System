@@ -591,4 +591,39 @@ mod tests {
         assert!(snapshot.skipped_sensors.iter().any(|s| s.name == "systemd"));
         agent.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn starts_the_systemd_sensor_when_the_audit_log_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = dir.path().join("systemd-audit.log");
+        std::fs::write(&audit_log, "").unwrap();
+        let mut config = base_config(&dir);
+        config.systemd_audit_log_path = Some(audit_log.to_string_lossy().to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert!(status.sensors.iter().any(|s| s.name == "systemd"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn starts_the_persistence_sensor_when_a_watch_target_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let watch_dir = dir.path().join("systemd-units");
+        std::fs::create_dir(&watch_dir).unwrap();
+        let mut config = base_config(&dir);
+        config.persistence_watch_paths = vec![osiris_sensors_persistence::PersistenceWatchTarget {
+            path: watch_dir.to_string_lossy().to_string(),
+            kind: osiris_sensors_persistence::PersistenceWatchKind::SystemdUnitDir,
+        }];
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert!(status.sensors.iter().any(|s| s.name == "persistence"));
+        agent.shutdown().await;
+    }
 }

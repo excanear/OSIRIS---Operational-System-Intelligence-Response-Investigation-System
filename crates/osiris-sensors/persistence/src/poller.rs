@@ -103,7 +103,7 @@ impl PersistencePoller {
                 // itself does, from whichever target's directory the path
                 // lived under.
                 if let Some(kind) = self.targets.iter().find_map(|t| {
-                    if PathBuf::from(&t.path) == *path || path.starts_with(&t.path) {
+                    if path.starts_with(&t.path) {
                         checkpoint_kind_for(t.kind, path)
                     } else {
                         None
