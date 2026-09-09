@@ -1,0 +1,15 @@
+[package]
+name = "osiris-sensors-persistence"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+osiris-sensor-api = { path = "../../osiris-sensor-api" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
