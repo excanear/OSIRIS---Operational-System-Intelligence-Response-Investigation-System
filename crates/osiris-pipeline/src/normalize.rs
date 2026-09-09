@@ -716,7 +716,7 @@ fn classify_persistence_event(
                 // operation disclosed in event_data so nothing downstream
                 // mistakes a removal for an edit.
                 (SystemdTimer, Removed) => (EventType::TimerModify, "delete", Some("removed")),
-                (SystemdUnit, _) | (Cron | ShellProfile | LdPreload | Sudoers, _) => {
+                (Cron | ShellProfile | LdPreload | Sudoers, _) => {
                     unreachable!("outer match already narrowed to SystemdUnit | SystemdTimer")
                 }
             };
