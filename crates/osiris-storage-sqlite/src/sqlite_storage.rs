@@ -39,6 +39,7 @@ impl SqliteStorage {
                 dns_domain TEXT,
                 session_id TEXT,
                 user_uid INTEGER,
+                unit_name TEXT,
                 raw_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_host_timestamp ON events(host_id, timestamp);
@@ -88,6 +89,12 @@ impl SqliteStorage {
         // no database created before Phase 4a can contain an event with a
         // populated `session` or `user`, because nothing populated either
         // field until this phase's pipeline changes.
+        //
+        // Phase 4b adds `unit_name` the same way. As with every earlier
+        // phase's columns, pre-existing rows are not backfilled — they
+        // read back NULL. No database created before Phase 4b can contain
+        // an event with a populated `service`, so this has no practical
+        // impact.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
@@ -106,6 +113,7 @@ impl SqliteStorage {
             ("dns_domain", "ALTER TABLE events ADD COLUMN dns_domain TEXT"),
             ("session_id", "ALTER TABLE events ADD COLUMN session_id TEXT"),
             ("user_uid", "ALTER TABLE events ADD COLUMN user_uid INTEGER"),
+            ("unit_name", "ALTER TABLE events ADD COLUMN unit_name TEXT"),
         ] {
             if !column_exists(&conn, "events", column)? {
                 conn.execute(ddl, [])
@@ -119,7 +127,8 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS idx_events_network_dst_ip ON events(network_dst_ip);
              CREATE INDEX IF NOT EXISTS idx_events_dns_domain ON events(dns_domain);
              CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
-             CREATE INDEX IF NOT EXISTS idx_events_user_uid ON events(user_uid);",
+             CREATE INDEX IF NOT EXISTS idx_events_user_uid ON events(user_uid);
+             CREATE INDEX IF NOT EXISTS idx_events_unit_name ON events(unit_name);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
@@ -188,10 +197,11 @@ impl Storage for SqliteStorage {
             // most u32::MAX, so this widening is always lossless — the same
             // cast the file inode/device columns already use.
             let user_uid = event.user.as_ref().map(|u| u.uid as i64);
+            let unit_name = event.service.as_ref().map(|s| s.unit_name.clone());
             let changed = tx
                 .execute(
-                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, unit_name, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         event.event_id.to_string(),
                         event.host_id.to_string(),
@@ -207,6 +217,7 @@ impl Storage for SqliteStorage {
                         dns_domain,
                         session_id,
                         user_uid,
+                        unit_name,
                         raw_json,
                     ],
                 )
@@ -267,6 +278,10 @@ impl Storage for SqliteStorage {
         if let Some(uid) = plan.user_uid {
             sql.push_str(" AND user_uid = ?");
             sql_params.push(Box::new(uid as i64));
+        }
+        if let Some(unit_name) = &plan.unit_name {
+            sql.push_str(" AND unit_name = ?");
+            sql_params.push(Box::new(unit_name.clone()));
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
@@ -927,6 +942,113 @@ mod tests {
     fn open_test_storage() -> SqliteStorage {
         let dir = tempfile::tempdir().unwrap();
         SqliteStorage::open(dir.path().join("events.db")).unwrap()
+    }
+
+    fn systemd_event(unit_name: &str, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(500, timestamp);
+        event.event_type = osiris_schema::EventType::ServiceStart;
+        event.category = osiris_schema::Category::Systemd;
+        event.service = Some(osiris_schema::ServiceRef {
+            unit_name: unit_name.to_string(),
+            unit_type: "service".to_string(),
+            action: "start".to_string(),
+        });
+        event
+    }
+
+    #[test]
+    fn query_filters_by_unit_name() {
+        let storage = open_test_storage();
+        let backdoor = systemd_event("backdoor.service", 1000);
+        let mut backdoor_stop = systemd_event("backdoor.service", 2000);
+        backdoor_stop.event_type = osiris_schema::EventType::ServiceStop;
+        let sshd = systemd_event("sshd.service", 3000);
+        // An event with no service at all must never match any unit_name
+        // filter — NULL never equals a string in SQL, same discipline as
+        // Phase 4a's uid-0-vs-NULL distinction.
+        let unrelated = sample_event(900, 4000);
+        storage
+            .batch_write(&[
+                backdoor.clone(),
+                backdoor_stop.clone(),
+                sshd.clone(),
+                unrelated,
+            ])
+            .unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.unit_name = Some("backdoor.service".to_string());
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<_> = results.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&backdoor.event_id));
+        assert!(ids.contains(&backdoor_stop.event_id));
+        assert!(!ids.contains(&sshd.event_id));
+    }
+
+    /// Non-destructive/idempotent migration proof, matching every prior
+    /// phase's precedent exactly.
+    #[test]
+    fn migrates_a_pre_phase_4b_database_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let pre_phase_4b_event = sample_event(300, 1000);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    file_path TEXT,
+                    file_inode INTEGER,
+                    file_device_id INTEGER,
+                    network_src_ip TEXT,
+                    network_dst_ip TEXT,
+                    dns_domain TEXT,
+                    session_id TEXT,
+                    user_uid INTEGER,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    pre_phase_4b_event.event_id.to_string(),
+                    pre_phase_4b_event.host_id.to_string(),
+                    pre_phase_4b_event.timestamp as i64,
+                    "PROCESS_EXEC",
+                    serde_json::to_string(&pre_phase_4b_event).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.query(&QueryPlan::new()).unwrap().len(),
+            1,
+            "the pre-existing row must survive migration"
+        );
+
+        reopened.write(&systemd_event("backdoor.service", 2000)).unwrap();
+        let mut plan = QueryPlan::new();
+        plan.unit_name = Some("backdoor.service".to_string());
+        assert_eq!(
+            reopened.query(&plan).unwrap().len(),
+            1,
+            "the migrated unit_name column must exist and filter correctly"
+        );
+
+        let reopened_again = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened_again.query(&QueryPlan::new()).unwrap().len(), 2);
+        assert_eq!(reopened_again.query(&plan).unwrap().len(), 1);
     }
 
     #[test]

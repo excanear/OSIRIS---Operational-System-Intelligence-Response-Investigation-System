@@ -32,6 +32,14 @@ pub struct QueryPlan {
     /// long-lived service account and needs §12.3's query planner, which is
     /// Phase 7 (Phase 4a plan Global Constraint #10).
     pub user_uid: Option<u32>,
+    /// Exact-match on `service.unit_name`. Covers both this phase's
+    /// Systemd runtime-lifecycle events (`SERVICE_START`/`STOP`) and its
+    /// unit-*file*-lifecycle events (`SERVICE_CREATE`/`MODIFY`/`DELETE`,
+    /// `TIMER_CREATE`/`MODIFY`) — Task 4's Normalize populates
+    /// `service.unit_name` identically for both, so one filter serves the
+    /// whole unit's history regardless of which sensor observed which part
+    /// of it.
+    pub unit_name: Option<String>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
@@ -108,6 +116,12 @@ mod tests {
         let plan = QueryPlan::new();
         assert!(plan.session_id.is_none());
         assert!(plan.user_uid.is_none());
+    }
+
+    #[test]
+    fn new_query_plan_defaults_unit_name_to_none_too() {
+        let plan = QueryPlan::new();
+        assert!(plan.unit_name.is_none());
     }
 
     #[test]
