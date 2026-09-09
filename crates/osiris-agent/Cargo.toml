@@ -29,6 +29,8 @@ osiris-sensors-process = { path = "../osiris-sensors/process" }
 osiris-sensors-fs = { path = "../osiris-sensors/fs" }
 osiris-sensors-net = { path = "../osiris-sensors/net" }
 osiris-sensors-identity = { path = "../osiris-sensors/identity" }
+osiris-sensors-systemd = { path = "../osiris-sensors/systemd" }
+osiris-sensors-persistence = { path = "../osiris-sensors/persistence" }
 osiris-generator = { path = "../../generator" }
 
 [dev-dependencies]

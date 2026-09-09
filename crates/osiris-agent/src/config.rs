@@ -48,16 +48,31 @@ pub struct AgentConfig {
     /// silently, if absent or non-existent.
     #[serde(default)]
     pub identity_audit_log_path: Option<String>,
+    /// Path to a Linux auditd-style log file for the Systemd sensor's audit
+    /// backend, carrying `SERVICE_START`/`SERVICE_STOP` records (plan
+    /// Global Constraint #1). Skipped, never silently, if absent or
+    /// non-existent.
+    #[serde(default)]
+    pub systemd_audit_log_path: Option<String>,
+    /// Persistence Monitor's config-declared watch targets (plan Global
+    /// Constraint #4). Empty by default, in which case the sensor is
+    /// skipped (capabilities()-driven, never silently) — same pattern
+    /// every other optional sensor config uses, adapted to a list rather
+    /// than a single path since this sensor watches several locations at
+    /// once.
+    #[serde(default)]
+    pub persistence_watch_paths: Vec<osiris_sensors_persistence::PersistenceWatchTarget>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
     /// Which canned scenario the synthetic sensor emits: `"exec_chain"`
     /// (default, Phase 1's sshd->bash->curl), `"web_shell_drop"` (that
     /// chain continued into the filesystem), `"network_beacon"` (that
-    /// chain continued into DNS and network), or `"ssh_sudo_escalation"`
+    /// chain continued into DNS and network), `"ssh_sudo_escalation"`
     /// (§26's trace from its first step: login, shell, sudo escalation,
-    /// file write, outbound connection). Ignored unless `enable_synthetic`
-    /// is true.
+    /// file write, outbound connection), or `"persistence_via_systemd_service"`
+    /// (that same opening continued into a backdoor systemd unit install and
+    /// start). Ignored unless `enable_synthetic` is true.
     #[serde(default)]
     pub synthetic_scenario: Option<String>,
     /// Path to the NDJSON spool file (plan Global Constraints #3).
@@ -140,6 +155,44 @@ mod tests {
             config.identity_audit_log_path.as_deref(),
             Some("/var/log/audit/audit.log")
         );
+    }
+
+    #[test]
+    fn defaults_systemd_and_persistence_config_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: false\nspool_path: /tmp/spool.ndjson\n\
+             status_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.systemd_audit_log_path.is_none());
+        assert!(config.persistence_watch_paths.is_empty());
+    }
+
+    #[test]
+    fn loads_persistence_watch_paths_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: false\nspool_path: /tmp/spool.ndjson\n\
+             status_addr: 127.0.0.1:9200\n\
+             systemd_audit_log_path: /var/log/audit/audit.log\n\
+             persistence_watch_paths:\n  \
+               - path: /etc/systemd/system\n    kind: systemd_unit_dir\n  \
+               - path: /etc/cron.d\n    kind: cron\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert_eq!(
+            config.systemd_audit_log_path.as_deref(),
+            Some("/var/log/audit/audit.log")
+        );
+        assert_eq!(config.persistence_watch_paths.len(), 2);
+        assert_eq!(config.persistence_watch_paths[0].path, "/etc/systemd/system");
     }
 
     #[test]

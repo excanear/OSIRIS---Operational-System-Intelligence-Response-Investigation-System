@@ -1,8 +1,9 @@
 use osiris_schema::encode_device_id;
 use osiris_sensor_api::{
     DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
-    NetworkDirection, NetworkEventRaw, NetworkOperation, PrivilegeEventRaw, PrivilegeOperation,
-    ProcessExecRaw, RawEvent, RawEventSource,
+    NetworkDirection, NetworkEventRaw, NetworkOperation, PersistenceCheckpointKind,
+    PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw, PrivilegeOperation,
+    ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw, SystemdOperation,
 };
 
 /// The identity the staged payload keeps across create -> write -> rename.
@@ -35,6 +36,10 @@ const ROOT_KEYS_INODE: u64 = 400_555;
 /// Where it then connects — a NETWORK-category event under the same
 /// session, completing §26's identity->process->file->network chain.
 pub const ESCALATION_C2_IP: &str = "203.0.113.77";
+
+/// The backdoor systemd service Task 9's rule exists to catch.
+pub const BACKDOOR_UNIT_NAME: &str = "backdoor.service";
+pub const BACKDOOR_UNIT_PATH: &str = "/etc/systemd/system/backdoor.service";
 
 /// A minimal process/exec scenario mirroring ARCHITECTURE.md §26's worked
 /// trace (sshd -> bash -> curl). Timestamps are relative nanoseconds
@@ -296,6 +301,124 @@ pub fn ssh_sudo_escalation_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
     ]
 }
 
+/// Phase 4b's flagship trace: the same SSH-login-then-sudo-escalation
+/// opening `ssh_sudo_escalation_scenario` uses, now continuing into
+/// PERSISTENCE and SYSTEMD instead of FILE and NETWORK — an already-root
+/// attacker installs a backdoor systemd unit file (observed by Persistence
+/// Monitor's periodic scan, unattributed — no pid triggered it) and starts
+/// it (observed by the audit-backed Systemd sensor, whose record's own
+/// `ses=` carries the SSH session id directly). Nine events spanning five
+/// categories, every one of them under session id `SSH_SESSION_ID` once
+/// Task 1's fixed `SessionResolver` has propagated or directly observed it.
+pub fn persistence_via_systemd_service_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
+    vec![
+        exec(100, 1, "/usr/sbin/sshd", "sshd", base_ts_ns),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 1_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }),
+        exec(200, 100, "/bin/bash", "bash", base_ts_ns + 2_000_000),
+        exec(300, 200, "/usr/bin/sudo", "sudo", base_ts_ns + 3_000_000),
+        RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::Sudo,
+            pid: 300,
+            ppid: 0,
+            uid: 1000,
+            gid: None,
+            euid: None,
+            egid: None,
+            auid: Some(1000),
+            session_id: Some(SSH_SESSION_ID.to_string()),
+            username: None,
+            target_uid: None,
+            target_gid: None,
+            command: Some("/usr/bin/systemctl enable --now backdoor.service".to_string()),
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: base_ts_ns + 4_000_000,
+            audit_serial: Some(469),
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Privilege(PrivilegeEventRaw {
+            operation: PrivilegeOperation::UidChange,
+            pid: 300,
+            ppid: 200,
+            uid: 1000,
+            gid: Some(1000),
+            euid: Some(0),
+            egid: Some(1000),
+            auid: Some(1000),
+            session_id: Some(SSH_SESSION_ID.to_string()),
+            username: None,
+            target_uid: Some(0),
+            target_gid: None,
+            command: None,
+            success: true,
+            exe_path: "/usr/bin/sudo".to_string(),
+            comm: "sudo".to_string(),
+            timestamp_ns: base_ts_ns + 5_000_000,
+            audit_serial: Some(470),
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Persistence(PersistenceEventRaw {
+            operation: PersistenceOperation::Created,
+            checkpoint_kind: PersistenceCheckpointKind::SystemdUnit,
+            path: BACKDOOR_UNIT_PATH.to_string(),
+            content_hash: Some("b".repeat(64)),
+            size: Some(96),
+            timestamp_ns: base_ts_ns + 6_000_000,
+            source: RawEventSource::Procfs,
+        }),
+        RawEvent::Systemd(SystemdEventRaw {
+            operation: SystemdOperation::Start,
+            unit_name: BACKDOOR_UNIT_NAME.to_string(),
+            // Genuinely systemd's own pid on a real host (plan Global
+            // Constraint #3) — never the attacker's pid 300.
+            pid: 1,
+            uid: 0,
+            auid: Some(1000),
+            session_id: Some(SSH_SESSION_ID.to_string()),
+            success: true,
+            exe_path: "/usr/lib/systemd/systemd".to_string(),
+            comm: "systemd".to_string(),
+            timestamp_ns: base_ts_ns + 7_000_000,
+            audit_serial: Some(512),
+            source: RawEventSource::Synthetic,
+        }),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Logout,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 8_000_000,
+            audit_serial: Some(560),
+            source: RawEventSource::Synthetic,
+        }),
+    ]
+}
+
 fn exec(pid: u32, ppid: u32, exe_path: &str, comm: &str, timestamp_ns: u64) -> RawEvent {
     RawEvent::ProcessExec(ProcessExecRaw {
         pid,
@@ -383,6 +506,7 @@ mod tests {
             exec_chain_scenario(1000),
             web_shell_drop_scenario(1000),
             ssh_sudo_escalation_scenario(1000),
+            persistence_via_systemd_service_scenario(1000),
         ] {
             for pair in scenario.windows(2) {
                 assert!(
@@ -590,6 +714,101 @@ mod tests {
     #[test]
     fn ssh_sudo_escalation_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
         let scenario = ssh_sudo_escalation_scenario(1_000_000_000);
+        let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(timestamps, sorted);
+        assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
+        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout));
+    }
+
+    fn systemd_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::SystemdEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Systemd(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn persistence_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::PersistenceEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Persistence(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The Phase 4b flagship trace: an already-escalated attacker (this
+    /// scenario opens with the same SSH-login-then-sudo shape
+    /// `ssh_sudo_escalation_scenario` established) installs a backdoor
+    /// systemd service and starts it — the identity->process->privilege
+    /// chain now continuing into PERSISTENCE and SYSTEMD, the two
+    /// categories this phase adds. Nine events across five categories,
+    /// under one session id once the Enrich stage's `SessionResolver` (and
+    /// Task 1's fix) has propagated it.
+    #[test]
+    fn persistence_via_systemd_service_scenario_spans_all_five_categories_under_one_session() {
+        let scenario = persistence_via_systemd_service_scenario(1_000_000_000);
+        assert_eq!(scenario.len(), 9);
+
+        assert_eq!(exec_events(&scenario).len(), 3, "sshd, bash, sudo");
+
+        let identity = identity_raw_events(&scenario);
+        assert_eq!(identity.len(), 2, "one login, one logout");
+        assert_eq!(identity[0].session_id, SSH_SESSION_ID);
+
+        let privilege = privilege_raw_events(&scenario);
+        assert_eq!(privilege.len(), 2, "one sudo invocation, one uid change");
+        assert_eq!(privilege[1].target_uid, Some(0), "escalation to root");
+
+        let persistence = persistence_raw_events(&scenario);
+        assert_eq!(persistence.len(), 1);
+        assert_eq!(persistence[0].path, BACKDOOR_UNIT_PATH);
+        assert_eq!(
+            persistence[0].checkpoint_kind,
+            osiris_sensor_api::PersistenceCheckpointKind::SystemdUnit
+        );
+
+        let systemd = systemd_raw_events(&scenario);
+        assert_eq!(systemd.len(), 1);
+        assert_eq!(systemd[0].unit_name, BACKDOOR_UNIT_NAME);
+        assert_eq!(
+            systemd[0].operation,
+            osiris_sensor_api::SystemdOperation::Start
+        );
+        assert_eq!(
+            systemd[0].session_id.as_deref(),
+            Some(SSH_SESSION_ID),
+            "the service-start record's own observed session is what makes \
+             Task 9's rule expressible"
+        );
+        // Genuinely systemd's own pid, not the attacker's shell — plan
+        // Global Constraint #3's disclosure, pinned as a test so a future
+        // edit cannot casually "fix" it into pid 300 by mistake.
+        assert_eq!(systemd[0].pid, 1);
+    }
+
+    /// The exec chain must form a real ancestry (Global Constraint #2 in
+    /// Phase 4a's sense: the generator must produce records the real
+    /// sensors could actually have produced) even though the Persistence
+    /// and Systemd events themselves carry no pid the chain reaches.
+    #[test]
+    fn every_exec_event_descends_from_the_logins_pid() {
+        let scenario = persistence_via_systemd_service_scenario(1_000_000_000);
+        let execs = exec_events(&scenario);
+        assert_eq!((execs[0].pid, execs[0].ppid), (100, 1), "sshd");
+        assert_eq!((execs[1].pid, execs[1].ppid), (200, 100), "bash under sshd");
+        assert_eq!((execs[2].pid, execs[2].ppid), (300, 200), "sudo under bash");
+    }
+
+    #[test]
+    fn persistence_via_systemd_service_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
+        let scenario = persistence_via_systemd_service_scenario(1_000_000_000);
         let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();

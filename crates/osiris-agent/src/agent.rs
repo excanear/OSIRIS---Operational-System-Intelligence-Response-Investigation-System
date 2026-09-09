@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
 use osiris_generator::{
-    exec_chain_scenario, network_beacon_scenario, ssh_sudo_escalation_scenario,
-    web_shell_drop_scenario, SyntheticSensor,
+    exec_chain_scenario, network_beacon_scenario, persistence_via_systemd_service_scenario,
+    ssh_sudo_escalation_scenario, web_shell_drop_scenario, SyntheticSensor,
 };
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
@@ -14,7 +14,9 @@ use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
 use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_identity::IdentitySensor;
 use osiris_sensors_net::NetworkSensor;
+use osiris_sensors_persistence::PersistenceSensor;
 use osiris_sensors_process::ProcessExecSensor;
+use osiris_sensors_systemd::SystemdSensor;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +89,14 @@ impl Agent {
         if let Some(path) = &config.identity_audit_log_path {
             candidate_sensors.push(Box::new(IdentitySensor::new(path.clone())));
         }
+        if let Some(path) = &config.systemd_audit_log_path {
+            candidate_sensors.push(Box::new(SystemdSensor::new(path.clone())));
+        }
+        if !config.persistence_watch_paths.is_empty() {
+            candidate_sensors.push(Box::new(PersistenceSensor::new(
+                config.persistence_watch_paths.clone(),
+            )));
+        }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -96,6 +106,9 @@ impl Agent {
                 Some("web_shell_drop") => web_shell_drop_scenario(base_ts),
                 Some("network_beacon") => network_beacon_scenario(base_ts),
                 Some("ssh_sudo_escalation") => ssh_sudo_escalation_scenario(base_ts),
+                Some("persistence_via_systemd_service") => {
+                    persistence_via_systemd_service_scenario(base_ts)
+                }
                 Some("exec_chain") | None => exec_chain_scenario(base_ts),
                 Some(other) => {
                     tracing::warn!(
@@ -257,6 +270,8 @@ mod tests {
             fs_audit_log_path: None,
             network_proc_root: None,
             identity_audit_log_path: None,
+            systemd_audit_log_path: None,
+            persistence_watch_paths: vec![],
             enable_synthetic: false,
             synthetic_scenario: None,
             spool_path: dir
@@ -543,5 +558,37 @@ mod tests {
         for expected in ["IDENTITY", "PROCESS", "PRIVILEGE", "FILE", "NETWORK"] {
             assert!(categories.contains(expected), "missing category {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_persistence_via_systemd_service_scenario_is_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("persistence_via_systemd_service".to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let snapshot = agent.status_snapshot().await;
+        assert!(snapshot.sensors.iter().any(|s| s.name == "synthetic_generator"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_but_missing_systemd_audit_log_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.systemd_audit_log_path = Some(
+            dir.path()
+                .join("missing-audit.log")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let snapshot = agent.status_snapshot().await;
+        assert!(snapshot.skipped_sensors.iter().any(|s| s.name == "systemd"));
+        agent.shutdown().await;
     }
 }
