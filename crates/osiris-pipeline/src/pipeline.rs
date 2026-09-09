@@ -274,4 +274,74 @@ mod tests {
             .iter()
             .any(|r| r.relation == osiris_schema::Relation::ExecutedAs));
     }
+
+    /// The whole Normalize -> Enrich -> Validate -> Prioritize path for a
+    /// Systemd event whose `ses=` matches an already-open session — proof
+    /// that Task 1's fix plus this task's direct-observation normalize
+    /// combine to make Global Constraint #3's "free" cross-category
+    /// correlation real, not just unit-tested in isolation.
+    #[test]
+    fn a_systemd_service_start_inherits_no_pid_but_keeps_its_observed_session() {
+        use osiris_sensor_api::{
+            IdentityEventRaw, IdentityOperation, SystemdEventRaw, SystemdOperation,
+        };
+        let host = test_host();
+        let mut pipeline = Pipeline::new(host.clone(), "boot-1".to_string());
+
+        let _sshd = pipeline.process(RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 100,
+            ppid: 1,
+            uid: 0,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 1_000,
+            start_time_mono: 1_000,
+            source: RawEventSource::Synthetic,
+        }));
+        let _login = pipeline.process(RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: "3".to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some("198.51.100.10".to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: 2_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }));
+
+        // The systemd service-start record's own outer pid is 1 (systemd
+        // itself) — unrelated to pid 100/sshd's ancestry entirely. Its
+        // session attribution comes ONLY from its own observed `ses=`.
+        let start = pipeline.process(RawEvent::Systemd(SystemdEventRaw {
+            operation: SystemdOperation::Start,
+            unit_name: "backdoor.service".to_string(),
+            pid: 1,
+            uid: 0,
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            success: true,
+            exe_path: "/usr/lib/systemd/systemd".to_string(),
+            comm: "systemd".to_string(),
+            timestamp_ns: 3_000,
+            audit_serial: Some(501),
+            source: RawEventSource::Synthetic,
+        }));
+
+        assert!(!start.event.tags.contains(&"INVALID".to_string()));
+        let session = start.event.session.expect("session must be observed");
+        assert_eq!(session.session_id, "3");
+        assert_eq!(
+            session.remote_addr.as_deref(),
+            Some("198.51.100.10"),
+            "the systemd event must be enriched to the full session record, \
+             which is what makes Task 9's rule expressible"
+        );
+    }
 }

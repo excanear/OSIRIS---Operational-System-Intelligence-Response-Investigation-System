@@ -2,12 +2,14 @@ use uuid::Uuid;
 
 use osiris_schema::{
     CanonicalEvent, Category, DnsRef, EventType, FileRef, HostRef, NetworkDirection, NetworkRef,
-    ProcessKey, ProcessRef, SessionRef, Severity, Source, UserRef, SCHEMA_VERSION,
+    ProcessKey, ProcessRef, ServiceRef, SessionRef, Severity, Source, UserRef, SCHEMA_VERSION,
 };
 use osiris_sensor_api::{
     DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
-    NetworkDirection as RawNetworkDirection, NetworkEventRaw, NetworkOperation, PrivilegeEventRaw,
-    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    NetworkDirection as RawNetworkDirection, NetworkEventRaw, NetworkOperation,
+    PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw,
+    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw,
+    SystemdOperation,
 };
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
@@ -25,6 +27,8 @@ pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent
         RawEvent::Dns(d) => normalize_dns_event(d, host, boot_id),
         RawEvent::Identity(i) => normalize_identity_event(i, host, boot_id),
         RawEvent::Privilege(p) => normalize_privilege_event(p, host, boot_id),
+        RawEvent::Systemd(s) => normalize_systemd_event(s, host, boot_id),
+        RawEvent::Persistence(p) => normalize_persistence_event(p, host, boot_id),
     }
 }
 
@@ -527,6 +531,225 @@ fn normalize_privilege_event(
     }
 }
 
+fn normalize_systemd_event(raw: SystemdEventRaw, host: &HostRef, boot_id: &str) -> CanonicalEvent {
+    let event_type = match raw.operation {
+        SystemdOperation::Start => EventType::ServiceStart,
+        SystemdOperation::Stop => EventType::ServiceStop,
+    };
+    let (user, partial) = build_user_ref(raw.uid, None, None, None, None, raw.auid);
+    let mut tags = Vec::new();
+    if partial {
+        tags.push("USER_REF_PARTIAL".to_string());
+    }
+    // A minimal SessionRef from the record's own `ses=` — the same
+    // direct-observation pattern `normalize_privilege_event` established in
+    // Phase 4a. The Enrich stage's now-fixed `attach_session` (Task 1)
+    // prefers this over any pid/ppid-inferred session, and enriches it
+    // further when that session's login was itself observed.
+    let session = raw.session_id.clone().map(|session_id| SessionRef {
+        session_id,
+        tty: None,
+        remote_addr: None,
+        auth_method: None,
+    });
+    let unit_type = unit_type_from_name(&raw.unit_name);
+    let action = match raw.operation {
+        SystemdOperation::Start => "start",
+        SystemdOperation::Stop => "stop",
+    };
+    // Genuinely systemd's own pid on a real host (plan Global Constraint
+    // #3's disclosure) — kept honestly, not discarded, so it still resolves
+    // through the ordinary ProcessResolver/PROCESS_KEY_PROVISIONAL path
+    // like any other pid nothing independently observed an exec for.
+    let process = provisional_process(Some(raw.pid), &raw.exe_path, host.host_id, boot_id);
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category: Category::Systemd,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: Some(user),
+        session,
+        process,
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: Some(ServiceRef {
+            unit_name: raw.unit_name,
+            unit_type: unit_type.to_string(),
+            action: action.to_string(),
+        }),
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: "systemd_sensor/audit".to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags,
+        risk: None,
+        event_data: serde_json::json!({
+            "comm": raw.comm,
+            "auid": raw.auid,
+            "success": raw.success,
+            "audit_serial": raw.audit_serial,
+        }),
+    }
+}
+
+/// `.timer` -> `"timer"`, anything else -> `"service"` — the only two unit
+/// types this phase's sensor and monitor ever report (plan Global
+/// Constraint #4: a `systemd_unit_dir` watch target's non-`.service`/
+/// `.timer` files are silently skipped upstream, so this function never
+/// sees them).
+fn unit_type_from_name(unit_name: &str) -> &'static str {
+    if unit_name.ends_with(".timer") {
+        "timer"
+    } else {
+        "service"
+    }
+}
+
+fn normalize_persistence_event(
+    raw: PersistenceEventRaw,
+    host: &HostRef,
+    boot_id: &str,
+) -> CanonicalEvent {
+    let (event_type, category, service, disclosed_operation) = classify_persistence_event(&raw);
+    let mut event_data = serde_json::json!({
+        "checkpoint_kind": raw.checkpoint_kind,
+    });
+    if let Some(operation) = disclosed_operation {
+        event_data["operation"] = serde_json::Value::String(operation.to_string());
+    }
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category,
+        severity: Severity::Info,
+        host: host.clone(),
+        // No process/session/user identity: the scanner observed a path on
+        // disk, not a process's action (plan Global Constraint #3). An
+        // invented actor here would be exactly the fabrication this
+        // codebase's discipline forbids for file/network/privilege
+        // identity elsewhere.
+        user: None,
+        session: None,
+        process: None,
+        parent_process: None,
+        thread: None,
+        file: Some(FileRef {
+            path: raw.path,
+            previous_path: None,
+            inode: None,
+            device_id: None,
+            size: raw.size,
+            mode: None,
+            owner_uid: None,
+            owner_gid: None,
+            hash: raw.content_hash,
+        }),
+        network: None,
+        dns: None,
+        device: None,
+        service,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: "persistence_sensor/procfs".to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags: vec![],
+        risk: None,
+        event_data,
+    }
+}
+
+/// Maps a Persistence Monitor result to its taxonomy home (plan Global
+/// Constraints #1/#5). A `SystemdUnit`/`SystemdTimer` checkpoint is a
+/// SYSTEMD-category unit-*file*-lifecycle event; every other checkpoint
+/// kind is a PERSISTENCE-category event. One path maps to exactly one
+/// category, never both, so a unit file's own creation is never
+/// double-counted as generic persistence too. Returns the disclosed
+/// operation string (Global Constraint #5) only for the one case where the
+/// frozen `EventType` can't distinguish it from a real modification
+/// (a removed `.timer` file, mapped to `TimerModify`) — `None` everywhere
+/// else, since every other mapping's `event_type` already names its own
+/// operation precisely.
+fn classify_persistence_event(
+    raw: &PersistenceEventRaw,
+) -> (EventType, Category, Option<ServiceRef>, Option<&'static str>) {
+    use PersistenceCheckpointKind::*;
+    use PersistenceOperation::*;
+    match raw.checkpoint_kind {
+        SystemdUnit | SystemdTimer => {
+            let unit_name = unit_name_from_path(&raw.path);
+            let unit_type = if raw.checkpoint_kind == SystemdTimer {
+                "timer"
+            } else {
+                "service"
+            };
+            let (event_type, action, disclosed) = match (raw.checkpoint_kind, raw.operation) {
+                (SystemdUnit, Created) => (EventType::ServiceCreate, "create", None),
+                (SystemdUnit, Modified) => (EventType::ServiceModify, "modify", None),
+                (SystemdUnit, Removed) => (EventType::ServiceDelete, "delete", None),
+                (SystemdTimer, Created) => (EventType::TimerCreate, "create", None),
+                (SystemdTimer, Modified) => (EventType::TimerModify, "modify", None),
+                // Global Constraint #5: no TIMER_DELETE exists in the
+                // frozen taxonomy. TIMER_MODIFY stands in, with the real
+                // operation disclosed in event_data so nothing downstream
+                // mistakes a removal for an edit.
+                (SystemdTimer, Removed) => (EventType::TimerModify, "delete", Some("removed")),
+                (SystemdUnit, _) | (Cron | ShellProfile | LdPreload | Sudoers, _) => {
+                    unreachable!("outer match already narrowed to SystemdUnit | SystemdTimer")
+                }
+            };
+            (
+                event_type,
+                Category::Systemd,
+                Some(ServiceRef {
+                    unit_name,
+                    unit_type: unit_type.to_string(),
+                    action: action.to_string(),
+                }),
+                disclosed,
+            )
+        }
+        Cron | ShellProfile | LdPreload | Sudoers => {
+            let event_type = match raw.operation {
+                Created => EventType::PersistenceCreated,
+                Modified => EventType::PersistenceModified,
+                Removed => EventType::PersistenceRemoved,
+            };
+            (event_type, Category::Persistence, None, None)
+        }
+    }
+}
+
+/// The file stem of a unit-file path — matches `basename`'s job in the
+/// identity sensor's own parser, but this one operates on a full
+/// filesystem path from the scanner, not an auditd `exe=` field, so it is
+/// not worth sharing (different input shape, same one-liner either way).
+fn unit_name_from_path(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1241,188 @@ mod tests {
         let session = event.session.as_ref().expect("session must be populated");
         assert_eq!(session.session_id, "3");
         assert_eq!(session.remote_addr, None);
+    }
+
+    fn systemd_start_raw() -> SystemdEventRaw {
+        SystemdEventRaw {
+            operation: SystemdOperation::Start,
+            unit_name: "backdoor.service".to_string(),
+            pid: 1,
+            uid: 0,
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            success: true,
+            exe_path: "/usr/lib/systemd/systemd".to_string(),
+            comm: "systemd".to_string(),
+            timestamp_ns: 1_000,
+            audit_serial: Some(501),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    #[test]
+    fn normalizes_a_systemd_start_event_with_directly_observed_session() {
+        let host = sample_host();
+        let event = normalize(RawEvent::Systemd(systemd_start_raw()), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::ServiceStart);
+        assert_eq!(event.category, Category::Systemd);
+        let service = event.service.as_ref().expect("service must be set");
+        assert_eq!(service.unit_name, "backdoor.service");
+        assert_eq!(service.unit_type, "service");
+        assert_eq!(service.action, "start");
+        assert_eq!(
+            event.session.as_ref().expect("session must be observed").session_id,
+            "3"
+        );
+        assert_eq!(event.user.as_ref().unwrap().uid, 0);
+    }
+
+    #[test]
+    fn normalizes_a_systemd_stop_event_for_a_timer_unit() {
+        let host = sample_host();
+        let mut raw = systemd_start_raw();
+        raw.operation = SystemdOperation::Stop;
+        raw.unit_name = "backdoor.timer".to_string();
+        let event = normalize(RawEvent::Systemd(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::ServiceStop);
+        let service = event.service.as_ref().unwrap();
+        assert_eq!(service.unit_type, "timer");
+        assert_eq!(service.action, "stop");
+    }
+
+    #[test]
+    fn a_systemd_event_with_no_observed_session_gets_none_not_a_guess() {
+        let host = sample_host();
+        let mut raw = systemd_start_raw();
+        raw.session_id = None;
+        let event = normalize(RawEvent::Systemd(raw), &host, "boot-1");
+        assert!(event.session.is_none());
+    }
+
+    fn persistence_raw(
+        operation: PersistenceOperation,
+        checkpoint_kind: PersistenceCheckpointKind,
+        path: &str,
+    ) -> PersistenceEventRaw {
+        PersistenceEventRaw {
+            operation,
+            checkpoint_kind,
+            path: path.to_string(),
+            content_hash: match operation {
+                PersistenceOperation::Removed => None,
+                _ => Some("a".repeat(64)),
+            },
+            size: match operation {
+                PersistenceOperation::Removed => None,
+                _ => Some(64),
+            },
+            timestamp_ns: 2_000,
+            source: RawEventSource::Procfs,
+        }
+    }
+
+    #[test]
+    fn a_new_systemd_unit_file_normalizes_to_service_create_not_persistence() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Created,
+            PersistenceCheckpointKind::SystemdUnit,
+            "/etc/systemd/system/backdoor.service",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::ServiceCreate);
+        assert_eq!(event.category, Category::Systemd);
+        let service = event.service.as_ref().expect("service must be set");
+        assert_eq!(service.unit_name, "backdoor.service");
+        assert_eq!(service.unit_type, "service");
+        assert_eq!(service.action, "create");
+        // Unit-file-lifecycle events are still FileRef-carrying too — the
+        // path/hash is real, observable data, and Task 10's Systemd Story
+        // does not need it, but nothing forbids keeping it honestly.
+        assert_eq!(
+            event.file.as_ref().unwrap().path,
+            "/etc/systemd/system/backdoor.service"
+        );
+    }
+
+    #[test]
+    fn a_modified_systemd_timer_file_normalizes_to_timer_modify() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Modified,
+            PersistenceCheckpointKind::SystemdTimer,
+            "/etc/systemd/system/backdoor.timer",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::TimerModify);
+        assert_eq!(event.category, Category::Systemd);
+        assert_eq!(event.service.as_ref().unwrap().unit_type, "timer");
+    }
+
+    /// Global Constraint #5: there is no TIMER_DELETE in the frozen
+    /// taxonomy, so a removed timer file normalizes to TIMER_MODIFY with
+    /// the true operation disclosed in event_data, never invented as a new
+    /// enum variant and never silently conflated with an actual edit
+    /// without that disclosure.
+    #[test]
+    fn a_removed_systemd_timer_file_normalizes_to_timer_modify_with_operation_disclosed() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Removed,
+            PersistenceCheckpointKind::SystemdTimer,
+            "/etc/systemd/system/backdoor.timer",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::TimerModify);
+        assert_eq!(
+            event.event_data.get("operation").and_then(|v| v.as_str()),
+            Some("removed")
+        );
+    }
+
+    #[test]
+    fn a_new_cron_file_normalizes_to_generic_persistence_created() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Created,
+            PersistenceCheckpointKind::Cron,
+            "/etc/cron.d/backdoor",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::PersistenceCreated);
+        assert_eq!(event.category, Category::Persistence);
+        assert!(event.service.is_none());
+        assert_eq!(event.file.as_ref().unwrap().path, "/etc/cron.d/backdoor");
+    }
+
+    #[test]
+    fn a_removed_ld_preload_normalizes_to_persistence_removed_with_no_hash() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Removed,
+            PersistenceCheckpointKind::LdPreload,
+            "/etc/ld.so.preload",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert_eq!(event.event_type, EventType::PersistenceRemoved);
+        assert!(event.file.as_ref().unwrap().hash.is_none());
+    }
+
+    /// Persistence-category events carry no process/session identity — the
+    /// scanner is not triggered by a process event (plan Global Constraint
+    /// #3), and inventing either would be exactly the fabrication this
+    /// codebase's discipline forbids everywhere else.
+    #[test]
+    fn a_persistence_event_carries_no_process_or_session() {
+        let host = sample_host();
+        let raw = persistence_raw(
+            PersistenceOperation::Created,
+            PersistenceCheckpointKind::Sudoers,
+            "/etc/sudoers.d/backdoor",
+        );
+        let event = normalize(RawEvent::Persistence(raw), &host, "boot-1");
+        assert!(event.process.is_none());
+        assert!(event.session.is_none());
+        assert!(event.user.is_none());
     }
 }
