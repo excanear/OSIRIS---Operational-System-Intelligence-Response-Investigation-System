@@ -632,4 +632,85 @@ match:
         );
         assert_eq!(alerts[0].rule_id(), "privilege_escalation_to_root_in_remote_session");
     }
+
+    fn systemd_start_event(unit_name: &str, remote_addr: Option<&str>) -> CanonicalEvent {
+        let mut e = event(EventType::ServiceStart, "/unused", "/usr/lib/systemd/systemd");
+        e.file = None;
+        e.service = Some(osiris_schema::ServiceRef {
+            unit_name: unit_name.to_string(),
+            unit_type: "service".to_string(),
+            action: "start".to_string(),
+        });
+        e.session = remote_addr.map(|addr| osiris_schema::SessionRef {
+            session_id: "3".to_string(),
+            tty: None,
+            remote_addr: Some(addr.to_string()),
+            auth_method: Some("sshd".to_string()),
+        });
+        e
+    }
+
+    #[test]
+    fn the_shipped_systemd_remote_start_rule_loads_and_fires_on_its_positive_fixture_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let engine = DetectionEngine::new(vec![Rule::from_yaml_str(
+            &yaml,
+            "systemd_service_started_in_remote_session.yaml",
+        )
+        .expect("the shipped rule must parse")]);
+
+        let event = systemd_start_event("backdoor.service", Some("198.51.100.10"));
+        let alerts = engine.evaluate(&event);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "systemd_service_started_in_remote_session");
+        assert_eq!(alerts[0].severity(), Severity::High);
+        assert_eq!(alerts[0].reasons().len(), 2);
+    }
+
+    #[test]
+    fn the_shipped_systemd_remote_start_rule_does_not_fire_on_a_local_or_sessionless_start() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![
+            Rule::from_yaml_str(&yaml, "systemd_service_started_in_remote_session.yaml").unwrap(),
+        ]);
+
+        // No session at all (a unit started at boot with no D-Bus caller).
+        let local = systemd_start_event("cron.service", None);
+        assert!(engine.evaluate(&local).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_systemd_remote_start_rule_does_not_fire_on_a_service_stop() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![
+            Rule::from_yaml_str(&yaml, "systemd_service_started_in_remote_session.yaml").unwrap(),
+        ]);
+
+        let mut e = systemd_start_event("backdoor.service", Some("198.51.100.10"));
+        e.event_type = EventType::ServiceStop;
+        e.category = EventType::ServiceStop.category();
+        assert!(engine.evaluate(&e).is_empty());
+    }
+
+    /// All four shipped rules must load together and stay independent as
+    /// `config/rules/` grows — the same guard Phase 3 added for two and
+    /// Phase 4a added for three.
+    #[test]
+    fn all_four_shipped_rules_load_together_without_cross_firing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        assert!(engine.rule_count() >= 4);
+
+        let event = systemd_start_event("backdoor.service", Some("198.51.100.10"));
+        let alerts = engine.evaluate(&event);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "systemd_service_started_in_remote_session");
+    }
 }

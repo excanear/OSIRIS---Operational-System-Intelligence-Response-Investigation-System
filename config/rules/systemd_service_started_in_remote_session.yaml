@@ -1,0 +1,29 @@
+# Detects a systemd service starting inside a session that was opened from
+# a remote address — the same "actor plus artifact, not artifact alone"
+# shape as Phase 4a's privilege_escalation_to_root_in_remote_session, now
+# applied to Phase 4b's persistence mechanism: installing and starting a
+# backdoor service is the natural continuation of a remote escalation, and
+# neither half is suspicious alone (services start constantly at boot and
+# via local admin action; remote sessions are ordinary).
+#
+# `session.remote_addr ne ""` relies on the same null-handling `eval::
+# field_value`/`engine::evaluate_rule` already provide (Phase 4a plan
+# Global Constraint #9's precedent, reaffirmed by this phase's Global
+# Constraint #9): a SERVICE_START with no observed session (e.g. one
+# started at boot, with no D-Bus caller to attribute) resolves to a
+# non-match, not a fabricated "local" classification.
+#
+# MITRE ATT&CK: T1543.002 (Create or Modify System Process: Systemd
+# Service), reached over T1021.004 (Remote Services: SSH).
+id: systemd_service_started_in_remote_session
+version: 1
+severity: HIGH
+match:
+  - field: event_type
+    op: eq
+    value: "SERVICE_START"
+    reason: "A systemd service transitioned to the running state"
+  - field: session.remote_addr
+    op: ne
+    value: ""
+    reason: "The service was started inside a session opened from a remote network address (an SSH login), not a local console or an unattributed system service"
