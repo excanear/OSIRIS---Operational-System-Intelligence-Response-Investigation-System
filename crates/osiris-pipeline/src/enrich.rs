@@ -89,10 +89,33 @@ fn attach_session(event: &mut CanonicalEvent, sessions: &mut SessionResolver) {
         return;
     };
     let ppid = current_ppid(event);
-    let Some(session_id) = sessions.attach(pid, ppid) else {
-        return;
+    let inferred_session_id = sessions.attach(pid, ppid);
+
+    // An event may already carry an observed session id, populated
+    // directly from the record's own `ses=` field in Normalize
+    // (`normalize_privilege_event` does this today; this phase's
+    // `normalize_systemd_event` will too). Observation always wins over
+    // pid/ppid inference here — the same "never let a guess override a
+    // fact" discipline this stage already applies to process identity
+    // (`PROCESS_KEY_PROVISIONAL`) and file identity (no edge over a
+    // fabricated one). `sessions.attach` above is still called
+    // unconditionally for its pid-inheritance teaching side effect —
+    // unrelated descendants of `pid` must still resolve correctly through
+    // it — only its *return value* is demoted to a fallback here.
+    let session_id = match event.session.as_ref() {
+        Some(observed) => observed.session_id.clone(),
+        None => match inferred_session_id {
+            Some(inferred) => inferred,
+            None => return,
+        },
     };
+
     let Some(record) = sessions.record_for(&session_id) else {
+        // The session id (observed or inferred) doesn't match a known
+        // login record. Leave `event.session` exactly as Normalize
+        // produced it — a minimal ref, or `None` — rather than discarding
+        // real, directly-observed data because enrichment has nothing
+        // fuller to offer it.
         return;
     };
     event.session = Some(SessionRef {
@@ -975,5 +998,93 @@ mod tests {
 
         let after = enrich(bare_event(host_id, 400, 100), "boot-1", &mut resolver, &mut sessions);
         assert!(after.session.is_none());
+    }
+
+    /// Regression test for the Phase 4a final-review finding parked for
+    /// this phase: an event that already carries an OBSERVED session
+    /// (populated directly from the record's own `ses=` in Normalize, the
+    /// same way `normalize_privilege_event` already works) must keep that
+    /// session even when the pid/ppid chain would infer a *different* one —
+    /// the nested-login (`su`) case where a pid moves from one real audit
+    /// session into another.
+    #[test]
+    fn an_observed_session_wins_over_a_pid_inferred_one() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+
+        // pid 100 is the root of session "3" (e.g. the original SSH login).
+        let _login_a = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        // pid 200 execs under 100 and inherits session "3" by ppid chain.
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+
+        // A second, independent login roots session "5" at pid 500 (e.g. a
+        // concurrent console session, unrelated to pid 200's ancestry).
+        let mut login_b = login_event(host_id, 500);
+        login_b.session.as_mut().unwrap().session_id = "5".to_string();
+        login_b.session.as_mut().unwrap().remote_addr = None;
+        login_b.session.as_mut().unwrap().auth_method = Some("login".to_string());
+        let _login_b = enrich(login_b, "boot-1", &mut resolver, &mut sessions);
+
+        // pid 200 (a known member of session "3" via inheritance) now
+        // produces an event whose record OWN `ses=` says "5" — e.g. it ran
+        // `su` and its next audit-visible action is a Systemd/Privilege
+        // record carrying the real, current, observed session. Normalize
+        // would have populated `event.session` from that observation before
+        // `enrich` ever runs; this test constructs that pre-enriched shape
+        // directly, exactly as `normalize_privilege_event` and (this
+        // phase's) `normalize_systemd_event` do.
+        let mut observed_event = bare_event(host_id, 200, 100);
+        observed_event.session = Some(SessionRef {
+            session_id: "5".to_string(),
+            tty: None,
+            remote_addr: None,
+            auth_method: None,
+        });
+        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions);
+
+        assert_eq!(
+            result.session.as_ref().unwrap().session_id,
+            "5",
+            "the record's own observed session must win over the pid-inferred one"
+        );
+        assert_eq!(
+            result.session.as_ref().unwrap().auth_method.as_deref(),
+            Some("login"),
+            "the observed session id must still be enriched from its own known record"
+        );
+    }
+
+    /// When the observed session id does not (yet, or ever) match a known
+    /// login record, the minimal observed ref must be kept exactly as
+    /// Normalize produced it — not cleared, and not replaced by an
+    /// unrelated pid-inferred session.
+    #[test]
+    fn an_observed_session_with_no_known_record_is_kept_minimal_not_overwritten() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+
+        // pid 200 is a known member of session "3", but this event's own
+        // record observed a session ("9") the resolver has never heard of
+        // (its login happened before the Agent started).
+        let mut observed_event = bare_event(host_id, 200, 100);
+        observed_event.session = Some(SessionRef {
+            session_id: "9".to_string(),
+            tty: None,
+            remote_addr: None,
+            auth_method: None,
+        });
+        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions);
+
+        assert_eq!(
+            result.session.as_ref().unwrap().session_id,
+            "9",
+            "an unknown observed session must be kept, never silently swapped for pid-3"
+        );
+        assert!(result.session.as_ref().unwrap().tty.is_none());
     }
 }

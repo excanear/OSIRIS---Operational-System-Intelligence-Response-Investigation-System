@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Everything the Enrich stage needs to reconstruct a §9.2 `SessionRef`
 /// (plus the session owner's uid) for any process that belongs to a
@@ -38,7 +38,7 @@ pub struct SessionResolver {
     /// Reverse index so `forget` is O(members) rather than a full scan of
     /// `by_pid` — the map can hold many thousands of pids across many
     /// sessions, and logouts are common.
-    members: HashMap<String, Vec<u32>>,
+    members: HashMap<String, HashSet<u32>>,
 }
 
 impl SessionResolver {
@@ -54,7 +54,7 @@ impl SessionResolver {
         let session_id = record.session_id.clone();
         self.sessions.insert(session_id.clone(), record);
         self.by_pid.insert(pid, session_id.clone());
-        self.members.entry(session_id).or_default().push(pid);
+        self.members.entry(session_id).or_default().insert(pid);
     }
 
     /// Resolves `pid`'s session, adopting its parent's session if `pid` is
@@ -75,7 +75,7 @@ impl SessionResolver {
         self.members
             .entry(session_id.clone())
             .or_default()
-            .push(pid);
+            .insert(pid);
         Some(session_id)
     }
 
@@ -194,5 +194,21 @@ mod tests {
         assert_eq!(sessions.attach(600, 500), Some("4".to_string()));
         sessions.forget("3");
         assert_eq!(sessions.attach(600, 500), Some("4".to_string()));
+    }
+
+    /// A real audit stream emits both `USER_LOGIN` and `USER_START` for one
+    /// session, and `enrich.rs`'s `attach_session` calls `record_login` for
+    /// both — `members` must not accumulate the same pid twice from that,
+    /// or `forget`'s iteration does needless repeated work per session.
+    #[test]
+    fn record_login_called_twice_for_the_same_pid_does_not_duplicate_membership() {
+        let mut sessions = SessionResolver::new();
+        sessions.record_login(100, ssh_session());
+        sessions.record_login(100, ssh_session());
+        sessions.forget("3");
+        // If pid 100 had been double-counted, this would still resolve
+        // (the first `forget` pass would only remove one of two identical
+        // entries) — asserting `None` here is the actual proof.
+        assert_eq!(sessions.attach(100, 1), None);
     }
 }
