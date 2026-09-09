@@ -1,99 +1,9 @@
-use std::collections::HashMap;
-
-use osiris_fileutil::{parse_audit_msg_id, tokenize, AuditMsgId};
+use osiris_fileutil::{
+    parse_id, split_record, unknown_to_none, usable_session, RecordParts,
+};
 use osiris_sensor_api::{
     IdentityEventRaw, IdentityOperation, PrivilegeEventRaw, PrivilegeOperation, RawEventSource,
 };
-
-/// auditd's `(unsigned)-1` sentinel, printed for an unset `auid=`/`ses=`
-/// and for a `setuid`/`setgid` argument meaning "leave this id unchanged".
-const UNSET_ID: &str = "4294967295";
-
-/// One auditd record, split into the three layers a `USER_*` line actually
-/// has: the `type=… msg=audit(<secs>.<millis>:<serial>):` header, the outer
-/// `key=value` body, and the single-quoted `msg='…'` sub-record.
-///
-/// This split is mandatory, not a convenience (Phase 4a plan Global
-/// Constraint #9): `osiris_fileutil::tokenize` returns a `HashMap`, so
-/// tokenizing a whole `USER_*` line lets the nested `msg='…'` overwrite the
-/// header's `msg=audit(…)` value and destroys the timestamp and serial.
-/// Nothing in this crate ever calls `tokenize` on a whole `USER_*` line.
-#[derive(Debug, Clone)]
-pub struct RecordParts {
-    pub id: AuditMsgId,
-    pub record_type: String,
-    pub outer: HashMap<String, String>,
-    pub inner: HashMap<String, String>,
-}
-
-impl RecordParts {
-    /// Reads a field from either layer, outer first. The two layers never
-    /// carry the same key in the record types this sensor parses, so the
-    /// precedence is a tiebreak that is not exercised in practice — but it
-    /// is defined here rather than left to iteration order.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.outer
-            .get(key)
-            .or_else(|| self.inner.get(key))
-            .map(String::as_str)
-    }
-}
-
-/// Splits one auditd line into header / outer body / inner `msg='…'`.
-/// Returns `None` for any line with no parseable `msg=audit(…):` header —
-/// never panics, never half-parses.
-pub fn split_record(line: &str) -> Option<RecordParts> {
-    // The header always ends `…:<serial>): `. Splitting there is exact: the
-    // sequence `"): "` cannot occur earlier, because everything before it
-    // is `type=<T> msg=audit(<digits>.<digits>:<digits>)`.
-    let end = line.find("): ")?;
-    // `..end + 2` keeps the trailing `:`, which `parse_audit_msg_id`
-    // explicitly accepts (see its doc comment in osiris-fileutil).
-    let header = &line[..end + 2];
-    let body = &line[end + 3..];
-
-    let header_fields = tokenize(header);
-    let id = parse_audit_msg_id(header_fields.get("msg")?)?;
-    let record_type = header_fields.get("type")?.clone();
-
-    // Carve the nested sub-record out of the body before tokenizing what
-    // remains, so neither layer's fields can shadow the other's.
-    let (outer_text, inner_text) = match body.find("msg='") {
-        Some(start) => {
-            let after = &body[start + 5..];
-            // Close on the LAST `'` in the remainder, not the first. Every
-            // real auditd `USER_*` record puts the nested `msg='…'`
-            // sub-record last, so its closing quote is the final `'` on the
-            // line. Closing on the first `'` instead would let an embedded
-            // quote inside an inner field (e.g. `acct="o'brien"`) truncate
-            // the inner record early and splice the genuine remainder back
-            // into the trusted `outer` layer, where a forged `ses=`/`uid=`/
-            // `pid=` could shadow the real one via `tokenize`'s last-wins
-            // `HashMap` semantics.
-            match after.rfind('\'') {
-                Some(close) => {
-                    let mut outer = String::with_capacity(body.len());
-                    outer.push_str(&body[..start]);
-                    outer.push_str(&after[close + 1..]);
-                    (outer, after[..close].to_string())
-                }
-                // An unterminated quote: treat the remainder as the inner
-                // sub-record rather than dropping the record outright. The
-                // caller's required-field lookups then decide whether
-                // enough survived to build an event.
-                None => (body[..start].to_string(), after.to_string()),
-            }
-        }
-        None => (body.to_string(), String::new()),
-    };
-
-    Some(RecordParts {
-        id,
-        record_type,
-        outer: tokenize(&outer_text),
-        inner: tokenize(&inner_text),
-    })
-}
 
 /// The two disjoint record families this sensor emits (Phase 4a plan Global
 /// Constraint #4). One `LineTailer` over one audit log produces both; there
@@ -239,28 +149,6 @@ fn sudo(parts: &RecordParts, line: &str) -> Option<IdentityRecord> {
     }))
 }
 
-/// auditd prints a literal `?` for an unknown `addr=`/`hostname=`/
-/// `terminal=` — a local console login has no remote address. That is
-/// "unknown", so it becomes `None`; `Some("?")` must never reach a
-/// `SessionRef` (Phase 4a plan Global Constraint #9).
-fn unknown_to_none(value: Option<&str>) -> Option<&str> {
-    value.filter(|v| !v.is_empty() && *v != "?" && *v != "(none)")
-}
-
-/// Parses a uid-like field, mapping auditd's unset sentinel to `None`
-/// rather than to 4,294,967,295.
-fn parse_id(value: Option<&str>) -> Option<u32> {
-    value.filter(|v| *v != UNSET_ID)?.parse().ok()
-}
-
-/// A session id that can actually be correlated: present, non-empty, and
-/// not the unset sentinel.
-fn usable_session(value: Option<&str>) -> Option<String> {
-    value
-        .filter(|v| !v.is_empty() && *v != UNSET_ID && *v != "?")
-        .map(str::to_string)
-}
-
 /// The file stem of an executable path — `"/usr/sbin/sshd"` -> `"sshd"`.
 /// This is what lands in `SessionRef.auth_method` (§9.2) and, for records
 /// carrying no `comm=`, in `comm`. Returns `None` for an empty path rather
@@ -336,67 +224,6 @@ mod tests {
     /// `USER_*` line has TWO `msg=` fields, and `tokenize`'s `HashMap` keeps
     /// only the last one, so feeding such a line to `tokenize` whole
     /// destroys the audit header. `split_record` must not.
-    #[test]
-    fn a_whole_user_line_fed_to_tokenize_loses_the_header_but_split_record_does_not() {
-        // Proof of the hazard, so this fails loudly if `tokenize`'s
-        // contract ever changes underneath us.
-        let naive = osiris_fileutil::tokenize(USER_LOGIN);
-        assert!(
-            osiris_fileutil::parse_audit_msg_id(naive.get("msg").unwrap()).is_none(),
-            "the nested msg='...' must be what a naive tokenize sees — if this ever \
-             passes, re-read Global Constraint #9 before simplifying the splitter"
-        );
-
-        let parts = split_record(USER_LOGIN).expect("must split");
-        assert_eq!(parts.id.timestamp_ns, 1_690_000_000_123_000_000);
-        assert_eq!(parts.id.serial, 456);
-        assert_eq!(parts.record_type, "USER_LOGIN");
-    }
-
-    #[test]
-    fn split_record_separates_outer_fields_from_the_nested_msg_fields() {
-        let parts = split_record(USER_START).expect("must split");
-        // Outer body.
-        assert_eq!(parts.outer.get("pid").map(String::as_str), Some("1200"));
-        assert_eq!(parts.outer.get("uid").map(String::as_str), Some("0"));
-        assert_eq!(parts.outer.get("auid").map(String::as_str), Some("1000"));
-        assert_eq!(parts.outer.get("ses").map(String::as_str), Some("3"));
-        // Inner sub-record.
-        assert_eq!(parts.inner.get("acct").map(String::as_str), Some("alice"));
-        assert_eq!(
-            parts.inner.get("exe").map(String::as_str),
-            Some("/usr/sbin/sshd")
-        );
-        assert_eq!(parts.inner.get("res").map(String::as_str), Some("success"));
-        assert_eq!(
-            parts.inner.get("addr").map(String::as_str),
-            Some("198.51.100.10")
-        );
-        // `get` reads either layer, outer first.
-        assert_eq!(parts.get("ses"), Some("3"));
-        assert_eq!(parts.get("acct"), Some("alice"));
-        assert_eq!(parts.get("nope"), None);
-    }
-
-    /// A `SYSCALL` record has no nested `msg='...'` at all — the splitter
-    /// must treat that as the ordinary case, with an empty inner map,
-    /// rather than rejecting the line.
-    #[test]
-    fn split_record_handles_a_record_with_no_nested_msg() {
-        let parts = split_record(SYSCALL_SETUID).expect("must split");
-        assert_eq!(parts.record_type, "SYSCALL");
-        assert!(parts.inner.is_empty());
-        assert_eq!(parts.outer.get("syscall").map(String::as_str), Some("105"));
-        assert_eq!(parts.outer.get("a0").map(String::as_str), Some("0"));
-        assert_eq!(parts.id.serial, 470);
-    }
-
-    #[test]
-    fn split_record_rejects_a_line_with_no_audit_header() {
-        assert!(split_record("this is not an audit record").is_none());
-        assert!(split_record("type=USER_LOGIN pid=1200").is_none());
-    }
-
     /// An embedded `'` inside an inner field (e.g. `acct="o'brien"`) must
     /// not let the splitter close the nested `msg='...'` sub-record early
     /// and splice the genuine remainder — including a forged `ses=` placed
