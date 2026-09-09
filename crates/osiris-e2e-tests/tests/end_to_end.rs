@@ -4,7 +4,7 @@ use std::time::Duration;
 use osiris_agent::{Agent, AgentConfig};
 use osiris_api::build_router;
 use osiris_detect::DetectionEngine;
-use osiris_schema::{EntityRef, EventType, HostRef, Relation};
+use osiris_schema::{Category, EntityRef, EventType, HostRef, Relation};
 use osiris_server::run_ingestion_loop;
 use osiris_storage::{QueryPlan, Storage};
 use osiris_storage_sqlite::SqliteStorage;
@@ -1028,6 +1028,302 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
 
     // 10. The real CLI binary still works against this richer dataset
     //     (regression check, unchanged from Phase 2/3).
+    let cli_binary = cli_binary_path();
+    let output = std::process::Command::new(&cli_binary)
+        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 9);
+}
+
+/// Phase 4b's flagship trace: continuing the same SSH-login-then-sudo-to-
+/// root escalation `ssh_sudo_escalation_flows_end_to_end_and_triggers_detection`
+/// proves, the same attacker now installs a backdoor systemd unit file
+/// (observed by Persistence Monitor's periodic scan-and-diff — unattributed,
+/// no pid triggered it) and starts it (observed by the audit-backed Systemd
+/// sensor, whose record's own `ses=` carries the SSH session directly) — all
+/// through the real Agent, Server, and HTTP API.
+///
+/// Verifies, in order: all 9 events landed across the four categories this
+/// trace touches; the `SERVICE_CREATE` event carries no session (Global
+/// Constraint #3 — the scanner is not triggered by a process) while the
+/// `SERVICE_START` event's directly-observed session is enriched to the full
+/// record (proof that Task 1's fix and this phase's direct-observation
+/// normalize combine correctly); `SERVICE_START` carries zero relationship
+/// edges (Global Constraint #3's "no fabricated actor" ruling, asserted as
+/// an absence check the way Phase 4a's own final review required); both the
+/// new systemd rule and Phase 4a's escalation rule fired — and only those
+/// two; and the new Systemd Story endpoint returns exactly the two
+/// `backdoor.service`-named events plus the one alert that cites either of
+/// them as evidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        systemd_audit_log_path: None,
+        persistence_watch_paths: vec![],
+        enable_synthetic: true,
+        synthetic_scenario: Some("persistence_via_systemd_service".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+
+    // The real shipped rules directory — now four rules.
+    let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+    let detection_engine = Arc::new(DetectionEngine::load_from_dir(&rules_dir).unwrap());
+    assert!(detection_engine.rule_count() >= 4);
+
+    let ingestion_cancellation = CancellationToken::new();
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        detection_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // 9-event scenario, same generous budget as the ssh_sudo_escalation e2e.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    // 1. Storage directly: all 9 events landed, across exactly four
+    //    categories (no FILE, no NETWORK, no generic PERSISTENCE — this
+    //    scenario's one checkpoint is a SystemdUnit, which Global Constraint
+    //    #1 routes entirely into SYSTEMD).
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    assert_eq!(
+        events.len(),
+        9,
+        "expected sshd/bash/sudo execs, login, sudo, uid change, unit-file create, service start, logout"
+    );
+    // `Category` derives neither `Hash` nor `Ord` (schema-frozen, Global
+    // Constraint #6 — not something this phase may add just for a test), so
+    // this checks membership directly rather than building a `HashSet`.
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(
+                e.category,
+                Category::Process | Category::Identity | Category::Privilege | Category::Systemd
+            )),
+        "no FILE/NETWORK/PERSISTENCE event exists in this scenario"
+    );
+    for expected in [
+        Category::Process,
+        Category::Identity,
+        Category::Privilege,
+        Category::Systemd,
+    ] {
+        assert!(
+            events.iter().any(|e| e.category == expected),
+            "expected at least one {expected:?} event"
+        );
+    }
+
+    // 2. The two SYSTEMD-category events, told apart by event_type: the
+    //    Persistence-Monitor-observed unit-file creation, and the
+    //    audit-observed service start.
+    let unit_create = events
+        .iter()
+        .find(|e| e.event_type == EventType::ServiceCreate)
+        .expect("the SERVICE_CREATE event must be present");
+    let service_start = events
+        .iter()
+        .find(|e| e.event_type == EventType::ServiceStart)
+        .expect("the SERVICE_START event must be present");
+    assert_eq!(unit_create.service.as_ref().unwrap().unit_name, "backdoor.service");
+    assert_eq!(service_start.service.as_ref().unwrap().unit_name, "backdoor.service");
+
+    // 3. Session propagation (Global Constraint #3's disclosed asymmetry):
+    //    SERVICE_CREATE carries none at all (the scanner has no process to
+    //    attribute it to); SERVICE_START carries the SSH session, enriched
+    //    to the full record — proof Task 1's fix and this phase's direct
+    //    observation combine correctly, not just in the pipeline unit test.
+    assert!(
+        unit_create.session.is_none(),
+        "a Persistence-Monitor-observed event must carry no session — it was never triggered by a process"
+    );
+    let start_session = service_start
+        .session
+        .as_ref()
+        .expect("SERVICE_START's own ses= must be observed and preserved");
+    assert_eq!(start_session.session_id, "3");
+    assert_eq!(
+        start_session.remote_addr.as_deref(),
+        Some("198.51.100.10"),
+        "the observed session id must be enriched to the full record, not left minimal"
+    );
+    assert_eq!(start_session.auth_method.as_deref(), Some("sshd"));
+
+    let sshd_exec = events
+        .iter()
+        .find(|e| {
+            e.event_type == EventType::ProcessExec
+                && e.process.as_ref().map(|p| p.pid) == Some(100)
+        })
+        .expect("the sshd exec must be present");
+    assert!(
+        sshd_exec.session.is_none(),
+        "the exec that preceded the login must not be retro-attributed to it"
+    );
+
+    for event in &events {
+        if event.event_id == sshd_exec.event_id || event.event_id == unit_create.event_id {
+            continue;
+        }
+        let session = event
+            .session
+            .as_ref()
+            .unwrap_or_else(|| panic!("{:?} must carry the session", event.event_type));
+        assert_eq!(session.session_id, "3");
+    }
+
+    // 4. Global Constraint #3: no entity-graph edges for either SYSTEMD
+    //    event this phase adds — asserted as an absence, on
+    //    event.relationships directly, not inferred from a Story join.
+    assert!(
+        service_start.relationships.is_empty(),
+        "a SERVICE_START event must carry zero relationship edges — systemd's own \
+         pid=1 is not an attacker-controlled process to graph an edge from"
+    );
+    assert!(
+        unit_create.relationships.is_empty(),
+        "a SERVICE_CREATE event must carry zero relationship edges — the scanner \
+         observed a path on disk, not a process's action"
+    );
+
+    // ...while the pre-existing edges from Phase 4a's own escalation step
+    // are still present, exactly as ssh_sudo_escalation's own e2e proved —
+    // this phase changes nothing about them.
+    let escalation = events
+        .iter()
+        .find(|e| e.event_type == EventType::PrivilegeUidChange)
+        .expect("the PRIVILEGE_UID_CHANGE event must be present");
+    assert_eq!(
+        escalation
+            .relationships
+            .iter()
+            .filter(|r| r.relation == Relation::ExecutedAs)
+            .count(),
+        1
+    );
+
+    // 5. Storage's new unit_name filter works on real ingested rows (Task 7).
+    let mut plan = QueryPlan::new();
+    plan.unit_name = Some("backdoor.service".to_string());
+    assert_eq!(
+        storage.query(&plan).unwrap().len(),
+        2,
+        "both the create and the start belong to backdoor.service"
+    );
+
+    // 6. Over real HTTP: both alerts fired, and only those two.
+    let app = build_router(storage.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let alerts: serde_json::Value = client
+        .get(format!("http://{}/api/v1/alerts", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alerts_array = alerts.as_array().unwrap();
+    assert_eq!(
+        alerts_array.len(),
+        2,
+        "exactly two alerts: the new systemd rule and Phase 4a's escalation rule \
+         — the same attacker continuing the same session, not cross-firing"
+    );
+    let rule_ids: std::collections::HashSet<_> = alerts_array
+        .iter()
+        .map(|a| a["rule_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        rule_ids,
+        std::collections::HashSet::from([
+            "systemd_service_started_in_remote_session".to_string(),
+            "privilege_escalation_to_root_in_remote_session".to_string(),
+        ]),
+        "the Phase 2/3 rules must stay silent — this scenario has no FILE_WRITE/DNS_QUERY event"
+    );
+    for alert in alerts_array {
+        let reasons = alert["reasons"].as_array().unwrap();
+        assert!(!reasons.is_empty());
+        assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+        assert_eq!(alert["rule_content_hash"].as_str().unwrap().len(), 64);
+    }
+
+    // 7. The new Systemd Story endpoint (Task 10) over real HTTP: exactly
+    //    the two backdoor.service events, plus the one alert that cites
+    //    either of them as evidence (the escalation alert's evidence is the
+    //    PRIVILEGE_UID_CHANGE event, which this unit-scoped story does not
+    //    include).
+    let story: serde_json::Value = client
+        .get(format!("http://{}/api/v1/systemd/story?unit_name=backdoor.service", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let story_events = story["events"].as_array().unwrap();
+    assert_eq!(story_events.len(), 2);
+    let story_event_types: std::collections::HashSet<_> = story_events
+        .iter()
+        .map(|e| e["event_type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        story_event_types,
+        std::collections::HashSet::from([
+            "SERVICE_CREATE".to_string(),
+            "SERVICE_START".to_string(),
+        ])
+    );
+    let story_alerts = story["alerts"].as_array().unwrap();
+    assert_eq!(
+        story_alerts.len(),
+        1,
+        "only the systemd rule's alert cites a backdoor.service event as evidence"
+    );
+    assert_eq!(
+        story_alerts[0]["rule_id"].as_str().unwrap(),
+        "systemd_service_started_in_remote_session"
+    );
+
+    // 8. The real CLI binary still works against this richer dataset
+    //    (regression check, unchanged from Phase 2/3/4a).
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
