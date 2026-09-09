@@ -310,6 +310,111 @@ pub struct PrivilegeEventRaw {
     pub source: RawEventSource,
 }
 
+/// The two systemd unit-lifecycle operations this phase's audit-backed
+/// sensor observes (plan Global Constraint #1). Each maps 1:1 onto one
+/// standard auditd record type systemd itself emits when audit is enabled:
+/// `Start` <- `type=SERVICE_START`, `Stop` <- `type=SERVICE_STOP`. Unlike
+/// Identity/Privilege's records, the outer `pid=`/`uid=` are genuinely
+/// systemd's own (typically `pid=1 uid=0`), not an attacker-controlled
+/// process — there is no process identity to correlate here, only session
+/// identity when the record's own `ses=` reports one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemdOperation {
+    Start,
+    Stop,
+}
+
+/// A systemd unit start/stop record, parsed from one auditd `SERVICE_START`/
+/// `SERVICE_STOP` line. Same nested `outer key=value` + single-quoted
+/// `msg='...'` shape as Identity/Privilege's `USER_*` records (plan Global
+/// Constraint #7) — `crate::osiris_fileutil::split_record` (shared, not
+/// reimplemented) handles both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemdEventRaw {
+    pub operation: SystemdOperation,
+    /// From the nested `msg='unit=...'`, full unit name including its
+    /// `.service`/`.timer` suffix.
+    pub unit_name: String,
+    /// The outer `pid=` — genuinely systemd's own pid (typically `1`) on a
+    /// real host, not an actor's process. Kept rather than discarded: it is
+    /// what the record actually reports, and Normalize/Enrich treat it
+    /// exactly like any other honestly-reported-but-uninteresting pid
+    /// (`PROCESS_KEY_PROVISIONAL` if never independently observed).
+    pub pid: u32,
+    pub uid: u32,
+    /// From the outer `auid=`. `None` when the record omits it or prints
+    /// the unset sentinel — systemd does not always have an actor's login
+    /// uid to report (e.g. a unit started at boot, with no D-Bus caller).
+    pub auid: Option<u32>,
+    /// From the outer `ses=`. `None` when absent/unset. When present, this
+    /// is the *direct observation* `normalize_systemd_event` uses to
+    /// populate `CanonicalEvent.session` (plan Global Constraint #3) —
+    /// exactly the same pattern `PrivilegeEventRaw.session_id` already
+    /// established in Phase 4a.
+    pub session_id: Option<String>,
+    /// From the nested `res=`: `res=success` -> true.
+    pub success: bool,
+    /// From the nested `exe=`, full path (typically
+    /// `/usr/lib/systemd/systemd`).
+    pub exe_path: String,
+    /// From the nested `comm=` (typically `"systemd"`).
+    pub comm: String,
+    pub timestamp_ns: u64,
+    pub audit_serial: Option<u64>,
+    pub source: RawEventSource,
+}
+
+/// Which of Persistence Monitor's config-declared watch targets a changed
+/// path belongs to (plan Global Constraint #4). Explicitly set by the
+/// sensor from its own config — never inferred by pattern-matching the path
+/// string. `SystemdUnit`/`SystemdTimer` are the one place this phase
+/// distinguishes *within* a single watch target, by file extension, since a
+/// `systemd_unit_dir` target's directory holds both kinds of file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceCheckpointKind {
+    SystemdUnit,
+    SystemdTimer,
+    Cron,
+    ShellProfile,
+    LdPreload,
+    Sudoers,
+}
+
+/// The three lifecycle transitions Persistence Monitor's periodic scan-and-
+/// diff observes for one watched path (plan Global Constraint #8: the very
+/// first scan after Agent start seeds a baseline silently and emits none of
+/// these for whatever it finds already present).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceOperation {
+    Created,
+    Modified,
+    Removed,
+}
+
+/// A persistence-checkpoint-path lifecycle record, from Persistence
+/// Monitor's periodic scan (never from Linux Audit — plan Global Constraint
+/// #1). No process/session identity is ever attached: the scanner is not
+/// triggered by a process event, so any pid it reported would be
+/// fabricated. `content_hash`/`size` are always `None` for `Removed` (there
+/// is nothing left to hash — plan-mandated, not an oversight).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistenceEventRaw {
+    pub operation: PersistenceOperation,
+    pub checkpoint_kind: PersistenceCheckpointKind,
+    pub path: String,
+    /// SHA-256 hex digest of the file's current content. `None` for
+    /// `Removed`.
+    pub content_hash: Option<String>,
+    /// `None` for `Removed`.
+    pub size: Option<u64>,
+    pub timestamp_ns: u64,
+    /// Always `RawEventSource::Procfs` in practice (plan Global Constraint
+    /// #1 — no audit-log equivalent exists for a generic file-content
+    /// scan); kept as the full enum rather than hardcoded so a future
+    /// fanotify-backed variant is a value change here, not a type change.
+    pub source: RawEventSource,
+}
+
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
 /// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 added
 /// File; Phase 3 added Network and Dns; Phase 4a adds Identity and
@@ -322,6 +427,8 @@ pub enum RawEvent {
     Dns(DnsEventRaw),
     Identity(IdentityEventRaw),
     Privilege(PrivilegeEventRaw),
+    Systemd(SystemdEventRaw),
+    Persistence(PersistenceEventRaw),
 }
 
 impl RawEvent {
@@ -336,6 +443,8 @@ impl RawEvent {
             RawEvent::Dns(d) => d.timestamp_ns,
             RawEvent::Identity(i) => i.timestamp_ns,
             RawEvent::Privilege(p) => p.timestamp_ns,
+            RawEvent::Systemd(s) => s.timestamp_ns,
+            RawEvent::Persistence(p) => p.timestamp_ns,
         }
     }
 }
@@ -607,5 +716,82 @@ mod tests {
             RawEvent::Privilege(privilege_raw()).timestamp_ns(),
             1_690_000_005_000_000_000
         );
+    }
+
+    fn systemd_raw() -> SystemdEventRaw {
+        SystemdEventRaw {
+            operation: SystemdOperation::Start,
+            unit_name: "sshd.service".to_string(),
+            pid: 1,
+            uid: 0,
+            auid: Some(1000),
+            session_id: Some("3".to_string()),
+            success: true,
+            exe_path: "/usr/lib/systemd/systemd".to_string(),
+            comm: "systemd".to_string(),
+            timestamp_ns: 1_690_000_000_123_000_000,
+            audit_serial: Some(501),
+            source: RawEventSource::Audit,
+        }
+    }
+
+    #[test]
+    fn systemd_raw_event_round_trips_through_raw_event() {
+        let raw = RawEvent::Systemd(systemd_raw());
+        assert_eq!(raw.timestamp_ns(), 1_690_000_000_123_000_000);
+        match raw {
+            RawEvent::Systemd(s) => {
+                assert_eq!(s.operation, SystemdOperation::Start);
+                assert_eq!(s.unit_name, "sshd.service");
+                assert_eq!(s.session_id.as_deref(), Some("3"));
+            }
+            other => panic!("expected RawEvent::Systemd, got {other:?}"),
+        }
+    }
+
+    fn persistence_raw() -> PersistenceEventRaw {
+        PersistenceEventRaw {
+            operation: PersistenceOperation::Created,
+            checkpoint_kind: PersistenceCheckpointKind::SystemdUnit,
+            path: "/etc/systemd/system/backdoor.service".to_string(),
+            content_hash: Some("a".repeat(64)),
+            size: Some(128),
+            timestamp_ns: 1_690_000_010_000_000_000,
+            source: RawEventSource::Procfs,
+        }
+    }
+
+    #[test]
+    fn persistence_raw_event_round_trips_through_raw_event() {
+        let raw = RawEvent::Persistence(persistence_raw());
+        assert_eq!(raw.timestamp_ns(), 1_690_000_010_000_000_000);
+        match raw {
+            RawEvent::Persistence(p) => {
+                assert_eq!(p.operation, PersistenceOperation::Created);
+                assert_eq!(p.checkpoint_kind, PersistenceCheckpointKind::SystemdUnit);
+                assert_eq!(p.path, "/etc/systemd/system/backdoor.service");
+                assert_eq!(p.content_hash.as_deref(), Some("a".repeat(64).as_str()));
+            }
+            other => panic!("expected RawEvent::Persistence, got {other:?}"),
+        }
+    }
+
+    /// A removed artifact carries no content hash — there is nothing left
+    /// to hash, and inventing one (e.g. reusing the last-known hash) would
+    /// misrepresent a deletion as a content fact.
+    #[test]
+    fn a_removed_persistence_event_carries_no_content_hash() {
+        let mut raw = persistence_raw();
+        raw.operation = PersistenceOperation::Removed;
+        raw.content_hash = None;
+        raw.size = None;
+        let event = RawEvent::Persistence(raw);
+        match event {
+            RawEvent::Persistence(p) => {
+                assert!(p.content_hash.is_none());
+                assert!(p.size.is_none());
+            }
+            other => panic!("expected RawEvent::Persistence, got {other:?}"),
+        }
     }
 }
