@@ -652,15 +652,8 @@ match:
 
     #[test]
     fn the_shipped_systemd_remote_start_rule_loads_and_fires_on_its_positive_fixture_only() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
-        let yaml = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-        let engine = DetectionEngine::new(vec![Rule::from_yaml_str(
-            &yaml,
-            "systemd_service_started_in_remote_session.yaml",
-        )
-        .expect("the shipped rule must parse")]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
 
         let event = systemd_start_event("backdoor.service", Some("198.51.100.10"));
         let alerts = engine.evaluate(&event);
@@ -672,12 +665,8 @@ match:
 
     #[test]
     fn the_shipped_systemd_remote_start_rule_does_not_fire_on_a_local_or_sessionless_start() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
-        let yaml = std::fs::read_to_string(&path).unwrap();
-        let engine = DetectionEngine::new(vec![
-            Rule::from_yaml_str(&yaml, "systemd_service_started_in_remote_session.yaml").unwrap(),
-        ]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
 
         // No session at all (a unit started at boot with no D-Bus caller).
         let local = systemd_start_event("cron.service", None);
@@ -686,12 +675,8 @@ match:
 
     #[test]
     fn the_shipped_systemd_remote_start_rule_does_not_fire_on_a_service_stop() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/rules/systemd_service_started_in_remote_session.yaml");
-        let yaml = std::fs::read_to_string(&path).unwrap();
-        let engine = DetectionEngine::new(vec![
-            Rule::from_yaml_str(&yaml, "systemd_service_started_in_remote_session.yaml").unwrap(),
-        ]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
 
         let mut e = systemd_start_event("backdoor.service", Some("198.51.100.10"));
         e.event_type = EventType::ServiceStop;
