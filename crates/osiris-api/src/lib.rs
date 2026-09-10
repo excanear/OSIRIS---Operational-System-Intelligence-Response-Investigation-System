@@ -28,6 +28,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
+        .route("/api/v1/containers/story", get(container_story_handler))
         .with_state(storage)
 }
 
@@ -495,6 +496,64 @@ async fn systemd_story_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(SystemdStory { events, alerts }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ContainerStoryQuery {
+    container_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContainerStory {
+    events: Vec<CanonicalEvent>,
+    alerts: Vec<Alert>,
+}
+
+/// Composed query implementing this phase's plan Task 10 and
+/// ARCHITECTURE.md §12.1's `*_story` shape. One `container_id` filter
+/// returns a container's whole observed history regardless of which
+/// mechanism produced which part of it — Task 2's Normalize populates
+/// `container.container_id` on the Container sensor's own lifecycle
+/// events, and Task 4's `NsCgroupResolver` populates it identically on
+/// every other category's events for a containerized process, so this one
+/// indexed column already spans both without a union query (the same
+/// "one indexed column already spans both" reasoning `systemd_story`
+/// established in Phase 4b).
+async fn container_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<ContainerStoryQuery>,
+) -> Result<Json<ContainerStory>, (StatusCode, String)> {
+    if q.container_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide container_id".to_string(),
+        ));
+    }
+
+    let (events, alerts) = tokio::task::spawn_blocking(move || {
+        let mut plan = QueryPlan::new();
+        plan.container_id = q.container_id.clone();
+        plan.limit = 10_000;
+        let mut events = storage.query(&plan)?;
+        events.sort_by_key(|e| (e.timestamp, e.event_id));
+
+        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
+        let alerts = if evidence_ids.is_empty() {
+            vec![]
+        } else {
+            let mut alert_plan = AlertQueryPlan::new();
+            alert_plan.evidence_event_ids = evidence_ids;
+            alert_plan.limit = 10_000;
+            storage.query_alerts(&alert_plan)?
+        };
+
+        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ContainerStory { events, alerts }))
 }
 
 #[cfg(test)]
@@ -1372,6 +1431,73 @@ mod tests {
             State(storage),
             Query(SystemdStoryQuery {
                 unit_name: Some("does-not-exist.service".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(story.events.is_empty());
+        assert!(story.alerts.is_empty());
+    }
+
+    fn container_event(container_id: &str, event_type: EventType, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(800, None, timestamp);
+        event.category = Category::Container;
+        event.event_type = event_type;
+        event.container = Some(osiris_schema::ContainerRef {
+            container_id: container_id.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            pod_ref: None,
+        });
+        event
+    }
+
+    #[tokio::test]
+    async fn container_story_returns_400_when_container_id_is_missing() {
+        let (_dir, storage) = test_storage();
+        let result = container_story_handler(
+            State(storage),
+            Query(ContainerStoryQuery { container_id: None }),
+        )
+        .await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn container_story_returns_every_event_for_the_named_container() {
+        let (_dir, storage) = test_storage();
+        let id = "a".repeat(64);
+        let other_id = "b".repeat(64);
+        let create = container_event(&id, EventType::ContainerCreate, 1000);
+        let start = container_event(&id, EventType::ContainerStart, 2000);
+        let other_container = container_event(&other_id, EventType::ContainerStart, 3000);
+        storage
+            .batch_write(&[create.clone(), start.clone(), other_container])
+            .unwrap();
+
+        let Json(story) = container_story_handler(
+            State(storage),
+            Query(ContainerStoryQuery {
+                container_id: Some(id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(story.events.len(), 2);
+        let ids: Vec<_> = story.events.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&create.event_id));
+        assert!(ids.contains(&start.event_id));
+    }
+
+    #[tokio::test]
+    async fn container_story_returns_an_empty_story_rather_than_404_for_an_unknown_container() {
+        let (_dir, storage) = test_storage();
+        let Json(story) = container_story_handler(
+            State(storage),
+            Query(ContainerStoryQuery {
+                container_id: Some("c".repeat(64)),
             }),
         )
         .await
