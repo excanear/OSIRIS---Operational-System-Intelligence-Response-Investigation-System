@@ -1,0 +1,15 @@
+[package]
+name = "osiris-baseline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osiris-schema = { path = "../osiris-schema" }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
