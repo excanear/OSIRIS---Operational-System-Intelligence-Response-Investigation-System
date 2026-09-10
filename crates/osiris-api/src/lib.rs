@@ -5,8 +5,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use osiris_schema::{Alert, CanonicalEvent, EventType, FileIdentity};
-use osiris_storage::{AlertQueryPlan, QueryPlan, Storage};
+use osiris_correlate::{BehavioralChain, CorrelationEngine, EdgeSource};
+use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessKey, RiskScoreRecord};
+use osiris_storage::{AlertQueryPlan, QueryPlan, RelationshipQueryPlan, RiskQueryPlan, Storage};
 use serde::{Deserialize, Serialize};
 
 /// The Phase 1 API surface (ARCHITECTURE.md §14.2, narrowed to `/events`,
@@ -29,7 +30,118 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
         .route("/api/v1/containers/story", get(container_story_handler))
+        .route("/api/v1/graph", get(graph_handler))
+        .route("/api/v1/risk", get(risk_handler))
         .with_state(storage)
+}
+
+/// Server-side cap on `GET /api/v1/graph`'s `depth` parameter, regardless
+/// of what a caller requests — ARCHITECTURE.md §12.5's explicit "never the
+/// full graph — always scoped to a seed entity + depth + time range" is
+/// enforced here, not just documented.
+const MAX_GRAPH_DEPTH: usize = 5;
+
+/// Adapts `Storage::query_relationships` to `osiris_correlate::EdgeSource`
+/// for one bounded API request. Unlike `osiris-server`'s own
+/// `StorageEdgeSource` (which lets `CorrelationEngine` compute its window
+/// from a seed timestamp), this adapter carries the request's own explicit
+/// `since`/`until` and ignores the bounds `CorrelationEngine` would
+/// otherwise compute from a seed time — the API's `since`/`until` query
+/// parameters are the actual bound a caller asked for, not a symmetric
+/// window around one instant.
+struct RequestEdgeSource<'s> {
+    storage: &'s dyn Storage,
+    since: u64,
+    until: u64,
+}
+
+impl EdgeSource for RequestEdgeSource<'_> {
+    fn edges_for(&self, entity: &EntityRef, _since: u64, _until: u64) -> Vec<EntityRelationship> {
+        let plan = RelationshipQueryPlan {
+            entity: Some(entity.clone()),
+            since: Some(self.since),
+            until: Some(self.until),
+            ..RelationshipQueryPlan::new()
+        };
+        self.storage.query_relationships(&plan).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQuery {
+    entity: Option<String>,
+    depth: Option<usize>,
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+/// `GET /api/v1/graph` — a bounded subgraph query (§12.5): the Correlation
+/// Engine's graph walk, seeded from `entity` (the same tagged string
+/// `EntityRef::storage_key()` produces), depth-capped at
+/// `MAX_GRAPH_DEPTH` regardless of the request, and time-bounded by
+/// `since`/`until` (defaulting to "everything" when omitted, since the
+/// depth cap alone already bounds response size).
+async fn graph_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<GraphQuery>,
+) -> Result<Json<BehavioralChain>, (StatusCode, String)> {
+    let Some(entity_key) = q.entity else {
+        return Err((StatusCode::BAD_REQUEST, "must provide entity".to_string()));
+    };
+    let entity = EntityRef::parse_storage_key(&entity_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let depth = q.depth.unwrap_or(MAX_GRAPH_DEPTH).min(MAX_GRAPH_DEPTH);
+    let since = q.since.unwrap_or(0);
+    let until = q.until.unwrap_or(u64::MAX);
+
+    let chain = tokio::task::spawn_blocking(move || {
+        let source = RequestEdgeSource {
+            storage: storage.as_ref(),
+            since,
+            until,
+        };
+        // window_ns is irrelevant here — RequestEdgeSource ignores the
+        // bounds CorrelationEngine would compute and always applies the
+        // request's own since/until instead (see its doc comment above).
+        let engine = CorrelationEngine::new(depth, u64::MAX / 4);
+        engine.build_chain(&source, entity, since)
+    })
+    .await
+    .unwrap();
+
+    Ok(Json(chain))
+}
+
+#[derive(Debug, Deserialize)]
+struct RiskQuery {
+    process_key: Option<String>,
+    event_id: Option<String>,
+}
+
+/// `GET /api/v1/risk` — queries persisted `RiskScoreRecord`s by
+/// `process_key` and/or `event_id` (ARCHITECTURE.md §11.4).
+async fn risk_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<RiskQuery>,
+) -> Result<Json<Vec<RiskScoreRecord>>, (StatusCode, String)> {
+    let mut plan = RiskQueryPlan::new();
+    if let Some(pk) = &q.process_key {
+        let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(pk.clone()))
+            .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid process_key: {pk}")))?;
+        plan.process_key = Some(process_key);
+    }
+    if let Some(eid) = &q.event_id {
+        let event_id: uuid::Uuid = eid
+            .parse()
+            .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid event_id: {eid}")))?;
+        plan.event_id = Some(event_id);
+    }
+
+    let records = tokio::task::spawn_blocking(move || storage.query_risk_scores(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(records))
 }
 
 #[derive(Debug, Serialize)]
@@ -1504,5 +1616,141 @@ mod tests {
         .unwrap();
         assert!(story.events.is_empty());
         assert!(story.alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_returns_400_when_entity_is_missing() {
+        let (_dir, storage) = test_storage();
+        let err = graph_handler(
+            State(storage),
+            Query(GraphQuery {
+                entity: None,
+                depth: None,
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn graph_returns_400_for_an_unparseable_entity_key() {
+        let (_dir, storage) = test_storage();
+        let err = graph_handler(
+            State(storage),
+            Query(GraphQuery {
+                entity: Some("NOT_A_VALID_KEY".to_string()),
+                depth: None,
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn graph_returns_the_bounded_subgraph_seeded_from_the_entity() {
+        let (_dir, storage) = test_storage();
+        let host_id = Uuid::new_v4();
+        let process_key = ProcessKey::new(host_id, "b", 300, 1);
+        let process_entity = EntityRef::Process { process_key };
+        let ip_entity = EntityRef::Ip {
+            addr: "203.0.113.10".to_string(),
+        };
+        storage
+            .write_relationships(&[EntityRelationship {
+                from: process_entity.clone(),
+                to: ip_entity.clone(),
+                relation: osiris_schema::Relation::ConnectedTo,
+                event_id: Uuid::now_v7(),
+                timestamp: 1000,
+            }])
+            .unwrap();
+
+        let Json(chain) = graph_handler(
+            State(storage),
+            Query(GraphQuery {
+                entity: Some(process_entity.storage_key()),
+                depth: None,
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chain.edges.len(), 1);
+        assert_eq!(chain.edges[0].to.storage_key(), ip_entity.storage_key());
+    }
+
+    #[tokio::test]
+    async fn risk_filters_by_process_key() {
+        let (_dir, storage) = test_storage();
+        let host_id = Uuid::new_v4();
+        let process_key = ProcessKey::new(host_id, "b", 300, 1);
+        let other_key = ProcessKey::new(host_id, "b", 301, 1);
+        let event_id = Uuid::now_v7();
+        storage
+            .write_risk_scores(&[
+                RiskScoreRecord {
+                    event_id,
+                    process_key: Some(process_key),
+                    host_id,
+                    timestamp: 1000,
+                    score: 42,
+                    severity: Severity::High,
+                    reasons: vec![osiris_schema::WeightedReason {
+                        label: "because".to_string(),
+                        weight: 42,
+                        evidence: event_id,
+                    }],
+                    related_events: vec![event_id],
+                },
+                RiskScoreRecord {
+                    event_id: Uuid::now_v7(),
+                    process_key: Some(other_key),
+                    host_id,
+                    timestamp: 2000,
+                    score: 10,
+                    severity: Severity::Low,
+                    reasons: vec![osiris_schema::WeightedReason {
+                        label: "unrelated".to_string(),
+                        weight: 10,
+                        evidence: Uuid::now_v7(),
+                    }],
+                    related_events: vec![],
+                },
+            ])
+            .unwrap();
+
+        let Json(records) = risk_handler(
+            State(storage),
+            Query(RiskQuery {
+                process_key: Some(process_key.as_hex()),
+                event_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].score, 42);
+    }
+
+    #[tokio::test]
+    async fn risk_returns_400_for_an_invalid_event_id() {
+        let (_dir, storage) = test_storage();
+        let err = risk_handler(
+            State(storage),
+            Query(RiskQuery {
+                process_key: None,
+                event_id: Some("not-a-uuid".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }

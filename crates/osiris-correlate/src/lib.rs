@@ -18,7 +18,7 @@ pub trait EdgeSource {
 /// edges reached from `seed` within the walk's depth/time bounds, and the
 /// deduplicated, time-ordered set of every edge's `event_id` — the input
 /// `§12.1`'s `*Story`/`§14.4`'s `reconstruct_incident` compose on top of.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BehavioralChain {
     pub seed: EntityRef,
     pub edges: Vec<EntityRelationship>,
