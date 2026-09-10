@@ -41,6 +41,43 @@ pub fn container_story_url(server: &str, container_id: &str) -> String {
     )
 }
 
+/// Builds the `/api/v1/graph` request URL (Phase 6 plan Task 12).
+/// `entity` is the tagged string `EntityRef::storage_key()` produces
+/// (e.g. `PROCESS:<hex>`) — passed through unencoded, the same posture
+/// `container_story_url` already takes for hex container ids, since none
+/// of this crate's entity key shapes contain characters a query string
+/// needs to escape (Ip/Domain names are the one exception in principle,
+/// left as a documented limitation rather than adding a URL-encoding
+/// dependency for this phase).
+pub fn chain_url(server: &str, entity: &str, depth: &Option<usize>) -> String {
+    let mut url = format!(
+        "{}/api/v1/graph?entity={}",
+        server.trim_end_matches('/'),
+        entity
+    );
+    if let Some(d) = depth {
+        url.push_str(&format!("&depth={}", d));
+    }
+    url
+}
+
+/// Builds the `/api/v1/risk` request URL (Phase 6 plan Task 12).
+pub fn risk_url(server: &str, process_key: &Option<String>, event_id: &Option<String>) -> String {
+    let mut url = format!("{}/api/v1/risk", server.trim_end_matches('/'));
+    let mut params = vec![];
+    if let Some(pk) = process_key {
+        params.push(format!("process_key={}", pk));
+    }
+    if let Some(eid) = event_id {
+        params.push(format!("event_id={}", eid));
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
+    url
+}
+
 /// Renders events as a human-readable tab-separated table (the default
 /// `--format table` output; `--format json` bypasses this and prints the
 /// API's raw JSON body instead — ARCHITECTURE.md §15's interactive vs.
@@ -193,6 +230,40 @@ mod tests {
         assert_eq!(
             url,
             "http://localhost:8080/api/v1/containers/story?container_id=abc123"
+        );
+    }
+
+    #[test]
+    fn chain_url_includes_the_entity_and_omits_depth_when_not_given() {
+        let url = chain_url("http://localhost:8080", "PROCESS:abcd", &None);
+        assert_eq!(url, "http://localhost:8080/api/v1/graph?entity=PROCESS:abcd");
+    }
+
+    #[test]
+    fn chain_url_includes_depth_when_given() {
+        let url = chain_url("http://localhost:8080/", "IP:203.0.113.10", &Some(3));
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/graph?entity=IP:203.0.113.10&depth=3"
+        );
+    }
+
+    #[test]
+    fn risk_url_with_no_filters_has_no_query_string() {
+        let url = risk_url("http://localhost:8080", &None, &None);
+        assert_eq!(url, "http://localhost:8080/api/v1/risk");
+    }
+
+    #[test]
+    fn risk_url_includes_process_key_and_event_id() {
+        let url = risk_url(
+            "http://localhost:8080",
+            &Some("abcd".to_string()),
+            &Some("1234".to_string()),
+        );
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/risk?process_key=abcd&event_id=1234"
         );
     }
 

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use osiris_cli::client::{container_story_url, events_url, format_events_table};
+use osiris_cli::client::{chain_url, container_story_url, events_url, format_events_table, risk_url};
 use osiris_schema::CanonicalEvent;
 
 #[derive(Parser)]
@@ -43,6 +43,22 @@ enum Command {
     /// Show a container's whole observed lifecycle/activity timeline (Phase
     /// 5 plan Task 11 — this CLI's first `*_story` subcommand).
     ContainerStory { container_id: String },
+    /// Show the bounded BehavioralChain graph walk seeded from an entity
+    /// (Phase 6 plan Task 12). `entity` is the tagged string
+    /// `EntityRef::storage_key()` produces, e.g. `PROCESS:<hex>`.
+    Chain {
+        entity: String,
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+    /// Show risk scores, filtered by process_key and/or event_id (Phase 6
+    /// plan Task 12).
+    Risk {
+        #[arg(long)]
+        process_key: Option<String>,
+        #[arg(long)]
+        event_id: Option<String>,
+    },
 }
 
 /// Sends the request, then treats a non-2xx HTTP status as a failure —
@@ -99,6 +115,17 @@ fn main() {
         }
         Command::ContainerStory { container_id } => {
             let url = container_story_url(&cli.server, container_id);
+            get(&client, url)
+        }
+        Command::Chain { entity, depth } => {
+            let url = chain_url(&cli.server, entity, depth);
+            get(&client, url)
+        }
+        Command::Risk {
+            process_key,
+            event_id,
+        } => {
+            let url = risk_url(&cli.server, process_key, event_id);
             get(&client, url)
         }
     };
