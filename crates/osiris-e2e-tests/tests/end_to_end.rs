@@ -1345,6 +1345,262 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     assert_eq!(parsed.as_array().unwrap().len(), 9);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_triggers_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    // A fake proc root so Task 4's `NsCgroupResolver` (agent-side, wired
+    // through `AgentConfig.proc_root`) has something real to resolve for
+    // pid 300 (the `docker` CLI invocation) — proof the container-aware
+    // Entity Graph wiring works on a real ingested dataset, not just in
+    // `osiris-pipeline`'s own unit tests.
+    let proc_root = dir.path().join("proc");
+    let pid_dir = proc_root.join("300");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(
+        pid_dir.join("cgroup"),
+        format!(
+            "0::{}\n",
+            osiris_generator::DEPLOYED_CONTAINER_CGROUP_PATH
+        ),
+    )
+    .unwrap();
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        systemd_audit_log_path: None,
+        persistence_watch_paths: vec![],
+        container_cgroup_roots: vec![],
+        proc_root: Some(proc_root.to_string_lossy().to_string()),
+        enable_synthetic: true,
+        synthetic_scenario: Some("container_deploy_in_remote_session".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+
+    // The real shipped rules directory — now five rules.
+    let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+    let detection_engine = Arc::new(DetectionEngine::load_from_dir(&rules_dir).unwrap());
+    assert!(detection_engine.rule_count() >= 5);
+
+    let ingestion_cancellation = CancellationToken::new();
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        detection_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // 7-event scenario, same generous budget as the other flagship e2e
+    // tests.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    // 1. Storage directly: all 7 events landed, across exactly three
+    //    categories.
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    assert_eq!(
+        events.len(),
+        7,
+        "expected sshd/bash/docker execs, login, container create, container start, logout"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e.category, Category::Process | Category::Identity | Category::Container)),
+        "no FILE/NETWORK/PERSISTENCE/SYSTEMD event exists in this scenario"
+    );
+    for expected in [Category::Process, Category::Identity, Category::Container] {
+        assert!(
+            events.iter().any(|e| e.category == expected),
+            "expected at least one {expected:?} event"
+        );
+    }
+
+    // 2. The two CONTAINER-category events, told apart by event_type.
+    let create = events
+        .iter()
+        .find(|e| e.event_type == EventType::ContainerCreate)
+        .expect("the CONTAINER_CREATE event must be present");
+    let start = events
+        .iter()
+        .find(|e| e.event_type == EventType::ContainerStart)
+        .expect("the CONTAINER_START event must be present");
+    assert_eq!(
+        create.container.as_ref().unwrap().container_id,
+        osiris_generator::DEPLOYED_CONTAINER_ID
+    );
+    assert_eq!(
+        start.container.as_ref().unwrap().container_id,
+        osiris_generator::DEPLOYED_CONTAINER_ID
+    );
+    assert_eq!(create.container.as_ref().unwrap().runtime, "cgroup");
+
+    // 3. Session propagation: both container events carry pid 300 (the
+    //    docker CLI), already a known session member via its own exec —
+    //    proof the fallback backend's cgroup.procs-derived pid
+    //    attribution (Task 8) combines correctly with session inheritance
+    //    (Task 1/4a's mechanism), not just in the pipeline unit tests.
+    let create_session = create
+        .session
+        .as_ref()
+        .expect("CONTAINER_CREATE must inherit the session via its cgroup.procs pid");
+    assert_eq!(create_session.session_id, "3");
+    assert_eq!(create_session.remote_addr.as_deref(), Some("198.51.100.10"));
+    let start_session = start
+        .session
+        .as_ref()
+        .expect("CONTAINER_START must inherit the session via its cgroup.procs pid");
+    assert_eq!(start_session.session_id, "3");
+    assert_eq!(start_session.auth_method.as_deref(), Some("sshd"));
+
+    // 4. Container-aware Entity Graph (Task 4): the docker CLI's own exec
+    //    event (pid 300) resolves, via the fake proc root, into the
+    //    deployed container's cgroup/container context and a
+    //    BELONGS_TO_CONTAINER edge — proof `NsCgroupResolver`'s wiring
+    //    works on a real ingested dataset, the one assertion with no
+    //    Phase 4b analogue.
+    let docker_exec = events
+        .iter()
+        .find(|e| {
+            e.event_type == EventType::ProcessExec
+                && e.process.as_ref().map(|p| p.pid) == Some(300)
+        })
+        .expect("the docker exec must be present");
+    let docker_container = docker_exec
+        .container
+        .as_ref()
+        .expect("the docker CLI's own cgroup must resolve to the deployed container");
+    assert_eq!(docker_container.container_id, osiris_generator::DEPLOYED_CONTAINER_ID);
+    assert!(
+        docker_exec
+            .relationships
+            .iter()
+            .any(|r| r.relation == Relation::BelongsToContainer
+                && matches!(&r.to, EntityRef::Container { container_id } if container_id == osiris_generator::DEPLOYED_CONTAINER_ID)),
+        "the docker exec event must carry a BELONGS_TO_CONTAINER edge to the deployed container"
+    );
+
+    // 5. Storage's new container_id filter works on real ingested rows
+    //    (Task 6) — matches the create/start events AND the docker exec,
+    //    since NsCgroupResolver populated `container` on all three.
+    let mut plan = QueryPlan::new();
+    plan.container_id = Some(osiris_generator::DEPLOYED_CONTAINER_ID.to_string());
+    assert_eq!(
+        storage.query(&plan).unwrap().len(),
+        3,
+        "the create, the start, and the docker exec all carry the deployed container_id"
+    );
+
+    // 6. Over real HTTP: both alerts fired, and only those two.
+    let app = build_router(storage.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let alerts: serde_json::Value = client
+        .get(format!("http://{}/api/v1/alerts", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alerts_array = alerts.as_array().unwrap();
+    assert_eq!(
+        alerts_array.len(),
+        1,
+        "exactly one alert: the new container rule — this scenario has no privilege \
+         escalation step to also fire Phase 4a's rule"
+    );
+    assert_eq!(
+        alerts_array[0]["rule_id"].as_str().unwrap(),
+        "container_started_in_remote_session"
+    );
+    let reasons = alerts_array[0]["reasons"].as_array().unwrap();
+    assert!(!reasons.is_empty());
+    assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+    assert_eq!(alerts_array[0]["rule_content_hash"].as_str().unwrap().len(), 64);
+
+    // 7. The new Container Story endpoint (Task 10) over real HTTP: the
+    //    create/start/docker-exec events, plus the one alert that cites
+    //    the CONTAINER_START event as evidence.
+    let story: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/containers/story?container_id={}",
+            addr,
+            osiris_generator::DEPLOYED_CONTAINER_ID
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let story_events = story["events"].as_array().unwrap();
+    assert_eq!(story_events.len(), 3);
+    let story_event_types: std::collections::HashSet<_> = story_events
+        .iter()
+        .map(|e| e["event_type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        story_event_types,
+        std::collections::HashSet::from([
+            "CONTAINER_CREATE".to_string(),
+            "CONTAINER_START".to_string(),
+            "PROCESS_EXEC".to_string(),
+        ])
+    );
+    let story_alerts = story["alerts"].as_array().unwrap();
+    assert_eq!(story_alerts.len(), 1);
+    assert_eq!(
+        story_alerts[0]["rule_id"].as_str().unwrap(),
+        "container_started_in_remote_session"
+    );
+
+    // 8. The real CLI binary's new container-story subcommand.
+    let cli_binary = cli_binary_path();
+    let output = std::process::Command::new(&cli_binary)
+        .args([
+            "--server",
+            &format!("http://{}", addr),
+            "--format",
+            "json",
+            "container-story",
+            osiris_generator::DEPLOYED_CONTAINER_ID,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
+}
+
 /// Minimal ad-hoc percent-encoding for the one query-string value this test
 /// needs to send (a `/`-containing path) — not a general URL encoder.
 /// `reqwest` does not percent-encode a raw string interpolated into a

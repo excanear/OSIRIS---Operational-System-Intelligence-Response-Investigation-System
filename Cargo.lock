@@ -1083,6 +1083,7 @@ dependencies = [
  "osiris-agent",
  "osiris-api",
  "osiris-detect",
+ "osiris-generator",
  "osiris-pipeline",
  "osiris-schema",
  "osiris-sensor-api",
