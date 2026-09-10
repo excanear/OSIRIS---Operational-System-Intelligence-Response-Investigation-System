@@ -40,6 +40,15 @@ pub struct QueryPlan {
     /// whole unit's history regardless of which sensor observed which part
     /// of it.
     pub unit_name: Option<String>,
+    /// Exact-match on `container.container_id`. Populated identically by
+    /// this phase's Container sensor's own `CONTAINER_*` lifecycle events
+    /// and by `NsCgroupResolver`'s per-process enrichment on every other
+    /// category's events for a containerized process (Phase 5 plan Task 4),
+    /// so this one filter serves a container's whole observed history
+    /// regardless of which event category or backend produced which part
+    /// of it — the same "one indexed column already spans both" reasoning
+    /// `unit_name` established in Phase 4b.
+    pub container_id: Option<String>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
@@ -122,6 +131,12 @@ mod tests {
     fn new_query_plan_defaults_unit_name_to_none_too() {
         let plan = QueryPlan::new();
         assert!(plan.unit_name.is_none());
+    }
+
+    #[test]
+    fn new_query_plan_defaults_container_id_to_none_too() {
+        let plan = QueryPlan::new();
+        assert!(plan.container_id.is_none());
     }
 
     #[test]

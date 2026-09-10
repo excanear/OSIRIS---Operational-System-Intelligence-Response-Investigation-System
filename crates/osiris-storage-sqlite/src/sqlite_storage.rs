@@ -40,6 +40,7 @@ impl SqliteStorage {
                 session_id TEXT,
                 user_uid INTEGER,
                 unit_name TEXT,
+                container_id TEXT,
                 raw_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_host_timestamp ON events(host_id, timestamp);
@@ -95,6 +96,11 @@ impl SqliteStorage {
         // read back NULL. No database created before Phase 4b can contain
         // an event with a populated `service`, so this has no practical
         // impact.
+        //
+        // Phase 5 adds `container_id` the same way. No database created
+        // before Phase 5 can contain an event with a populated
+        // `container`, so pre-existing rows reading back NULL has no
+        // practical impact either.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
@@ -114,6 +120,10 @@ impl SqliteStorage {
             ("session_id", "ALTER TABLE events ADD COLUMN session_id TEXT"),
             ("user_uid", "ALTER TABLE events ADD COLUMN user_uid INTEGER"),
             ("unit_name", "ALTER TABLE events ADD COLUMN unit_name TEXT"),
+            (
+                "container_id",
+                "ALTER TABLE events ADD COLUMN container_id TEXT",
+            ),
         ] {
             if !column_exists(&conn, "events", column)? {
                 conn.execute(ddl, [])
@@ -128,7 +138,8 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS idx_events_dns_domain ON events(dns_domain);
              CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_user_uid ON events(user_uid);
-             CREATE INDEX IF NOT EXISTS idx_events_unit_name ON events(unit_name);",
+             CREATE INDEX IF NOT EXISTS idx_events_unit_name ON events(unit_name);
+             CREATE INDEX IF NOT EXISTS idx_events_container_id ON events(container_id);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
@@ -198,10 +209,11 @@ impl Storage for SqliteStorage {
             // cast the file inode/device columns already use.
             let user_uid = event.user.as_ref().map(|u| u.uid as i64);
             let unit_name = event.service.as_ref().map(|s| s.unit_name.clone());
+            let container_id = event.container.as_ref().map(|c| c.container_id.clone());
             let changed = tx
                 .execute(
-                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, unit_name, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, unit_name, container_id, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                     params![
                         event.event_id.to_string(),
                         event.host_id.to_string(),
@@ -218,6 +230,7 @@ impl Storage for SqliteStorage {
                         session_id,
                         user_uid,
                         unit_name,
+                        container_id,
                         raw_json,
                     ],
                 )
@@ -282,6 +295,10 @@ impl Storage for SqliteStorage {
         if let Some(unit_name) = &plan.unit_name {
             sql.push_str(" AND unit_name = ?");
             sql_params.push(Box::new(unit_name.clone()));
+        }
+        if let Some(container_id) = &plan.container_id {
+            sql.push_str(" AND container_id = ?");
+            sql_params.push(Box::new(container_id.clone()));
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
@@ -1044,6 +1061,114 @@ mod tests {
             reopened.query(&plan).unwrap().len(),
             1,
             "the migrated unit_name column must exist and filter correctly"
+        );
+
+        let reopened_again = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened_again.query(&QueryPlan::new()).unwrap().len(), 2);
+        assert_eq!(reopened_again.query(&plan).unwrap().len(), 1);
+    }
+
+    fn container_event(container_id: &str, event_type: osiris_schema::EventType, timestamp: u64) -> CanonicalEvent {
+        let mut event = sample_event(600, timestamp);
+        event.event_type = event_type;
+        event.category = osiris_schema::Category::Container;
+        event.container = Some(osiris_schema::ContainerRef {
+            container_id: container_id.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            pod_ref: None,
+        });
+        event
+    }
+
+    #[test]
+    fn query_filters_by_container_id() {
+        let storage = open_test_storage();
+        let id_a = "a".repeat(64);
+        let id_b = "b".repeat(64);
+        let create = container_event(&id_a, osiris_schema::EventType::ContainerCreate, 1000);
+        let start = container_event(&id_a, osiris_schema::EventType::ContainerStart, 2000);
+        let other = container_event(&id_b, osiris_schema::EventType::ContainerStart, 3000);
+        // An event with no container at all must never match any
+        // container_id filter — NULL never equals a string in SQL, same
+        // discipline as `query_filters_by_unit_name`.
+        let unrelated = sample_event(900, 4000);
+        storage
+            .batch_write(&[create.clone(), start.clone(), other.clone(), unrelated])
+            .unwrap();
+
+        let mut plan = QueryPlan::new();
+        plan.container_id = Some(id_a);
+        let results = storage.query(&plan).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<_> = results.iter().map(|e| e.event_id).collect();
+        assert!(ids.contains(&create.event_id));
+        assert!(ids.contains(&start.event_id));
+        assert!(!ids.contains(&other.event_id));
+    }
+
+    /// Non-destructive/idempotent migration proof, matching every prior
+    /// phase's precedent exactly.
+    #[test]
+    fn migrates_a_pre_phase_5_database_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let pre_phase_5_event = sample_event(300, 1000);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    file_path TEXT,
+                    file_inode INTEGER,
+                    file_device_id INTEGER,
+                    network_src_ip TEXT,
+                    network_dst_ip TEXT,
+                    dns_domain TEXT,
+                    session_id TEXT,
+                    user_uid INTEGER,
+                    unit_name TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    pre_phase_5_event.event_id.to_string(),
+                    pre_phase_5_event.host_id.to_string(),
+                    pre_phase_5_event.timestamp as i64,
+                    "PROCESS_EXEC",
+                    serde_json::to_string(&pre_phase_5_event).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.query(&QueryPlan::new()).unwrap().len(),
+            1,
+            "the pre-existing row must survive migration"
+        );
+
+        let id = "c".repeat(64);
+        reopened
+            .write(&container_event(&id, osiris_schema::EventType::ContainerStart, 2000))
+            .unwrap();
+        let mut plan = QueryPlan::new();
+        plan.container_id = Some(id.clone());
+        assert_eq!(
+            reopened.query(&plan).unwrap().len(),
+            1,
+            "the migrated container_id column must exist and filter correctly"
         );
 
         let reopened_again = SqliteStorage::open(&db_path).unwrap();
