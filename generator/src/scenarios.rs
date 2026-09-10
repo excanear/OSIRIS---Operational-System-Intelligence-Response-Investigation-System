@@ -1,9 +1,10 @@
 use osiris_schema::encode_device_id;
 use osiris_sensor_api::{
-    DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
-    NetworkDirection, NetworkEventRaw, NetworkOperation, PersistenceCheckpointKind,
-    PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw, PrivilegeOperation,
-    ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw, SystemdOperation,
+    ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw, FileOperation,
+    IdentityEventRaw, IdentityOperation, NetworkDirection, NetworkEventRaw, NetworkOperation,
+    PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw,
+    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw,
+    SystemdOperation,
 };
 
 /// The identity the staged payload keeps across create -> write -> rename.
@@ -40,6 +41,14 @@ pub const ESCALATION_C2_IP: &str = "203.0.113.77";
 /// The backdoor systemd service Task 9's rule exists to catch.
 pub const BACKDOOR_UNIT_NAME: &str = "backdoor.service";
 pub const BACKDOOR_UNIT_PATH: &str = "/etc/systemd/system/backdoor.service";
+
+/// The container id Phase 5's scenario deploys — a fixed 64-hex string
+/// (a real container id's shape), reused by this scenario's own
+/// detection-rule fixture and by any test asserting on the deployed
+/// container's identity.
+pub const DEPLOYED_CONTAINER_ID: &str = "d00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d";
+pub const DEPLOYED_CONTAINER_CGROUP_PATH: &str =
+    "/system.slice/docker-d00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d.scope";
 
 /// A minimal process/exec scenario mirroring ARCHITECTURE.md §26's worked
 /// trace (sshd -> bash -> curl). Timestamps are relative nanoseconds
@@ -413,6 +422,83 @@ pub fn persistence_via_systemd_service_scenario(base_ts_ns: u64) -> Vec<RawEvent
             exe_path: "/usr/sbin/sshd".to_string(),
             comm: "sshd".to_string(),
             timestamp_ns: base_ts_ns + 8_000_000,
+            audit_serial: Some(560),
+            source: RawEventSource::Synthetic,
+        }),
+    ]
+}
+
+/// Phase 5's flagship scenario (plan Task 8): the same SSH-login-then-sudo
+/// opening as `persistence_via_systemd_service_scenario`, continued into a
+/// container deploy instead of a systemd backdoor — the natural sibling
+/// vertical slice for this phase's own attacker technique (T1610, Deploy
+/// Container), reached over the same remote-session precondition
+/// (T1021.004) the systemd rule already established.
+pub fn container_deploy_in_remote_session_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
+    vec![
+        exec(100, 1, "/usr/sbin/sshd", "sshd", base_ts_ns),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Login,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 1_000_000,
+            audit_serial: Some(456),
+            source: RawEventSource::Synthetic,
+        }),
+        exec(200, 100, "/bin/bash", "bash", base_ts_ns + 2_000_000),
+        exec(300, 200, "/usr/bin/docker", "docker", base_ts_ns + 3_000_000),
+        RawEvent::Container(ContainerEventRaw {
+            operation: ContainerOperation::Create,
+            container_id: DEPLOYED_CONTAINER_ID.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            cgroup_path: DEPLOYED_CONTAINER_CGROUP_PATH.to_string(),
+            // Derived from the new cgroup's `cgroup.procs` (the real
+            // Linux mechanism `ContainerCgroupPoller::read_cgroup_procs_pid`
+            // reads) — here, the `docker` CLI invocation itself (pid 300),
+            // the one process the fallback backend can honestly observe as
+            // a member of the just-created cgroup at scan time.
+            pid: Some(300),
+            pod_name: None,
+            pod_namespace: None,
+            timestamp_ns: base_ts_ns + 4_000_000,
+            source: RawEventSource::Procfs,
+        }),
+        RawEvent::Container(ContainerEventRaw {
+            operation: ContainerOperation::Start,
+            container_id: DEPLOYED_CONTAINER_ID.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            cgroup_path: DEPLOYED_CONTAINER_CGROUP_PATH.to_string(),
+            pid: Some(300),
+            pod_name: None,
+            pod_namespace: None,
+            timestamp_ns: base_ts_ns + 5_000_000,
+            source: RawEventSource::Procfs,
+        }),
+        RawEvent::Identity(IdentityEventRaw {
+            operation: IdentityOperation::Logout,
+            session_id: SSH_SESSION_ID.to_string(),
+            pid: 100,
+            uid: 0,
+            auid: Some(1000),
+            username: Some("alice".to_string()),
+            terminal: Some("/dev/pts/0".to_string()),
+            remote_addr: Some(SSH_REMOTE_ADDR.to_string()),
+            auth_method: Some("sshd".to_string()),
+            success: true,
+            exe_path: "/usr/sbin/sshd".to_string(),
+            comm: "sshd".to_string(),
+            timestamp_ns: base_ts_ns + 6_000_000,
             audit_serial: Some(560),
             source: RawEventSource::Synthetic,
         }),
@@ -809,6 +895,70 @@ mod tests {
     #[test]
     fn persistence_via_systemd_service_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
         let scenario = persistence_via_systemd_service_scenario(1_000_000_000);
+        let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(timestamps, sorted);
+        assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
+        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout));
+    }
+
+    fn container_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::ContainerEventRaw> {
+        scenario
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::Container(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn container_deploy_in_remote_session_scenario_spans_process_identity_and_container_categories() {
+        let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
+        assert_eq!(scenario.len(), 7);
+
+        assert_eq!(exec_events(&scenario).len(), 3, "sshd, bash, docker");
+
+        let identity = identity_raw_events(&scenario);
+        assert_eq!(identity.len(), 2, "one login, one logout");
+        assert_eq!(identity[0].session_id, SSH_SESSION_ID);
+        assert_eq!(identity[0].remote_addr.as_deref(), Some(SSH_REMOTE_ADDR));
+
+        let containers = container_raw_events(&scenario);
+        assert_eq!(containers.len(), 2, "one create, one start");
+        assert_eq!(containers[0].operation, ContainerOperation::Create);
+        assert_eq!(containers[1].operation, ContainerOperation::Start);
+        for c in &containers {
+            assert_eq!(c.container_id, DEPLOYED_CONTAINER_ID);
+            assert_eq!(c.runtime, "cgroup");
+            assert!(c.cgroup_path.contains(DEPLOYED_CONTAINER_ID));
+            assert_eq!(
+                c.pid,
+                Some(300),
+                "the docker CLI's own pid — the fallback backend's honest \
+                 cgroup.procs-derived actor"
+            );
+        }
+    }
+
+    /// Pid 300 (the `docker` CLI invocation) is a known session member via
+    /// its own exec, exactly like `ssh_sudo_escalation_scenario`'s own
+    /// `every_post_login_actor_descends_from_the_logins_pid` proves for
+    /// its escalation step — this is what makes Task 9's rule expressible.
+    #[test]
+    fn the_container_events_actor_descends_from_the_logins_pid() {
+        let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
+        let execs = exec_events(&scenario);
+        assert_eq!((execs[2].pid, execs[2].ppid), (300, 200), "docker under bash");
+        let containers = container_raw_events(&scenario);
+        assert_eq!(containers[1].pid, Some(300));
+    }
+
+    #[test]
+    fn container_deploy_in_remote_session_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
+        let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
         let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();

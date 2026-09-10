@@ -39,12 +39,15 @@ impl ContainerCgroupPoller {
         let mut current: HashSet<String> = HashSet::new();
         let mut cgroup_paths: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut cgroup_pids: std::collections::HashMap<String, Option<u32>> =
+            std::collections::HashMap::new();
         for root in &self.roots {
             for dir in candidate_container_dirs(root) {
                 let Some(container_id) = container_id_for_dir(&dir) else {
                     continue;
                 };
                 cgroup_paths.insert(container_id.clone(), dir.to_string_lossy().to_string());
+                cgroup_pids.insert(container_id.clone(), read_cgroup_procs_pid(&dir));
                 current.insert(container_id);
             }
         }
@@ -61,25 +64,35 @@ impl ContainerCgroupPoller {
                 .get(container_id)
                 .cloned()
                 .unwrap_or_default();
+            let pid = cgroup_pids.get(container_id).copied().flatten();
             events.push(make_event(
                 ContainerOperation::Create,
                 container_id,
                 &cgroup_path,
+                pid,
                 now_ns,
             ));
             events.push(make_event(
                 ContainerOperation::Start,
                 container_id,
                 &cgroup_path,
+                pid,
                 now_ns,
             ));
         }
         for container_id in self.previous.difference(&current) {
-            events.push(make_event(ContainerOperation::Stop, container_id, "", now_ns));
+            events.push(make_event(
+                ContainerOperation::Stop,
+                container_id,
+                "",
+                None,
+                now_ns,
+            ));
             events.push(make_event(
                 ContainerOperation::Destroy,
                 container_id,
                 "",
+                None,
                 now_ns,
             ));
         }
@@ -93,6 +106,7 @@ fn make_event(
     operation: ContainerOperation,
     container_id: &str,
     cgroup_path: &str,
+    pid: Option<u32>,
     now_ns: u64,
 ) -> ContainerEventRaw {
     ContainerEventRaw {
@@ -101,12 +115,25 @@ fn make_event(
         image: String::new(),
         runtime: "cgroup".to_string(),
         cgroup_path: cgroup_path.to_string(),
-        pid: None,
+        pid,
         pod_name: None,
         pod_namespace: None,
         timestamp_ns: now_ns,
         source: RawEventSource::Procfs,
     }
+}
+
+/// Reads a cgroup directory's `cgroup.procs` file (the real Linux cgroup
+/// v2 ABI: a newline-separated list of member pids) and returns the first
+/// one, when present — the closest thing to "who's inside this container
+/// right now" the cgroup-only fallback backend can honestly report
+/// (plan Task 5/Global Constraint #1: no live runtime API to ask instead).
+/// `None` when the file is absent (a synthetic/test-fixture cgroup
+/// directory, or a real one queried in the narrow race window before any
+/// process has joined it) or unparseable — never a fabricated pid.
+fn read_cgroup_procs_pid(dir: &std::path::Path) -> Option<u32> {
+    let contents = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;
+    contents.lines().next()?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -173,6 +200,32 @@ mod tests {
         let mut poller = ContainerCgroupPoller::new(vec![root(dir.path())]);
         assert!(poller.poll(1_000).is_empty());
         assert!(poller.poll(2_000).is_empty());
+    }
+
+    #[test]
+    fn a_created_container_reports_the_pid_from_cgroup_procs_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut poller = ContainerCgroupPoller::new(vec![root(dir.path())]);
+        assert!(poller.poll(1_000).is_empty());
+
+        let id = hex64('e');
+        let cgroup_dir = dir.path().join(format!("docker-{id}.scope"));
+        std::fs::create_dir(&cgroup_dir).unwrap();
+        std::fs::write(cgroup_dir.join("cgroup.procs"), "4242\n5555\n").unwrap();
+        let events = poller.poll(2_000);
+        assert_eq!(events[0].pid, Some(4242));
+        assert_eq!(events[1].pid, Some(4242));
+    }
+
+    #[test]
+    fn a_created_container_with_no_cgroup_procs_file_reports_no_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut poller = ContainerCgroupPoller::new(vec![root(dir.path())]);
+        assert!(poller.poll(1_000).is_empty());
+
+        std::fs::create_dir(dir.path().join(format!("docker-{}.scope", hex64('f')))).unwrap();
+        let events = poller.poll(2_000);
+        assert_eq!(events[0].pid, None);
     }
 
     #[test]

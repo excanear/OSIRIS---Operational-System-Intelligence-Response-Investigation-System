@@ -83,9 +83,11 @@ pub struct AgentConfig {
     /// chain continued into the filesystem), `"network_beacon"` (that
     /// chain continued into DNS and network), `"ssh_sudo_escalation"`
     /// (§26's trace from its first step: login, shell, sudo escalation,
-    /// file write, outbound connection), or `"persistence_via_systemd_service"`
+    /// file write, outbound connection), `"persistence_via_systemd_service"`
     /// (that same opening continued into a backdoor systemd unit install and
-    /// start). Ignored unless `enable_synthetic` is true.
+    /// start), or `"container_deploy_in_remote_session"` (that same opening
+    /// continued into a container create+start instead). Ignored unless
+    /// `enable_synthetic` is true.
     #[serde(default)]
     pub synthetic_scenario: Option<String>,
     /// Path to the NDJSON spool file (plan Global Constraints #3).

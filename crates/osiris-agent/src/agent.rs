@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
 use osiris_generator::{
-    exec_chain_scenario, network_beacon_scenario, persistence_via_systemd_service_scenario,
-    ssh_sudo_escalation_scenario, web_shell_drop_scenario, SyntheticSensor,
+    container_deploy_in_remote_session_scenario, exec_chain_scenario, network_beacon_scenario,
+    persistence_via_systemd_service_scenario, ssh_sudo_escalation_scenario,
+    web_shell_drop_scenario, SyntheticSensor,
 };
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
@@ -114,6 +115,9 @@ impl Agent {
                 Some("ssh_sudo_escalation") => ssh_sudo_escalation_scenario(base_ts),
                 Some("persistence_via_systemd_service") => {
                     persistence_via_systemd_service_scenario(base_ts)
+                }
+                Some("container_deploy_in_remote_session") => {
+                    container_deploy_in_remote_session_scenario(base_ts)
                 }
                 Some("exec_chain") | None => exec_chain_scenario(base_ts),
                 Some(other) => {
@@ -575,6 +579,20 @@ mod tests {
         let mut config = base_config(&dir);
         config.enable_synthetic = true;
         config.synthetic_scenario = Some("persistence_via_systemd_service".to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let snapshot = agent.status_snapshot().await;
+        assert!(snapshot.sensors.iter().any(|s| s.name == "synthetic_generator"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_container_deploy_in_remote_session_scenario_is_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("container_deploy_in_remote_session".to_string());
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
             .unwrap();
