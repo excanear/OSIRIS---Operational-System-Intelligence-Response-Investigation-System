@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
 use osiris_generator::{
     container_deploy_in_remote_session_scenario, exec_chain_scenario, network_beacon_scenario,
-    persistence_via_systemd_service_scenario, ssh_sudo_escalation_scenario,
-    web_shell_drop_scenario, SyntheticSensor,
+    network_download_then_write_scenario, persistence_via_systemd_service_scenario,
+    ssh_sudo_escalation_scenario, web_shell_drop_scenario, SyntheticSensor,
 };
 use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
@@ -112,6 +112,9 @@ impl Agent {
             let scenario = match config.synthetic_scenario.as_deref() {
                 Some("web_shell_drop") => web_shell_drop_scenario(base_ts),
                 Some("network_beacon") => network_beacon_scenario(base_ts),
+                Some("network_download_then_write") => {
+                    network_download_then_write_scenario(base_ts)
+                }
                 Some("ssh_sudo_escalation") => ssh_sudo_escalation_scenario(base_ts),
                 Some("persistence_via_systemd_service") => {
                     persistence_via_systemd_service_scenario(base_ts)
@@ -502,6 +505,28 @@ mod tests {
         assert!(contents.contains("\"NETWORK_CONNECT\""));
         assert!(contents.contains("\"NETWORK_CLOSE\""));
         assert!(contents.contains("cdn-assets.xyz"));
+    }
+
+    #[tokio::test]
+    async fn the_network_download_then_write_scenario_reaches_the_spool_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("network_download_then_write".to_string());
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert_eq!(contents.lines().count(), 5);
+        assert!(contents.contains("\"NETWORK_CONNECT\""));
+        assert!(contents.contains("\"FILE_CREATE\""));
+        assert!(contents.contains("203.0.113.90"));
+        assert!(contents.contains("/tmp/payload"));
     }
 
     #[tokio::test]

@@ -408,6 +408,175 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     assert_eq!(parsed.as_array().unwrap().len(), 7);
 }
 
+/// Phase 6's full vertical slice — ARCHITECTURE.md §26's own worked trace
+/// (curl connects, then the same process writes a file), flowing through
+/// the real Agent, Server (ingest -> stateful sequence Detection ->
+/// persisted relationships -> Correlation -> Baseline -> Risk), and HTTP
+/// API. Proves the mature engines this phase built actually compose end to
+/// end: the shipped sequence rule fires only once both steps have been
+/// observed, `GET /api/v1/graph` returns the bounded multi-category
+/// subgraph seeded from the process, and `GET /api/v1/risk` returns a
+/// score whose reasons cite both the fired alert and the chain-pattern
+/// bonus.
+#[tokio::test(flavor = "multi_thread")]
+async fn network_download_then_write_scenario_flows_end_to_end_through_every_phase_6_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        systemd_audit_log_path: None,
+        persistence_watch_paths: vec![],
+        container_cgroup_roots: vec![],
+        proc_root: None,
+        enable_synthetic: true,
+        synthetic_scenario: Some("network_download_then_write".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+    let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+    let detection_engine = Arc::new(DetectionEngine::load_from_dir(&rules_dir).unwrap());
+    assert!(
+        detection_engine.rule_count() >= 6,
+        "config/rules/ must contain at least the six rules Phases 2-6 have shipped"
+    );
+
+    let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // 5-event scenario (3 exec + connect + file create), 1ms apart, well
+    // inside the shipped sequence rule's 30s window; 1500ms is the same
+    // generous budget the other scenario tests here use.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    // 1. All 5 events landed.
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    assert_eq!(events.len(), 5, "expected sshd, bash, curl, connect, and file create");
+    let curl_process_key = events
+        .iter()
+        .find(|e| e.process.as_ref().is_some_and(|p| p.exe_path == "/usr/bin/curl"))
+        .unwrap()
+        .process
+        .as_ref()
+        .unwrap()
+        .process_key;
+
+    let app = build_router(storage.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = reqwest::Client::new();
+
+    // 2. The shipped sequence rule fired — exactly it, since this
+    //    scenario's actor/path/IP have nothing in common with any other
+    //    shipped rule's positive fixture.
+    let alerts: serde_json::Value = client
+        .get(format!("http://{}/api/v1/alerts", addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alerts_array = alerts.as_array().unwrap();
+    assert_eq!(alerts_array.len(), 1);
+    assert_eq!(
+        alerts_array[0]["rule_id"].as_str().unwrap(),
+        "network_download_then_write"
+    );
+    let evidence = alerts_array[0]["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 2, "evidence must cite both the connect and the write");
+
+    // 3. GET /api/v1/graph, seeded at curl's process, returns the bounded
+    //    multi-category subgraph: the ConnectedTo and Wrote edges §9.4
+    //    computes at enrichment time, now persisted and queryable.
+    let entity_key = format!("PROCESS:{}", curl_process_key);
+    let graph: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/graph?entity={}",
+            addr, entity_key
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let graph_edges = graph["edges"].as_array().unwrap();
+    assert_eq!(graph_edges.len(), 2, "the process's ConnectedTo and Wrote edges");
+    let relations: std::collections::HashSet<_> = graph_edges
+        .iter()
+        .map(|e| e["relation"].as_str().unwrap().to_string())
+        .collect();
+    assert!(relations.contains("CONNECTED_TO"));
+    assert!(relations.contains("WROTE"));
+
+    // 4. GET /api/v1/risk, filtered by curl's process_key, returns a score
+    //    whose reasons cite both the fired alert (severity weight) and the
+    //    chain-pattern bonus (§26 step 11's own example, made real).
+    let risk: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/risk?process_key={}",
+            addr, curl_process_key
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let risk_records = risk.as_array().unwrap();
+    assert!(!risk_records.is_empty(), "at least one risk score must be queryable");
+    let has_alert_reason = risk_records.iter().any(|r| {
+        r["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["label"].as_str().unwrap().contains("network connection"))
+    });
+    let has_chain_bonus = risk_records.iter().any(|r| {
+        r["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["label"].as_str().unwrap().contains("Network connection followed by file write"))
+    });
+    assert!(has_alert_reason, "a risk record must cite the fired sequence alert");
+    assert!(has_chain_bonus, "a risk record must cite the chain-pattern bonus");
+}
+
 /// Phase 3's full vertical slice: the network-beacon scenario (sshd -> bash
 /// -> curl, then curl resolves a suspicious-TLD domain and connects to the
 /// resolved address before the connection closes) flows through the real

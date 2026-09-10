@@ -85,8 +85,11 @@ pub struct AgentConfig {
     /// (§26's trace from its first step: login, shell, sudo escalation,
     /// file write, outbound connection), `"persistence_via_systemd_service"`
     /// (that same opening continued into a backdoor systemd unit install and
-    /// start), or `"container_deploy_in_remote_session"` (that same opening
-    /// continued into a container create+start instead). Ignored unless
+    /// start), `"container_deploy_in_remote_session"` (that same opening
+    /// continued into a container create+start instead), or
+    /// `"network_download_then_write"` (curl connects, then the same
+    /// process writes a file — §26's own worked trace verbatim, and the
+    /// Phase 6 shipped sequence rule's positive fixture). Ignored unless
     /// `enable_synthetic` is true.
     #[serde(default)]
     pub synthetic_scenario: Option<String>,

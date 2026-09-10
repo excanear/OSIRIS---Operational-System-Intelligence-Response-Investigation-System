@@ -17,6 +17,17 @@ use crate::rule::{Rule, RuleError};
 struct SequenceState {
     next_step: usize,
     started_at: u64,
+    /// The timestamp of the most recently matched step's event. A
+    /// candidate match for the *next* step is only accepted when its
+    /// `event.timestamp >= last_ts` (Phase 6 review finding): the
+    /// ingestion pipeline does not guarantee events reach `evaluate()` in
+    /// timestamp order (concurrent per-event resolution can reorder
+    /// delivery), so without this guard two events whose *arrival* order
+    /// happens to match a sequence's step order can fire the rule even
+    /// though the events' own timestamps say the steps did not actually
+    /// happen in that order — turning "sequence" into "arrival order",
+    /// not the temporal order the rule's semantics require.
+    last_ts: u64,
     event_ids: Vec<Uuid>,
 }
 
@@ -171,14 +182,30 @@ impl DetectionEngine {
             if !matched {
                 continue;
             }
+            // Reject an otherwise-matching event for any step after the
+            // first if it is chronologically earlier than the step that
+            // already advanced this state — see `SequenceState::last_ts`.
+            // A step-0 match always restarts state below regardless (a
+            // fresh sequence attempt, not a continuation).
+            if step_index > 0 {
+                let in_order = state_map
+                    .get(&state_key)
+                    .map(|s| event.timestamp >= s.last_ts)
+                    .unwrap_or(true);
+                if !in_order {
+                    continue;
+                }
+            }
 
             let entry = state_map.entry(state_key.clone()).or_insert_with(|| SequenceState {
                 next_step: 0,
                 started_at: event.timestamp,
+                last_ts: event.timestamp,
                 event_ids: Vec::with_capacity(steps.len()),
             });
             entry.event_ids.push(event.event_id);
             entry.next_step += 1;
+            entry.last_ts = event.timestamp;
 
             if entry.next_step == steps.len() {
                 let event_ids = entry.event_ids.clone();
@@ -984,6 +1011,26 @@ sequence:
 
         assert!(engine.evaluate(&connect).is_empty());
         assert!(engine.evaluate(&write).is_empty());
+    }
+
+    #[test]
+    fn a_step_1_match_chronologically_earlier_than_the_step_0_match_does_not_fire() {
+        // Regression test (Phase 6 whole-branch review): the ingestion
+        // pipeline does not guarantee events reach `evaluate()` in
+        // timestamp order. If a FILE_WRITE with an *earlier* timestamp
+        // than an already-matched NETWORK_CONNECT arrives second (by
+        // delivery order, not by time), the sequence must not fire —
+        // the write did not actually happen after the connect.
+        let engine = sequence_engine();
+        let host_id = Uuid::new_v4();
+        let connect = network_connect_event(host_id, 300, 1_000_000_000 + 7_000_000);
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 6_000_000);
+
+        assert!(engine.evaluate(&connect).is_empty());
+        assert!(
+            engine.evaluate(&write).is_empty(),
+            "a write timestamped before the connect it arrived after must not complete the sequence"
+        );
     }
 
     #[test]

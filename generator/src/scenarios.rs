@@ -178,6 +178,53 @@ pub fn network_beacon_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
     ]
 }
 
+/// ARCHITECTURE.md §26's own worked trace, verbatim: curl (pid 300)
+/// connects outbound, then — the same process, well inside the Phase 6
+/// shipped sequence rule's 30s window — writes the downloaded payload to
+/// disk. This is the one pattern no prior scenario produces (`web_shell_
+/// drop_scenario` writes a file with no preceding network activity from
+/// the same process; `network_beacon_scenario` connects but never writes),
+/// and exactly what `network_download_then_write.yaml` (Phase 6 plan Task
+/// 9) exists to detect — this scenario is both that rule's positive
+/// fixture and the Phase 6 e2e test's realistic multi-category chain.
+pub const DOWNLOAD_C2_IP: &str = "203.0.113.90";
+pub const DOWNLOAD_PAYLOAD_PATH: &str = "/tmp/payload";
+const DOWNLOAD_PAYLOAD_INODE: u64 = 500_111;
+
+pub fn network_download_then_write_scenario(base_ts_ns: u64) -> Vec<RawEvent> {
+    vec![
+        exec(100, 1, "/usr/sbin/sshd", "sshd", base_ts_ns),
+        exec(200, 100, "/bin/bash", "bash", base_ts_ns + 1_000_000),
+        exec(300, 200, "/usr/bin/curl", "curl", base_ts_ns + 2_000_000),
+        RawEvent::Network(NetworkEventRaw {
+            operation: NetworkOperation::Connect,
+            local_addr: "10.0.0.5".to_string(),
+            local_port: 51002,
+            remote_addr: DOWNLOAD_C2_IP.to_string(),
+            remote_port: 443,
+            proto: "tcp".to_string(),
+            direction: NetworkDirection::Outbound,
+            pid: Some(300),
+            uid: 1000,
+            exe_path: "/usr/bin/curl".to_string(),
+            comm: "curl".to_string(),
+            timestamp_ns: base_ts_ns + 3_000_000,
+            source: RawEventSource::Synthetic,
+        }),
+        file_event(
+            FileOperation::Create,
+            DOWNLOAD_PAYLOAD_PATH,
+            None,
+            DOWNLOAD_PAYLOAD_INODE,
+            300,
+            200,
+            "/usr/bin/curl",
+            "curl",
+            base_ts_ns + 4_000_000,
+        ),
+    ]
+}
+
 /// ARCHITECTURE.md §26's worked trace from its true first step: sshd
 /// accepts a remote connection, audit records the login, a shell runs
 /// inside that session, sudo escalates it to root, and the escalated
@@ -593,6 +640,7 @@ mod tests {
             web_shell_drop_scenario(1000),
             ssh_sudo_escalation_scenario(1000),
             persistence_via_systemd_service_scenario(1000),
+            network_download_then_write_scenario(1000),
         ] {
             for pair in scenario.windows(2) {
                 assert!(
@@ -697,6 +745,33 @@ mod tests {
         assert_eq!(net[0].pid, Some(300));
         assert_eq!(net[1].operation, osiris_sensor_api::NetworkOperation::Close);
         assert_eq!(net[1].remote_addr, BEACON_IP);
+    }
+
+    #[test]
+    fn network_download_then_write_scenario_has_the_full_exec_then_network_then_file_chain() {
+        let scenario = network_download_then_write_scenario(1000);
+        assert_eq!(scenario.len(), 5);
+
+        let execs = exec_events(&scenario);
+        assert_eq!(execs.len(), 3);
+        assert_eq!(execs[2].exe_path, "/usr/bin/curl");
+        assert_eq!(execs[2].pid, 300);
+
+        let net = network_raw_events(&scenario);
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].operation, osiris_sensor_api::NetworkOperation::Connect);
+        assert_eq!(net[0].remote_addr, DOWNLOAD_C2_IP);
+        assert_eq!(net[0].pid, Some(300));
+
+        let files = file_events(&scenario);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].operation, FileOperation::Create);
+        assert_eq!(files[0].path, DOWNLOAD_PAYLOAD_PATH);
+        assert_eq!(files[0].pid, 300);
+
+        // The Phase 6 sequence rule's whole premise: the connect precedes
+        // the write, from the same process.
+        assert!(net[0].timestamp_ns < files[0].timestamp_ns);
     }
 
     #[test]
