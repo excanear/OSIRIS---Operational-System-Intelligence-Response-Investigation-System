@@ -30,6 +30,17 @@ pub fn events_url(
     url
 }
 
+/// Builds the `/api/v1/containers/story` request URL (Phase 5 plan Task
+/// 11 — the CLI's first `*_story` subcommand; container ids are hex
+/// strings, so no percent-encoding is needed).
+pub fn container_story_url(server: &str, container_id: &str) -> String {
+    format!(
+        "{}/api/v1/containers/story?container_id={}",
+        server.trim_end_matches('/'),
+        container_id
+    )
+}
+
 /// Renders events as a human-readable tab-separated table (the default
 /// `--format table` output; `--format json` bypasses this and prints the
 /// API's raw JSON body instead — ARCHITECTURE.md §15's interactive vs.
@@ -165,6 +176,24 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn container_story_url_includes_the_container_id() {
+        let url = container_story_url("http://localhost:8080", &"a".repeat(64));
+        assert_eq!(
+            url,
+            format!("http://localhost:8080/api/v1/containers/story?container_id={}", "a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn container_story_url_strips_trailing_slash_from_server() {
+        let url = container_story_url("http://localhost:8080/", "abc123");
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/containers/story?container_id=abc123"
+        );
     }
 
     #[test]

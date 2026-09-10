@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use osiris_cli::client::{events_url, format_events_table};
+use osiris_cli::client::{container_story_url, events_url, format_events_table};
 use osiris_schema::CanonicalEvent;
 
 #[derive(Parser)]
@@ -40,6 +40,9 @@ enum Command {
     /// List processes, or show one process's exec record + children (a
     /// Process Tree, per plan Global Constraints #9).
     Processes { process_key: Option<String> },
+    /// Show a container's whole observed lifecycle/activity timeline (Phase
+    /// 5 plan Task 11 — this CLI's first `*_story` subcommand).
+    ContainerStory { container_id: String },
 }
 
 /// Sends the request, then treats a non-2xx HTTP status as a failure —
@@ -92,6 +95,10 @@ fn main() {
                 ),
                 None => format!("{}/api/v1/processes", cli.server.trim_end_matches('/')),
             };
+            get(&client, url)
+        }
+        Command::ContainerStory { container_id } => {
+            let url = container_story_url(&cli.server, container_id);
             get(&client, url)
         }
     };
