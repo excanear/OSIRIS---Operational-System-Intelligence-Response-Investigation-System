@@ -3,6 +3,7 @@ use osiris_schema::{
     Relation, SessionRef,
 };
 
+use crate::ns_cgroup_resolver::NsCgroupResolver;
 use crate::process_resolver::ProcessResolver;
 use crate::session_resolver::{SessionRecord, SessionResolver};
 
@@ -18,6 +19,7 @@ pub fn enrich(
     boot_id: &str,
     resolver: &mut ProcessResolver,
     sessions: &mut SessionResolver,
+    ns_cgroup: &mut NsCgroupResolver,
 ) -> CanonicalEvent {
     event.boot_id = boot_id.to_string();
 
@@ -33,6 +35,7 @@ pub fn enrich(
     }
 
     attach_session(&mut event, sessions);
+    enrich_container_context(&mut event, ns_cgroup);
 
     match event.category {
         Category::File => attach_file_relationship(&mut event),
@@ -44,6 +47,47 @@ pub fn enrich(
     }
 
     event
+}
+
+/// Phase 5 plan Task 4: per-process namespace/cgroup/container context,
+/// attached to any event that carries a process pid — not just
+/// `Category::Container` events (the point is context on *everything* a
+/// containerized process does, matching this phase's "container-aware
+/// Entity Graph and Stories" mandate). Never overwrites `namespace`/
+/// `cgroup` that Normalize already set (a `CONTAINER_*` event's own
+/// scan-observed `cgroup` from Task 2 must not be clobbered by this
+/// per-process resolution).
+fn enrich_container_context(event: &mut CanonicalEvent, ns_cgroup: &mut NsCgroupResolver) {
+    let Some(pid) = event.process.as_ref().map(|p| p.pid) else {
+        return;
+    };
+    let Some((namespace, cgroup, container)) = ns_cgroup.resolve(pid) else {
+        return;
+    };
+    if event.namespace.is_none() {
+        event.namespace = Some(namespace);
+    }
+    if event.cgroup.is_none() {
+        event.cgroup = Some(cgroup);
+    }
+    if event.container.is_none() {
+        if let Some(container) = container {
+            let process_key = event.process.as_ref().map(|p| p.process_key);
+            event.container = Some(container.clone());
+            if let Some(process_key) = process_key {
+                let edge = EntityRelationship {
+                    from: EntityRef::Process { process_key },
+                    to: EntityRef::Container {
+                        container_id: container.container_id,
+                    },
+                    relation: Relation::BelongsToContainer,
+                    event_id: event.event_id,
+                    timestamp: event.timestamp,
+                };
+                event.relationships.push(edge);
+            }
+        }
+    }
 }
 
 /// §26 step 3's session linkage, in both directions:
@@ -400,7 +444,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let event = enrich(bare_event(host_id, 100, 1), "boot-xyz", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let event = enrich(bare_event(host_id, 100, 1), "boot-xyz", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert_eq!(event.boot_id, "boot-xyz");
     }
 
@@ -409,8 +454,9 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert_eq!(
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
@@ -426,8 +472,9 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         let parent = curl.parent_process.expect("parent must resolve");
         assert_eq!(parent.pid, 100, "must be the real ppid, not 0");
@@ -465,7 +512,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let file_event = enrich(
@@ -473,6 +521,7 @@ mod tests {
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert_eq!(
             file_event.process.unwrap().process_key,
@@ -489,11 +538,13 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let file_event = enrich(
             bare_file_event(host_id, 777, 1, 131075),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert!(file_event
             .tags
@@ -505,14 +556,16 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
-        let _curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let _curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         let file_event = enrich(
             bare_file_event(host_id, 300, 200, 131075),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         let parent = file_event.parent_process.expect("parent must resolve");
         assert_eq!(parent.process_key, bash.process.unwrap().process_key);
@@ -527,7 +580,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let file_event = enrich(
@@ -535,6 +589,7 @@ mod tests {
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert_eq!(file_event.relationships.len(), 1);
         let edge = &file_event.relationships[0];
@@ -563,11 +618,12 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let mut event = bare_file_event(host_id, 300, 200, 131075);
         if let Some(file) = event.file.as_mut() {
             file.inode = None;
         }
-        let enriched = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        let enriched = enrich(event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(enriched.relationships.is_empty());
     }
 
@@ -579,8 +635,9 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
-        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let bash = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let curl = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert_eq!(
             curl.parent_process.unwrap().process_key,
             bash.process.unwrap().process_key
@@ -620,7 +677,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let net_event = enrich(
@@ -628,6 +686,7 @@ mod tests {
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert_eq!(net_event.relationships.len(), 1);
         let edge = &net_event.relationships[0];
@@ -649,11 +708,13 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let net_event = enrich(
             bare_network_event(host_id, None, "203.0.113.50"),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert!(net_event.relationships.is_empty());
         assert!(net_event.process.is_none());
@@ -664,10 +725,11 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let mut event = bare_network_event(host_id, Some(300), "203.0.113.50");
         event.event_type = EventType::NetworkClose;
-        let closed = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        let closed = enrich(event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(
             closed.relationships.is_empty(),
             "the opening event already carries the edge; close must not duplicate it"
@@ -700,6 +762,7 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let dns_event = enrich(
             bare_dns_event(
                 host_id,
@@ -709,6 +772,7 @@ mod tests {
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert_eq!(dns_event.relationships.len(), 2);
         for (edge, expected_ip) in dns_event
@@ -735,11 +799,13 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let dns_event = enrich(
             bare_dns_event(host_id, Some(300), vec![]),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert!(dns_event.relationships.is_empty());
     }
@@ -752,7 +818,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let curl_exec = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let authoritative = curl_exec.process.unwrap().process_key;
 
         let dns_event = enrich(
@@ -760,6 +827,7 @@ mod tests {
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert_eq!(dns_event.process.unwrap().process_key, authoritative);
         assert!(!dns_event.tags.contains(&"PROCESS_KEY_PROVISIONAL".to_string()));
@@ -816,11 +884,12 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
 
-        let _sshd = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions);
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
-        let curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let _sshd = enrich(bare_event(host_id, 100, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let curl = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         for (name, event) in [("bash", &bash), ("curl", &curl)] {
             let session = event
@@ -838,8 +907,9 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(cron.session.is_none());
     }
 
@@ -851,8 +921,9 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         let edges: Vec<_> = bash
             .relationships
@@ -878,7 +949,8 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let cron = enrich(bare_event(host_id, 900, 1), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(cron
             .relationships
             .iter()
@@ -890,14 +962,16 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
-        let sudo = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let sudo = enrich(bare_event(host_id, 300, 200), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         let escalation = enrich(
             privilege_event(host_id, 300, 200, 1000, Some(0)),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
 
         let edges: Vec<_> = escalation
@@ -936,11 +1010,13 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let event = enrich(
             privilege_event(host_id, 300, 200, 1000, Some(1000)),
             "boot-1",
             &mut resolver,
             &mut sessions,
+            &mut ns_cgroup,
         );
         assert!(event
             .relationships
@@ -955,9 +1031,10 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let mut event = privilege_event(host_id, 300, 200, 1000, None);
         event.event_type = EventType::PrivilegeSudo;
-        let event = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        let event = enrich(event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(event
             .relationships
             .iter()
@@ -972,9 +1049,10 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
         let mut event = privilege_event(host_id, 300, 200, 1000, Some(0));
         event.event_type = EventType::PrivilegeSudo;
-        let event = enrich(event, "boot-1", &mut resolver, &mut sessions);
+        let event = enrich(event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(event
             .relationships
             .iter()
@@ -988,15 +1066,16 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(bash.session.is_some());
 
         let mut logout = login_event(host_id, 100);
         logout.event_type = EventType::SessionLogout;
-        let _logout = enrich(logout, "boot-1", &mut resolver, &mut sessions);
+        let _logout = enrich(logout, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
-        let after = enrich(bare_event(host_id, 400, 100), "boot-1", &mut resolver, &mut sessions);
+        let after = enrich(bare_event(host_id, 400, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         assert!(after.session.is_none());
     }
 
@@ -1012,11 +1091,12 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
 
         // pid 100 is the root of session "3" (e.g. the original SSH login).
-        let _login_a = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
+        let _login_a = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
         // pid 200 execs under 100 and inherits session "3" by ppid chain.
-        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         // A second, independent login roots session "5" at pid 500 (e.g. a
         // concurrent console session, unrelated to pid 200's ancestry).
@@ -1024,7 +1104,7 @@ mod tests {
         login_b.session.as_mut().unwrap().session_id = "5".to_string();
         login_b.session.as_mut().unwrap().remote_addr = None;
         login_b.session.as_mut().unwrap().auth_method = Some("login".to_string());
-        let _login_b = enrich(login_b, "boot-1", &mut resolver, &mut sessions);
+        let _login_b = enrich(login_b, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         // pid 200 (a known member of session "3" via inheritance) now
         // produces an event whose record OWN `ses=` says "5" — e.g. it ran
@@ -1041,7 +1121,7 @@ mod tests {
             remote_addr: None,
             auth_method: None,
         });
-        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions);
+        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         assert_eq!(
             result.session.as_ref().unwrap().session_id,
@@ -1064,9 +1144,10 @@ mod tests {
         let host_id = Uuid::new_v4();
         let mut resolver = ProcessResolver::new();
         let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
 
-        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions);
-        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions);
+        let _login = enrich(login_event(host_id, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        let _bash = enrich(bare_event(host_id, 200, 100), "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         // pid 200 is a known member of session "3", but this event's own
         // record observed a session ("9") the resolver has never heard of
@@ -1078,7 +1159,7 @@ mod tests {
             remote_addr: None,
             auth_method: None,
         });
-        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions);
+        let result = enrich(observed_event, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
 
         assert_eq!(
             result.session.as_ref().unwrap().session_id,
@@ -1086,5 +1167,116 @@ mod tests {
             "an unknown observed session must be kept, never silently swapped for pid-3"
         );
         assert!(result.session.as_ref().unwrap().tty.is_none());
+    }
+
+    fn write_fake_cgroup(proc_root: &std::path::Path, pid: u32, contents: &str) {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup"), contents).unwrap();
+    }
+
+    /// Phase 5 plan Task 4: a process-exec event whose fake proc root
+    /// resolves to a docker cgroup path gets `.namespace`/`.cgroup`/
+    /// `.container` populated and one `BELONGS_TO_CONTAINER` edge.
+    #[test]
+    fn a_process_event_in_a_container_cgroup_gets_container_context_and_an_edge() {
+        let host_id = Uuid::new_v4();
+        let tmp = tempfile::tempdir().unwrap();
+        let container_id = "f".repeat(64);
+        write_fake_cgroup(
+            tmp.path(),
+            100,
+            &format!("0::/system.slice/docker-{container_id}.scope\n"),
+        );
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new(tmp.path());
+
+        let event = enrich(
+            bare_event(host_id, 100, 1),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+            &mut ns_cgroup,
+        );
+
+        let cgroup = event.cgroup.as_ref().expect("cgroup must be resolved");
+        assert!(cgroup.cgroup_path.contains(&container_id));
+        let container = event.container.as_ref().expect("container must be resolved");
+        assert_eq!(container.container_id, container_id);
+        assert!(event.namespace.is_some());
+        assert_eq!(
+            event
+                .relationships
+                .iter()
+                .filter(|r| r.relation == Relation::BelongsToContainer)
+                .count(),
+            1
+        );
+    }
+
+    /// An event whose pid resolves to no cgroup file at all (proc root has
+    /// nothing for it) is left untouched — no panic, no fabricated context.
+    #[test]
+    fn an_event_with_no_resolvable_cgroup_is_left_untouched() {
+        let host_id = Uuid::new_v4();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new(tmp.path());
+
+        let event = enrich(
+            bare_event(host_id, 100, 1),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+            &mut ns_cgroup,
+        );
+        assert!(event.cgroup.is_none());
+        assert!(event.container.is_none());
+        assert!(event.namespace.is_none());
+        assert!(event
+            .relationships
+            .iter()
+            .all(|r| r.relation != Relation::BelongsToContainer));
+    }
+
+    /// A `CONTAINER_START` event's own `cgroup` (set by Normalize per Task
+    /// 2) must not be overwritten by this per-process resolution, even
+    /// when the resolver could independently derive one for the same pid.
+    #[test]
+    fn a_container_events_own_cgroup_is_not_overwritten_by_the_resolver() {
+        let host_id = Uuid::new_v4();
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_cgroup(
+            tmp.path(),
+            4242,
+            &format!("0::/system.slice/docker-{}.scope\n", "1".repeat(64)),
+        );
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new(tmp.path());
+
+        let mut container_event = bare_event(host_id, 4242, 1);
+        container_event.category = Category::Container;
+        container_event.event_type = EventType::ContainerStart;
+        container_event.cgroup = Some(osiris_schema::CgroupRef {
+            cgroup_path: "/normalize-set-this-path".to_string(),
+            cgroup_id: 0,
+            version: osiris_schema::CgroupVersion::Unknown,
+        });
+
+        let event = enrich(
+            container_event,
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+            &mut ns_cgroup,
+        );
+        assert_eq!(
+            event.cgroup.unwrap().cgroup_path,
+            "/normalize-set-this-path",
+            "Normalize's own cgroup must survive, not be clobbered by the resolver"
+        );
     }
 }

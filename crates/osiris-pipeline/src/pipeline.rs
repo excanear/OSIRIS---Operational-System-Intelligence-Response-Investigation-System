@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+
 use osiris_schema::{CanonicalEvent, HostRef};
 use osiris_sensor_api::RawEvent;
 
 use crate::enrich::enrich;
 use crate::normalize::normalize;
+use crate::ns_cgroup_resolver::NsCgroupResolver;
 use crate::prioritize::{prioritize, PriorityLane, PriorityTable};
 use crate::process_resolver::ProcessResolver;
 use crate::session_resolver::SessionResolver;
@@ -25,6 +28,7 @@ pub struct Pipeline {
     boot_id: String,
     resolver: ProcessResolver,
     sessions: SessionResolver,
+    ns_cgroup: NsCgroupResolver,
     priority_table: PriorityTable,
 }
 
@@ -35,8 +39,19 @@ impl Pipeline {
             boot_id,
             resolver: ProcessResolver::new(),
             sessions: SessionResolver::new(),
+            ns_cgroup: NsCgroupResolver::new("/proc"),
             priority_table: PriorityTable::default(),
         }
+    }
+
+    /// Points the namespace/cgroup resolver at a different procfs root
+    /// (Phase 5 plan Task 4) — used by tests and by `osiris-agent`'s
+    /// config-driven `proc_root` so a fake or non-default root can be
+    /// supplied without touching every existing `Pipeline::new` call site
+    /// (mirrors `PersistenceSensor::with_poll_interval`'s builder shape).
+    pub fn with_proc_root(mut self, proc_root: impl Into<PathBuf>) -> Self {
+        self.ns_cgroup = NsCgroupResolver::new(proc_root);
+        self
     }
 
     /// Runs Normalize -> Enrich(local) -> Validate -> Prioritize on one raw
@@ -44,7 +59,13 @@ impl Pipeline {
     /// dropped — the caller always gets a PrioritizedEvent back.
     pub fn process(&mut self, raw: RawEvent) -> PrioritizedEvent {
         let event = normalize(raw, &self.host, &self.boot_id);
-        let mut event = enrich(event, &self.boot_id, &mut self.resolver, &mut self.sessions);
+        let mut event = enrich(
+            event,
+            &self.boot_id,
+            &mut self.resolver,
+            &mut self.sessions,
+            &mut self.ns_cgroup,
+        );
         validate(&mut event);
         let lane = prioritize(&event, &self.priority_table);
         PrioritizedEvent { event, lane }
