@@ -10,6 +10,13 @@ pub enum RawEventSource {
     /// audit — carries no audit serial and no guarantee of catching every
     /// transition between poll ticks.
     Procfs,
+    /// Queried from a container runtime's API (Docker/containerd/CRI-O over
+    /// its unix socket). Not used by any sensor yet this phase (Phase 5
+    /// plan Global Constraint #1: the Container sensor ships its
+    /// cgroup-only fallback first, which honestly reports
+    /// `RawEventSource::Procfs`) — added now so the deferred primary
+    /// backend is a value change, not a type change, when implemented.
+    ContainerApi,
 }
 
 /// A Process/Exec creation record at MINIMAL telemetry (ARCHITECTURE.md §6:
@@ -415,10 +422,51 @@ pub struct PersistenceEventRaw {
     pub source: RawEventSource,
 }
 
+/// The four container lifecycle transitions this phase's fallback sensor
+/// observes (Phase 5 plan Global Constraint #7). A cgroup directory
+/// appearing is reported as `Create` immediately followed by `Start` (a
+/// one-shot poll cannot distinguish "just created" from "just started");
+/// a cgroup directory disappearing is `Stop` immediately followed by
+/// `Destroy` — both pairings disclosed via `event_data.observed_transition`
+/// at normalize time, never silently merged into one guessed operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerOperation {
+    Create,
+    Start,
+    Stop,
+    Destroy,
+}
+
+/// A container lifecycle record. Phase 5 plan Global Constraint #6: the
+/// cgroup-only fallback backend that emits this in practice never has
+/// `image`/`pod_ref` metadata — `image`/`runtime` are honest empty/`"cgroup"`
+/// values in that case, not fabricated. `pid` is the container's resolved
+/// init process, when the poller could derive one from the cgroup's
+/// `cgroup.procs` file; `None` when it couldn't (plan Global Constraint #1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerEventRaw {
+    pub operation: ContainerOperation,
+    pub container_id: String,
+    /// `""` when the backend has no image metadata (cgroup-only
+    /// correlation, plan Global Constraint #6).
+    pub image: String,
+    /// `"cgroup"` for the fallback backend (plan Global Constraint #6);
+    /// `"docker"`/`"containerd"`/`"cri-o"` reserved for the deferred
+    /// runtime-API primary backend (plan Global Constraint #1).
+    pub runtime: String,
+    pub cgroup_path: String,
+    pub pid: Option<u32>,
+    pub pod_name: Option<String>,
+    pub pod_namespace: Option<String>,
+    pub timestamp_ns: u64,
+    pub source: RawEventSource,
+}
+
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
 /// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 added
 /// File; Phase 3 added Network and Dns; Phase 4a adds Identity and
-/// Privilege.
+/// Privilege; Phase 4b added Systemd and Persistence; Phase 5 adds
+/// Container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     ProcessExec(ProcessExecRaw),
@@ -429,6 +477,7 @@ pub enum RawEvent {
     Privilege(PrivilegeEventRaw),
     Systemd(SystemdEventRaw),
     Persistence(PersistenceEventRaw),
+    Container(ContainerEventRaw),
 }
 
 impl RawEvent {
@@ -445,6 +494,7 @@ impl RawEvent {
             RawEvent::Privilege(p) => p.timestamp_ns,
             RawEvent::Systemd(s) => s.timestamp_ns,
             RawEvent::Persistence(p) => p.timestamp_ns,
+            RawEvent::Container(c) => c.timestamp_ns,
         }
     }
 }
@@ -779,6 +829,55 @@ mod tests {
     /// A removed artifact carries no content hash — there is nothing left
     /// to hash, and inventing one (e.g. reusing the last-known hash) would
     /// misrepresent a deletion as a content fact.
+    fn container_raw() -> ContainerEventRaw {
+        ContainerEventRaw {
+            operation: ContainerOperation::Start,
+            container_id: "a".repeat(64),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            cgroup_path: "/system.slice/docker-".to_string() + &"a".repeat(64) + ".scope",
+            pid: Some(4242),
+            pod_name: None,
+            pod_namespace: None,
+            timestamp_ns: 1_690_000_020_000_000_000,
+            source: RawEventSource::Procfs,
+        }
+    }
+
+    #[test]
+    fn container_raw_event_round_trips_through_raw_event() {
+        let raw = RawEvent::Container(container_raw());
+        assert_eq!(raw.timestamp_ns(), 1_690_000_020_000_000_000);
+        let json = serde_json::to_string(&raw).unwrap();
+        let back: RawEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RawEvent::Container(c) => {
+                assert_eq!(c.operation, ContainerOperation::Start);
+                assert_eq!(c.container_id, "a".repeat(64));
+                assert_eq!(c.pid, Some(4242));
+                assert_eq!(c.runtime, "cgroup");
+            }
+            other => panic!("expected RawEvent::Container, got {other:?}"),
+        }
+    }
+
+    /// A `Destroy` event's process may already be reaped — `pid: None`
+    /// must round-trip, never be coerced into a fabricated value.
+    #[test]
+    fn a_destroyed_container_event_may_carry_no_pid() {
+        let mut raw = container_raw();
+        raw.operation = ContainerOperation::Destroy;
+        raw.pid = None;
+        let json = serde_json::to_string(&RawEvent::Container(raw)).unwrap();
+        match serde_json::from_str::<RawEvent>(&json).unwrap() {
+            RawEvent::Container(c) => {
+                assert_eq!(c.operation, ContainerOperation::Destroy);
+                assert_eq!(c.pid, None);
+            }
+            other => panic!("expected RawEvent::Container, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_removed_persistence_event_carries_no_content_hash() {
         let mut raw = persistence_raw();

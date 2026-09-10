@@ -1,15 +1,16 @@
 use uuid::Uuid;
 
 use osiris_schema::{
-    CanonicalEvent, Category, DnsRef, EventType, FileRef, HostRef, NetworkDirection, NetworkRef,
-    ProcessKey, ProcessRef, ServiceRef, SessionRef, Severity, Source, UserRef, SCHEMA_VERSION,
+    CanonicalEvent, Category, CgroupRef, CgroupVersion, ContainerRef, DnsRef, EventType, FileRef,
+    HostRef, NetworkDirection, NetworkRef, PodRef, ProcessKey, ProcessRef, ServiceRef, SessionRef,
+    Severity, Source, UserRef, SCHEMA_VERSION,
 };
 use osiris_sensor_api::{
-    DnsEventRaw, FileEventRaw, FileOperation, IdentityEventRaw, IdentityOperation,
-    NetworkDirection as RawNetworkDirection, NetworkEventRaw, NetworkOperation,
-    PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw,
-    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw,
-    SystemdOperation,
+    ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw, FileOperation,
+    IdentityEventRaw, IdentityOperation, NetworkDirection as RawNetworkDirection, NetworkEventRaw,
+    NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation,
+    PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    SystemdEventRaw, SystemdOperation,
 };
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
@@ -29,6 +30,7 @@ pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent
         RawEvent::Privilege(p) => normalize_privilege_event(p, host, boot_id),
         RawEvent::Systemd(s) => normalize_systemd_event(s, host, boot_id),
         RawEvent::Persistence(p) => normalize_persistence_event(p, host, boot_id),
+        RawEvent::Container(c) => normalize_container_event(c, host, boot_id),
     }
 }
 
@@ -36,14 +38,16 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
-        // No process/exec backend uses procfs polling in this codebase;
-        // handled for match exhaustiveness only.
+        // No process/exec backend uses procfs polling or the container API
+        // in this codebase; handled for match exhaustiveness only.
         RawEventSource::Procfs => Source::Procfs,
+        RawEventSource::ContainerApi => Source::ContainerApi,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "process_exec_sensor/audit",
         RawEventSource::Synthetic => "process_exec_sensor/synthetic",
         RawEventSource::Procfs => "process_exec_sensor/procfs",
+        RawEventSource::ContainerApi => "process_exec_sensor/container_api",
     };
     let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, raw.start_time_mono);
     CanonicalEvent {
@@ -92,14 +96,16 @@ fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> Can
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
-        // No filesystem backend uses procfs polling in this codebase;
-        // handled for match exhaustiveness only.
+        // No filesystem backend uses procfs polling or the container API
+        // in this codebase; handled for match exhaustiveness only.
         RawEventSource::Procfs => Source::Procfs,
+        RawEventSource::ContainerApi => Source::ContainerApi,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "filesystem_sensor/audit",
         RawEventSource::Synthetic => "filesystem_sensor/synthetic",
         RawEventSource::Procfs => "filesystem_sensor/procfs",
+        RawEventSource::ContainerApi => "filesystem_sensor/container_api",
     };
     let event_type = match raw.operation {
         FileOperation::Create => EventType::FileCreate,
@@ -196,11 +202,15 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
         RawEventSource::Procfs => Source::Procfs,
+        // No network backend uses the container API in this codebase;
+        // handled for match exhaustiveness only.
+        RawEventSource::ContainerApi => Source::ContainerApi,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "network_sensor/audit",
         RawEventSource::Synthetic => "network_sensor/synthetic",
         RawEventSource::Procfs => "network_sensor/procfs",
+        RawEventSource::ContainerApi => "network_sensor/container_api",
     };
     let event_type = match raw.operation {
         NetworkOperation::Connect => EventType::NetworkConnect,
@@ -278,11 +288,15 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
         // provider string is intentionally backend-neutral rather than
         // implying an audit-based DNS sensor exists.
         RawEventSource::Procfs => Source::Procfs,
+        // No DNS backend uses the container API in this codebase; handled
+        // for match exhaustiveness only.
+        RawEventSource::ContainerApi => Source::ContainerApi,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "dns_sensor/unknown",
         RawEventSource::Synthetic => "dns_sensor/synthetic",
         RawEventSource::Procfs => "dns_sensor/unknown",
+        RawEventSource::ContainerApi => "dns_sensor/unknown",
     };
     let process = provisional_process(raw.pid, &raw.exe_path, host.host_id, boot_id);
     CanonicalEvent {
@@ -372,6 +386,9 @@ fn identity_provider(source: RawEventSource) -> &'static str {
         // not an event source — plan Global Constraint #2); handled for
         // match exhaustiveness only.
         RawEventSource::Procfs => "identity_sensor/procfs",
+        // No identity/privilege backend uses the container API in this
+        // codebase; handled for match exhaustiveness only.
+        RawEventSource::ContainerApi => "identity_sensor/container_api",
     }
 }
 
@@ -380,6 +397,7 @@ fn schema_source(source: RawEventSource) -> Source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
         RawEventSource::Procfs => Source::Procfs,
+        RawEventSource::ContainerApi => Source::ContainerApi,
     }
 }
 
@@ -739,6 +757,84 @@ fn classify_persistence_event(
             };
             (event_type, Category::Persistence, None, None)
         }
+    }
+}
+
+/// Normalizes a Container-sensor lifecycle record (Phase 5 plan Task 2).
+/// No process/session identity is resolved here — the sensor only has a
+/// pid *candidate* from the cgroup's `cgroup.procs`, not an observed exec,
+/// so Enrich (`enrich_container_context`, Task 4) is what turns it into a
+/// real, resolver-backed `ProcessRef` when possible. `cgroup` here is
+/// deliberately left `Unknown`/`0` (Global Constraint from Task 2's doc
+/// comment): this backend's own scan does not independently classify
+/// v1-vs-v2 for the cgroup it just observed — that determination is
+/// `NsCgroupResolver`'s job when it resolves *other* events' per-process
+/// context, not something this event's own normalization fabricates.
+fn normalize_container_event(
+    raw: ContainerEventRaw,
+    host: &HostRef,
+    boot_id: &str,
+) -> CanonicalEvent {
+    let event_type = match raw.operation {
+        ContainerOperation::Create => EventType::ContainerCreate,
+        ContainerOperation::Start => EventType::ContainerStart,
+        ContainerOperation::Stop => EventType::ContainerStop,
+        ContainerOperation::Destroy => EventType::ContainerDestroy,
+    };
+    let process = provisional_process(raw.pid, "", host.host_id, boot_id);
+    let pod_ref = match (&raw.pod_name, &raw.pod_namespace) {
+        (Some(pod_name), Some(pod_namespace)) => Some(PodRef {
+            pod_name: pod_name.clone(),
+            namespace: pod_namespace.clone(),
+        }),
+        _ => None,
+    };
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type,
+        category: Category::Container,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: None,
+        session: None,
+        process,
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: Some(ContainerRef {
+            container_id: raw.container_id,
+            image: raw.image,
+            runtime: raw.runtime,
+            pod_ref,
+        }),
+        namespace: None,
+        cgroup: Some(CgroupRef {
+            cgroup_path: raw.cgroup_path,
+            cgroup_id: 0,
+            version: CgroupVersion::Unknown,
+        }),
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: "container_sensor/cgroup".to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags: vec![],
+        risk: None,
+        event_data: serde_json::json!({
+            "observed_transition": matches!(
+                raw.operation,
+                ContainerOperation::Create | ContainerOperation::Destroy
+            ),
+        }),
     }
 }
 
@@ -1424,5 +1520,106 @@ mod tests {
         assert!(event.process.is_none());
         assert!(event.session.is_none());
         assert!(event.user.is_none());
+    }
+
+    fn container_raw(operation: ContainerOperation, pid: Option<u32>) -> ContainerEventRaw {
+        ContainerEventRaw {
+            operation,
+            container_id: "a".repeat(64),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            cgroup_path: "/system.slice/docker-".to_string() + &"a".repeat(64) + ".scope",
+            pid,
+            pod_name: None,
+            pod_namespace: None,
+            timestamp_ns: 1_690_000_020_000_000_000,
+            source: RawEventSource::Procfs,
+        }
+    }
+
+    #[test]
+    fn container_create_normalizes_to_correct_event_type_and_category() {
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Create, Some(4242))),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(event.event_type, EventType::ContainerCreate);
+        assert_eq!(event.category, Category::Container);
+        let container = event.container.as_ref().expect("container must be set");
+        assert_eq!(container.container_id, "a".repeat(64));
+        assert_eq!(container.runtime, "cgroup");
+        assert_eq!(container.image, "");
+    }
+
+    #[test]
+    fn container_start_normalizes_with_a_provisional_process_when_pid_is_known() {
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Start, Some(4242))),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(event.event_type, EventType::ContainerStart);
+        let process = event.process.as_ref().expect("process must be set");
+        assert_eq!(process.pid, 4242);
+    }
+
+    #[test]
+    fn container_destroy_normalizes_with_no_process_when_pid_is_unknown() {
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Destroy, None)),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(event.event_type, EventType::ContainerDestroy);
+        assert!(event.process.is_none());
+    }
+
+    #[test]
+    fn container_stop_maps_to_container_stop_event_type() {
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Stop, Some(1))),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(event.event_type, EventType::ContainerStop);
+    }
+
+    /// Global Constraint from Task 2: this backend's own scan does not
+    /// independently classify v1-vs-v2 for the cgroup it observed.
+    #[test]
+    fn container_event_leaves_cgroup_version_unknown() {
+        let host = sample_host();
+        let event = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Create, None)),
+            &host,
+            "boot-1",
+        );
+        let cgroup = event.cgroup.as_ref().expect("cgroup must be set");
+        assert_eq!(cgroup.version, osiris_schema::CgroupVersion::Unknown);
+    }
+
+    /// Plan Global Constraint #7's disclosed pairing: Create/Destroy are
+    /// the "observed transition was inferred, not directly witnessed"
+    /// cases; Start/Stop are the steady-state operations reported alone.
+    #[test]
+    fn container_event_discloses_observed_transition_flag() {
+        let host = sample_host();
+        let create = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Create, None)),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(create.event_data["observed_transition"], true);
+        let start = normalize(
+            RawEvent::Container(container_raw(ContainerOperation::Start, None)),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(start.event_data["observed_transition"], false);
     }
 }
