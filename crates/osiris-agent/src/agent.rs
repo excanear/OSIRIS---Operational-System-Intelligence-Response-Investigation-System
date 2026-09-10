@@ -11,6 +11,7 @@ use osiris_pipeline::Pipeline;
 use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
 use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
+use osiris_sensors_container::ContainerSensor;
 use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_identity::IdentitySensor;
 use osiris_sensors_net::NetworkSensor;
@@ -97,6 +98,11 @@ impl Agent {
                 config.persistence_watch_paths.clone(),
             )));
         }
+        if !config.container_cgroup_roots.is_empty() {
+            candidate_sensors.push(Box::new(ContainerSensor::new(
+                config.container_cgroup_roots.clone(),
+            )));
+        }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -173,7 +179,8 @@ impl Agent {
         ));
 
         let bus = Arc::new(bus);
-        let mut pipeline = Pipeline::new(host, boot_id);
+        let proc_root = config.proc_root.clone().unwrap_or_else(|| "/proc".to_string());
+        let mut pipeline = Pipeline::new(host, boot_id).with_proc_root(proc_root);
         let pipeline_cancellation = cancellation.clone();
         let pipeline_bus = bus.clone();
         let pipeline_handle = tokio::spawn(async move {
@@ -272,6 +279,8 @@ mod tests {
             identity_audit_log_path: None,
             systemd_audit_log_path: None,
             persistence_watch_paths: vec![],
+            container_cgroup_roots: vec![],
+            proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
             spool_path: dir
@@ -624,6 +633,28 @@ mod tests {
             .unwrap();
         let status = agent.status_snapshot().await;
         assert!(status.sensors.iter().any(|s| s.name == "persistence"));
+        agent.shutdown().await;
+    }
+
+    /// Phase 5 plan Task 7: proof `ContainerSensor` is actually constructed
+    /// in `Agent::start`, not just defined — the exact bug Phase 4b's own
+    /// final review caught for its two sensors, guarded against here from
+    /// the start.
+    #[tokio::test]
+    async fn starts_the_container_sensor_when_a_cgroup_root_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = dir.path().join("system.slice");
+        std::fs::create_dir(&cgroup_dir).unwrap();
+        let mut config = base_config(&dir);
+        config.container_cgroup_roots = vec![osiris_sensors_container::ContainerCgroupRoot {
+            path: cgroup_dir.to_string_lossy().to_string(),
+        }];
+
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let status = agent.status_snapshot().await;
+        assert!(status.sensors.iter().any(|s| s.name == "container"));
         agent.shutdown().await;
     }
 }

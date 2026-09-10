@@ -62,6 +62,19 @@ pub struct AgentConfig {
     /// once.
     #[serde(default)]
     pub persistence_watch_paths: Vec<osiris_sensors_persistence::PersistenceWatchTarget>,
+    /// Container sensor's config-declared cgroup roots to scan (Phase 5
+    /// plan Task 7). Empty by default, in which case the sensor is
+    /// skipped (capabilities()-driven, never silently) — same pattern
+    /// `persistence_watch_paths` established.
+    #[serde(default)]
+    pub container_cgroup_roots: Vec<osiris_sensors_container::ContainerCgroupRoot>,
+    /// Procfs root the pipeline's `NsCgroupResolver` reads per-process
+    /// namespace/cgroup context from (Phase 5 plan Task 7). Defaults to
+    /// `/proc` when absent — new surface this phase introduces (no earlier
+    /// sensor reads `/proc` directly by pid), not a changed default for any
+    /// existing sensor.
+    #[serde(default)]
+    pub proc_root: Option<String>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
@@ -193,6 +206,44 @@ mod tests {
         );
         assert_eq!(config.persistence_watch_paths.len(), 2);
         assert_eq!(config.persistence_watch_paths[0].path, "/etc/systemd/system");
+    }
+
+    #[test]
+    fn defaults_container_cgroup_roots_and_proc_root_to_empty_and_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: false\nspool_path: /tmp/spool.ndjson\n\
+             status_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.container_cgroup_roots.is_empty());
+        assert!(config.proc_root.is_none());
+    }
+
+    #[test]
+    fn loads_container_cgroup_roots_and_proc_root_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: false\nspool_path: /tmp/spool.ndjson\n\
+             status_addr: 127.0.0.1:9200\n\
+             proc_root: /proc\n\
+             container_cgroup_roots:\n  \
+               - path: /sys/fs/cgroup/system.slice\n  \
+               - path: /sys/fs/cgroup/kubepods.slice\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert_eq!(config.proc_root.as_deref(), Some("/proc"));
+        assert_eq!(config.container_cgroup_roots.len(), 2);
+        assert_eq!(
+            config.container_cgroup_roots[0].path,
+            "/sys/fs/cgroup/system.slice"
+        );
     }
 
     #[test]

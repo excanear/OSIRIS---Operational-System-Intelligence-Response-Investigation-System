@@ -973,6 +973,7 @@ dependencies = [
  "osiris-schema",
  "osiris-selftelemetry",
  "osiris-sensor-api",
+ "osiris-sensors-container",
  "osiris-sensors-fs",
  "osiris-sensors-identity",
  "osiris-sensors-net",
