@@ -2,7 +2,7 @@ use std::path::Path;
 
 use osiris_schema::{Alert, CanonicalEvent};
 
-use crate::eval::{field_value, matches};
+use crate::eval::{eval_node, field_value, matches};
 use crate::rule::{Rule, RuleError};
 
 /// The Phase 2 Detection Engine: stateless, single-event matching over the
@@ -92,16 +92,22 @@ impl DetectionEngine {
         event: &CanonicalEvent,
         event_json: &serde_json::Value,
     ) -> Option<Alert> {
-        let mut reasons = Vec::with_capacity(rule.match_conditions.len());
-        for condition in &rule.match_conditions {
-            // A missing (or null) field never matches — a file rule must
-            // not fire on a process event that carries no `file` at all.
-            let actual = field_value(event_json, &condition.field)?;
-            if !matches(condition.op, actual, &condition.value) {
-                return None;
+        let reasons = if let Some(node) = &rule.conditions {
+            eval_node(node, event_json)?
+        } else {
+            let mut reasons = Vec::with_capacity(rule.match_conditions.len());
+            for condition in &rule.match_conditions {
+                // A missing (or null) field never matches — a file rule
+                // must not fire on a process event that carries no `file`
+                // at all.
+                let actual = field_value(event_json, &condition.field)?;
+                if !matches(condition.op, actual, &condition.value) {
+                    return None;
+                }
+                reasons.push(condition.reason.clone());
             }
-            reasons.push(condition.reason.clone());
-        }
+            reasons
+        };
         match Alert::new(
             rule.id.clone(),
             rule.version,

@@ -1,4 +1,4 @@
-use crate::rule::Operator;
+use crate::rule::{ConditionNode, Operator};
 
 /// Resolves a dotted field path against an event's JSON projection.
 /// Matching against the serialized event rather than against
@@ -51,10 +51,46 @@ pub fn matches(op: Operator, actual: &serde_json::Value, expected: &serde_json::
     }
 }
 
+/// Evaluates a `ConditionNode` boolean tree against an event's JSON
+/// projection (ARCHITECTURE.md §12.3's AND/OR/NOT/parentheses grammar).
+/// Returns `Some(reasons)` on a match — the ordered, concatenated reasons
+/// of every `Match` leaf that actually contributed to the match — or
+/// `None` if the node did not match. `Not` never contributes a reason
+/// (there is nothing positive to explain about an absence); `Any`
+/// short-circuits on the first matching branch, so its result contains
+/// only that branch's reasons, not every branch's.
+pub fn eval_node(node: &ConditionNode, event_json: &serde_json::Value) -> Option<Vec<String>> {
+    match node {
+        ConditionNode::Match(condition) => {
+            let actual = field_value(event_json, &condition.field)?;
+            if matches(condition.op, actual, &condition.value) {
+                Some(vec![condition.reason.clone()])
+            } else {
+                None
+            }
+        }
+        ConditionNode::All { all } => {
+            let mut reasons = Vec::with_capacity(all.len());
+            for child in all {
+                reasons.extend(eval_node(child, event_json)?);
+            }
+            Some(reasons)
+        }
+        ConditionNode::Any { any } => any.iter().find_map(|child| eval_node(child, event_json)),
+        ConditionNode::Not { not } => {
+            if eval_node(not, event_json).is_none() {
+                Some(vec![])
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rule::Operator;
+    use crate::rule::{Condition, Operator};
     use serde_json::json;
 
     fn event_json() -> serde_json::Value {
@@ -140,5 +176,97 @@ mod tests {
     fn eq_and_ne_work_on_non_string_values_too() {
         assert!(matches(Operator::Eq, &json!(300), &json!(300)));
         assert!(matches(Operator::Ne, &json!(300), &json!(301)));
+    }
+
+    fn leaf(field: &str, op: Operator, value: serde_json::Value, reason: &str) -> ConditionNode {
+        ConditionNode::Match(Condition {
+            field: field.to_string(),
+            op,
+            value,
+            reason: reason.to_string(),
+        })
+    }
+
+    #[test]
+    fn all_requires_every_child_to_match_and_concatenates_reasons_in_order() {
+        let tree = ConditionNode::All {
+            all: vec![
+                leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "r1"),
+                leaf("file.path", Operator::StartsWith, json!("/var/www/"), "r2"),
+            ],
+        };
+        let reasons = eval_node(&tree, &event_json()).unwrap();
+        assert_eq!(reasons, vec!["r1".to_string(), "r2".to_string()]);
+
+        let broken = ConditionNode::All {
+            all: vec![
+                leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "r1"),
+                leaf("file.path", Operator::StartsWith, json!("/etc/"), "r2"),
+            ],
+        };
+        assert!(eval_node(&broken, &event_json()).is_none());
+    }
+
+    #[test]
+    fn any_short_circuits_on_the_first_matching_branch_only() {
+        let tree = ConditionNode::Any {
+            any: vec![
+                leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "matches"),
+                leaf("event_type", Operator::Eq, json!("NOT_THIS"), "never reached"),
+            ],
+        };
+        let reasons = eval_node(&tree, &event_json()).unwrap();
+        assert_eq!(reasons, vec!["matches".to_string()]);
+
+        let none_match = ConditionNode::Any {
+            any: vec![
+                leaf("event_type", Operator::Eq, json!("A"), "a"),
+                leaf("event_type", Operator::Eq, json!("B"), "b"),
+            ],
+        };
+        assert!(eval_node(&none_match, &event_json()).is_none());
+    }
+
+    #[test]
+    fn not_inverts_its_child_and_never_contributes_a_reason() {
+        let tree = ConditionNode::Not {
+            not: Box::new(leaf(
+                "event_type",
+                Operator::Eq,
+                json!("SOMETHING_ELSE"),
+                "unused",
+            )),
+        };
+        assert_eq!(eval_node(&tree, &event_json()), Some(vec![]));
+
+        let inverted_match = ConditionNode::Not {
+            not: Box::new(leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "unused")),
+        };
+        assert!(eval_node(&inverted_match, &event_json()).is_none());
+    }
+
+    #[test]
+    fn a_nested_and_or_not_tree_evaluates_correctly() {
+        // (event_type == FILE_CREATE AND NOT path starts_with /etc/) OR event_type == PRIVILEGE_SUDO
+        let tree = ConditionNode::Any {
+            any: vec![
+                ConditionNode::All {
+                    all: vec![
+                        leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "is a file create"),
+                        ConditionNode::Not {
+                            not: Box::new(leaf(
+                                "file.path",
+                                Operator::StartsWith,
+                                json!("/etc/"),
+                                "unused",
+                            )),
+                        },
+                    ],
+                },
+                leaf("event_type", Operator::Eq, json!("PRIVILEGE_SUDO"), "is sudo"),
+            ],
+        };
+        let reasons = eval_node(&tree, &event_json()).unwrap();
+        assert_eq!(reasons, vec!["is a file create".to_string()]);
     }
 }

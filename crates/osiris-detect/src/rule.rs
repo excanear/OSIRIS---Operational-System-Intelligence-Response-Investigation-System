@@ -33,30 +33,56 @@ pub struct Condition {
     pub reason: String,
 }
 
+/// A boolean tree of conditions (ARCHITECTURE.md §12.3's AND/OR/NOT/
+/// parentheses grammar, compiled directly into a rule's `conditions:`
+/// field rather than through a general query-language parser — Phase 6
+/// plan Global Constraint #2). Deserialized from one of four YAML shapes:
+/// `{field, op, value, reason}` (a leaf match), `{all: [...]}`,
+/// `{any: [...]}`, `{not: {...}}`. Order matters for serde's `untagged`
+/// resolution: `All`/`Any`/`Not` are tried before `Match` so a node with an
+/// `all`/`any`/`not` key is never mistaken for (or forced to also satisfy)
+/// `Condition`'s required fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ConditionNode {
+    All { all: Vec<ConditionNode> },
+    Any { any: Vec<ConditionNode> },
+    Not { not: Box<ConditionNode> },
+    Match(Condition),
+}
+
 /// A compiled detection rule. `content_hash` is the SHA-256 of the exact
 /// rule text, stored on every `Alert` this rule produces so an alert always
-/// cites the precise rule revision that fired (§11.1).
+/// cites the precise rule revision that fired (§11.1). Exactly one of
+/// `match_conditions` (non-empty) or `conditions` is populated —
+/// `Rule::from_yaml_str` enforces this at load time (Phase 6 plan Global
+/// Constraint #10).
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub id: String,
     pub version: u32,
     pub severity: Severity,
     pub match_conditions: Vec<Condition>,
+    pub conditions: Option<ConditionNode>,
     pub content_hash: String,
 }
 
 /// The on-disk YAML shape. A strict subset of §11.1's rule structure:
-/// `window`, `sequence`, `scope` and `mitre` are Phase 6 and are rejected
-/// rather than silently ignored (serde's default deny-unknown behaviour is
-/// off by default, so `deny_unknown_fields` makes that explicit).
+/// `window`, `sequence`, `scope` and `mitre` remain unsupported and are
+/// rejected rather than silently ignored (serde's default deny-unknown
+/// behaviour is off by default, so `deny_unknown_fields` makes that
+/// explicit). `conditions` (Phase 6 plan Task 2) is now accepted alongside
+/// the existing flat `match`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
     id: String,
     version: u32,
     severity: Severity,
-    #[serde(rename = "match")]
+    #[serde(rename = "match", default)]
     match_conditions: Vec<Condition>,
+    #[serde(default)]
+    conditions: Option<ConditionNode>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,8 +103,21 @@ pub enum RuleError {
     BlankId { origin: String },
     #[error("rule {id} has no match conditions — it would fire on everything")]
     NoConditions { id: String },
+    #[error("rule {id} sets both 'match' and 'conditions' — a rule must use exactly one condition form")]
+    ConflictingConditions { id: String },
     #[error("rule {id} condition {index} has a blank reason (ARCHITECTURE.md §11.2 requires one explanation per matched condition)")]
     EmptyReason { id: String, index: usize },
+    #[error("rule {id} has a condition in its 'conditions' tree with a blank reason (ARCHITECTURE.md §11.2 requires one explanation per matched condition)")]
+    EmptyConditionReason { id: String },
+}
+
+fn condition_node_has_blank_reason(node: &ConditionNode) -> bool {
+    match node {
+        ConditionNode::Match(condition) => condition.reason.trim().is_empty(),
+        ConditionNode::All { all } => all.iter().any(condition_node_has_blank_reason),
+        ConditionNode::Any { any } => any.iter().any(condition_node_has_blank_reason),
+        ConditionNode::Not { not } => condition_node_has_blank_reason(not),
+    }
 }
 
 impl Rule {
@@ -96,15 +135,27 @@ impl Rule {
                 origin: origin.to_string(),
             });
         }
-        if parsed.match_conditions.is_empty() {
+        let has_match = !parsed.match_conditions.is_empty();
+        let has_conditions = parsed.conditions.is_some();
+        if has_match && has_conditions {
+            return Err(RuleError::ConflictingConditions { id: parsed.id });
+        }
+        if !has_match && !has_conditions {
             return Err(RuleError::NoConditions { id: parsed.id });
         }
-        for (index, condition) in parsed.match_conditions.iter().enumerate() {
-            if condition.reason.trim().is_empty() {
-                return Err(RuleError::EmptyReason {
-                    id: parsed.id.clone(),
-                    index,
-                });
+        if has_match {
+            for (index, condition) in parsed.match_conditions.iter().enumerate() {
+                if condition.reason.trim().is_empty() {
+                    return Err(RuleError::EmptyReason {
+                        id: parsed.id.clone(),
+                        index,
+                    });
+                }
+            }
+        }
+        if let Some(node) = &parsed.conditions {
+            if condition_node_has_blank_reason(node) {
+                return Err(RuleError::EmptyConditionReason { id: parsed.id });
             }
         }
         let mut hasher = Sha256::new();
@@ -114,6 +165,7 @@ impl Rule {
             version: parsed.version,
             severity: parsed.severity,
             match_conditions: parsed.match_conditions,
+            conditions: parsed.conditions,
             content_hash: hex::encode(hasher.finalize()),
         })
     }
@@ -227,5 +279,81 @@ match:
     reason: "because"
 "#;
         assert!(Rule::from_yaml_str(yaml, "bad_op.yaml").is_err());
+    }
+
+    const NESTED_RULE: &str = r#"
+id: nested_boolean_rule
+version: 1
+severity: HIGH
+conditions:
+  any:
+    - all:
+        - field: event_type
+          op: eq
+          value: "FILE_CREATE"
+          reason: "A file was created"
+        - not:
+            field: process.exe_path
+            op: eq
+            value: "/usr/sbin/nginx"
+            reason: "unused — NOT never contributes a reason"
+    - field: event_type
+      op: eq
+      value: "PRIVILEGE_SUDO"
+      reason: "A sudo invocation occurred"
+"#;
+
+    #[test]
+    fn parses_a_nested_all_any_not_condition_tree() {
+        let rule = Rule::from_yaml_str(NESTED_RULE, "test.yaml").expect("must parse");
+        assert_eq!(rule.id, "nested_boolean_rule");
+        assert!(rule.match_conditions.is_empty());
+        assert!(rule.conditions.is_some());
+    }
+
+    #[test]
+    fn rejects_a_rule_that_sets_both_match_and_conditions() {
+        let yaml = r#"
+id: conflicting
+version: 1
+severity: LOW
+match:
+  - field: file.path
+    op: eq
+    value: "/x"
+    reason: "because"
+conditions:
+  field: file.path
+  op: eq
+  value: "/x"
+  reason: "because"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "conflicting.yaml").unwrap_err(),
+            RuleError::ConflictingConditions { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_a_conditions_tree_with_a_blank_reason_anywhere_in_it() {
+        let yaml = r#"
+id: unexplained_tree
+version: 1
+severity: LOW
+conditions:
+  all:
+    - field: file.path
+      op: eq
+      value: "/x"
+      reason: "because"
+    - field: event_type
+      op: eq
+      value: "FILE_CREATE"
+      reason: "   "
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "unexplained_tree.yaml").unwrap_err(),
+            RuleError::EmptyConditionReason { .. }
+        ));
     }
 }
