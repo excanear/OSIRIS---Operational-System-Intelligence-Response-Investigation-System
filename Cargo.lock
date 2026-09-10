@@ -1131,10 +1131,12 @@ name = "osiris-pipeline"
 version = "0.1.0"
 dependencies = [
  "osiris-config",
+ "osiris-fileutil",
  "osiris-schema",
  "osiris-sensor-api",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 

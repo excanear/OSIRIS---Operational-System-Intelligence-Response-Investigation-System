@@ -10,3 +10,7 @@ uuid = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-sensor-api = { path = "../osiris-sensor-api" }
 osiris-config = { path = "../osiris-config" }
+osiris-fileutil = { path = "../osiris-fileutil" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
