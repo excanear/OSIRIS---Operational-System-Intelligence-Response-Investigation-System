@@ -1,4 +1,4 @@
-use osiris_schema::{EventType, FileIdentity, ProcessKey};
+use osiris_schema::{EntityRef, EventType, FileIdentity, ProcessKey};
 use uuid::Uuid;
 
 /// This phase's minimal query surface (plan Global Constraints #11) — what
@@ -84,6 +84,50 @@ impl AlertQueryPlan {
     }
 }
 
+/// The relationships/edge-table query surface (ARCHITECTURE.md §9.4,
+/// Phase 6 plan Task 3). `entity` matches a row where its `storage_key()`
+/// equals either side of the edge (`from` OR `to`) — a caller does not
+/// need to know or care which direction the edge was recorded in to find
+/// "everything connected to this entity", exactly the query the
+/// Correlation Engine's graph walk (`osiris-correlate`, Task 4) and
+/// `GET /api/v1/graph` (Task 11) both need.
+#[derive(Debug, Clone, Default)]
+pub struct RelationshipQueryPlan {
+    pub entity: Option<EntityRef>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    pub limit: usize,
+}
+
+impl RelationshipQueryPlan {
+    pub fn new() -> Self {
+        Self {
+            limit: 1000,
+            ..Default::default()
+        }
+    }
+}
+
+/// The risk-score query surface (ARCHITECTURE.md §11.4, Phase 6 plan
+/// Task 7).
+#[derive(Debug, Clone, Default)]
+pub struct RiskQueryPlan {
+    pub process_key: Option<ProcessKey>,
+    pub event_id: Option<Uuid>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    pub limit: usize,
+}
+
+impl RiskQueryPlan {
+    pub fn new() -> Self {
+        Self {
+            limit: 100,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeleteCriteria {
     pub before_timestamp: u64,
@@ -145,6 +189,25 @@ mod tests {
         assert_eq!(plan.limit, 100);
         assert!(plan.rule_id.is_none());
         assert!(plan.evidence_event_ids.is_empty());
+        assert!(plan.since.is_none());
+        assert!(plan.until.is_none());
+    }
+
+    #[test]
+    fn new_relationship_query_plan_defaults_to_limit_1000_and_no_filters() {
+        let plan = RelationshipQueryPlan::new();
+        assert_eq!(plan.limit, 1000);
+        assert!(plan.entity.is_none());
+        assert!(plan.since.is_none());
+        assert!(plan.until.is_none());
+    }
+
+    #[test]
+    fn new_risk_query_plan_defaults_to_limit_100_and_no_filters() {
+        let plan = RiskQueryPlan::new();
+        assert_eq!(plan.limit, 100);
+        assert!(plan.process_key.is_none());
+        assert!(plan.event_id.is_none());
         assert!(plan.since.is_none());
         assert!(plan.until.is_none());
     }

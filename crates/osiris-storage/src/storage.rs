@@ -1,8 +1,9 @@
-use osiris_schema::{Alert, CanonicalEvent};
+use osiris_schema::{Alert, CanonicalEvent, EntityRelationship, RiskScoreRecord};
 use thiserror::Error;
 
 use crate::plan::{
-    AlertQueryPlan, DeleteCriteria, QueryPlan, RetentionPolicy, RetentionReport, WriteReport,
+    AlertQueryPlan, DeleteCriteria, QueryPlan, RelationshipQueryPlan, RetentionPolicy,
+    RetentionReport, RiskQueryPlan, WriteReport,
 };
 
 #[derive(Debug, Error)]
@@ -42,4 +43,25 @@ pub trait Storage: Send + Sync {
     /// ignored and counted as failed, matching `batch_write`'s semantics.
     fn write_alerts(&self, alerts: &[Alert]) -> Result<WriteReport, StorageError>;
     fn query_alerts(&self, plan: &AlertQueryPlan) -> Result<Vec<Alert>, StorageError>;
+
+    /// Persists relationship edges as first-class, queryable rows
+    /// (ARCHITECTURE.md §9.4 — "computed once, at enrichment time, and
+    /// stored as first-class edges"; Phase 6 plan Task 3 closes the gap
+    /// where, before this phase, an edge round-tripped only inside its
+    /// owning event's serialized blob). Edges are immutable facts, so this
+    /// is insert-only — re-persisting the same edge twice is harmless for
+    /// every read-only graph query this trait supports.
+    fn write_relationships(&self, edges: &[EntityRelationship]) -> Result<WriteReport, StorageError>;
+    fn query_relationships(
+        &self,
+        plan: &RelationshipQueryPlan,
+    ) -> Result<Vec<EntityRelationship>, StorageError>;
+
+    /// Persists/queries Risk Engine output (ARCHITECTURE.md §11.4, Phase 6
+    /// plan Task 7). Kept in its own table rather than mutating
+    /// `CanonicalEvent.risk` on an already-written event — this trait has
+    /// no update-in-place method for events, by design (append-only,
+    /// §10.5's spirit).
+    fn write_risk_scores(&self, scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError>;
+    fn query_risk_scores(&self, plan: &RiskQueryPlan) -> Result<Vec<RiskScoreRecord>, StorageError>;
 }

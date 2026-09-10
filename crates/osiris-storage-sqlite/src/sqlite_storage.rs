@@ -1,12 +1,16 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use osiris_schema::{Alert, CanonicalEvent, FileIdentity};
+use osiris_schema::{
+    Alert, CanonicalEvent, EntityRef, EntityRelationship, FileIdentity, Relation,
+    RiskScoreRecord, Severity, WeightedReason,
+};
 use osiris_storage::{
-    AlertQueryPlan, DeleteCriteria, QueryPlan, RetentionPolicy, RetentionReport, Storage,
-    StorageError, StorageHealth, WriteReport,
+    AlertQueryPlan, DeleteCriteria, QueryPlan, RelationshipQueryPlan, RetentionPolicy,
+    RetentionReport, RiskQueryPlan, Storage, StorageError, StorageHealth, WriteReport,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
 
 /// SQLite-backed Storage (ARCHITECTURE.md §10.2, MVP tier). One table
 /// (`events`) with a few indexed columns for filtering plus the full
@@ -65,7 +69,44 @@ impl SqliteStorage {
                 event_id TEXT NOT NULL,
                 PRIMARY KEY (alert_id, event_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_alert_evidence_event ON alert_evidence(event_id);",
+            CREATE INDEX IF NOT EXISTS idx_alert_evidence_event ON alert_evidence(event_id);
+
+            -- Phase 6: relationships as a first-class, queryable edge table
+            -- (ARCHITECTURE.md §9.4), keyed on the stable EntityRef string
+            -- encoding (`EntityRef::storage_key()`) rather than a typed
+            -- per-variant column, so one index serves every entity kind.
+            CREATE TABLE IF NOT EXISTS relationships (
+                from_key TEXT NOT NULL,
+                to_key TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationships_from ON relationships(from_key);
+            CREATE INDEX IF NOT EXISTS idx_relationships_to ON relationships(to_key);
+            CREATE INDEX IF NOT EXISTS idx_relationships_timestamp ON relationships(timestamp);
+
+            -- Phase 6: Risk Engine output (ARCHITECTURE.md §11.4), mirroring
+            -- the alerts/alert_evidence split above exactly.
+            CREATE TABLE IF NOT EXISTS risk_scores (
+                event_id TEXT PRIMARY KEY,
+                process_key TEXT,
+                host_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                score INTEGER NOT NULL,
+                severity TEXT NOT NULL,
+                related_events TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_risk_scores_process_key ON risk_scores(process_key);
+            CREATE INDEX IF NOT EXISTS idx_risk_scores_timestamp ON risk_scores(timestamp);
+
+            CREATE TABLE IF NOT EXISTS risk_score_reasons (
+                event_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                weight INTEGER NOT NULL,
+                evidence TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_risk_score_reasons_event ON risk_score_reasons(event_id);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
@@ -427,6 +468,271 @@ impl Storage for SqliteStorage {
             alerts.push(alert);
         }
         Ok(alerts)
+    }
+
+    fn write_relationships(
+        &self,
+        edges: &[EntityRelationship],
+    ) -> Result<WriteReport, StorageError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let mut report = WriteReport::default();
+        for edge in edges {
+            let relation = serde_json::to_string(&edge.relation)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?
+                .trim_matches('"')
+                .to_string();
+            tx.execute(
+                "INSERT INTO relationships (from_key, to_key, relation, event_id, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.from.storage_key(),
+                    edge.to.storage_key(),
+                    relation,
+                    edge.event_id.to_string(),
+                    edge.timestamp as i64,
+                ],
+            )
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+            report.written_count += 1;
+        }
+        tx.commit()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        Ok(report)
+    }
+
+    fn query_relationships(
+        &self,
+        plan: &RelationshipQueryPlan,
+    ) -> Result<Vec<EntityRelationship>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let mut sql =
+            "SELECT from_key, to_key, relation, event_id, timestamp FROM relationships WHERE 1=1"
+                .to_string();
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(entity) = &plan.entity {
+            sql.push_str(" AND (from_key = ? OR to_key = ?)");
+            let key = entity.storage_key();
+            sql_params.push(Box::new(key.clone()));
+            sql_params.push(Box::new(key));
+        }
+        if let Some(since) = plan.since {
+            sql.push_str(" AND timestamp >= ?");
+            sql_params.push(Box::new(since as i64));
+        }
+        if let Some(until) = plan.until {
+            sql.push_str(" AND timestamp <= ?");
+            sql_params.push(Box::new(until as i64));
+        }
+        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
+        let limit = if plan.limit == 0 { 1000 } else { plan.limit };
+        sql_params.push(Box::new(limit as i64));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            let (from_key, to_key, relation, event_id, timestamp) =
+                row.map_err(|e| StorageError::Backend(e.to_string()))?;
+            let from = EntityRef::parse_storage_key(&from_key)
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let to = EntityRef::parse_storage_key(&to_key)
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let relation: Relation = serde_json::from_value(serde_json::Value::String(relation))
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+            edges.push(EntityRelationship {
+                from,
+                to,
+                relation,
+                event_id: event_id
+                    .parse()
+                    .map_err(|e: uuid::Error| StorageError::Backend(e.to_string()))?,
+                timestamp: timestamp as u64,
+            });
+        }
+        Ok(edges)
+    }
+
+    fn write_risk_scores(&self, scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let mut report = WriteReport::default();
+        for record in scores {
+            let severity = serde_json::to_string(&record.severity)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?
+                .trim_matches('"')
+                .to_string();
+            let related_events = serde_json::to_string(&record.related_events)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO risk_scores (event_id, process_key, host_id, timestamp, score, severity, related_events)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        record.event_id.to_string(),
+                        record.process_key.map(|k| k.as_hex()),
+                        record.host_id.to_string(),
+                        record.timestamp as i64,
+                        record.score as i64,
+                        severity,
+                        related_events,
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            if changed == 1 {
+                report.written_count += 1;
+                for reason in &record.reasons {
+                    tx.execute(
+                        "INSERT INTO risk_score_reasons (event_id, label, weight, evidence) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            record.event_id.to_string(),
+                            reason.label,
+                            reason.weight as i64,
+                            reason.evidence.to_string(),
+                        ],
+                    )
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+                }
+            } else {
+                report.failed_count += 1;
+            }
+        }
+        tx.commit()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        Ok(report)
+    }
+
+    fn query_risk_scores(&self, plan: &RiskQueryPlan) -> Result<Vec<RiskScoreRecord>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let mut sql = "SELECT event_id, process_key, host_id, timestamp, score, severity, related_events FROM risk_scores WHERE 1=1".to_string();
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(process_key) = &plan.process_key {
+            sql.push_str(" AND process_key = ?");
+            sql_params.push(Box::new(process_key.as_hex()));
+        }
+        if let Some(event_id) = &plan.event_id {
+            sql.push_str(" AND event_id = ?");
+            sql_params.push(Box::new(event_id.to_string()));
+        }
+        if let Some(since) = plan.since {
+            sql.push_str(" AND timestamp >= ?");
+            sql_params.push(Box::new(since as i64));
+        }
+        if let Some(until) = plan.until {
+            sql.push_str(" AND timestamp <= ?");
+            sql_params.push(Box::new(until as i64));
+        }
+        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
+        let limit = if plan.limit == 0 { 100 } else { plan.limit };
+        sql_params.push(Box::new(limit as i64));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (event_id, process_key, host_id, timestamp, score, severity, related_events) =
+                row.map_err(|e| StorageError::Backend(e.to_string()))?;
+            let event_id: Uuid = event_id
+                .parse()
+                .map_err(|e: uuid::Error| StorageError::Backend(e.to_string()))?;
+            let severity: Severity = serde_json::from_value(serde_json::Value::String(severity))
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+            let related_events: Vec<Uuid> = serde_json::from_str(&related_events)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+
+            let mut reason_stmt = conn
+                .prepare("SELECT label, weight, evidence FROM risk_score_reasons WHERE event_id = ?1")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let reason_rows = reason_stmt
+                .query_map(params![event_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let mut reasons = Vec::new();
+            for reason_row in reason_rows {
+                let (label, weight, evidence) =
+                    reason_row.map_err(|e| StorageError::Backend(e.to_string()))?;
+                reasons.push(WeightedReason {
+                    label,
+                    weight: weight as i16,
+                    evidence: evidence
+                        .parse()
+                        .map_err(|e: uuid::Error| StorageError::Backend(e.to_string()))?,
+                });
+            }
+
+            records.push(RiskScoreRecord {
+                event_id,
+                process_key: match process_key {
+                    Some(hex) => Some(
+                        serde_json::from_value(serde_json::Value::String(hex))
+                            .map_err(|e| StorageError::Serialize(e.to_string()))?,
+                    ),
+                    None => None,
+                },
+                host_id: host_id
+                    .parse()
+                    .map_err(|e: uuid::Error| StorageError::Backend(e.to_string()))?,
+                timestamp: timestamp as u64,
+                score: score as u8,
+                severity,
+                reasons,
+                related_events,
+            });
+        }
+        Ok(records)
     }
 
     fn delete(&self, criteria: &DeleteCriteria) -> Result<u64, StorageError> {
@@ -865,6 +1171,142 @@ mod tests {
         assert_eq!(report.written_count, 0);
         assert_eq!(report.failed_count, 1);
         assert_eq!(storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_and_query_relationships_round_trips_by_either_side_of_the_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let host_id = Uuid::new_v4();
+        let process_key = ProcessKey::new(host_id, "b", 300, 1);
+        let event_id = Uuid::now_v7();
+        let edge = EntityRelationship {
+            from: EntityRef::Process { process_key },
+            to: EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            },
+            relation: Relation::ConnectedTo,
+            event_id,
+            timestamp: 5000,
+        };
+
+        let report = storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
+        assert_eq!(report.written_count, 1);
+
+        // Found by the `from` side.
+        let by_from = storage
+            .query_relationships(&RelationshipQueryPlan {
+                entity: Some(EntityRef::Process { process_key }),
+                ..RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(by_from.len(), 1);
+        assert_eq!(by_from[0].event_id, event_id);
+        assert_eq!(by_from[0].relation, Relation::ConnectedTo);
+
+        // Found by the `to` side too — a caller need not know which side
+        // an entity was recorded on.
+        let by_to = storage
+            .query_relationships(&RelationshipQueryPlan {
+                entity: Some(EntityRef::Ip {
+                    addr: "203.0.113.10".to_string(),
+                }),
+                ..RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(by_to.len(), 1);
+    }
+
+    #[test]
+    fn query_relationships_filters_by_time_range_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let entity = EntityRef::Domain {
+            name: "evil.example".to_string(),
+        };
+        let edges: Vec<EntityRelationship> = (0..3)
+            .map(|i| EntityRelationship {
+                from: entity.clone(),
+                to: EntityRef::Session {
+                    session_id: i.to_string(),
+                },
+                relation: Relation::ResolvedTo,
+                event_id: Uuid::now_v7(),
+                timestamp: 1000 * (i + 1) as u64,
+            })
+            .collect();
+        storage.write_relationships(&edges).unwrap();
+
+        let by_time = storage
+            .query_relationships(&RelationshipQueryPlan {
+                entity: Some(entity.clone()),
+                since: Some(1500),
+                until: Some(2500),
+                ..RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(by_time.len(), 1);
+        assert_eq!(by_time[0].timestamp, 2000);
+
+        let limited = storage
+            .query_relationships(&RelationshipQueryPlan {
+                entity: Some(entity),
+                limit: 1,
+                ..RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    fn sample_risk_record(process_key: Option<ProcessKey>, timestamp: u64) -> RiskScoreRecord {
+        let event_id = Uuid::now_v7();
+        RiskScoreRecord {
+            event_id,
+            process_key,
+            host_id: Uuid::new_v4(),
+            timestamp,
+            score: 42,
+            severity: Severity::High,
+            reasons: vec![WeightedReason {
+                label: "Rare executable path".to_string(),
+                weight: 10,
+                evidence: event_id,
+            }],
+            related_events: vec![event_id],
+        }
+    }
+
+    #[test]
+    fn write_and_query_risk_scores_round_trips_reasons_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let process_key = ProcessKey::new(Uuid::new_v4(), "b", 300, 1);
+        let record = sample_risk_record(Some(process_key), 5000);
+
+        let report = storage.write_risk_scores(std::slice::from_ref(&record)).unwrap();
+        assert_eq!(report.written_count, 1);
+
+        let by_process = storage
+            .query_risk_scores(&RiskQueryPlan {
+                process_key: Some(process_key),
+                ..RiskQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(by_process.len(), 1);
+        assert_eq!(by_process[0].score, 42);
+        assert_eq!(by_process[0].severity, Severity::High);
+        assert_eq!(by_process[0].reasons.len(), 1);
+        assert_eq!(by_process[0].reasons[0].label, "Rare executable path");
+        assert_eq!(by_process[0].reasons[0].weight, 10);
+
+        let by_event = storage
+            .query_risk_scores(&RiskQueryPlan {
+                event_id: Some(record.event_id),
+                ..RiskQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(by_event.len(), 1);
+        assert_eq!(by_event[0].event_id, record.event_id);
     }
 
     /// A database created by Phase 1 has an `events` table with no file
