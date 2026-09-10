@@ -60,6 +60,7 @@ check_forbidden osiris-sensors-net osiris-server osiris-api
 check_forbidden osiris-sensors-identity osiris-server osiris-api
 check_forbidden osiris-sensors-systemd osiris-server osiris-api
 check_forbidden osiris-sensors-persistence osiris-server osiris-api
+check_forbidden osiris-sensors-container osiris-server osiris-api
 
 if [ "$fail" -ne 0 ]; then
   echo "Dependency-graph check FAILED"
