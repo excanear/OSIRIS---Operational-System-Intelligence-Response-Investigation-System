@@ -1,0 +1,14 @@
+id: network_download_then_write
+version: 1
+severity: HIGH
+# 30 seconds, in nanoseconds (ARCHITECTURE.md §11.1's `window` field).
+window: 30000000000
+sequence:
+  - field: event_type
+    op: eq
+    value: "NETWORK_CONNECT"
+    reason: "The process opened a network connection"
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "The same process then created or wrote a file"

@@ -1022,4 +1022,57 @@ sequence:
         assert_eq!(alerts_a.len(), 1, "a's own sequence still completes independently");
         assert_eq!(alerts_a[0].evidence(), &[connect_a.event_id, write_a.event_id]);
     }
+
+    /// The repository's own shipped sequence rule must load and behave —
+    /// the CI-enforced half of §11.1's "every rule ships with a fixture
+    /// that must trigger it, and a negative fixture that must not,"
+    /// extended to a stateful sequence rule for the first time.
+    #[test]
+    fn the_shipped_network_download_then_write_rule_loads_and_fires_on_its_positive_fixture_only() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        let host_id = Uuid::new_v4();
+
+        // Positive: connect then write, same process, within the window.
+        let connect = network_connect_event(host_id, 300, 1_000_000_000);
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 5_000_000_000);
+        assert!(engine
+            .evaluate(&connect)
+            .iter()
+            .all(|a| a.rule_id() != "network_download_then_write"));
+        let alerts = engine.evaluate(&write);
+        let matching: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.rule_id() == "network_download_then_write")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].severity(), Severity::High);
+
+        // Negative: a write with no preceding connect from a fresh process
+        // must not fire the sequence rule.
+        let lone_write = file_write_event(Uuid::new_v4(), 400, 1_000_000_000);
+        assert!(engine
+            .evaluate(&lone_write)
+            .iter()
+            .all(|a| a.rule_id() != "network_download_then_write"));
+    }
+
+    /// All six shipped rules must load together and stay independent as
+    /// `config/rules/` grows — the same guard every earlier phase added.
+    #[test]
+    fn all_six_shipped_rules_load_together_without_cross_firing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        assert!(engine.rule_count() >= 6);
+
+        let event = container_start_event(&"b".repeat(64), Some("198.51.100.10"));
+        let alerts = engine.evaluate(&event);
+        assert_eq!(
+            alerts.len(),
+            1,
+            "a container-start event must fire exactly the container rule — none of the \
+             file/DNS/privilege/systemd/sequence rules"
+        );
+        assert_eq!(alerts[0].rule_id(), "container_started_in_remote_session");
+    }
 }
