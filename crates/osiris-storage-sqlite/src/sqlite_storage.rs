@@ -343,11 +343,17 @@ impl Storage for SqliteStorage {
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
-            sql_params.push(Box::new(since as i64));
+            // Clamp rather than cast directly: a caller-supplied window can
+            // legitimately be `u64::MAX`/near it (e.g. the Correlation
+            // Engine's "effectively unbounded" test configuration), and
+            // SQLite has no unsigned column type — an un-clamped cast would
+            // silently wrap into a negative i64, making a wide-open time
+            // range filter out every real (small, positive) timestamp.
+            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
         }
         if let Some(until) = plan.until {
             sql.push_str(" AND timestamp <= ?");
-            sql_params.push(Box::new(until as i64));
+            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
         }
         sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
         let limit = if plan.limit == 0 { 100 } else { plan.limit };
@@ -442,11 +448,17 @@ impl Storage for SqliteStorage {
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND a.timestamp >= ?");
-            sql_params.push(Box::new(since as i64));
+            // Clamp rather than cast directly: a caller-supplied window can
+            // legitimately be `u64::MAX`/near it (e.g. the Correlation
+            // Engine's "effectively unbounded" test configuration), and
+            // SQLite has no unsigned column type — an un-clamped cast would
+            // silently wrap into a negative i64, making a wide-open time
+            // range filter out every real (small, positive) timestamp.
+            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
         }
         if let Some(until) = plan.until {
             sql.push_str(" AND a.timestamp <= ?");
-            sql_params.push(Box::new(until as i64));
+            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
         }
         sql.push_str(" ORDER BY a.timestamp ASC LIMIT ?");
         let limit = if plan.limit == 0 { 100 } else { plan.limit };
@@ -527,11 +539,17 @@ impl Storage for SqliteStorage {
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
-            sql_params.push(Box::new(since as i64));
+            // Clamp rather than cast directly: a caller-supplied window can
+            // legitimately be `u64::MAX`/near it (e.g. the Correlation
+            // Engine's "effectively unbounded" test configuration), and
+            // SQLite has no unsigned column type — an un-clamped cast would
+            // silently wrap into a negative i64, making a wide-open time
+            // range filter out every real (small, positive) timestamp.
+            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
         }
         if let Some(until) = plan.until {
             sql.push_str(" AND timestamp <= ?");
-            sql_params.push(Box::new(until as i64));
+            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
         }
         sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
         let limit = if plan.limit == 0 { 1000 } else { plan.limit };
@@ -648,11 +666,17 @@ impl Storage for SqliteStorage {
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
-            sql_params.push(Box::new(since as i64));
+            // Clamp rather than cast directly: a caller-supplied window can
+            // legitimately be `u64::MAX`/near it (e.g. the Correlation
+            // Engine's "effectively unbounded" test configuration), and
+            // SQLite has no unsigned column type — an un-clamped cast would
+            // silently wrap into a negative i64, making a wide-open time
+            // range filter out every real (small, positive) timestamp.
+            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
         }
         if let Some(until) = plan.until {
             sql.push_str(" AND timestamp <= ?");
-            sql_params.push(Box::new(until as i64));
+            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
         }
         sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
         let limit = if plan.limit == 0 { 100 } else { plan.limit };

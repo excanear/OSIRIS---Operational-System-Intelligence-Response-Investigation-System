@@ -23,6 +23,10 @@ osiris-api = { path = "../osiris-api" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }
 osiris-fileutil = { path = "../osiris-fileutil" }
 osiris-detect = { path = "../osiris-detect" }
+osiris-correlate = { path = "../osiris-correlate" }
+osiris-baseline = { path = "../osiris-baseline" }
+osiris-risk = { path = "../osiris-risk" }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

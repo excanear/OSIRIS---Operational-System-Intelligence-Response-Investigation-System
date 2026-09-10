@@ -1,20 +1,93 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use osiris_baseline::BaselineEngine;
+use osiris_correlate::{BehavioralChain, CorrelationEngine, EdgeSource};
 use osiris_detect::DetectionEngine;
-use osiris_schema::CanonicalEvent;
-use osiris_storage::Storage;
+use osiris_risk::RiskEngine;
+use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship};
+use osiris_storage::{RelationshipQueryPlan, Storage};
 use tokio_util::sync::CancellationToken;
 
 use osiris_fileutil::LineTailer;
 
+/// Adapts `osiris_storage::Storage::query_relationships` to
+/// `osiris_correlate::EdgeSource` — the one place `osiris-correlate` and
+/// `osiris-storage` meet, keeping the Correlation Engine itself decoupled
+/// from the storage layer (Phase 6 plan Task 10 / Global Constraint #3). A
+/// query failure degrades to "no edges found" rather than panicking the
+/// ingestion loop — correlation is best-effort enrichment, not a
+/// correctness-critical path.
+struct StorageEdgeSource<'s> {
+    storage: &'s dyn Storage,
+}
+
+impl EdgeSource for StorageEdgeSource<'_> {
+    fn edges_for(&self, entity: &EntityRef, since: u64, until: u64) -> Vec<EntityRelationship> {
+        let plan = RelationshipQueryPlan {
+            entity: Some(entity.clone()),
+            since: Some(since),
+            until: Some(until),
+            ..RelationshipQueryPlan::new()
+        };
+        match self.storage.query_relationships(&plan) {
+            Ok(edges) => edges,
+            Err(e) => {
+                tracing::warn!(error = %e, "query_relationships failed during correlation; treating as no edges");
+                vec![]
+            }
+        }
+    }
+}
+
+/// One event's worth of Correlation/Baseline/Risk processing (ARCHITECTURE.md
+/// §26 step 5/9/11: "simultaneously fans the batch out to: Detection...
+/// Correlation... Baseline", then Risk annotates from both). Runs after
+/// `storage.write_relationships` for the whole batch, so a chain built for
+/// an early event in the batch can already see relationships persisted by
+/// this same batch.
+fn correlate_baseline_and_score(
+    storage: &dyn Storage,
+    baseline_engine: &BaselineEngine,
+    risk_engine: &RiskEngine,
+    correlation_engine: &CorrelationEngine,
+    event: &CanonicalEvent,
+    alerts_for_event: &[Alert],
+) -> Result<(), osiris_storage::StorageError> {
+    let Some(process) = &event.process else {
+        return Ok(());
+    };
+    let observations = match baseline_engine.observe(event) {
+        Ok(obs) => obs,
+        Err(e) => {
+            tracing::warn!(error = %e, event_id = %event.event_id, "baseline observe failed; scoring without baseline input");
+            vec![]
+        }
+    };
+
+    let seed = EntityRef::Process {
+        process_key: process.process_key,
+    };
+    let edge_source = StorageEdgeSource { storage };
+    let chain: BehavioralChain = correlation_engine.build_chain(&edge_source, seed, event.timestamp);
+
+    if let Some(record) = risk_engine.score(event, alerts_for_event, &observations, Some(&chain)) {
+        storage.write_risk_scores(std::slice::from_ref(&record))?;
+    }
+    Ok(())
+}
+
 /// Tails the Agent's spool file and ingests each new line into Storage —
 /// the Phase 1 substitute for the UDS Agent→Server transport's server-side
 /// half (plan Global Constraints #3).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ingestion_loop(
     spool_path: impl Into<std::path::PathBuf>,
     storage: Arc<dyn Storage>,
     detection_engine: Arc<DetectionEngine>,
+    baseline_engine: Arc<BaselineEngine>,
+    risk_engine: Arc<RiskEngine>,
+    correlation_engine: Arc<CorrelationEngine>,
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
@@ -32,6 +105,9 @@ pub async fn run_ingestion_loop(
                 if !events.is_empty() {
                     let storage = storage.clone();
                     let detection_engine = detection_engine.clone();
+                    let baseline_engine = baseline_engine.clone();
+                    let risk_engine = risk_engine.clone();
+                    let correlation_engine = correlation_engine.clone();
                     let event_count = events.len();
                     match tokio::task::spawn_blocking(move || {
                         Ok::<_, osiris_storage::StorageError>({
@@ -40,6 +116,31 @@ pub async fn run_ingestion_loop(
                             if !alerts.is_empty() {
                                 storage.write_alerts(&alerts)?;
                             }
+
+                            let edges: Vec<EntityRelationship> = events
+                                .iter()
+                                .flat_map(|e| e.relationships.clone())
+                                .collect();
+                            if !edges.is_empty() {
+                                storage.write_relationships(&edges)?;
+                            }
+
+                            for event in &events {
+                                let alerts_for_event: Vec<Alert> = alerts
+                                    .iter()
+                                    .filter(|a| a.evidence().contains(&event.event_id))
+                                    .cloned()
+                                    .collect();
+                                correlate_baseline_and_score(
+                                    storage.as_ref(),
+                                    &baseline_engine,
+                                    &risk_engine,
+                                    &correlation_engine,
+                                    event,
+                                    &alerts_for_event,
+                                )?;
+                            }
+
                             report
                         })
                     })
@@ -87,6 +188,20 @@ mod tests {
     use osiris_storage_sqlite::SqliteStorage;
     use std::io::Write;
     use uuid::Uuid;
+
+    /// Fresh, empty Baseline/Risk/Correlation engines for a test —
+    /// `baseline.db` lives under `dir` (a per-test tempdir), `risk_engine`
+    /// uses every documented default weight, `correlation_engine` uses a
+    /// generous depth/window since these tests operate on nanosecond-scale
+    /// synthetic timestamps that may span more than a real-world 30s.
+    fn test_engines(
+        dir: &std::path::Path,
+    ) -> (Arc<BaselineEngine>, Arc<RiskEngine>, Arc<CorrelationEngine>) {
+        let baseline_engine = Arc::new(BaselineEngine::open(dir.join("baseline.db")).unwrap());
+        let risk_engine = Arc::new(RiskEngine::new(Default::default()));
+        let correlation_engine = Arc::new(CorrelationEngine::new(5, u64::MAX / 2));
+        (baseline_engine, risk_engine, correlation_engine)
+    }
 
     fn sample_event() -> CanonicalEvent {
         let host_id = Uuid::new_v4();
@@ -140,11 +255,15 @@ mod tests {
             Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
         let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
 
         let handle = tokio::spawn(run_ingestion_loop(
             spool_path.clone(),
             storage.clone(),
             detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -172,11 +291,15 @@ mod tests {
             Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
         let cancellation = CancellationToken::new();
         let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
 
         let handle = tokio::spawn(run_ingestion_loop(
             spool_path.clone(),
             storage.clone(),
             detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -293,11 +416,15 @@ match:
         let cancellation = CancellationToken::new();
         let rule = osiris_detect::Rule::from_yaml_str(WEB_ROOT_RULE, "test.yaml").unwrap();
         let detection_engine = Arc::new(DetectionEngine::new(vec![rule]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
 
         let handle = tokio::spawn(run_ingestion_loop(
             spool_path.clone(),
             storage.clone(),
             detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -320,5 +447,161 @@ match:
         let alerts = storage.query_alerts(&AlertQueryPlan::new()).unwrap();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule_id(), "shell_wrote_file_to_web_root");
+    }
+
+    const SEQUENCE_RULE: &str = r#"
+id: network_download_then_write
+version: 1
+severity: HIGH
+window: 30000000000
+sequence:
+  - field: event_type
+    op: eq
+    value: "NETWORK_CONNECT"
+    reason: "The process opened a network connection"
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "The same process then created or wrote a file"
+"#;
+
+    fn network_connect_event(host_id: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
+        let mut e = sample_event();
+        e.host_id = host_id;
+        e.timestamp = timestamp;
+        e.event_type = EventType::NetworkConnect;
+        e.category = Category::Network;
+        e.process = Some(ProcessRef {
+            process_key: ProcessKey::new(host_id, "b", pid, 1),
+            pid,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 1,
+        });
+        e.network = Some(osiris_schema::NetworkRef {
+            src_ip: "10.0.0.5".to_string(),
+            src_port: 4444,
+            dst_ip: "203.0.113.10".to_string(),
+            dst_port: 443,
+            proto: "tcp".to_string(),
+            direction: osiris_schema::NetworkDirection::Outbound,
+            bytes: None,
+        });
+        e.relationships = vec![osiris_schema::EntityRelationship {
+            from: EntityRef::Process {
+                process_key: e.process.as_ref().unwrap().process_key,
+            },
+            to: EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            },
+            relation: osiris_schema::Relation::ConnectedTo,
+            event_id: e.event_id,
+            timestamp,
+        }];
+        e
+    }
+
+    fn file_write_event(host_id: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
+        let mut e = web_root_shell_event();
+        e.host_id = host_id;
+        e.timestamp = timestamp;
+        e.process = Some(ProcessRef {
+            process_key: ProcessKey::new(host_id, "b", pid, 1),
+            pid,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 1,
+        });
+        e.relationships = vec![osiris_schema::EntityRelationship {
+            from: EntityRef::Process {
+                process_key: e.process.as_ref().unwrap().process_key,
+            },
+            to: EntityRef::File {
+                host_id,
+                inode: 1,
+                device_id: encode_device_id(8, 1),
+            },
+            relation: osiris_schema::Relation::Wrote,
+            event_id: e.event_id,
+            timestamp,
+        }];
+        e
+    }
+
+    /// ARCHITECTURE.md §26's full worked trace, exercised through the real
+    /// ingestion loop: a process connects to the network, then writes a
+    /// file, within the sequence rule's window. Proves the sequence alert
+    /// fires, the relationship edges land in the queryable edge table, a
+    /// baseline observation is recorded, and a `RiskScoreRecord` citing the
+    /// chain-pattern bonus is queryable afterward.
+    #[tokio::test]
+    async fn the_full_detection_correlation_baseline_risk_trace_runs_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        std::fs::write(&spool_path, "").unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let cancellation = CancellationToken::new();
+        let rule = osiris_detect::Rule::from_yaml_str(SEQUENCE_RULE, "seq.yaml").unwrap();
+        let detection_engine = Arc::new(DetectionEngine::new(vec![rule]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+
+        let handle = tokio::spawn(run_ingestion_loop(
+            spool_path.clone(),
+            storage.clone(),
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            Duration::from_millis(20),
+            cancellation.clone(),
+        ));
+
+        let host_id = Uuid::new_v4();
+        let connect = network_connect_event(host_id, 300, 1_000_000_000);
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 5_000_000_000);
+        let process_key = connect.process.as_ref().unwrap().process_key;
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&connect).unwrap()).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        writeln!(file, "{}", serde_json::to_string(&write).unwrap()).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cancellation.cancel();
+        handle.await.unwrap();
+
+        // The sequence rule fired.
+        let alerts = storage.query_alerts(&AlertQueryPlan::new()).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "network_download_then_write");
+
+        // The relationships landed as queryable edges.
+        let edges = storage
+            .query_relationships(&osiris_storage::RelationshipQueryPlan {
+                entity: Some(EntityRef::Process { process_key }),
+                ..osiris_storage::RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+
+        // A risk score was computed, citing the alert and the chain-pattern
+        // bonus.
+        let scores = storage
+            .query_risk_scores(&osiris_storage::RiskQueryPlan {
+                process_key: Some(process_key),
+                ..osiris_storage::RiskQueryPlan::new()
+            })
+            .unwrap();
+        assert!(!scores.is_empty());
+        let has_chain_bonus = scores
+            .iter()
+            .any(|s| s.reasons.iter().any(|r| r.label.contains("Network connection")));
+        assert!(has_chain_bonus, "risk score must cite the chain-pattern bonus");
     }
 }

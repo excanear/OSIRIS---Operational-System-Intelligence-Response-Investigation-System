@@ -3,13 +3,27 @@ use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
 use osiris_api::build_router;
+use osiris_baseline::BaselineEngine;
+use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
+use osiris_risk::RiskEngine;
 use osiris_schema::{Category, EntityRef, EventType, HostRef, Relation};
 use osiris_server::run_ingestion_loop;
 use osiris_storage::{QueryPlan, Storage};
 use osiris_storage_sqlite::SqliteStorage;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Fresh Phase 6 engines for one e2e test — mirrors
+/// `osiris-server/src/ingest.rs`'s own `test_engines` helper.
+fn phase6_engines(
+    dir: &std::path::Path,
+) -> (Arc<BaselineEngine>, Arc<RiskEngine>, Arc<CorrelationEngine>) {
+    let baseline_engine = Arc::new(BaselineEngine::open(dir.join("baseline.db")).unwrap());
+    let risk_engine = Arc::new(RiskEngine::new(Default::default()));
+    let correlation_engine = Arc::new(CorrelationEngine::new(5, 60_000_000_000));
+    (baseline_engine, risk_engine, correlation_engine)
+}
 
 /// Exercises ARCHITECTURE.md §26's worked trace, narrowed to the
 /// process/exec portion per Phase 1's exit criterion (§29): a synthetic
@@ -57,10 +71,14 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
 
     let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         Arc::new(DetectionEngine::new(vec![])),
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -219,10 +237,14 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     );
 
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -436,10 +458,14 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     assert!(detection_engine.rule_count() >= 2);
 
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -725,10 +751,14 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     assert!(detection_engine.rule_count() >= 3);
 
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -1107,10 +1137,14 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     assert!(detection_engine.rule_count() >= 4);
 
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -1402,10 +1436,14 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     assert!(detection_engine.rule_count() >= 5);
 
     let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
         detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));

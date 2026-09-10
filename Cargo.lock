@@ -1021,6 +1021,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-baseline"
+version = "0.1.0"
+dependencies = [
+ "osiris-schema",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-bus"
 version = "0.1.0"
 dependencies = [
@@ -1060,6 +1073,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-correlate"
+version = "0.1.0"
+dependencies = [
+ "osiris-schema",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-detect"
 version = "0.1.0"
 dependencies = [
@@ -1082,9 +1103,12 @@ dependencies = [
  "axum",
  "osiris-agent",
  "osiris-api",
+ "osiris-baseline",
+ "osiris-correlate",
  "osiris-detect",
  "osiris-generator",
  "osiris-pipeline",
+ "osiris-risk",
  "osiris-schema",
  "osiris-sensor-api",
  "osiris-server",
@@ -1139,6 +1163,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "osiris-risk"
+version = "0.1.0"
+dependencies = [
+ "osiris-baseline",
+ "osiris-correlate",
+ "osiris-schema",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
  "uuid",
 ]
 
@@ -1267,8 +1306,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "osiris-api",
+ "osiris-baseline",
+ "osiris-correlate",
  "osiris-detect",
  "osiris-fileutil",
+ "osiris-risk",
  "osiris-schema",
  "osiris-selftelemetry",
  "osiris-storage",
