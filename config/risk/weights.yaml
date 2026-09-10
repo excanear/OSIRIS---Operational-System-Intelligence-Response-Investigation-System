@@ -1,0 +1,23 @@
+# OSIRIS Risk Engine weight configuration (ARCHITECTURE.md §11.4).
+# Every field is optional — an omitted field keeps osiris-risk's documented
+# built-in default (see crates/osiris-risk/src/lib.rs). Governed the same
+# way detection rules are (§11.1's rule-file governance, extended here).
+
+severity_weights:
+  info: 0
+  low: 5
+  medium: 15
+  high: 30
+  critical: 50
+
+# Added once per `NEW`/`RARE` Baseline Engine observation attached to the
+# scored event (ARCHITECTURE.md §26 step 11's own example: "Rare
+# executable path for this session" +10).
+baseline_new_weight: 10
+baseline_rare_weight: 5
+
+# Added once when the event's process has both a ConnectedTo and a Wrote
+# edge in its correlated BehavioralChain within the correlation window —
+# ARCHITECTURE.md §26 step 11's other example: "Network connection
+# followed by file write" (+20).
+chain_pattern_weight: 20
