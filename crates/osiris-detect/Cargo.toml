@@ -12,7 +12,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-uuid = { workspace = true }

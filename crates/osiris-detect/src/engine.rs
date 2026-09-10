@@ -1,24 +1,57 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use osiris_schema::{Alert, CanonicalEvent};
+use uuid::Uuid;
 
 use crate::eval::{eval_node, field_value, matches};
 use crate::rule::{Rule, RuleError};
 
-/// The Phase 2 Detection Engine: stateless, single-event matching over the
-/// rules loaded at startup (plan Global Constraints #10). Stateful
-/// `sequence`/`window` evaluation and rule hot-reload are Phase 6
-/// (ARCHITECTURE.md §11.1/§29). Runs on the Server's ingestion path, after
-/// each successful `batch_write` — never on the Agent, which must not link
-/// this crate at all (§27's privilege boundary).
+/// In-progress state for one `(rule_id, subject_key)` pair (Phase 6 plan
+/// Task 8). `subject_key` is the triggering event's `process_key` hex, or
+/// its `session_id` when no process is present — the same subject-key
+/// derivation `derive_subject_key` below implements once and every
+/// sequence rule shares.
+#[derive(Debug, Clone)]
+struct SequenceState {
+    next_step: usize,
+    started_at: u64,
+    event_ids: Vec<Uuid>,
+}
+
+/// Derives the entity a sequence rule tracks progress against (Phase 6
+/// plan Global Constraint #7): the event's `process_key` when present,
+/// else its `session_id`, else `None` — a rule cannot enter sequence state
+/// for an event with neither (this is documented, not a silent gap: every
+/// `sequence` rule this phase ships targets process-carrying event types).
+fn derive_subject_key(event: &CanonicalEvent) -> Option<String> {
+    if let Some(process) = &event.process {
+        return Some(process.process_key.as_hex());
+    }
+    event.session.as_ref().map(|s| s.session_id.clone())
+}
+
+/// The Detection Engine: compiles the OQL-native YAML rule format (§11.1)
+/// into a matcher tree — stateless single-event conditions (flat `match:`
+/// or a `conditions:` boolean tree, §12.3) evaluated inline, and stateful
+/// `sequence`/`window` conditions tracked in a bounded per-subject state
+/// table (Phase 6 plan Task 8), exactly the execution model §11.1
+/// describes. Runs on the Server's ingestion path, after each successful
+/// `batch_write` — never on the Agent, which must not link this crate at
+/// all (§27's privilege boundary).
 #[derive(Debug)]
 pub struct DetectionEngine {
     rules: Vec<Rule>,
+    sequence_state: Mutex<HashMap<(String, String), SequenceState>>,
 }
 
 impl DetectionEngine {
     pub fn new(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            sequence_state: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Loads every `*.yaml`/`*.yml` file in `dir`, sorted by file name so
@@ -62,7 +95,8 @@ impl DetectionEngine {
     }
 
     /// Evaluates one event against every rule, returning one `Alert` per
-    /// rule whose conditions all matched.
+    /// single-event rule whose conditions all matched, plus one `Alert`
+    /// per sequence rule that completed its final step on this event.
     pub fn evaluate(&self, event: &CanonicalEvent) -> Vec<Alert> {
         if self.rules.is_empty() {
             return vec![];
@@ -76,10 +110,98 @@ impl DetectionEngine {
             return vec![];
         };
 
-        self.rules
+        let mut alerts: Vec<Alert> = self
+            .rules
             .iter()
+            .filter(|rule| rule.sequence.is_none())
             .filter_map(|rule| self.evaluate_rule(rule, event, &event_json))
-            .collect()
+            .collect();
+        alerts.extend(self.evaluate_sequence_rules(event, &event_json));
+        alerts
+    }
+
+    /// Advances (or starts) every sequence rule's per-subject state
+    /// against `event`, firing an `Alert` for any rule that just completed
+    /// its final step. An event a sequence step doesn't match leaves any
+    /// existing in-progress state untouched — steps need not be adjacent —
+    /// and state older than the rule's `window` is dropped before being
+    /// considered, so a stale, never-completed sequence cannot be revived
+    /// by an unrelated later event.
+    fn evaluate_sequence_rules(
+        &self,
+        event: &CanonicalEvent,
+        event_json: &serde_json::Value,
+    ) -> Vec<Alert> {
+        let sequence_rules: Vec<&Rule> = self
+            .rules
+            .iter()
+            .filter(|r| r.sequence.is_some())
+            .collect();
+        if sequence_rules.is_empty() {
+            return vec![];
+        }
+        let Some(subject_key) = derive_subject_key(event) else {
+            return vec![];
+        };
+
+        let mut alerts = Vec::new();
+        let mut state_map = match self.sequence_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for rule in sequence_rules {
+            let steps = rule.sequence.as_ref().expect("filtered to Some above");
+            let window = rule.window.expect("Rule::from_yaml_str requires both");
+            let state_key = (rule.id.clone(), subject_key.clone());
+
+            let stale = state_map
+                .get(&state_key)
+                .map(|s| event.timestamp.saturating_sub(s.started_at) > window)
+                .unwrap_or(false);
+            if stale {
+                state_map.remove(&state_key);
+            }
+
+            let step_index = state_map.get(&state_key).map(|s| s.next_step).unwrap_or(0);
+            let condition = &steps[step_index];
+            let matched = field_value(event_json, &condition.field)
+                .map(|actual| matches(condition.op, actual, &condition.value))
+                .unwrap_or(false);
+            if !matched {
+                continue;
+            }
+
+            let entry = state_map.entry(state_key.clone()).or_insert_with(|| SequenceState {
+                next_step: 0,
+                started_at: event.timestamp,
+                event_ids: Vec::with_capacity(steps.len()),
+            });
+            entry.event_ids.push(event.event_id);
+            entry.next_step += 1;
+
+            if entry.next_step == steps.len() {
+                let event_ids = entry.event_ids.clone();
+                state_map.remove(&state_key);
+                let reasons: Vec<String> = steps.iter().map(|c| c.reason.clone()).collect();
+                match Alert::new(
+                    rule.id.clone(),
+                    rule.version,
+                    rule.content_hash.clone(),
+                    rule.severity,
+                    event.timestamp,
+                    event.host_id,
+                    reasons,
+                    event_ids,
+                ) {
+                    Ok(alert) => alerts.push(alert),
+                    Err(e) => {
+                        tracing::error!(rule_id = %rule.id, error = %e, "sequence rule completed but produced an invalid alert; dropping it");
+                    }
+                }
+            }
+        }
+        alerts
     }
 
     pub fn evaluate_batch(&self, events: &[CanonicalEvent]) -> Vec<Alert> {
@@ -775,5 +897,129 @@ match:
              file/DNS/privilege/systemd rules"
         );
         assert_eq!(alerts[0].rule_id(), "container_started_in_remote_session");
+    }
+
+    const SEQUENCE_RULE: &str = r#"
+id: network_download_then_write
+version: 1
+severity: HIGH
+window: 30000000000
+sequence:
+  - field: event_type
+    op: eq
+    value: "NETWORK_CONNECT"
+    reason: "The process opened a network connection"
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "The same process then created or wrote a file"
+"#;
+
+    fn sequence_engine() -> DetectionEngine {
+        DetectionEngine::new(vec![Rule::from_yaml_str(SEQUENCE_RULE, "seq.yaml").unwrap()])
+    }
+
+    fn network_connect_event(host_id: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
+        let mut e = event(EventType::NetworkConnect, "/unused", "/usr/bin/curl");
+        e.host_id = host_id;
+        e.timestamp = timestamp;
+        e.file = None;
+        e.process = Some(ProcessRef {
+            process_key: ProcessKey::new(host_id, "b", pid, 1),
+            pid,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 1,
+        });
+        e.network = Some(osiris_schema::NetworkRef {
+            src_ip: "10.0.0.5".to_string(),
+            src_port: 4444,
+            dst_ip: "203.0.113.10".to_string(),
+            dst_port: 443,
+            proto: "tcp".to_string(),
+            direction: osiris_schema::NetworkDirection::Outbound,
+            bytes: None,
+        });
+        e
+    }
+
+    fn file_write_event(host_id: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
+        let mut e = event(EventType::FileCreate, "/tmp/payload", "/usr/bin/curl");
+        e.host_id = host_id;
+        e.timestamp = timestamp;
+        e.process = Some(ProcessRef {
+            process_key: ProcessKey::new(host_id, "b", pid, 1),
+            pid,
+            exe_path: "/usr/bin/curl".to_string(),
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: 1,
+        });
+        e
+    }
+
+    #[test]
+    fn a_sequence_rule_fires_when_both_steps_match_the_same_process_within_the_window() {
+        let engine = sequence_engine();
+        let host_id = Uuid::new_v4();
+        let connect = network_connect_event(host_id, 300, 1_000_000_000);
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 5_000_000_000);
+
+        assert!(engine.evaluate(&connect).is_empty());
+        let alerts = engine.evaluate(&write);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "network_download_then_write");
+        assert_eq!(alerts[0].evidence(), &[connect.event_id, write.event_id]);
+        assert_eq!(alerts[0].reasons().len(), 2);
+    }
+
+    #[test]
+    fn a_sequence_rule_does_not_fire_outside_its_window() {
+        let engine = sequence_engine();
+        let host_id = Uuid::new_v4();
+        let connect = network_connect_event(host_id, 300, 1_000_000_000);
+        // 60s later — the rule's window is 30s.
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 60_000_000_000);
+
+        assert!(engine.evaluate(&connect).is_empty());
+        assert!(engine.evaluate(&write).is_empty());
+    }
+
+    #[test]
+    fn an_interleaving_unrelated_event_does_not_reset_sequence_progress() {
+        let engine = sequence_engine();
+        let host_id = Uuid::new_v4();
+        let connect = network_connect_event(host_id, 300, 1_000_000_000);
+        let unrelated = event(EventType::ProcessExit, "/unused", "/usr/bin/curl");
+        let write = file_write_event(host_id, 300, 1_000_000_000 + 2_000_000_000);
+
+        assert!(engine.evaluate(&connect).is_empty());
+        assert!(engine.evaluate(&unrelated).is_empty());
+        let alerts = engine.evaluate(&write);
+        assert_eq!(alerts.len(), 1, "progress must survive an unrelated event in between");
+    }
+
+    #[test]
+    fn two_different_processes_mid_sequence_do_not_cross_contaminate() {
+        let engine = sequence_engine();
+        let host_id = Uuid::new_v4();
+        let connect_a = network_connect_event(host_id, 300, 1_000_000_000);
+        let connect_b = network_connect_event(host_id, 301, 1_000_000_000);
+        // Only process 301 (b) completes its sequence.
+        let write_b = file_write_event(host_id, 301, 1_000_000_000 + 1_000_000_000);
+
+        assert!(engine.evaluate(&connect_a).is_empty());
+        assert!(engine.evaluate(&connect_b).is_empty());
+        let alerts = engine.evaluate(&write_b);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].evidence(), &[connect_b.event_id, write_b.event_id]);
+
+        // Process a's sequence is still only half-complete, and must not
+        // have been advanced or fired by b's write.
+        let write_a = file_write_event(host_id, 300, 1_000_000_000 + 2_000_000_000);
+        let alerts_a = engine.evaluate(&write_a);
+        assert_eq!(alerts_a.len(), 1, "a's own sequence still completes independently");
+        assert_eq!(alerts_a[0].evidence(), &[connect_a.event_id, write_a.event_id]);
     }
 }

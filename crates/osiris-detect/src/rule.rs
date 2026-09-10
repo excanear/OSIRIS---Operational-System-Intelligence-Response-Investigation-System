@@ -56,7 +56,9 @@ pub enum ConditionNode {
 /// cites the precise rule revision that fired (§11.1). Exactly one of
 /// `match_conditions` (non-empty) or `conditions` is populated —
 /// `Rule::from_yaml_str` enforces this at load time (Phase 6 plan Global
-/// Constraint #10).
+/// Constraint #10). `window`+`sequence` are either both `None` (a plain
+/// single-event rule) or both `Some` (a stateful sequence rule, Phase 6
+/// plan Task 8) — never one without the other.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub id: String,
@@ -65,14 +67,17 @@ pub struct Rule {
     pub match_conditions: Vec<Condition>,
     pub conditions: Option<ConditionNode>,
     pub content_hash: String,
+    /// Sequence correlation window, nanoseconds.
+    pub window: Option<u64>,
+    pub sequence: Option<Vec<Condition>>,
 }
 
 /// The on-disk YAML shape. A strict subset of §11.1's rule structure:
-/// `window`, `sequence`, `scope` and `mitre` remain unsupported and are
-/// rejected rather than silently ignored (serde's default deny-unknown
-/// behaviour is off by default, so `deny_unknown_fields` makes that
-/// explicit). `conditions` (Phase 6 plan Task 2) is now accepted alongside
-/// the existing flat `match`.
+/// `scope` and `mitre` remain unsupported and are rejected rather than
+/// silently ignored (serde's default deny-unknown behaviour is off by
+/// default, so `deny_unknown_fields` makes that explicit). `conditions`
+/// (Phase 6 plan Task 2) and `window`/`sequence` (Task 8) are accepted
+/// alongside the existing flat `match`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
@@ -83,6 +88,10 @@ struct RuleFile {
     match_conditions: Vec<Condition>,
     #[serde(default)]
     conditions: Option<ConditionNode>,
+    #[serde(default)]
+    window: Option<u64>,
+    #[serde(default)]
+    sequence: Option<Vec<Condition>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +118,12 @@ pub enum RuleError {
     EmptyReason { id: String, index: usize },
     #[error("rule {id} has a condition in its 'conditions' tree with a blank reason (ARCHITECTURE.md §11.2 requires one explanation per matched condition)")]
     EmptyConditionReason { id: String },
+    #[error("rule {id} sets 'sequence' without 'window' — an unbounded sequence window is a resource-bound violation (ARCHITECTURE.md §19.1)")]
+    SequenceWithoutWindow { id: String },
+    #[error("rule {id} sets 'window' without 'sequence' — 'window' only has meaning for a sequence rule")]
+    WindowWithoutSequence { id: String },
+    #[error("rule {id} sequence has fewer than 2 steps — a sequence of one step is just a match condition")]
+    SequenceTooShort { id: String },
 }
 
 fn condition_node_has_blank_reason(node: &ConditionNode) -> bool {
@@ -135,12 +150,40 @@ impl Rule {
                 origin: origin.to_string(),
             });
         }
+        // window/sequence pairing is checked first and independently of
+        // match/conditions, so a rule with e.g. both `match` and a lone
+        // `window` (no `sequence`) is reported as the specific
+        // WindowWithoutSequence mistake rather than the generic
+        // ConflictingConditions.
+        match (parsed.window, &parsed.sequence) {
+            (Some(_), None) => return Err(RuleError::WindowWithoutSequence { id: parsed.id }),
+            (None, Some(_)) => return Err(RuleError::SequenceWithoutWindow { id: parsed.id }),
+            (Some(_), Some(steps)) if steps.len() < 2 => {
+                return Err(RuleError::SequenceTooShort { id: parsed.id })
+            }
+            (Some(_), Some(steps)) => {
+                for (index, condition) in steps.iter().enumerate() {
+                    if condition.reason.trim().is_empty() {
+                        return Err(RuleError::EmptyReason {
+                            id: parsed.id.clone(),
+                            index,
+                        });
+                    }
+                }
+            }
+            (None, None) => {}
+        }
+
         let has_match = !parsed.match_conditions.is_empty();
         let has_conditions = parsed.conditions.is_some();
+        let has_sequence = parsed.sequence.is_some();
         if has_match && has_conditions {
             return Err(RuleError::ConflictingConditions { id: parsed.id });
         }
-        if !has_match && !has_conditions {
+        if (has_match || has_conditions) && has_sequence {
+            return Err(RuleError::ConflictingConditions { id: parsed.id });
+        }
+        if !has_match && !has_conditions && !has_sequence {
             return Err(RuleError::NoConditions { id: parsed.id });
         }
         if has_match {
@@ -167,6 +210,8 @@ impl Rule {
             match_conditions: parsed.match_conditions,
             conditions: parsed.conditions,
             content_hash: hex::encode(hasher.finalize()),
+            window: parsed.window,
+            sequence: parsed.sequence,
         })
     }
 }
@@ -354,6 +399,119 @@ conditions:
         assert!(matches!(
             Rule::from_yaml_str(yaml, "unexplained_tree.yaml").unwrap_err(),
             RuleError::EmptyConditionReason { .. }
+        ));
+    }
+
+    const SEQUENCE_RULE: &str = r#"
+id: network_download_then_write
+version: 1
+severity: HIGH
+window: 30000000000
+sequence:
+  - field: event_type
+    op: eq
+    value: "NETWORK_CONNECT"
+    reason: "The process opened a network connection"
+  - field: event_type
+    op: in
+    value: ["FILE_CREATE", "FILE_WRITE"]
+    reason: "The same process then created or wrote a file"
+"#;
+
+    #[test]
+    fn parses_a_sequence_rule_with_a_window() {
+        let rule = Rule::from_yaml_str(SEQUENCE_RULE, "test.yaml").expect("must parse");
+        assert_eq!(rule.window, Some(30_000_000_000));
+        assert_eq!(rule.sequence.as_ref().unwrap().len(), 2);
+        assert!(rule.match_conditions.is_empty());
+        assert!(rule.conditions.is_none());
+    }
+
+    #[test]
+    fn rejects_sequence_without_window() {
+        let yaml = r#"
+id: bad
+version: 1
+severity: LOW
+sequence:
+  - field: event_type
+    op: eq
+    value: "A"
+    reason: "r1"
+  - field: event_type
+    op: eq
+    value: "B"
+    reason: "r2"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "bad.yaml").unwrap_err(),
+            RuleError::SequenceWithoutWindow { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_window_without_sequence() {
+        let yaml = r#"
+id: bad
+version: 1
+severity: LOW
+window: 1000
+match:
+  - field: event_type
+    op: eq
+    value: "A"
+    reason: "r1"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "bad.yaml").unwrap_err(),
+            RuleError::WindowWithoutSequence { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_a_sequence_with_fewer_than_two_steps() {
+        let yaml = r#"
+id: bad
+version: 1
+severity: LOW
+window: 1000
+sequence:
+  - field: event_type
+    op: eq
+    value: "A"
+    reason: "r1"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "bad.yaml").unwrap_err(),
+            RuleError::SequenceTooShort { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_a_rule_that_sets_both_match_and_sequence() {
+        let yaml = r#"
+id: bad
+version: 1
+severity: LOW
+window: 1000
+sequence:
+  - field: event_type
+    op: eq
+    value: "A"
+    reason: "r1"
+  - field: event_type
+    op: eq
+    value: "B"
+    reason: "r2"
+match:
+  - field: event_type
+    op: eq
+    value: "C"
+    reason: "r3"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "bad.yaml").unwrap_err(),
+            RuleError::ConflictingConditions { .. }
         ));
     }
 }
