@@ -1174,6 +1174,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-sensors-container"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "osiris-fileutil",
+ "osiris-sensor-api",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "osiris-sensors-fs"
 version = "0.1.0"
 dependencies = [
