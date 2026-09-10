@@ -2,7 +2,8 @@
 # Enforces ARCHITECTURE.md §27's privilege-boundary dependency rules:
 # osiris-sensors/*, osiris-ebpf, osiris-kernel must never reach osiris-server
 # or osiris-api; osiris-storage-*, osiris-detect, osiris-correlate,
-# osiris-risk must never reach osiris-agent; osiris-schema and osiris-fileutil
+# osiris-risk, osiris-baseline must never reach osiris-agent; osiris-schema
+# and osiris-fileutil
 # must not depend on any other OSIRIS-internal crate (osiris-fileutil sits
 # below both the privileged Agent side and the unprivileged Server side, so
 # it must stay a leaf). Crates that don't exist yet in the
@@ -53,7 +54,7 @@ check_no_internal_deps osiris-fileutil
 check_forbidden osiris-detect osiris-storage osiris-sensors osiris-agent osiris-server osiris-api
 check_forbidden osiris-server osiris-sensors osiris-ebpf osiris-kernel
 check_forbidden osiris-api osiris-sensors osiris-ebpf osiris-kernel
-check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiris-risk
+check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiris-risk osiris-baseline
 check_forbidden osiris-sensors-fs osiris-server osiris-api
 check_forbidden osiris-sensors-process osiris-server osiris-api
 check_forbidden osiris-sensors-net osiris-server osiris-api
