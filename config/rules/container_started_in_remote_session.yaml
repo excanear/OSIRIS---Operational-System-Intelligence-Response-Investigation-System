@@ -1,0 +1,30 @@
+# Detects a container starting inside a session that was opened from a
+# remote address — the same "actor plus artifact, not artifact alone"
+# shape as Phase 4b's systemd_service_started_in_a_remote_session rule,
+# now applied to Phase 5's own attacker technique: deploying a container is
+# the natural continuation of a remote escalation (staging a backdoor
+# workload, pivoting via a privileged container, etc.), and neither half is
+# suspicious alone (containers start constantly via CI/orchestration;
+# remote sessions are ordinary).
+#
+# `session.remote_addr ne ""` relies on the same null-handling
+# `eval::field_value`/`engine::evaluate_rule` already provide (Phase 4a/4b
+# precedent, reaffirmed by this phase's Global Constraint #9): a
+# CONTAINER_START whose fallback cgroup-only backend could not attribute an
+# actor pid at all (Global Constraint #1) resolves to a non-match, not a
+# fabricated "local" classification.
+#
+# MITRE ATT&CK: T1610 (Deploy Container), reached over T1021.004 (Remote
+# Services: SSH).
+id: container_started_in_remote_session
+version: 1
+severity: HIGH
+match:
+  - field: event_type
+    op: eq
+    value: "CONTAINER_START"
+    reason: "A container transitioned to the running state"
+  - field: session.remote_addr
+    op: ne
+    value: ""
+    reason: "The container was started inside a session opened from a remote network address (an SSH login), not a local console or an unattributed orchestration process"

@@ -698,4 +698,76 @@ match:
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule_id(), "systemd_service_started_in_remote_session");
     }
+
+    fn container_start_event(container_id: &str, remote_addr: Option<&str>) -> CanonicalEvent {
+        let mut e = event(EventType::ContainerStart, "/unused", "/usr/bin/docker");
+        e.file = None;
+        e.container = Some(osiris_schema::ContainerRef {
+            container_id: container_id.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            pod_ref: None,
+        });
+        e.session = remote_addr.map(|addr| osiris_schema::SessionRef {
+            session_id: "3".to_string(),
+            tty: None,
+            remote_addr: Some(addr.to_string()),
+            auth_method: Some("sshd".to_string()),
+        });
+        e
+    }
+
+    #[test]
+    fn the_shipped_container_remote_start_rule_loads_and_fires_on_its_positive_fixture_only() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+
+        let event = container_start_event(&"d".repeat(64), Some("198.51.100.10"));
+        let alerts = engine.evaluate(&event);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "container_started_in_remote_session");
+        assert_eq!(alerts[0].severity(), Severity::High);
+        assert_eq!(alerts[0].reasons().len(), 2);
+    }
+
+    #[test]
+    fn the_shipped_container_remote_start_rule_does_not_fire_on_a_local_or_sessionless_start() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+
+        // No session at all — the cgroup-only fallback backend could not
+        // attribute an actor pid (plan Global Constraint #1).
+        let local = container_start_event(&"e".repeat(64), None);
+        assert!(engine.evaluate(&local).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_container_remote_start_rule_does_not_fire_on_a_container_stop() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+
+        let mut e = container_start_event(&"f".repeat(64), Some("198.51.100.10"));
+        e.event_type = EventType::ContainerStop;
+        e.category = EventType::ContainerStop.category();
+        assert!(engine.evaluate(&e).is_empty());
+    }
+
+    /// All five shipped rules must load together and stay independent as
+    /// `config/rules/` grows — the same guard every earlier phase added.
+    #[test]
+    fn all_five_shipped_rules_load_together_without_cross_firing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules");
+        let engine = DetectionEngine::load_from_dir(&dir).unwrap();
+        assert!(engine.rule_count() >= 5);
+
+        let event = container_start_event(&"a".repeat(64), Some("198.51.100.10"));
+        let alerts = engine.evaluate(&event);
+        assert_eq!(
+            alerts.len(),
+            1,
+            "a container-start event must fire exactly the container rule — none of the \
+             file/DNS/privilege/systemd rules"
+        );
+        assert_eq!(alerts[0].rule_id(), "container_started_in_remote_session");
+    }
 }
