@@ -1779,9 +1779,15 @@ mod tests {
             }])
             .unwrap();
 
-        let q = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(1), since: None, until: None };
-        let Json(result) = subgraph_handler(State(storage), Query(q)).await.unwrap();
-        assert!(result.nodes.len() <= 1);
+        // Uncapped call should return seed + connected entity (>= 2 nodes)
+        let q_uncapped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(100), since: None, until: None };
+        let Json(uncapped_result) = subgraph_handler(State(storage.clone()), Query(q_uncapped)).await.unwrap();
+        assert!(uncapped_result.nodes.len() >= 2, "uncapped call should return seed + connected entity");
+
+        // Capped call should respect max_nodes=1 bound
+        let q_capped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(1), since: None, until: None };
+        let Json(capped_result) = subgraph_handler(State(storage), Query(q_capped)).await.unwrap();
+        assert_eq!(capped_result.nodes.len(), 1, "max_nodes=1 should return exactly 1 node");
     }
 
     #[tokio::test]
