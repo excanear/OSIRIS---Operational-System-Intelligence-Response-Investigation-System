@@ -33,6 +33,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/containers/story", get(container_story_handler))
         .route("/api/v1/system/story", get(system_story_handler))
         .route("/api/v1/graph", get(graph_handler))
+        .route("/api/v1/graph/subgraph", get(subgraph_handler))
         .route("/api/v1/risk", get(risk_handler))
         .route("/api/v1/incidents/:seed_entity/reconstruct", get(reconstruct_incident_handler))
         .with_state(storage)
@@ -113,6 +114,39 @@ async fn graph_handler(
     .unwrap();
 
     Ok(Json(chain))
+}
+
+const MAX_SUBGRAPH_NODES: usize = 500;
+
+#[derive(Debug, Deserialize)]
+struct SubgraphQuery {
+    entity: Option<String>,
+    depth: Option<usize>,
+    max_nodes: Option<usize>,
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+async fn subgraph_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<SubgraphQuery>,
+) -> Result<Json<osiris_investigate::Subgraph>, (StatusCode, String)> {
+    let Some(entity_key) = q.entity else {
+        return Err((StatusCode::BAD_REQUEST, "must provide entity".to_string()));
+    };
+    let seed = EntityRef::parse_storage_key(&entity_key).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let depth = q.depth.unwrap_or(MAX_GRAPH_DEPTH).min(MAX_GRAPH_DEPTH);
+    let max_nodes = q.max_nodes.unwrap_or(MAX_SUBGRAPH_NODES).min(MAX_SUBGRAPH_NODES);
+    let since = q.since.unwrap_or(0);
+    let until = q.until.unwrap_or(u64::MAX);
+
+    let result = tokio::task::spawn_blocking(move || {
+        osiris_investigate::subgraph(storage.as_ref(), seed, depth, max_nodes, since, until)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(result))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1727,6 +1761,34 @@ mod tests {
         let err = reconstruct_incident_handler(State(storage), Path("not-a-key".to_string()), Query(q))
             .await
             .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn subgraph_endpoint_bounds_by_node_count() {
+        let (_dir, storage) = test_storage();
+        let seed = EntityRef::Ip { addr: "10.0.0.1".to_string() };
+        let other = EntityRef::Ip { addr: "10.0.0.2".to_string() };
+        storage
+            .write_relationships(&[EntityRelationship {
+                from: seed.clone(),
+                to: other,
+                relation: osiris_schema::Relation::ConnectedTo,
+                event_id: uuid::Uuid::now_v7(),
+                timestamp: 100,
+            }])
+            .unwrap();
+
+        let q = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(1), since: None, until: None };
+        let Json(result) = subgraph_handler(State(storage), Query(q)).await.unwrap();
+        assert!(result.nodes.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn subgraph_endpoint_requires_an_entity_parameter() {
+        let (_dir, storage) = test_storage();
+        let q = SubgraphQuery { entity: None, depth: None, max_nodes: None, since: None, until: None };
+        let err = subgraph_handler(State(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
