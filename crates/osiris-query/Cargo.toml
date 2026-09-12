@@ -1,0 +1,13 @@
+[package]
+name = "osiris-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+
+[dev-dependencies]
+uuid = { workspace = true }
