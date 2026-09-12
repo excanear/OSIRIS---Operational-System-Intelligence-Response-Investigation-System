@@ -1169,6 +1169,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-query"
+version = "0.1.0"
+dependencies = [
+ "osiris-schema",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-risk"
 version = "0.1.0"
 dependencies = [
