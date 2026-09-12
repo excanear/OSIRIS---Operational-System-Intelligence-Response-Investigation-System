@@ -1354,6 +1354,7 @@ dependencies = [
 name = "osiris-storage-sqlite"
 version = "0.1.0"
 dependencies = [
+ "osiris-query",
  "osiris-schema",
  "osiris-storage",
  "rusqlite",

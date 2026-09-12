@@ -205,6 +205,27 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, S
     Ok(false)
 }
 
+/// `Some(leaves)` when `ast` is a pure `AND`-chain of `Compare` leaves (no
+/// `OR`/`NOT` anywhere) — the only shape this MVP's pushdown handles.
+/// `None` for anything else, telling the caller to skip pushdown for this
+/// filter and rely on `eval_ast` alone (still bounded by `since`/`until`
+/// and `PREFETCH_LIMIT`).
+fn conjunction_leaves(
+    ast: &osiris_query::Ast,
+) -> Option<Vec<(&str, osiris_query::Op, &osiris_query::Value)>> {
+    use osiris_query::Ast;
+    match ast {
+        Ast::Compare { field, op, value } => Some(vec![(field.as_str(), *op, value)]),
+        Ast::And(l, r) => {
+            let mut left = conjunction_leaves(l)?;
+            let right = conjunction_leaves(r)?;
+            left.extend(right);
+            Some(left)
+        }
+        Ast::Or(_, _) | Ast::Not(_) => None,
+    }
+}
+
 impl Storage for SqliteStorage {
     fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError> {
         let report = self.batch_write(std::slice::from_ref(event))?;
@@ -373,6 +394,99 @@ impl Storage for SqliteStorage {
             let event: CanonicalEvent = serde_json::from_str(&raw_json)
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
             events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn query_events(
+        &self,
+        plan: &osiris_query::EventQueryPlan,
+    ) -> Result<Vec<CanonicalEvent>, StorageError> {
+        use osiris_query::{eval_ast, Op, Value};
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+
+        // Pushdown: when the filter is a pure AND-conjunction (no OR/NOT),
+        // push every leaf this MVP has an indexed column for into SQL —
+        // exactly the same 8 columns `query()` already filters on above.
+        // Any leaf without a matching column, and the whole filter when it
+        // contains OR/NOT, is left to the residual `eval_ast` pass below —
+        // pushdown here is a pure performance optimization: every returned
+        // row is re-checked against the *entire* original filter before
+        // being included, so a pushdown bug can only over-fetch, never
+        // return a wrong result.
+        let mut sql = "SELECT raw_json FROM events WHERE 1=1".to_string();
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(filter) = &plan.filter {
+            if let Some(leaves) = conjunction_leaves(filter) {
+                for (field, op, value) in leaves {
+                    if op != Op::Eq {
+                        continue;
+                    }
+                    let column = match field {
+                        "event_type" => "event_type",
+                        "process.process_key" => "process_key",
+                        "file.path" => "file_path",
+                        "dns.query" => "dns_domain",
+                        "session.session_id" => "session_id",
+                        "user.uid" => "user_uid",
+                        "service.unit_name" => "unit_name",
+                        "container.container_id" => "container_id",
+                        _ => continue,
+                    };
+                    match value {
+                        Value::Str(s) => {
+                            sql.push_str(&format!(" AND {} = ?", column));
+                            sql_params.push(Box::new(s.clone()));
+                        }
+                        Value::Num(n) => {
+                            sql.push_str(&format!(" AND {} = ?", column));
+                            sql_params.push(Box::new(*n as i64));
+                        }
+                        Value::List(_) => continue,
+                    }
+                }
+            }
+        }
+        if let Some(since) = plan.since {
+            sql.push_str(" AND timestamp >= ?");
+            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
+        }
+        if let Some(until) = plan.until {
+            sql.push_str(" AND timestamp <= ?");
+            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
+        }
+        // Prefetch more than the final cap so the residual pass below has
+        // real candidates to filter from when pushdown covered only part
+        // (or none) of the filter — still bounded, never a full scan of an
+        // unbounded events table.
+        const PREFETCH_LIMIT: i64 = 20_000;
+        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
+        sql_params.push(Box::new(PREFETCH_LIMIT));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let raw_json = row.map_err(|e| StorageError::Backend(e.to_string()))?;
+            let event: CanonicalEvent = serde_json::from_str(&raw_json)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+            if plan.filter.as_ref().is_none_or(|f| eval_ast(&event, f)) {
+                events.push(event);
+            }
+            if events.len() >= plan.effective_limit() {
+                break;
+            }
         }
         Ok(events)
     }
@@ -890,6 +1004,81 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn query_events_with_no_filter_returns_everything_within_the_default_cap() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        for i in 0..3 {
+            storage.write(&sample_event(100 + i, 1000 + i as u64)).unwrap();
+        }
+        let plan = osiris_query::EventQueryPlan::new();
+        let events = storage.query_events(&plan).unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn query_events_pushes_down_an_exact_match_event_type_filter() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        storage.write(&sample_event(1, 100)).unwrap();
+        let plan =
+            osiris_query::EventQueryPlan::with_filter("event_type = \"PROCESS_EXEC\"").unwrap();
+        let events = storage.query_events(&plan).unwrap();
+        assert_eq!(events.len(), 1);
+        let plan_miss =
+            osiris_query::EventQueryPlan::with_filter("event_type = \"PROCESS_FORK\"").unwrap();
+        assert_eq!(storage.query_events(&plan_miss).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn query_events_residual_filters_a_field_with_no_sql_pushdown() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        storage.write(&sample_event(42, 100)).unwrap();
+        storage.write(&sample_event(43, 200)).unwrap();
+        // process.pid has no dedicated indexed column, so this exercises
+        // the in-memory eval_ast fallback, not SQL pushdown.
+        let plan = osiris_query::EventQueryPlan::with_filter("process.pid = 42").unwrap();
+        let events = storage.query_events(&plan).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].process.as_ref().unwrap().pid, 42);
+    }
+
+    #[test]
+    fn query_events_supports_or_and_not_via_residual_evaluation() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        storage.write(&sample_event(1, 100)).unwrap();
+        storage.write(&sample_event(2, 200)).unwrap();
+        let plan =
+            osiris_query::EventQueryPlan::with_filter("process.pid = 1 OR process.pid = 2").unwrap();
+        assert_eq!(storage.query_events(&plan).unwrap().len(), 2);
+
+        let plan_not = osiris_query::EventQueryPlan::with_filter("NOT process.pid = 1").unwrap();
+        assert_eq!(storage.query_events(&plan_not).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn query_events_respects_since_and_until() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        storage.write(&sample_event(1, 100)).unwrap();
+        storage.write(&sample_event(2, 500)).unwrap();
+        storage.write(&sample_event(3, 900)).unwrap();
+        let mut plan = osiris_query::EventQueryPlan::new();
+        plan.since = Some(200);
+        plan.until = Some(600);
+        let events = storage.query_events(&plan).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp, 500);
+    }
+
+    #[test]
+    fn query_events_clamps_to_the_effective_limit() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        for i in 0..5 {
+            storage.write(&sample_event(i, i as u64)).unwrap();
+        }
+        let mut plan = osiris_query::EventQueryPlan::new();
+        plan.limit = 2;
+        assert_eq!(storage.query_events(&plan).unwrap().len(), 2);
     }
 
     #[test]
