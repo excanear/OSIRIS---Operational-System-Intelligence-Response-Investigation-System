@@ -31,6 +31,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
         .route("/api/v1/containers/story", get(container_story_handler))
+        .route("/api/v1/system/story", get(system_story_handler))
         .route("/api/v1/graph", get(graph_handler))
         .route("/api/v1/risk", get(risk_handler))
         .with_state(storage)
@@ -472,6 +473,32 @@ async fn container_story_handler(
     };
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::container_story(storage.as_ref(), &container_id)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(story))
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemStoryQuery {
+    host_id: String,
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+async fn system_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<SystemStoryQuery>,
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
+    let host_id: uuid::Uuid = q
+        .host_id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid host_id: {}", q.host_id)))?;
+    let since = q.since.unwrap_or(0);
+    let until = q.until.unwrap_or(u64::MAX);
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::system_story(storage.as_ref(), host_id, since, until)
     })
     .await
     .unwrap()
@@ -1642,5 +1669,18 @@ mod tests {
         let (_dir, storage) = test_storage();
         let err = process_story_handler(State(storage), Path("not-hex".to_string())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn system_story_endpoint_filters_by_host_and_time_range() {
+        let (_dir, storage) = test_storage();
+        let event = sample_event(1, None, 500);
+        let host_id = event.host_id;
+        storage.write(&event).unwrap();
+        storage.write(&sample_event(2, None, 5000)).unwrap();
+
+        let q = SystemStoryQuery { host_id: host_id.to_string(), since: Some(0), until: Some(1000) };
+        let Json(story) = system_story_handler(State(storage), Query(q)).await.unwrap();
+        assert_eq!(story.events.len(), 1);
     }
 }
