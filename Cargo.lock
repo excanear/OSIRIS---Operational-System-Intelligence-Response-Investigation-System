@@ -997,6 +997,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "osiris-correlate",
+ "osiris-query",
  "osiris-schema",
  "osiris-storage",
  "osiris-storage-sqlite",

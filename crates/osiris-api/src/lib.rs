@@ -168,28 +168,47 @@ struct EventsQuery {
     since: Option<u64>,
     until: Option<u64>,
     limit: Option<usize>,
+    /// Free-form OQL (ARCHITECTURE.md §12.3). When both `q` and
+    /// `event_type` are given they intersect (`AND`), matching how the old
+    /// fixed-field filters composed before this task.
+    q: Option<String>,
 }
 
 async fn events_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<CanonicalEvent>>, (StatusCode, String)> {
-    let mut plan = QueryPlan::new();
+    let mut plan = if let Some(oql) = &q.q {
+        osiris_query::EventQueryPlan::with_filter(oql)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    } else {
+        osiris_query::EventQueryPlan::new()
+    };
+
     if let Some(et) = &q.event_type {
-        let parsed: EventType = serde_json::from_str(&format!("\"{}\"", et)).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid event_type: {}", et),
-            )
+        // Validate the sugar param the same way the OQL path would, so a
+        // typo here gets the same 400 an OQL typo would.
+        serde_json::from_str::<EventType>(&format!("\"{}\"", et)).map_err(|_| {
+            (StatusCode::BAD_REQUEST, format!("invalid event_type: {}", et))
         })?;
-        plan.event_type = Some(parsed);
+        let event_type_ast = osiris_query::ast::Ast::Compare {
+            field: "event_type".to_string(),
+            op: osiris_query::ast::Op::Eq,
+            value: osiris_query::ast::Value::Str(et.clone()),
+        };
+        plan.filter = Some(match plan.filter {
+            Some(existing) => osiris_query::ast::Ast::And(Box::new(existing), Box::new(event_type_ast)),
+            None => event_type_ast,
+        });
     }
     plan.since = q.since;
     plan.until = q.until;
     if let Some(limit) = q.limit {
         plan.limit = limit;
+        plan.export = true;
     }
-    let events = tokio::task::spawn_blocking(move || storage.query(&plan))
+
+    let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
         .await
         .unwrap()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -835,10 +854,56 @@ mod tests {
             since: Some(500),
             until: Some(5000),
             limit: None,
+            q: None,
         };
         let Json(events) = events_handler(State(storage), Query(query)).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].process.as_ref().unwrap().pid, 100);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_filters_by_oql_query_string() {
+        let (_dir, storage) = test_storage();
+        storage.write(&sample_event(1, None, 100)).unwrap();
+        storage.write(&sample_event(2, None, 200)).unwrap();
+        let q = EventsQuery {
+            event_type: None,
+            since: None,
+            until: None,
+            limit: None,
+            q: Some("process.pid = 1".to_string()),
+        };
+        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_rejects_a_malformed_oql_query_string() {
+        let (_dir, storage) = test_storage();
+        let q = EventsQuery {
+            event_type: None,
+            since: None,
+            until: None,
+            limit: None,
+            q: Some("process.pid =".to_string()),
+        };
+        let err = events_handler(State(storage), Query(q)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_rejects_an_unknown_field_in_the_oql_query_string() {
+        let (_dir, storage) = test_storage();
+        let q = EventsQuery {
+            event_type: None,
+            since: None,
+            until: None,
+            limit: None,
+            q: Some("bogus_field = 1".to_string()),
+        };
+        let err = events_handler(State(storage), Query(q)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("bogus_field"));
     }
 
     #[tokio::test]
