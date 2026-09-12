@@ -34,6 +34,11 @@ pub trait Storage: Send + Sync {
     fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError>;
     fn batch_write(&self, events: &[CanonicalEvent]) -> Result<WriteReport, StorageError>;
     fn query(&self, plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError>;
+    /// The OQL-backed, backend-agnostic query surface (ARCHITECTURE.md
+    /// §12.3), additive to `query` above — `query` and its `QueryPlan`
+    /// keep serving every existing caller unchanged (plan Global
+    /// Constraint #3).
+    fn query_events(&self, plan: &osiris_query::EventQueryPlan) -> Result<Vec<CanonicalEvent>, StorageError>;
     fn delete(&self, criteria: &DeleteCriteria) -> Result<u64, StorageError>;
     fn retention_apply(&self, policy: &RetentionPolicy) -> Result<RetentionReport, StorageError>;
     fn health(&self) -> StorageHealth;

@@ -1343,6 +1343,7 @@ dependencies = [
 name = "osiris-storage"
 version = "0.1.0"
 dependencies = [
+ "osiris-query",
  "osiris-schema",
  "serde",
  "thiserror",

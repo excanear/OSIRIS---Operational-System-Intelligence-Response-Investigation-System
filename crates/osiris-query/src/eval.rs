@@ -44,10 +44,26 @@ pub fn compare(actual: &serde_json::Value, op: Op, target: &Value) -> bool {
     }
 }
 
+/// Evaluates a whole OQL AST against one event — the in-memory residual
+/// filter `osiris-storage-sqlite`'s `query_events` (Task 7) falls back to
+/// for any filter this MVP's SQL pushdown doesn't cover.
+pub fn eval_ast(event: &CanonicalEvent, ast: &crate::ast::Ast) -> bool {
+    use crate::ast::Ast;
+    match ast {
+        Ast::And(l, r) => eval_ast(event, l) && eval_ast(event, r),
+        Ast::Or(l, r) => eval_ast(event, l) || eval_ast(event, r),
+        Ast::Not(inner) => !eval_ast(event, inner),
+        Ast::Compare { field, op, value } => match get_field(event, field) {
+            Some(actual) => compare(&actual, *op, value),
+            None => false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Op, Value};
+    use crate::ast::{Ast, Op, Value};
     use osiris_schema::{
         Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, CanonicalEvent,
         SCHEMA_VERSION,
@@ -190,5 +206,25 @@ mod tests {
                 field
             );
         }
+    }
+
+    #[test]
+    fn eval_ast_combines_and_or_not() {
+        let event = sample_event();
+        let is_exec = Ast::Compare {
+            field: "event_type".to_string(),
+            op: Op::Eq,
+            value: Value::Str("PROCESS_EXEC".to_string()),
+        };
+        let is_fork = Ast::Compare {
+            field: "event_type".to_string(),
+            op: Op::Eq,
+            value: Value::Str("PROCESS_FORK".to_string()),
+        };
+        assert!(eval_ast(&event, &is_exec));
+        assert!(!eval_ast(&event, &is_fork));
+        assert!(eval_ast(&event, &Ast::Or(Box::new(is_fork.clone()), Box::new(is_exec.clone()))));
+        assert!(!eval_ast(&event, &Ast::And(Box::new(is_fork.clone()), Box::new(is_exec.clone()))));
+        assert!(eval_ast(&event, &Ast::Not(Box::new(is_fork))));
     }
 }

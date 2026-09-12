@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
+osiris-query = { path = "../osiris-query" }
 thiserror = { workspace = true }
 uuid = { workspace = true }
