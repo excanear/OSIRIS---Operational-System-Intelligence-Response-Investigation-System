@@ -12,6 +12,7 @@ osiris-schema = { path = "../osiris-schema" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-correlate = { path = "../osiris-correlate" }
 osiris-query = { path = "../osiris-query" }
+osiris-investigate = { path = "../osiris-investigate" }
 uuid = { workspace = true }
 
 [dev-dependencies]

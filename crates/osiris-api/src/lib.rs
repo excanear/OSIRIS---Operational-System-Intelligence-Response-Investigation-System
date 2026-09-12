@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -321,100 +321,34 @@ struct FileStoryQuery {
     file_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct FileStory {
-    events: Vec<CanonicalEvent>,
-    alerts: Vec<Alert>,
-}
-
 async fn file_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<FileStoryQuery>,
-) -> Result<Json<FileStory>, (StatusCode, String)> {
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.path.is_none() && q.file_id.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "must provide path or file_id".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "must provide path or file_id".to_string()));
     }
-
-    if let Some(file_id) = &q.file_id {
-        if FileIdentity::parse_key(file_id).is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid file_id: {}", file_id),
-            ));
-        }
-    }
-
-    let (events, alerts) = tokio::task::spawn_blocking(move || {
-        let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
-        let mut identities: HashSet<FileIdentity> = HashSet::new();
-
-        if let Some(file_id) = &q.file_id {
-            if let Some(identity) = FileIdentity::parse_key(file_id) {
-                identities.insert(identity);
-            }
-        }
-
-        if let Some(path) = &q.path {
-            let mut plan = QueryPlan::new();
-            plan.file_path = Some(path.clone());
-            plan.limit = 10_000;
-            let path_events = storage.query(&plan)?;
-            for e in &path_events {
-                if let Some(file) = &e.file {
-                    if let Some(id) = FileIdentity::from_file_ref(file) {
-                        identities.insert(id);
-                    }
-                }
-            }
-            for e in path_events {
-                events_by_id.insert(e.event_id, e);
-            }
-        }
-
-        for identity in &identities {
-            let mut plan = QueryPlan::new();
-            plan.file_identity = Some(*identity);
-            plan.limit = 10_000;
-            for e in storage.query(&plan)? {
-                events_by_id.insert(e.event_id, e);
-            }
-        }
-
-        let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
-        events.sort_by_key(|a| (a.timestamp, a.event_id));
-
-        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
-        let alerts = if evidence_ids.is_empty() {
-            vec![]
-        } else {
-            let mut alert_plan = AlertQueryPlan::new();
-            alert_plan.evidence_event_ids = evidence_ids;
-            alert_plan.limit = 10_000;
-            storage.query_alerts(&alert_plan)?
-        };
-
-        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    let file_id = match &q.file_id {
+        Some(raw) => Some(
+            FileIdentity::parse_key(raw)
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("invalid file_id: {}", raw)))?,
+        ),
+        None => None,
+    };
+    let path = q.path.clone();
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::file_story(storage.as_ref(), path.as_deref(), file_id)
     })
     .await
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(FileStory { events, alerts }))
+    Ok(Json(story))
 }
 
 #[derive(Debug, Deserialize)]
 struct NetworkStoryQuery {
     ip: Option<String>,
     domain: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct NetworkStory {
-    events: Vec<CanonicalEvent>,
-    alerts: Vec<Alert>,
 }
 
 /// Composed query implementing Phase 3 plan Global Constraints #9: the
@@ -425,83 +359,23 @@ struct NetworkStory {
 async fn network_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<NetworkStoryQuery>,
-) -> Result<Json<NetworkStory>, (StatusCode, String)> {
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.ip.is_none() && q.domain.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "must provide ip or domain".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "must provide ip or domain".to_string()));
     }
-
-    let (events, alerts) = tokio::task::spawn_blocking(move || {
-        let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
-
-        if let Some(domain) = &q.domain {
-            let mut plan = QueryPlan::new();
-            plan.dns_domain = Some(domain.clone());
-            plan.limit = 10_000;
-            let dns_events = storage.query(&plan)?;
-
-            let mut resolved_ips: HashSet<String> = HashSet::new();
-            for e in &dns_events {
-                if let Some(dns) = &e.dns {
-                    resolved_ips.extend(dns.response_ips.iter().cloned());
-                }
-            }
-            for e in dns_events {
-                events_by_id.insert(e.event_id, e);
-            }
-            for ip in &resolved_ips {
-                let mut plan = QueryPlan::new();
-                plan.network_addr = Some(ip.clone());
-                plan.limit = 10_000;
-                for e in storage.query(&plan)? {
-                    events_by_id.insert(e.event_id, e);
-                }
-            }
-        }
-
-        if let Some(ip) = &q.ip {
-            let mut plan = QueryPlan::new();
-            plan.network_addr = Some(ip.clone());
-            plan.limit = 10_000;
-            for e in storage.query(&plan)? {
-                events_by_id.insert(e.event_id, e);
-            }
-        }
-
-        let mut events: Vec<CanonicalEvent> = events_by_id.into_values().collect();
-        events.sort_by_key(|a| (a.timestamp, a.event_id));
-
-        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
-        let alerts = if evidence_ids.is_empty() {
-            vec![]
-        } else {
-            let mut alert_plan = AlertQueryPlan::new();
-            alert_plan.evidence_event_ids = evidence_ids;
-            alert_plan.limit = 10_000;
-            storage.query_alerts(&alert_plan)?
-        };
-
-        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::network_story(storage.as_ref(), q.ip.as_deref(), q.domain.as_deref())
     })
     .await
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(NetworkStory { events, alerts }))
+    Ok(Json(story))
 }
 
 #[derive(Debug, Deserialize)]
 struct IdentityStoryQuery {
     session_id: Option<String>,
     uid: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
-struct IdentityStory {
-    events: Vec<CanonicalEvent>,
-    alerts: Vec<Alert>,
 }
 
 /// Composed query implementing Phase 4a plan Global Constraint #10, and
@@ -531,57 +405,22 @@ struct IdentityStory {
 async fn identity_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<IdentityStoryQuery>,
-) -> Result<Json<IdentityStory>, (StatusCode, String)> {
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.session_id.is_none() && q.uid.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "must provide session_id or uid".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "must provide session_id or uid".to_string()));
     }
-
-    let (events, alerts) = tokio::task::spawn_blocking(move || {
-        // Unlike the File and Network stories, this needs no union across
-        // several queries: one indexed filter already selects the whole
-        // chain, so there is no de-duplication step to perform and the
-        // storage layer's own ORDER BY timestamp is the ordering.
-        let mut plan = QueryPlan::new();
-        plan.session_id = q.session_id.clone();
-        plan.user_uid = q.uid;
-        plan.limit = 10_000;
-        let mut events = storage.query(&plan)?;
-        // Storage already orders by timestamp; the secondary event_id key
-        // makes the order total for same-timestamp events, matching the
-        // File and Network stories exactly.
-        events.sort_by_key(|e| (e.timestamp, e.event_id));
-
-        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
-        let alerts = if evidence_ids.is_empty() {
-            vec![]
-        } else {
-            let mut alert_plan = AlertQueryPlan::new();
-            alert_plan.evidence_event_ids = evidence_ids;
-            alert_plan.limit = 10_000;
-            storage.query_alerts(&alert_plan)?
-        };
-
-        Ok::<_, osiris_storage::StorageError>((events, alerts))
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::identity_story(storage.as_ref(), q.session_id.as_deref(), q.uid)
     })
     .await
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(IdentityStory { events, alerts }))
+    Ok(Json(story))
 }
 
 #[derive(Debug, Deserialize)]
 struct SystemdStoryQuery {
     unit_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SystemdStory {
-    events: Vec<CanonicalEvent>,
-    alerts: Vec<Alert>,
 }
 
 /// Composed query implementing this phase's Global Constraint #12 and
@@ -595,49 +434,22 @@ struct SystemdStory {
 async fn systemd_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<SystemdStoryQuery>,
-) -> Result<Json<SystemdStory>, (StatusCode, String)> {
-    if q.unit_name.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "must provide unit_name".to_string(),
-        ));
-    }
-
-    let (events, alerts) = tokio::task::spawn_blocking(move || {
-        let mut plan = QueryPlan::new();
-        plan.unit_name = q.unit_name.clone();
-        plan.limit = 10_000;
-        let mut events = storage.query(&plan)?;
-        events.sort_by_key(|e| (e.timestamp, e.event_id));
-
-        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
-        let alerts = if evidence_ids.is_empty() {
-            vec![]
-        } else {
-            let mut alert_plan = AlertQueryPlan::new();
-            alert_plan.evidence_event_ids = evidence_ids;
-            alert_plan.limit = 10_000;
-            storage.query_alerts(&alert_plan)?
-        };
-
-        Ok::<_, osiris_storage::StorageError>((events, alerts))
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
+    let Some(unit_name) = q.unit_name else {
+        return Err((StatusCode::BAD_REQUEST, "must provide unit_name".to_string()));
+    };
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::systemd_story(storage.as_ref(), &unit_name)
     })
     .await
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(SystemdStory { events, alerts }))
+    Ok(Json(story))
 }
 
 #[derive(Debug, Deserialize)]
 struct ContainerStoryQuery {
     container_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ContainerStory {
-    events: Vec<CanonicalEvent>,
-    alerts: Vec<Alert>,
 }
 
 /// Composed query implementing this phase's plan Task 10 and
@@ -653,38 +465,17 @@ struct ContainerStory {
 async fn container_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<ContainerStoryQuery>,
-) -> Result<Json<ContainerStory>, (StatusCode, String)> {
-    if q.container_id.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "must provide container_id".to_string(),
-        ));
-    }
-
-    let (events, alerts) = tokio::task::spawn_blocking(move || {
-        let mut plan = QueryPlan::new();
-        plan.container_id = q.container_id.clone();
-        plan.limit = 10_000;
-        let mut events = storage.query(&plan)?;
-        events.sort_by_key(|e| (e.timestamp, e.event_id));
-
-        let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
-        let alerts = if evidence_ids.is_empty() {
-            vec![]
-        } else {
-            let mut alert_plan = AlertQueryPlan::new();
-            alert_plan.evidence_event_ids = evidence_ids;
-            alert_plan.limit = 10_000;
-            storage.query_alerts(&alert_plan)?
-        };
-
-        Ok::<_, osiris_storage::StorageError>((events, alerts))
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
+    let Some(container_id) = q.container_id else {
+        return Err((StatusCode::BAD_REQUEST, "must provide container_id".to_string()));
+    };
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::container_story(storage.as_ref(), &container_id)
     })
     .await
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(ContainerStory { events, alerts }))
+    Ok(Json(story))
 }
 
 #[cfg(test)]
