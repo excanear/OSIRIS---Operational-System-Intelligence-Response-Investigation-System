@@ -1,0 +1,17 @@
+[package]
+name = "osiris-investigate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-query = { path = "../osiris-query" }
+osiris-correlate = { path = "../osiris-correlate" }
+
+[dev-dependencies]
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
