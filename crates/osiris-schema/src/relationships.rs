@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::process_key::ProcessKey;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EntityRef {
     Process {
