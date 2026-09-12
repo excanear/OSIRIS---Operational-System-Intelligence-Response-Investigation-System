@@ -1,0 +1,16 @@
+[package]
+name = "osiris-evidence"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-audit = { path = "../osiris-audit" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
