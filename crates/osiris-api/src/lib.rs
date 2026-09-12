@@ -34,6 +34,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/system/story", get(system_story_handler))
         .route("/api/v1/graph", get(graph_handler))
         .route("/api/v1/risk", get(risk_handler))
+        .route("/api/v1/incidents/:seed_entity/reconstruct", get(reconstruct_incident_handler))
         .with_state(storage)
 }
 
@@ -118,6 +119,12 @@ async fn graph_handler(
 struct RiskQuery {
     process_key: Option<String>,
     event_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconstructQuery {
+    since: Option<u64>,
+    until: Option<u64>,
 }
 
 /// `GET /api/v1/risk` — queries persisted `RiskScoreRecord`s by
@@ -519,6 +526,23 @@ async fn process_story_handler(
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(story))
+}
+
+async fn reconstruct_incident_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Path(seed_key): Path<String>,
+    Query(q): Query<ReconstructQuery>,
+) -> Result<Json<osiris_investigate::IncidentReconstruction>, (StatusCode, String)> {
+    let seed = EntityRef::parse_storage_key(&seed_key).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let since = q.since.unwrap_or(0);
+    let until = q.until.unwrap_or(u64::MAX);
+    let reconstruction = tokio::task::spawn_blocking(move || {
+        osiris_investigate::reconstruct_incident(storage.as_ref(), seed, since, until)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(reconstruction))
 }
 
 #[cfg(test)]
@@ -1682,5 +1706,27 @@ mod tests {
         let q = SystemStoryQuery { host_id: host_id.to_string(), since: Some(0), until: Some(1000) };
         let Json(story) = system_story_handler(State(storage), Query(q)).await.unwrap();
         assert_eq!(story.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_incident_endpoint_returns_a_reconstruction_for_a_known_entity() {
+        let (_dir, storage) = test_storage();
+        let seed = EntityRef::Ip { addr: "203.0.113.10".to_string() };
+        let q = ReconstructQuery { since: Some(0), until: Some(10_000) };
+        let Json(reconstruction) =
+            reconstruct_incident_handler(State(storage), Path(seed.storage_key()), Query(q))
+                .await
+                .unwrap();
+        assert_eq!(reconstruction.seed, seed);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_incident_endpoint_rejects_a_malformed_seed_key() {
+        let (_dir, storage) = test_storage();
+        let q = ReconstructQuery { since: None, until: None };
+        let err = reconstruct_incident_handler(State(storage), Path("not-a-key".to_string()), Query(q))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
