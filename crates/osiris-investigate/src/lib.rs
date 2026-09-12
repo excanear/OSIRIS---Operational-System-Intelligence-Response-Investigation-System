@@ -18,3 +18,6 @@ pub use container_story::container_story;
 
 pub mod process_story;
 pub use process_story::process_story;
+
+pub mod system_story;
+pub use system_story::system_story;
