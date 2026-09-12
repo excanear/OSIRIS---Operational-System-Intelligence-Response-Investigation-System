@@ -3,7 +3,6 @@ use osiris_query::EventQueryPlan;
 use osiris_storage::{Storage, StorageError};
 
 use crate::support::{assemble, Story};
-use osiris_schema::CanonicalEvent;
 
 /// ARCHITECTURE.md §12.1's Identity Story, refactored from `osiris-api`'s
 /// former `identity_story_handler`. `session_id` alone already returns the
@@ -44,7 +43,7 @@ pub fn identity_story(storage: &dyn Storage, session_id: Option<&str>, uid: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{Category, EventType, HostRef, Severity, Source, SessionRef, UserRef, SCHEMA_VERSION};
+    use osiris_schema::{CanonicalEvent, Category, EventType, HostRef, Severity, Source, SessionRef, UserRef, SCHEMA_VERSION};
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
