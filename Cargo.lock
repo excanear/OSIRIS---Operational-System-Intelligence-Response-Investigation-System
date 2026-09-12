@@ -1125,6 +1125,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-evidence"
+version = "0.1.0"
+dependencies = [
+ "osiris-audit",
+ "osiris-schema",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-fileutil"
 version = "0.1.0"
 dependencies = [

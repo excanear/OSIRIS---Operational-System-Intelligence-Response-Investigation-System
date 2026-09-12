@@ -80,6 +80,13 @@ impl SqliteIncidentStore {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// Persists an incident via upsert (ON CONFLICT ... DO UPDATE). Unlike the append-only
+    /// `SqliteEvidenceStore::insert`, this is intentional — incidents are mutable records that
+    /// need status updates and other mutations.
+    ///
+    /// **Residual risk:** if `audit_log.append(...)` succeeds but this fails (e.g., SQLite I/O error),
+    /// the audit log holds a Success entry for a status change never persisted — audit/state divergence.
+    /// This is accepted (plan constraint only binds forward: audit failure blocks persistence, not reverse).
     fn write_row(&self, incident: &Incident) -> Result<(), IncidentStoreError> {
         let conn = self
             .conn
@@ -245,5 +252,24 @@ mod tests {
             .transition_status(Uuid::now_v7(), IncidentStatus::Resolved, ActorRef::System, None, &audit_log)
             .unwrap_err();
         assert!(matches!(err, IncidentStoreError::NotFound));
+    }
+
+    #[test]
+    fn transition_status_fails_when_the_incident_has_no_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap();
+        let audit_log = FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let no_entities = Incident {
+            incident_id: Uuid::now_v7(),
+            status: IncidentStatus::New,
+            entities: vec![],
+            alert_ids: vec![],
+            notes: vec![],
+        };
+        let created = store.create(no_entities).unwrap();
+        let err = store
+            .transition_status(created.incident_id, IncidentStatus::Investigating, ActorRef::System, None, &audit_log)
+            .unwrap_err();
+        assert!(matches!(err, IncidentStoreError::NoEntities));
     }
 }
