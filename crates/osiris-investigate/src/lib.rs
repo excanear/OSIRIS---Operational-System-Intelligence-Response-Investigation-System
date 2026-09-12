@@ -9,3 +9,6 @@ pub use network_story::network_story;
 
 pub mod identity_story;
 pub use identity_story::identity_story;
+
+pub mod systemd_story;
+pub use systemd_story::systemd_story;
