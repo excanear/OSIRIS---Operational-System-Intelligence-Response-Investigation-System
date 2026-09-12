@@ -12,3 +12,6 @@ pub use identity_story::identity_story;
 
 pub mod systemd_story;
 pub use systemd_story::systemd_story;
+
+pub mod container_story;
+pub use container_story::container_story;
