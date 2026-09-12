@@ -996,7 +996,9 @@ name = "osiris-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "osiris-audit",
  "osiris-correlate",
+ "osiris-evidence",
  "osiris-investigate",
  "osiris-query",
  "osiris-schema",

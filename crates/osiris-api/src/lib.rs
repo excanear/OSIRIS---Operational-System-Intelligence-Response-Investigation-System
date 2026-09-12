@@ -1798,3 +1798,6 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
+
+pub mod incidents;
+pub use incidents::{build_incident_evidence_router, IncidentEvidenceState};

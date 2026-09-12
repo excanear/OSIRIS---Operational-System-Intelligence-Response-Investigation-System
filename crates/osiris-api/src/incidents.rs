@@ -1,0 +1,176 @@
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use osiris_audit::{ActorRef, AuditLog};
+use osiris_evidence::{
+    EvidenceIncidentLinks, EvidenceStore, Incident, IncidentStatus, IncidentStore,
+};
+use osiris_schema::EntityRef;
+use serde::Deserialize;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct IncidentEvidenceState {
+    pub incidents: Arc<dyn IncidentStore>,
+    pub evidence: Arc<dyn EvidenceStore>,
+    pub links: Arc<dyn EvidenceIncidentLinks>,
+    pub audit_log: Arc<dyn AuditLog + Send + Sync>,
+}
+
+pub fn build_incident_evidence_router(state: IncidentEvidenceState) -> Router {
+    Router::new()
+        .route("/api/v1/incidents", get(list_incidents_handler).post(create_incident_handler))
+        .route(
+            "/api/v1/incidents/:incident_id",
+            get(get_incident_handler).patch(patch_incident_handler),
+        )
+        .with_state(state)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateIncidentBody {
+    pub entities: Vec<EntityRef>,
+}
+
+async fn create_incident_handler(
+    State(state): State<IncidentEvidenceState>,
+    Json(body): Json<CreateIncidentBody>,
+) -> Result<Json<Incident>, (StatusCode, String)> {
+    let incident = Incident {
+        incident_id: Uuid::now_v7(),
+        status: IncidentStatus::New,
+        entities: body.entities,
+        alert_ids: vec![],
+        notes: vec![],
+    };
+    let created = tokio::task::spawn_blocking(move || state.incidents.create(incident))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(created))
+}
+
+async fn get_incident_handler(
+    State(state): State<IncidentEvidenceState>,
+    Path(incident_id): Path<String>,
+) -> Result<Json<Incident>, (StatusCode, String)> {
+    let incident_id: Uuid = incident_id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", incident_id)))?;
+    let incident = tokio::task::spawn_blocking(move || state.incidents.get(incident_id))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "incident not found".to_string()))?;
+    Ok(Json(incident))
+}
+
+async fn list_incidents_handler(State(state): State<IncidentEvidenceState>) -> Json<Vec<Incident>> {
+    let incidents = tokio::task::spawn_blocking(move || state.incidents.list())
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    Json(incidents)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchIncidentBody {
+    pub status: IncidentStatus,
+    pub why: Option<String>,
+}
+
+async fn patch_incident_handler(
+    State(state): State<IncidentEvidenceState>,
+    Path(incident_id): Path<String>,
+    Json(body): Json<PatchIncidentBody>,
+) -> Result<Json<Incident>, (StatusCode, String)> {
+    let incident_id: Uuid = incident_id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", incident_id)))?;
+    let updated = tokio::task::spawn_blocking(move || {
+        state.incidents.transition_status(
+            incident_id,
+            body.status,
+            ActorRef::System,
+            body.why,
+            state.audit_log.as_ref(),
+        )
+    })
+    .await
+    .unwrap();
+    match updated {
+        Ok(incident) => Ok(Json(incident)),
+        Err(osiris_evidence::IncidentStoreError::NotFound) => {
+            Err((StatusCode::NOT_FOUND, "incident not found".to_string()))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osiris_audit::FileAuditLog;
+    use osiris_evidence::{SqliteEvidenceIncidentLinks, SqliteEvidenceStore, SqliteIncidentStore};
+    use osiris_schema::EntityRef;
+
+    fn test_state() -> (tempfile::TempDir, IncidentEvidenceState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = IncidentEvidenceState {
+            incidents: Arc::new(SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap()),
+            evidence: Arc::new(SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap()),
+            links: Arc::new(SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap()),
+            audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+        };
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn create_then_get_incident_round_trips() {
+        let (_dir, state) = test_state();
+        let body = CreateIncidentBody {
+            entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+        };
+        let Json(created) = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
+        assert_eq!(created.status, IncidentStatus::New);
+
+        let Json(found) = get_incident_handler(State(state), Path(created.incident_id.to_string())).await.unwrap();
+        assert_eq!(found.incident_id, created.incident_id);
+    }
+
+    #[tokio::test]
+    async fn list_incidents_returns_every_created_incident() {
+        let (_dir, state) = test_state();
+        let body = CreateIncidentBody { entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }] };
+        let _ = create_incident_handler(State(state.clone()), Json(body.clone())).await.unwrap();
+        let _ = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
+        let Json(list) = list_incidents_handler(State(state)).await;
+        assert_eq!(list.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn patch_incident_transitions_status_and_audits_it() {
+        let (_dir, state) = test_state();
+        let body = CreateIncidentBody { entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }] };
+        let Json(created) = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
+
+        let patch = PatchIncidentBody { status: IncidentStatus::Investigating, why: Some("starting triage".to_string()) };
+        let Json(updated) = patch_incident_handler(State(state), Path(created.incident_id.to_string()), Json(patch))
+            .await
+            .unwrap();
+        assert_eq!(updated.status, IncidentStatus::Investigating);
+    }
+
+    #[tokio::test]
+    async fn patch_incident_returns_404_for_an_unknown_id() {
+        let (_dir, state) = test_state();
+        let patch = PatchIncidentBody { status: IncidentStatus::Resolved, why: None };
+        let err = patch_incident_handler(State(state), Path(uuid::Uuid::now_v7().to_string()), Json(patch))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+}
