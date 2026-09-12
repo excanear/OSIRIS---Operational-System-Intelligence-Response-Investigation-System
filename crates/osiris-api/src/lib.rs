@@ -24,6 +24,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
             "/api/v1/processes/:process_key",
             get(process_detail_handler),
         )
+        .route("/api/v1/processes/:process_key/story", get(process_story_handler))
         .route("/api/v1/alerts", get(alerts_handler))
         .route("/api/v1/files/story", get(file_story_handler))
         .route("/api/v1/network/story", get(network_story_handler))
@@ -471,6 +472,21 @@ async fn container_story_handler(
     };
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::container_story(storage.as_ref(), &container_id)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(story))
+}
+
+async fn process_story_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Path(process_key_hex): Path<String>,
+) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
+    let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(process_key_hex.clone()))
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid process_key: {}", process_key_hex)))?;
+    let story = tokio::task::spawn_blocking(move || {
+        osiris_investigate::process_story(storage.as_ref(), process_key)
     })
     .await
     .unwrap()
@@ -1607,6 +1623,24 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn process_story_endpoint_returns_the_processs_own_events() {
+        let (_dir, storage) = test_storage();
+        let event = sample_event(100, None, 1000);
+        let process_key = event.process.as_ref().unwrap().process_key;
+        storage.write(&event).unwrap();
+
+        let Json(story) = process_story_handler(State(storage), Path(process_key.as_hex())).await.unwrap();
+        assert_eq!(story.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_story_endpoint_rejects_a_malformed_process_key() {
+        let (_dir, storage) = test_storage();
+        let err = process_story_handler(State(storage), Path("not-hex".to_string())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
