@@ -15,3 +15,6 @@ pub use systemd_story::systemd_story;
 
 pub mod container_story;
 pub use container_story::container_story;
+
+pub mod process_story;
+pub use process_story::process_story;
