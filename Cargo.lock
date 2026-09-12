@@ -1155,6 +1155,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-investigate"
+version = "0.1.0"
+dependencies = [
+ "osiris-correlate",
+ "osiris-query",
+ "osiris-schema",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-pipeline"
 version = "0.1.0"
 dependencies = [

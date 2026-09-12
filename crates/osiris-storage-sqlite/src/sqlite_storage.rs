@@ -491,6 +491,28 @@ impl Storage for SqliteStorage {
         Ok(events)
     }
 
+    fn get_event(&self, event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let raw_json: Option<String> = conn
+            .query_row(
+                "SELECT raw_json FROM events WHERE event_id = ?",
+                rusqlite::params![event_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        match raw_json {
+            Some(json) => {
+                let event = serde_json::from_str(&json).map_err(|e| StorageError::Serialize(e.to_string()))?;
+                Ok(Some(event))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn write_alerts(&self, alerts: &[Alert]) -> Result<WriteReport, StorageError> {
         let mut conn = self
             .conn
@@ -2107,6 +2129,22 @@ mod tests {
         let results = storage.query(&plan).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].event_id, alice_in_3.event_id);
+    }
+
+    #[test]
+    fn get_event_returns_the_matching_event_by_id() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let event = sample_event(1, 100);
+        let event_id = event.event_id;
+        storage.write(&event).unwrap();
+        let found = storage.get_event(event_id).unwrap();
+        assert_eq!(found.unwrap().event_id, event_id);
+    }
+
+    #[test]
+    fn get_event_returns_none_for_an_unknown_id() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        assert!(storage.get_event(Uuid::new_v4()).unwrap().is_none());
     }
 
     /// Non-destructive/idempotent migration proof, matching Phase 2 Task 6's

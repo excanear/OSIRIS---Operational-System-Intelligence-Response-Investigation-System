@@ -1,5 +1,6 @@
 use osiris_schema::{Alert, CanonicalEvent, EntityRelationship, RiskScoreRecord};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::plan::{
     AlertQueryPlan, DeleteCriteria, QueryPlan, RelationshipQueryPlan, RetentionPolicy,
@@ -39,6 +40,12 @@ pub trait Storage: Send + Sync {
     /// keep serving every existing caller unchanged (plan Global
     /// Constraint #3).
     fn query_events(&self, plan: &osiris_query::EventQueryPlan) -> Result<Vec<CanonicalEvent>, StorageError>;
+    /// Looks up one event by its primary key. Added for `osiris-investigate`'s
+    /// `reconstruct_incident` (ARCHITECTURE.md §12.1), which must resolve a
+    /// `BehavioralChain`'s bare `event_id`s back into real events to bucket
+    /// them by category — none of this trait's field-filtering query
+    /// methods can do that.
+    fn get_event(&self, event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError>;
     fn delete(&self, criteria: &DeleteCriteria) -> Result<u64, StorageError>;
     fn retention_apply(&self, policy: &RetentionPolicy) -> Result<RetentionReport, StorageError>;
     fn health(&self) -> StorageHealth;
