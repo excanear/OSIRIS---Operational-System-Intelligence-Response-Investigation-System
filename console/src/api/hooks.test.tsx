@@ -32,7 +32,18 @@ describe("api hooks", () => {
     const { result } = renderHook(() => useEvents("SENSOR_HEALTH"), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(spy).toHaveBeenCalledWith({ eventType: "SENSOR_HEALTH" });
+    expect(spy).toHaveBeenCalledWith({ eventType: "SENSOR_HEALTH", since: undefined });
+  });
+
+  it("useEvents forwards the since option to fetchEvents", async () => {
+    const spy = vi.spyOn(client, "fetchEvents").mockResolvedValue([]);
+
+    const { result } = renderHook(() => useEvents("SENSOR_HEALTH", { since: 1_700_000_000 }), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith({ eventType: "SENSOR_HEALTH", since: 1_700_000_000 });
   });
 
   it("useAlerts resolves with fetchAlerts's result", async () => {

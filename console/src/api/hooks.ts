@@ -8,10 +8,11 @@ export function useHealth() {
   });
 }
 
-export function useEvents(eventType?: string) {
+export function useEvents(eventType?: string, options: { since?: number } = {}) {
+  const { since } = options;
   return useQuery({
-    queryKey: ["events", eventType ?? "all"],
-    queryFn: () => fetchEvents({ eventType }),
+    queryKey: ["events", eventType ?? "all", since ?? "all-time"],
+    queryFn: () => fetchEvents({ eventType, since }),
   });
 }
 

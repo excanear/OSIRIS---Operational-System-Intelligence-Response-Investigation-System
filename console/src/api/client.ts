@@ -24,10 +24,19 @@ export function fetchHealth(): Promise<ApiHealth> {
   return apiGet<ApiHealth>("/health");
 }
 
-export function fetchEvents(params: { eventType?: string } = {}): Promise<CanonicalEvent[]> {
+export function fetchEvents(
+  params: { eventType?: string; since?: number } = {}
+): Promise<CanonicalEvent[]> {
   const search = new URLSearchParams();
   if (params.eventType) {
     search.set("event_type", params.eventType);
+  }
+  if (params.since !== undefined) {
+    // `since` mirrors CanonicalEvent.timestamp (nanoseconds since the Unix
+    // epoch, per crates/osiris-schema/src/envelope.rs and every sensor's
+    // `SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`), not
+    // seconds or milliseconds.
+    search.set("since", String(params.since));
   }
   const queryString = search.toString();
   return apiGet<CanonicalEvent[]>(`/events${queryString ? `?${queryString}` : ""}`);

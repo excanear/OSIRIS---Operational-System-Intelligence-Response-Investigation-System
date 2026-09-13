@@ -1,6 +1,6 @@
-import type { CanonicalEvent } from "../../api/types";
+import type { CanonicalEvent, HealthState, SensorHealthEventData } from "../../api/types";
 
-export type SensorRollupState = "HEALTHY" | "DEGRADED" | "FAILED";
+export type SensorRollupState = HealthState["state"];
 
 export interface SensorRollupRow {
   hostId: string;
@@ -10,13 +10,7 @@ export interface SensorRollupRow {
   lastEventAt: number | null;
 }
 
-interface SensorHealthEventDataShape {
-  sensor_name: string;
-  state: { state: SensorRollupState; last_error?: string };
-  last_event_at: number | null;
-}
-
-function isSensorHealthEventData(value: unknown): value is SensorHealthEventDataShape {
+function isSensorHealthEventData(value: unknown): value is SensorHealthEventData {
   if (typeof value !== "object" || value === null) {
     return false;
   }
@@ -53,7 +47,7 @@ export function rollupSensorHealth(events: CanonicalEvent[]): SensorRollupRow[] 
       hostId: event.host.host_id,
       sensorName: data.sensor_name,
       state: data.state.state,
-      lastError: data.state.last_error ?? null,
+      lastError: data.state.state === "HEALTHY" ? null : data.state.last_error,
       lastEventAt: data.last_event_at,
     };
 

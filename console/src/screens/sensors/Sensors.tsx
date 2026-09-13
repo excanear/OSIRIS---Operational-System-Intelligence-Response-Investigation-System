@@ -1,8 +1,17 @@
+import { useMemo } from "react";
 import { useEvents } from "../../api/hooks";
 import { rollupSensorHealth } from "./rollup";
 
+const ONE_HOUR_NS = 3_600 * 1_000_000_000;
+
 export function Sensors() {
-  const events = useEvents("SENSOR_HEALTH");
+  // GET /events defaults to ORDER BY timestamp ASC with a 500-row cap
+  // (osiris-query's DEFAULT_EVENT_LIMIT), so an unbounded query only ever
+  // returns the *oldest* 500 SensorHealth events once a deployment has
+  // accumulated more than that — this screen would freeze on stale data
+  // forever. Bound the query to a recent window instead.
+  const since = useMemo(() => Date.now() * 1_000_000 - ONE_HOUR_NS, []);
+  const events = useEvents("SENSOR_HEALTH", { since });
   const rows = events.data ? rollupSensorHealth(events.data) : [];
 
   return (

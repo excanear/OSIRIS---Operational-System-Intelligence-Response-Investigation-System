@@ -39,6 +39,22 @@ describe("api client", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/events?event_type=SENSOR_HEALTH");
   });
 
+  it("fetchEvents with a since adds the since query param", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchEvents({ since: 1_700_000_000_000_000_000 });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/events?since=1700000000000000000");
+  });
+
+  it("fetchEvents with an eventType and since combines both query params", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchEvents({ eventType: "SENSOR_HEALTH", since: 1000 });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/events?event_type=SENSOR_HEALTH&since=1000");
+  });
+
   it("fetchAlerts calls /api/v1/alerts", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
 
