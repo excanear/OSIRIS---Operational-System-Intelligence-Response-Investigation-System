@@ -4,6 +4,7 @@ import { ErrorBoundary } from "./app/ErrorBoundary";
 import { Shell } from "./app/Shell";
 import { Alerts } from "./screens/alerts/Alerts";
 import { ComingSoon } from "./screens/ComingSoon";
+import { IncidentList } from "./screens/incidents/IncidentList";
 import { Overview } from "./screens/overview/Overview";
 import { ProcessDetailScreen } from "./screens/processes/ProcessDetailScreen";
 import { ProcessList } from "./screens/processes/ProcessList";
@@ -27,7 +28,7 @@ export function App() {
               <Route path="/containers" element={<ComingSoon label="Containers" />} />
               <Route path="/timeline" element={<ComingSoon label="Timeline" />} />
               <Route path="/alerts" element={<Alerts />} />
-              <Route path="/incidents" element={<ComingSoon label="Incidents" />} />
+              <Route path="/incidents" element={<IncidentList />} />
               <Route path="/hunting" element={<ComingSoon label="Threat Hunting" />} />
               <Route path="/graph" element={<ComingSoon label="Entity Graph" />} />
               <Route path="/evidence" element={<ComingSoon label="Evidence" />} />

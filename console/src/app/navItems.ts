@@ -13,7 +13,7 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Containers", path: "/containers", enabled: false },
   { label: "Timeline", path: "/timeline", enabled: false },
   { label: "Alerts", path: "/alerts", enabled: true },
-  { label: "Incidents", path: "/incidents", enabled: false },
+  { label: "Incidents", path: "/incidents", enabled: true },
   { label: "Threat Hunting", path: "/hunting", enabled: false },
   { label: "Entity Graph", path: "/graph", enabled: false },
   { label: "Evidence", path: "/evidence", enabled: false },
