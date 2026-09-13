@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchAlerts, fetchEvents, fetchHealth, fetchIncidents } from "./client";
+import { fetchAlerts, fetchEvents, fetchHealth, fetchIncidents, fetchProcess, fetchProcesses, fetchProcessStory } from "./client";
 
 export function useHealth() {
   return useQuery({
@@ -27,5 +27,26 @@ export function useIncidents() {
   return useQuery({
     queryKey: ["incidents"],
     queryFn: fetchIncidents,
+  });
+}
+
+export function useProcesses() {
+  return useQuery({
+    queryKey: ["processes"],
+    queryFn: fetchProcesses,
+  });
+}
+
+export function useProcess(processKey: string) {
+  return useQuery({
+    queryKey: ["process", processKey],
+    queryFn: () => fetchProcess(processKey),
+  });
+}
+
+export function useProcessStory(processKey: string) {
+  return useQuery({
+    queryKey: ["process-story", processKey],
+    queryFn: () => fetchProcessStory(processKey),
   });
 }

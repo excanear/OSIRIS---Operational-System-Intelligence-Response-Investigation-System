@@ -1,4 +1,4 @@
-import type { ApiHealth, CanonicalEvent } from "./types";
+import type { ApiHealth, CanonicalEvent, ProcessDetail, ProcessSummary, Story } from "./types";
 
 const API_BASE = "/api/v1";
 
@@ -48,4 +48,16 @@ export function fetchAlerts(): Promise<unknown[]> {
 
 export function fetchIncidents(): Promise<unknown[]> {
   return apiGet<unknown[]>("/incidents");
+}
+
+export function fetchProcesses(): Promise<ProcessSummary[]> {
+  return apiGet<ProcessSummary[]>("/processes");
+}
+
+export function fetchProcess(processKey: string): Promise<ProcessDetail> {
+  return apiGet<ProcessDetail>(`/processes/${encodeURIComponent(processKey)}`);
+}
+
+export function fetchProcessStory(processKey: string): Promise<Story> {
+  return apiGet<Story>(`/processes/${encodeURIComponent(processKey)}/story`);
 }

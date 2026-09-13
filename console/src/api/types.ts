@@ -16,6 +16,15 @@ export interface SensorHealthEventData {
   last_event_at: number | null;
 }
 
+export interface ProcessRef {
+  process_key: string;
+  pid: number;
+  exe_path: string;
+  cmdline: string[];
+  exe_hash: string | null;
+  start_time_mono: number;
+}
+
 export interface CanonicalEvent {
   event_id: string;
   event_type: string;
@@ -24,5 +33,40 @@ export interface CanonicalEvent {
     host_id: string;
     hostname: string;
   };
+  process?: ProcessRef | null;
+  parent_process?: ProcessRef | null;
   event_data: unknown;
+}
+
+export interface ProcessSummary {
+  process_key: string;
+  pid: number;
+  exe_path: string;
+  timestamp: number;
+}
+
+export interface ProcessDetail {
+  process: CanonicalEvent;
+  children: CanonicalEvent[];
+}
+
+export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+export type AlertStatus = "OPEN" | "ACKNOWLEDGED" | "SUPPRESSED";
+
+export interface Alert {
+  alert_id: string;
+  rule_id: string;
+  rule_version: number;
+  rule_content_hash: string;
+  severity: AlertSeverity;
+  status: AlertStatus;
+  timestamp: number;
+  host_id: string;
+  reasons: string[];
+  evidence: string[];
+}
+
+export interface Story {
+  events: CanonicalEvent[];
+  alerts: Alert[];
 }

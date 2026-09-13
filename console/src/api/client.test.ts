@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchAlerts, fetchEvents, fetchHealth, fetchIncidents } from "./client";
+import {
+  ApiError,
+  fetchAlerts,
+  fetchEvents,
+  fetchHealth,
+  fetchIncidents,
+  fetchProcess,
+  fetchProcesses,
+  fetchProcessStory,
+} from "./client";
 
 describe("api client", () => {
   beforeEach(() => {
@@ -75,5 +84,33 @@ describe("api client", () => {
     vi.mocked(fetch).mockResolvedValue(new Response("boom", { status: 500 }));
 
     await expect(fetchHealth()).rejects.toThrow(ApiError);
+  });
+
+  it("fetchProcesses calls /api/v1/processes", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchProcesses();
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/processes");
+  });
+
+  it("fetchProcess calls /api/v1/processes/:processKey", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ process: {}, children: [] }), { status: 200 })
+    );
+
+    await fetchProcess("abc123");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/processes/abc123");
+  });
+
+  it("fetchProcessStory calls /api/v1/processes/:processKey/story", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 })
+    );
+
+    await fetchProcessStory("abc123");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/processes/abc123/story");
   });
 });

@@ -3,7 +3,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as client from "./client";
-import { useAlerts, useEvents, useHealth, useIncidents } from "./hooks";
+import { useAlerts, useEvents, useHealth, useIncidents, useProcess, useProcesses, useProcessStory } from "./hooks";
 
 function wrapper({ children }: { children: ReactNode }) {
   const queryClient = new QueryClient({
@@ -62,5 +62,39 @@ describe("api hooks", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([{ id: "i1" }]);
+  });
+
+  it("useProcesses resolves with fetchProcesses's result", async () => {
+    vi.spyOn(client, "fetchProcesses").mockResolvedValue([
+      { process_key: "abc123", pid: 42, exe_path: "/usr/bin/curl", timestamp: 1000 },
+    ]);
+
+    const { result } = renderHook(() => useProcesses(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([
+      { process_key: "abc123", pid: 42, exe_path: "/usr/bin/curl", timestamp: 1000 },
+    ]);
+  });
+
+  it("useProcess forwards the processKey to fetchProcess", async () => {
+    const spy = vi.spyOn(client, "fetchProcess").mockResolvedValue({
+      process: { event_id: "e1", event_type: "PROCESS_EXEC", timestamp: 1000, host: { host_id: "h1", hostname: "h" }, event_data: {} },
+      children: [],
+    });
+
+    const { result } = renderHook(() => useProcess("abc123"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("abc123");
+  });
+
+  it("useProcessStory forwards the processKey to fetchProcessStory", async () => {
+    const spy = vi.spyOn(client, "fetchProcessStory").mockResolvedValue({ events: [], alerts: [] });
+
+    const { result } = renderHook(() => useProcessStory("abc123"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("abc123");
   });
 });
