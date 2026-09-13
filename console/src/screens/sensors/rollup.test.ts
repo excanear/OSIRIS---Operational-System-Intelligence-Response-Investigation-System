@@ -117,4 +117,32 @@ describe("rollupSensorHealth", () => {
 
     expect(rows.map((r) => r.sensorName)).toEqual(["exec", "network"]);
   });
+
+  it("uses event.timestamp for tie-breaking, not nullable last_event_at", () => {
+    // Event A: later timestamp (5000), no last_event_at (null)
+    const eventA = sensorHealthEvent({
+      timestamp: 5000,
+      lastEventAt: null,
+      state: "HEALTHY",
+    });
+    // Event B: earlier timestamp (1000), has last_event_at (1000)
+    const eventB = sensorHealthEvent({
+      timestamp: 1000,
+      lastEventAt: 1000,
+      state: "FAILED",
+      lastError: "earlier failure",
+    });
+
+    // Process A then B: A should win because timestamp 5000 > 1000
+    const rowsAB = rollupSensorHealth([eventA, eventB]);
+    expect(rowsAB).toHaveLength(1);
+    expect(rowsAB[0].state).toBe("HEALTHY");
+    expect(rowsAB[0].lastEventAt).toBeNull();
+
+    // Process B then A: A should still win (same logic, not flipped by order)
+    const rowsBA = rollupSensorHealth([eventB, eventA]);
+    expect(rowsBA).toHaveLength(1);
+    expect(rowsBA[0].state).toBe("HEALTHY");
+    expect(rowsBA[0].lastEventAt).toBeNull();
+  });
 });

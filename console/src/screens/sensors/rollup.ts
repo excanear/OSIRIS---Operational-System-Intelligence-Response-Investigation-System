@@ -33,10 +33,11 @@ function isSensorHealthEventData(value: unknown): value is SensorHealthEventData
 
 /**
  * Reduces SensorHealth events (ARCHITECTURE.md §23) to one row per
- * (host, sensor): the most recently reported event wins.
+ * (host, sensor): the most recently reported event wins based on event.timestamp.
  */
 export function rollupSensorHealth(events: CanonicalEvent[]): SensorRollupRow[] {
   const latest = new Map<string, SensorRollupRow>();
+  const orderTime = new Map<string, number>();
 
   for (const event of events) {
     if (event.event_type !== "SENSOR_HEALTH") {
@@ -48,7 +49,6 @@ export function rollupSensorHealth(events: CanonicalEvent[]): SensorRollupRow[] 
 
     const data = event.event_data;
     const key = `${event.host.host_id}:${data.sensor_name}`;
-    const candidateTime = data.last_event_at ?? event.timestamp;
     const candidate: SensorRollupRow = {
       hostId: event.host.host_id,
       sensorName: data.sensor_name,
@@ -57,9 +57,10 @@ export function rollupSensorHealth(events: CanonicalEvent[]): SensorRollupRow[] 
       lastEventAt: data.last_event_at,
     };
 
-    const existing = latest.get(key);
-    if (!existing || candidateTime >= (existing.lastEventAt ?? 0)) {
+    const existingTime = orderTime.get(key);
+    if (existingTime === undefined || event.timestamp >= existingTime) {
       latest.set(key, candidate);
+      orderTime.set(key, event.timestamp);
     }
   }
 
