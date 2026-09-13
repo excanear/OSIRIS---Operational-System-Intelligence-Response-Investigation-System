@@ -27,6 +27,10 @@ pub fn build_incident_evidence_router(state: IncidentEvidenceState) -> Router {
             "/api/v1/incidents/:incident_id",
             get(get_incident_handler).patch(patch_incident_handler),
         )
+        .route(
+            "/api/v1/evidence",
+            get(crate::evidence::list_evidence_handler).post(crate::evidence::create_evidence_handler),
+        )
         .with_state(state)
 }
 
