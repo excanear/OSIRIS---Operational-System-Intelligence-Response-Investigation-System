@@ -712,6 +712,56 @@ mod tests {
         }
     }
 
+    fn sensor_health_event(host_id: Uuid, sensor_name: &str, timestamp: u64) -> CanonicalEvent {
+        CanonicalEvent {
+            event_id: Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::SensorHealth,
+            category: Category::System,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({
+                "sensor_name": sensor_name,
+                "state": {
+                    "state": "FAILED",
+                    "last_error": "eBPF load failure: verifier rejected program",
+                },
+                "events_processed": 42,
+                "last_event_at": timestamp,
+            }),
+        }
+    }
+
     fn sample_alert(rule_id: &str, evidence: Vec<Uuid>, timestamp: u64) -> Alert {
         Alert::new(
             rule_id,
@@ -775,6 +825,35 @@ mod tests {
         };
         let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_filters_by_sensor_health_event_type() {
+        let (_dir, storage) = test_storage();
+        let host_id = Uuid::new_v4();
+        storage
+            .write(&sensor_health_event(host_id, "network", 5000))
+            .unwrap();
+        storage.write(&sample_event(100, None, 1000)).unwrap();
+
+        let q = EventsQuery {
+            event_type: Some("SENSOR_HEALTH".to_string()),
+            since: None,
+            until: None,
+            limit: None,
+            export: None,
+            q: None,
+        };
+        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::SensorHealth);
+        assert_eq!(events[0].event_data["sensor_name"], "network");
+        assert_eq!(events[0].event_data["state"]["state"], "FAILED");
+        assert_eq!(
+            events[0].event_data["state"]["last_error"],
+            "eBPF load failure: verifier rejected program"
+        );
     }
 
     #[tokio::test]
