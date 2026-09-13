@@ -3,7 +3,20 @@ import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as client from "./client";
-import { useAlerts, useEvents, useHealth, useIncidents, useProcess, useProcesses, useProcessStory } from "./hooks";
+import {
+  useAlerts,
+  useCreateEvidence,
+  useCreateIncident,
+  useEvents,
+  useEvidence,
+  useHealth,
+  useIncident,
+  useIncidents,
+  usePatchIncidentStatus,
+  useProcess,
+  useProcesses,
+  useProcessStory,
+} from "./hooks";
 
 function wrapper({ children }: { children: ReactNode }) {
   const queryClient = new QueryClient({
@@ -77,12 +90,13 @@ describe("api hooks", () => {
   });
 
   it("useIncidents resolves with fetchIncidents's result", async () => {
-    vi.spyOn(client, "fetchIncidents").mockResolvedValue([{ id: "i1" }]);
+    const incident = { incident_id: "i1", status: "NEW" as const, entities: [], alert_ids: [], notes: [] };
+    vi.spyOn(client, "fetchIncidents").mockResolvedValue([incident]);
 
     const { result } = renderHook(() => useIncidents(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual([{ id: "i1" }]);
+    expect(result.current.data).toEqual([incident]);
   });
 
   it("useProcesses resolves with fetchProcesses's result", async () => {
@@ -117,5 +131,74 @@ describe("api hooks", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(spy).toHaveBeenCalledWith("abc123");
+  });
+
+  it("useIncident forwards the incidentId to fetchIncident", async () => {
+    const incident = { incident_id: "i1", status: "NEW" as const, entities: [], alert_ids: [], notes: [] };
+    const spy = vi.spyOn(client, "fetchIncident").mockResolvedValue(incident);
+
+    const { result } = renderHook(() => useIncident("i1"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("i1");
+  });
+
+  it("useCreateIncident calls createIncident with the given entities", async () => {
+    const incident = { incident_id: "i1", status: "NEW" as const, entities: [], alert_ids: [], notes: [] };
+    const spy = vi.spyOn(client, "createIncident").mockResolvedValue(incident);
+
+    const { result } = renderHook(() => useCreateIncident(), { wrapper });
+    await result.current.mutateAsync([{ kind: "IP", addr: "203.0.113.10" }]);
+
+    expect(spy).toHaveBeenCalledWith([{ kind: "IP", addr: "203.0.113.10" }]);
+  });
+
+  it("usePatchIncidentStatus calls patchIncidentStatus with the incidentId, status, and why", async () => {
+    const incident = { incident_id: "i1", status: "INVESTIGATING" as const, entities: [], alert_ids: [], notes: [] };
+    const spy = vi.spyOn(client, "patchIncidentStatus").mockResolvedValue(incident);
+
+    const { result } = renderHook(() => usePatchIncidentStatus("i1"), { wrapper });
+    await result.current.mutateAsync({ status: "INVESTIGATING", why: "starting" });
+
+    expect(spy).toHaveBeenCalledWith("i1", "INVESTIGATING", "starting");
+  });
+
+  it("useEvidence forwards the incidentId to fetchEvidence", async () => {
+    const spy = vi.spyOn(client, "fetchEvidence").mockResolvedValue([]);
+
+    const { result } = renderHook(() => useEvidence("i1"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("i1");
+  });
+
+  it("useCreateEvidence calls createEvidence with the incidentId merged into the body", async () => {
+    const evidence = {
+      evidence_id: "e1",
+      source: "MANUAL_UPLOAD" as const,
+      timestamp: 1000,
+      integrity: { hash: "abc", immutable_since: 1000 },
+      relationships: [],
+      supersedes: null,
+    };
+    const spy = vi.spyOn(client, "createEvidence").mockResolvedValue(evidence);
+
+    const { result } = renderHook(() => useCreateEvidence("i1"), { wrapper });
+    await result.current.mutateAsync({
+      source: "MANUAL_UPLOAD",
+      hash: "abc",
+      immutable_since: 1000,
+      relationships: [],
+      supersedes: null,
+    });
+
+    expect(spy).toHaveBeenCalledWith({
+      source: "MANUAL_UPLOAD",
+      hash: "abc",
+      immutable_since: 1000,
+      relationships: [],
+      supersedes: null,
+      incident_id: "i1",
+    });
   });
 });

@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  createEvidence,
+  createIncident,
   fetchAlerts,
   fetchEvents,
+  fetchEvidence,
   fetchHealth,
+  fetchIncident,
   fetchIncidents,
   fetchProcess,
   fetchProcesses,
   fetchProcessStory,
+  patchIncidentStatus,
 } from "./client";
 
 describe("api client", () => {
@@ -136,5 +141,101 @@ describe("api client", () => {
     await fetchProcessStory("abc123");
 
     expect(fetch).toHaveBeenCalledWith("/api/v1/processes/abc123/story");
+  });
+
+  it("fetchIncident calls /api/v1/incidents/:incidentId", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({ incident_id: "i1", status: "NEW", entities: [], alert_ids: [], notes: [] }),
+        { status: 200 }
+      )
+    );
+
+    await fetchIncident("i1");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/incidents/i1");
+  });
+
+  it("createIncident POSTs to /api/v1/incidents with the entities body", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({ incident_id: "i1", status: "NEW", entities: [], alert_ids: [], notes: [] }),
+        { status: 200 }
+      )
+    );
+
+    await createIncident([{ kind: "IP", addr: "203.0.113.10" }]);
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/incidents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entities: [{ kind: "IP", addr: "203.0.113.10" }] }),
+    });
+  });
+
+  it("patchIncidentStatus PATCHes /api/v1/incidents/:incidentId with status and why", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({ incident_id: "i1", status: "INVESTIGATING", entities: [], alert_ids: [], notes: [] }),
+        { status: 200 }
+      )
+    );
+
+    await patchIncidentStatus("i1", "INVESTIGATING", "starting investigation");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/incidents/i1", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "INVESTIGATING", why: "starting investigation" }),
+    });
+  });
+
+  it("fetchEvidence calls /api/v1/evidence with the incident_id query param", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchEvidence("i1");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/evidence?incident_id=i1");
+  });
+
+  it("createEvidence POSTs to /api/v1/evidence with the given body", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          evidence_id: "e1",
+          source: "MANUAL_UPLOAD",
+          timestamp: 1000,
+          integrity: { hash: "abc", immutable_since: 1000 },
+          relationships: [],
+          supersedes: null,
+        }),
+        { status: 200 }
+      )
+    );
+
+    const body = {
+      source: "MANUAL_UPLOAD" as const,
+      hash: "abc",
+      immutable_since: 1000,
+      relationships: [],
+      supersedes: null,
+      incident_id: "i1",
+    };
+    await createEvidence(body);
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/evidence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  });
+
+  it("fetchIncidents parses a real Incident shape", async () => {
+    const incident = { incident_id: "i1", status: "NEW", entities: [], alert_ids: [], notes: [] };
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([incident]), { status: 200 }));
+
+    const incidents = await fetchIncidents();
+
+    expect(incidents).toEqual([incident]);
   });
 });

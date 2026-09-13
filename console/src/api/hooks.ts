@@ -1,5 +1,19 @@
-import { useQuery } from "@tanstack/react-query";
-import { fetchAlerts, fetchEvents, fetchHealth, fetchIncidents, fetchProcess, fetchProcesses, fetchProcessStory } from "./client";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  createEvidence,
+  createIncident,
+  fetchAlerts,
+  fetchEvents,
+  fetchEvidence,
+  fetchHealth,
+  fetchIncident,
+  fetchIncidents,
+  fetchProcess,
+  fetchProcesses,
+  fetchProcessStory,
+  patchIncidentStatus,
+} from "./client";
+import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
 
 export function useHealth() {
   return useQuery({
@@ -49,5 +63,52 @@ export function useProcessStory(processKey: string) {
   return useQuery({
     queryKey: ["process-story", processKey],
     queryFn: () => fetchProcessStory(processKey),
+  });
+}
+
+export function useIncident(incidentId: string) {
+  return useQuery({
+    queryKey: ["incident", incidentId],
+    queryFn: () => fetchIncident(incidentId),
+  });
+}
+
+export function useCreateIncident() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (entities: EntityRef[]) => createIncident(entities),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["incidents"] });
+    },
+  });
+}
+
+export function usePatchIncidentStatus(incidentId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ status, why }: { status: IncidentStatus; why?: string }) =>
+      patchIncidentStatus(incidentId, status, why),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["incident", incidentId], updated);
+      queryClient.invalidateQueries({ queryKey: ["incidents"] });
+    },
+  });
+}
+
+export function useEvidence(incidentId: string) {
+  return useQuery({
+    queryKey: ["evidence", incidentId],
+    queryFn: () => fetchEvidence(incidentId),
+  });
+}
+
+export function useCreateEvidence(incidentId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Omit<CreateEvidenceBody, "incident_id">) =>
+      createEvidence({ ...body, incident_id: incidentId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["evidence", incidentId] });
+    },
   });
 }
