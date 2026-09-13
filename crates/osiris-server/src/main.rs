@@ -139,11 +139,56 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| "/var/lib/osiris/investigate-audit.jsonl".to_string());
 
+    // Unlike Baseline/Risk above, the Incident/Evidence/audit stores are
+    // core to this phase, not best-effort enrichment: silently degrading to
+    // a disabled investigation surface would be worse than refusing to
+    // start. So these fail fast — but with an actionable message naming the
+    // path and the config key that controls it, never a bare unwrap panic.
+    fn open_or_exit<T>(
+        opened: Result<T, impl std::fmt::Display>,
+        path: &str,
+        config_key: &str,
+    ) -> T {
+        match opened {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    path = %path,
+                    config_key = %config_key,
+                    error = %e,
+                    "failed to open a required investigation store; set the \
+                     named config key to a writable path and restart"
+                );
+                eprintln!(
+                    "fatal: failed to open required store at '{path}' \
+                     (config key '{config_key}'): {e}"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     let incident_evidence_state = IncidentEvidenceState {
-        incidents: Arc::new(SqliteIncidentStore::open(&incidents_db_path).unwrap()),
-        evidence: Arc::new(SqliteEvidenceStore::open(&evidence_db_path).unwrap()),
-        links: Arc::new(SqliteEvidenceIncidentLinks::open(&links_db_path).unwrap()),
-        audit_log: Arc::new(FileAuditLog::open(&investigate_audit_log_path).unwrap()),
+        incidents: Arc::new(open_or_exit(
+            SqliteIncidentStore::open(&incidents_db_path),
+            &incidents_db_path,
+            "incidents_db_path",
+        )),
+        evidence: Arc::new(open_or_exit(
+            SqliteEvidenceStore::open(&evidence_db_path),
+            &evidence_db_path,
+            "evidence_db_path",
+        )),
+        links: Arc::new(open_or_exit(
+            SqliteEvidenceIncidentLinks::open(&links_db_path),
+            &links_db_path,
+            "links_db_path",
+        )),
+        audit_log: Arc::new(open_or_exit(
+            FileAuditLog::open(&investigate_audit_log_path),
+            &investigate_audit_log_path,
+            "investigate_audit_log_path",
+        )),
     };
 
     let app = build_router(storage).merge(build_incident_evidence_router(incident_evidence_state));

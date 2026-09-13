@@ -209,7 +209,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, S
 /// `OR`/`NOT` anywhere) — the only shape this MVP's pushdown handles.
 /// `None` for anything else, telling the caller to skip pushdown for this
 /// filter and rely on `eval_ast` alone (still bounded by `since`/`until`
-/// and `PREFETCH_LIMIT`).
+/// and `SqliteStorage::MAX_SCAN_ROWS`).
 fn conjunction_leaves(
     ast: &osiris_query::Ast,
 ) -> Option<Vec<(&str, osiris_query::Op, &osiris_query::Value)>> {
@@ -223,6 +223,174 @@ fn conjunction_leaves(
             Some(left)
         }
         Ast::Or(_, _) | Ast::Not(_) => None,
+    }
+}
+
+impl SqliteStorage {
+    /// How many rows one SQL round-trip of `query_events`' scan pulls back
+    /// before the residual `eval_ast` pass filters them. This is a *batch*
+    /// size, not a result ceiling: `query_events_batched` keeps paginating
+    /// with a `(timestamp, event_id)` cursor until it has collected
+    /// `plan.effective_limit()` matches or the time range is exhausted.
+    const SCAN_BATCH_SIZE: i64 = 20_000;
+
+    /// Worst-case bound on how many rows a single `query_events` call will
+    /// scan when pushdown covers little or none of the filter (e.g. an
+    /// `OR`, a `!=`, or a field with no indexed column such as `host_id`).
+    /// A query matching nothing over a huge table stops here rather than
+    /// scanning unboundedly; the result is then bounded-incomplete, which
+    /// is the same class of behavior the old fixed 20k prefetch had, only
+    /// with a far more realistic ceiling.
+    const MAX_SCAN_ROWS: i64 = 1_000_000;
+
+    /// `query_events` with an explicit scan batch size so tests can prove
+    /// the cursor pagination actually paginates without writing millions
+    /// of rows.
+    fn query_events_batched(
+        &self,
+        plan: &osiris_query::EventQueryPlan,
+        batch_size: i64,
+    ) -> Result<Vec<CanonicalEvent>, StorageError> {
+        use osiris_query::{eval_ast, Op, Value};
+
+        let effective_limit = plan.effective_limit();
+        if effective_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+
+        // Pushdown: when the filter is a pure AND-conjunction (no OR/NOT),
+        // push every leaf this MVP has an indexed column for into SQL —
+        // exactly the same 8 columns `query()` already filters on above.
+        // Any leaf without a matching column, and the whole filter when it
+        // contains OR/NOT, is left to the residual `eval_ast` pass below —
+        // pushdown here is a pure performance optimization: every returned
+        // row is re-checked against the *entire* original filter before
+        // being included, so a pushdown bug can only over-fetch, never
+        // return a wrong result.
+        let mut base_sql = "SELECT raw_json, timestamp, event_id FROM events WHERE 1=1".to_string();
+        let mut base_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(filter) = &plan.filter {
+            if let Some(leaves) = conjunction_leaves(filter) {
+                for (field, op, value) in leaves {
+                    if op != Op::Eq {
+                        continue;
+                    }
+                    let column = match field {
+                        "event_type" => "event_type",
+                        "process.process_key" => "process_key",
+                        "file.path" => "file_path",
+                        "dns.query" => "dns_domain",
+                        "session.session_id" => "session_id",
+                        "user.uid" => "user_uid",
+                        "service.unit_name" => "unit_name",
+                        "container.container_id" => "container_id",
+                        _ => continue,
+                    };
+                    match value {
+                        Value::Str(s) => {
+                            base_sql.push_str(&format!(" AND {} = ?", column));
+                            base_params.push(Box::new(s.clone()));
+                        }
+                        Value::Num(n) => {
+                            base_sql.push_str(&format!(" AND {} = ?", column));
+                            base_params.push(Box::new(*n as i64));
+                        }
+                        Value::List(_) => continue,
+                    }
+                }
+            }
+        }
+        if let Some(since) = plan.since {
+            base_sql.push_str(" AND timestamp >= ?");
+            base_params.push(Box::new(since.min(i64::MAX as u64) as i64));
+        }
+        if let Some(until) = plan.until {
+            base_sql.push_str(" AND timestamp <= ?");
+            base_params.push(Box::new(until.min(i64::MAX as u64) as i64));
+        }
+
+        // Cursor-paginated scan. `event_id` is a TEXT PRIMARY KEY (a UUID
+        // string); it is only ever used here as a stable tiebreaker to make
+        // `(timestamp, event_id)` a total order, never as a meaningful
+        // ordering of its own.
+        let mut events = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        let mut scanned: i64 = 0;
+
+        loop {
+            let mut sql = base_sql.clone();
+            let mut extra_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+            if let Some((last_ts, last_id)) = &cursor {
+                sql.push_str(" AND (timestamp > ? OR (timestamp = ? AND event_id > ?))");
+                extra_params.push(Box::new(*last_ts));
+                extra_params.push(Box::new(*last_ts));
+                extra_params.push(Box::new(last_id.clone()));
+            }
+            sql.push_str(" ORDER BY timestamp ASC, event_id ASC LIMIT ?");
+            extra_params.push(Box::new(batch_size));
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> = base_params
+                .iter()
+                .chain(extra_params.iter())
+                .map(|p| p.as_ref())
+                .collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+            let mut batch_rows: i64 = 0;
+            let mut last_seen: Option<(i64, String)> = None;
+            let mut reached_limit = false;
+            for row in rows {
+                let (raw_json, timestamp, event_id) =
+                    row.map_err(|e| StorageError::Backend(e.to_string()))?;
+                batch_rows += 1;
+                last_seen = Some((timestamp, event_id));
+                let event: CanonicalEvent = serde_json::from_str(&raw_json)
+                    .map_err(|e| StorageError::Serialize(e.to_string()))?;
+                if plan.filter.as_ref().is_none_or(|f| eval_ast(&event, f)) {
+                    events.push(event);
+                    if events.len() >= effective_limit {
+                        reached_limit = true;
+                        break;
+                    }
+                }
+            }
+
+            if reached_limit {
+                break;
+            }
+            scanned += batch_rows;
+            // A short batch means the time range is exhausted: there is no
+            // more data to scan, so no match can be hiding past it.
+            if batch_rows < batch_size {
+                break;
+            }
+            if scanned >= Self::MAX_SCAN_ROWS {
+                break;
+            }
+            match last_seen {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(events)
     }
 }
 
@@ -402,93 +570,7 @@ impl Storage for SqliteStorage {
         &self,
         plan: &osiris_query::EventQueryPlan,
     ) -> Result<Vec<CanonicalEvent>, StorageError> {
-        use osiris_query::{eval_ast, Op, Value};
-
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
-
-        // Pushdown: when the filter is a pure AND-conjunction (no OR/NOT),
-        // push every leaf this MVP has an indexed column for into SQL —
-        // exactly the same 8 columns `query()` already filters on above.
-        // Any leaf without a matching column, and the whole filter when it
-        // contains OR/NOT, is left to the residual `eval_ast` pass below —
-        // pushdown here is a pure performance optimization: every returned
-        // row is re-checked against the *entire* original filter before
-        // being included, so a pushdown bug can only over-fetch, never
-        // return a wrong result.
-        let mut sql = "SELECT raw_json FROM events WHERE 1=1".to_string();
-        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        if let Some(filter) = &plan.filter {
-            if let Some(leaves) = conjunction_leaves(filter) {
-                for (field, op, value) in leaves {
-                    if op != Op::Eq {
-                        continue;
-                    }
-                    let column = match field {
-                        "event_type" => "event_type",
-                        "process.process_key" => "process_key",
-                        "file.path" => "file_path",
-                        "dns.query" => "dns_domain",
-                        "session.session_id" => "session_id",
-                        "user.uid" => "user_uid",
-                        "service.unit_name" => "unit_name",
-                        "container.container_id" => "container_id",
-                        _ => continue,
-                    };
-                    match value {
-                        Value::Str(s) => {
-                            sql.push_str(&format!(" AND {} = ?", column));
-                            sql_params.push(Box::new(s.clone()));
-                        }
-                        Value::Num(n) => {
-                            sql.push_str(&format!(" AND {} = ?", column));
-                            sql_params.push(Box::new(*n as i64));
-                        }
-                        Value::List(_) => continue,
-                    }
-                }
-            }
-        }
-        if let Some(since) = plan.since {
-            sql.push_str(" AND timestamp >= ?");
-            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
-        }
-        if let Some(until) = plan.until {
-            sql.push_str(" AND timestamp <= ?");
-            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
-        }
-        // Prefetch more than the final cap so the residual pass below has
-        // real candidates to filter from when pushdown covered only part
-        // (or none) of the filter — still bounded, never a full scan of an
-        // unbounded events table.
-        const PREFETCH_LIMIT: i64 = 20_000;
-        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
-        sql_params.push(Box::new(PREFETCH_LIMIT));
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-
-        let mut events = Vec::new();
-        for row in rows {
-            let raw_json = row.map_err(|e| StorageError::Backend(e.to_string()))?;
-            let event: CanonicalEvent = serde_json::from_str(&raw_json)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-            if plan.filter.as_ref().is_none_or(|f| eval_ast(&event, f)) {
-                events.push(event);
-            }
-            if events.len() >= plan.effective_limit() {
-                break;
-            }
-        }
-        Ok(events)
+        self.query_events_batched(plan, Self::SCAN_BATCH_SIZE)
     }
 
     fn get_event(&self, event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError> {
@@ -1101,6 +1183,61 @@ mod tests {
         let mut plan = osiris_query::EventQueryPlan::new();
         plan.limit = 2;
         assert_eq!(storage.query_events(&plan).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn query_events_paginates_past_the_first_scan_batch_to_find_a_residual_match() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        // 12 events, only the last of which matches. With a scan batch of 5
+        // the match sits in the *third* batch, so a single fixed-LIMIT
+        // prefetch of one batch would silently return nothing.
+        const BATCH: i64 = 5;
+        for i in 1..=12u32 {
+            storage.write(&sample_event(i, i as u64)).unwrap();
+        }
+        const { assert!(12 > BATCH, "the match must lie past the first batch") };
+
+        // `process.pid` has no pushdown column, so this is pure residual
+        // evaluation over the paginated scan.
+        let plan = osiris_query::EventQueryPlan::with_filter("process.pid = 12").unwrap();
+        let events = storage.query_events_batched(&plan, BATCH).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].process.as_ref().unwrap().pid, 12);
+
+        // Same story for an OR, which disables pushdown entirely.
+        let or_plan =
+            osiris_query::EventQueryPlan::with_filter("process.pid = 11 OR process.pid = 12")
+                .unwrap();
+        let or_events = storage.query_events_batched(&or_plan, BATCH).unwrap();
+        assert_eq!(or_events.len(), 2);
+    }
+
+    #[test]
+    fn query_events_pagination_cursor_does_not_skip_rows_sharing_a_timestamp() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        // Every row has the same timestamp, so the `event_id` tiebreaker is
+        // the only thing keeping `(timestamp, event_id)` a total order.
+        for i in 1..=12u32 {
+            storage.write(&sample_event(i, 1000)).unwrap();
+        }
+        let plan = osiris_query::EventQueryPlan::new();
+        let events = storage.query_events_batched(&plan, 5).unwrap();
+        assert_eq!(events.len(), 12);
+        let mut ids: Vec<_> = events.iter().map(|e| e.event_id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 12, "pagination must not duplicate rows");
+    }
+
+    #[test]
+    fn query_events_stops_paginating_once_the_effective_limit_is_reached() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        for i in 1..=12u32 {
+            storage.write(&sample_event(i, i as u64)).unwrap();
+        }
+        let mut plan = osiris_query::EventQueryPlan::new();
+        plan.limit = 7;
+        assert_eq!(storage.query_events_batched(&plan, 5).unwrap().len(), 7);
     }
 
     #[test]

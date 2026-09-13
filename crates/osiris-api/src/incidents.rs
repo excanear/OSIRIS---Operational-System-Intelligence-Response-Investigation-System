@@ -132,6 +132,27 @@ mod tests {
         (dir, state)
     }
 
+    /// `osiris-server`'s `main` composes the whole HTTP surface as
+    /// `build_router(storage).merge(build_incident_evidence_router(state))`.
+    /// axum panics on a route collision at merge time, so this is a fast
+    /// regression guard for that composition (e.g. after an axum/matchit
+    /// bump) without waiting for the slow e2e suite. It deliberately does
+    /// not bind a socket or issue a request — building the merged Router is
+    /// the thing that can panic.
+    #[test]
+    fn the_two_routers_merge_without_a_route_collision() {
+        let (_dir, state) = test_state();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn osiris_storage::Storage> = Arc::new(
+            osiris_storage_sqlite::SqliteStorage::open(storage_dir.path().join("events.db"))
+                .unwrap(),
+        );
+        let merged: Router = crate::build_router(storage)
+            .merge(crate::build_incident_evidence_router(state));
+        // Consume it so the construction cannot be optimized away.
+        let _ = std::hint::black_box(merged);
+    }
+
     #[tokio::test]
     async fn create_then_get_incident_round_trips() {
         let (_dir, state) = test_state();

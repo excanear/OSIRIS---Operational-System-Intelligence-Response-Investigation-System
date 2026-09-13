@@ -17,9 +17,26 @@ impl From<LexError> for ParseError {
     }
 }
 
+/// How deeply a query may nest `(...)` / `NOT` before the parser refuses it.
+///
+/// The parser is recursive-descent, so nesting depth is stack depth: without
+/// this bound a query like `"(".repeat(100_000)` would overflow the native
+/// stack, and a Rust stack overflow is an immediate process abort, not a
+/// catchable error. `/api/v1/events?q=...` is reachable before any
+/// `spawn_blocking`, so that abort would take the whole server down.
+/// 64 is far deeper than any hand-written analyst query and far shallower
+/// than the real stack limit.
+pub const MAX_PARSE_DEPTH: usize = 64;
+
 pub fn parse(input: &str) -> Result<Ast, ParseError> {
     let tokens = Lexer::tokenize(input)?;
-    let mut p = Parser { tokens, pos: 0 };
+    // A fresh `Parser` per `parse` call, so `depth` never needs resetting
+    // across calls.
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let ast = p.parse_or()?;
     p.expect_eof()?;
     Ok(ast)
@@ -28,9 +45,21 @@ pub fn parse(input: &str) -> Result<Ast, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
+    fn enter(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(self.err(format!(
+                "query nesting is too deep (limit {} levels)",
+                MAX_PARSE_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -60,6 +89,13 @@ impl Parser {
 
     // or := and (OR and)*
     fn parse_or(&mut self) -> Result<Ast, ParseError> {
+        self.enter()?;
+        let out = self.parse_or_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_or_inner(&mut self) -> Result<Ast, ParseError> {
         let mut left = self.parse_and()?;
         while *self.peek() == Token::Or {
             self.advance();
@@ -82,6 +118,13 @@ impl Parser {
 
     // unary := NOT unary | primary
     fn parse_unary(&mut self) -> Result<Ast, ParseError> {
+        self.enter()?;
+        let out = self.parse_unary_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Ast, ParseError> {
         if *self.peek() == Token::Not {
             self.advance();
             let inner = self.parse_unary()?;
@@ -236,5 +279,31 @@ mod tests {
     fn reports_an_unclosed_paren() {
         let err = parse("(a = 1 AND b = 2").unwrap_err();
         assert!(err.message.contains(')'));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_parens_instead_of_overflowing_the_stack() {
+        let query = format!("{}event_type = \"X\"{}", "(".repeat(5000), ")".repeat(5000));
+        let err = parse(&query).unwrap_err();
+        assert!(
+            err.message.contains("too deep"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_deeply_nested_not_instead_of_overflowing_the_stack() {
+        let query = format!("{}event_type = \"X\"", "NOT ".repeat(5000));
+        let err = parse(&query).unwrap_err();
+        assert!(err.message.contains("too deep"));
+    }
+
+    #[test]
+    fn nesting_within_the_depth_limit_still_parses() {
+        // 20 levels of parens is well inside MAX_PARSE_DEPTH even counting
+        // the two guarded frames (`or` + `unary`) each level costs.
+        let query = format!("{}event_type = \"X\"{}", "(".repeat(20), ")".repeat(20));
+        assert!(parse(&query).is_ok());
     }
 }

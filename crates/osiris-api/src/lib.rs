@@ -211,6 +211,12 @@ struct EventsQuery {
     since: Option<u64>,
     until: Option<u64>,
     limit: Option<usize>,
+    /// Opt-in to §19.2's export regime (`MAX_EVENT_LIMIT` ceiling instead of
+    /// `DEFAULT_EVENT_LIMIT`). Global Constraint #9 makes this the
+    /// *caller's* explicit choice, so it is deliberately independent of
+    /// whether `limit` was supplied — a bare `limit` stays under the
+    /// default cap.
+    export: Option<bool>,
     /// Free-form OQL (ARCHITECTURE.md §12.3). When both `q` and
     /// `event_type` are given they intersect (`AND`), matching how the old
     /// fixed-field filters composed before this task.
@@ -248,8 +254,8 @@ async fn events_handler(
     plan.until = q.until;
     if let Some(limit) = q.limit {
         plan.limit = limit;
-        plan.export = true;
     }
+    plan.export = q.export.unwrap_or(false);
 
     let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
         .await
@@ -746,6 +752,7 @@ mod tests {
             since: Some(500),
             until: Some(5000),
             limit: None,
+            export: None,
             q: None,
         };
         let Json(events) = events_handler(State(storage), Query(query)).await.unwrap();
@@ -763,6 +770,7 @@ mod tests {
             since: None,
             until: None,
             limit: None,
+            export: None,
             q: Some("process.pid = 1".to_string()),
         };
         let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
@@ -777,6 +785,7 @@ mod tests {
             since: None,
             until: None,
             limit: None,
+            export: None,
             q: Some("process.pid =".to_string()),
         };
         let err = events_handler(State(storage), Query(q)).await.unwrap_err();
@@ -791,11 +800,55 @@ mod tests {
             since: None,
             until: None,
             limit: None,
+            export: None,
             q: Some("bogus_field = 1".to_string()),
         };
         let err = events_handler(State(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("bogus_field"));
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_limit_alone_stays_under_the_default_cap() {
+        use osiris_query::DEFAULT_EVENT_LIMIT;
+        let (_dir, storage) = test_storage();
+        let batch: Vec<_> = (0..600u32).map(|i| sample_event(i, None, 1000 + i as u64)).collect();
+        storage.batch_write(&batch).unwrap();
+
+        // §19.2 / Global Constraint #9: `export` is opt-in. A caller that
+        // supplies only `limit` must stay under the *default* cap.
+        let q = EventsQuery {
+            event_type: None,
+            since: None,
+            until: None,
+            limit: Some(600),
+            export: None,
+            q: None,
+        };
+        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        assert_eq!(events.len(), DEFAULT_EVENT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_honors_an_explicit_export_above_the_default_cap() {
+        use osiris_query::{DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT};
+        // 600 is deliberately above the default cap and below the export
+        // ceiling, so this test can only pass under export semantics.
+        const { assert!(600 > DEFAULT_EVENT_LIMIT && 600 <= MAX_EVENT_LIMIT) };
+        let (_dir, storage) = test_storage();
+        let batch: Vec<_> = (0..600u32).map(|i| sample_event(i, None, 1000 + i as u64)).collect();
+        storage.batch_write(&batch).unwrap();
+
+        let q = EventsQuery {
+            event_type: None,
+            since: None,
+            until: None,
+            limit: Some(600),
+            export: Some(true),
+            q: None,
+        };
+        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        assert_eq!(events.len(), 600);
     }
 
     #[tokio::test]
