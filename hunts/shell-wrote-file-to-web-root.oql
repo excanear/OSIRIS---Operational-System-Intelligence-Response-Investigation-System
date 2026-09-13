@@ -1,0 +1,1 @@
+event_type = "FILE_WRITE" AND file.path STARTS_WITH "/var/www/"

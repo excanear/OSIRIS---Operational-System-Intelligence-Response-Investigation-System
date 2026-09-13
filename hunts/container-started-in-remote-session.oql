@@ -1,0 +1,1 @@
+event_type = "CONTAINER_START" AND session.session_id != ""

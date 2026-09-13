@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use osiris_cli::client::{chain_url, container_story_url, events_url, format_events_table, risk_url};
+use osiris_cli::client::{
+    chain_url, container_story_url, events_url, format_events_table, hunt_url, risk_url,
+};
+use osiris_cli::hunts::template;
 use osiris_schema::CanonicalEvent;
 
 #[derive(Parser)]
@@ -58,6 +61,19 @@ enum Command {
         process_key: Option<String>,
         #[arg(long)]
         event_id: Option<String>,
+    },
+    /// Run a saved or ad-hoc OQL hunt (ARCHITECTURE.md §12.2). Exactly one
+    /// of `query` or `--template` must be given.
+    Hunt {
+        query: Option<String>,
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        since: Option<u64>,
+        #[arg(long)]
+        until: Option<u64>,
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -126,6 +142,28 @@ fn main() {
             event_id,
         } => {
             let url = risk_url(&cli.server, process_key, event_id);
+            get(&client, url)
+        }
+        Command::Hunt { query, template: template_name, since, until, limit } => {
+            let resolved = match (query, template_name) {
+                (Some(q), None) => q.clone(),
+                (None, Some(name)) => match template(name) {
+                    Some(oql) => oql.to_string(),
+                    None => {
+                        eprintln!("unknown hunt template: {}", name);
+                        std::process::exit(1);
+                    }
+                },
+                (Some(_), Some(_)) => {
+                    eprintln!("provide either a query or --template, not both");
+                    std::process::exit(1);
+                }
+                (None, None) => {
+                    eprintln!("provide either a query or --template");
+                    std::process::exit(1);
+                }
+            };
+            let url = hunt_url(&cli.server, &resolved, since, until, limit);
             get(&client, url)
         }
     };

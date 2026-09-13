@@ -100,6 +100,41 @@ pub fn format_events_table(events: &[CanonicalEvent]) -> String {
     out
 }
 
+/// Minimal percent-encoding for the one context this CLI needs it in: an
+/// OQL string placed into a `?q=` query parameter. Unreserved characters
+/// (letters, digits, `-`, `_`, `.`, `~`) pass through unescaped per RFC
+/// 3986; everything else — including the space, `"`, `(`, `)`, `=` that
+/// every non-trivial OQL query contains — is escaped, unlike
+/// `container_story_url`'s documented no-encoding posture (that function's
+/// hex/container-id inputs never contain such characters; OQL always can).
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+/// Builds the `/api/v1/events?q=...` request URL for `osiris hunt`.
+pub fn hunt_url(server: &str, q: &str, since: &Option<u64>, until: &Option<u64>, limit: &Option<usize>) -> String {
+    let mut url = format!("{}/api/v1/events?q={}", server.trim_end_matches('/'), percent_encode(q));
+    if let Some(s) = since {
+        url.push_str(&format!("&since={}", s));
+    }
+    if let Some(u) = until {
+        url.push_str(&format!("&until={}", u));
+    }
+    if let Some(l) = limit {
+        url.push_str(&format!("&limit={}", l));
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +325,26 @@ mod tests {
         event.process = None;
         let table = format_events_table(&[event]);
         assert!(table.contains("\t-\t-\n"));
+    }
+
+    #[test]
+    fn percent_encode_escapes_spaces_quotes_and_parens() {
+        let encoded = percent_encode("a = \"b\" AND (c = 1)");
+        assert_eq!(encoded, "a%20%3D%20%22b%22%20AND%20%28c%20%3D%201%29");
+    }
+
+    #[test]
+    fn percent_encode_leaves_alphanumerics_and_dots_untouched() {
+        assert_eq!(percent_encode("process.pid_1"), "process.pid_1");
+    }
+
+    #[test]
+    fn hunt_url_includes_the_encoded_query_and_optional_filters() {
+        let url = hunt_url("http://localhost:8080", "a = \"b\"", &Some(100), &None, &Some(10));
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/events?q=a%20%3D%20%22b%22&since=100&limit=10"
+        );
     }
 
     #[test]
