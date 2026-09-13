@@ -7,7 +7,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { label: "Overview", path: "/", enabled: true },
   { label: "Live Events", path: "/live-events", enabled: false },
-  { label: "Process Explorer", path: "/processes", enabled: false },
+  { label: "Process Explorer", path: "/processes", enabled: true },
   { label: "Filesystem", path: "/files", enabled: false },
   { label: "Network", path: "/network", enabled: false },
   { label: "Containers", path: "/containers", enabled: false },
