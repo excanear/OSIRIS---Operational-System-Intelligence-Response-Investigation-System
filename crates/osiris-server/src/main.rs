@@ -191,7 +191,10 @@ async fn main() {
         )),
     };
 
-    let app = build_router(storage).merge(build_incident_evidence_router(incident_evidence_state));
+    let app = osiris_server::apply_dev_cors(
+        build_router(storage).merge(build_incident_evidence_router(incident_evidence_state)),
+        config.dev_cors,
+    );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

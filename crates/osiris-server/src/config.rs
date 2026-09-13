@@ -45,6 +45,13 @@ pub struct ServerConfig {
     pub links_db_path: Option<String>,
     #[serde(default)]
     pub investigate_audit_log_path: Option<String>,
+    /// Phase 7b-1: dev-only permissive CORS for the Console's Vite dev
+    /// server (a different origin/port than osiris-server). `None`/`false`
+    /// (the default for any config that doesn't mention it) leaves CORS
+    /// disabled — this must never be enabled unconditionally in a way a
+    /// production deployment could inherit by omission.
+    #[serde(default)]
+    pub dev_cors: Option<bool>,
 }
 
 impl ServerConfig {
@@ -120,5 +127,31 @@ mod tests {
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert!(config.incidents_db_path.is_none());
+    }
+
+    #[test]
+    fn dev_cors_defaults_to_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert_eq!(config.dev_cors, None);
+    }
+
+    #[test]
+    fn dev_cors_parses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\ndev_cors: true\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert_eq!(config.dev_cors, Some(true));
     }
 }
