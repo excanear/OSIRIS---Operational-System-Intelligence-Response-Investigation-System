@@ -141,11 +141,35 @@ console/
 └── tsconfig.json
 ```
 
+## Known gap: no code emits AgentHealth/SensorHealth events yet
+
+Investigated during plan-writing: `osiris-health`'s `HealthAggregator`/
+`SensorHealth`/`HealthState` types exist, but nothing in the codebase
+constructs an `EventType::SensorHealth` or `EventType::AgentHealth`
+`CanonicalEvent` and pushes it through the pipeline (`osiris-health` is
+never wired into `osiris-agent`'s emission path). So
+`GET /api/v1/events?event_type=SensorHealth` against a real, currently
+running Agent always returns empty — there is no live data path to
+validate the Sensors screen against yet. Wiring `osiris-health` into the
+Agent's event emission is out of scope here (it's Agent-side backend
+work, not Console work).
+
+**Resolution:** build the Sensors screen and its rollup logic as
+designed, and validate it by inserting synthetic `SensorHealth`/
+`AgentHealth` `CanonicalEvent`s directly into a test `Storage` (the same
+approach the backend's own tests already use — e.g. the fixture patterns
+in `crates/osiris-api/src/lib.rs`'s test module), then querying
+`/api/v1/events?event_type=SensorHealth` against that. This proves the
+screen's parsing/rollup/rendering logic is correct without depending on
+work no phase has scheduled yet.
+
 ## Done criteria
 
 `npm run build` and `npm test` (Vitest) pass in `console/`; `npm run
-lint` (ESLint) passes; Overview and Sensors render real data against a
-running `osiris-server` in dev (Vite proxy + the new CORS layer);
+lint` (ESLint) passes; Overview renders real data against a running
+`osiris-server` in dev (Vite proxy + the new CORS layer); Sensors is
+validated per the "Known gap" resolution above (synthetic events inserted
+into a test storage, not a live Agent — none emit these events yet);
 `cargo test --workspace` still passes after the CORS addition; no other
 screen route does anything but show "coming soon"; nothing in this phase
 touches `osiris-api`'s handlers, `osiris-query`, `osiris-investigate`, or
