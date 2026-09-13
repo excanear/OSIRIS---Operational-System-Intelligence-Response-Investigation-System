@@ -3,6 +3,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { ErrorBoundary } from "./app/ErrorBoundary";
 import { Shell } from "./app/Shell";
 import { ComingSoon } from "./screens/ComingSoon";
+import { Overview } from "./screens/overview/Overview";
 
 const queryClient = new QueryClient();
 
@@ -13,7 +14,7 @@ export function App() {
         <ErrorBoundary>
           <Routes>
             <Route element={<Shell />}>
-              <Route path="/" element={<ComingSoon label="Overview" />} />
+              <Route path="/" element={<Overview />} />
               <Route path="/live-events" element={<ComingSoon label="Live Events" />} />
               <Route path="/processes" element={<ComingSoon label="Process Explorer" />} />
               <Route path="/files" element={<ComingSoon label="Filesystem" />} />

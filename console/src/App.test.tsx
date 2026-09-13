@@ -12,13 +12,15 @@ describe("App", () => {
     }
   });
 
-  it("shows the Overview 'coming soon' placeholder at the root path", () => {
+  it("shows the Overview screen at the root path", () => {
     render(<App />);
-    expect(screen.getByText("This screen is not implemented yet.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
   });
 
-  it("renders no nav links yet, since no item is enabled", () => {
+  it("renders exactly one nav link, for Overview", () => {
     render(<App />);
-    expect(screen.queryAllByRole("link")).toHaveLength(0);
+    const links = screen.getAllByRole("link");
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveTextContent("Overview");
   });
 });
