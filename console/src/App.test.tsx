@@ -17,10 +17,10 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
   });
 
-  it("renders exactly three nav links, for Overview, Process Explorer, and Sensors", () => {
+  it("renders exactly four nav links, for Overview, Process Explorer, Alerts, and Sensors", () => {
     render(<App />);
     const links = screen.getAllByRole("link");
-    expect(links).toHaveLength(3);
-    expect(links.map((link) => link.textContent)).toEqual(["Overview", "Process Explorer", "Sensors"]);
+    expect(links).toHaveLength(4);
+    expect(links.map((link) => link.textContent)).toEqual(["Overview", "Process Explorer", "Alerts", "Sensors"]);
   });
 });

@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { ErrorBoundary } from "./app/ErrorBoundary";
 import { Shell } from "./app/Shell";
+import { Alerts } from "./screens/alerts/Alerts";
 import { ComingSoon } from "./screens/ComingSoon";
 import { Overview } from "./screens/overview/Overview";
 import { ProcessDetailScreen } from "./screens/processes/ProcessDetailScreen";
@@ -25,7 +26,7 @@ export function App() {
               <Route path="/network" element={<ComingSoon label="Network" />} />
               <Route path="/containers" element={<ComingSoon label="Containers" />} />
               <Route path="/timeline" element={<ComingSoon label="Timeline" />} />
-              <Route path="/alerts" element={<ComingSoon label="Alerts" />} />
+              <Route path="/alerts" element={<Alerts />} />
               <Route path="/incidents" element={<ComingSoon label="Incidents" />} />
               <Route path="/hunting" element={<ComingSoon label="Threat Hunting" />} />
               <Route path="/graph" element={<ComingSoon label="Entity Graph" />} />
