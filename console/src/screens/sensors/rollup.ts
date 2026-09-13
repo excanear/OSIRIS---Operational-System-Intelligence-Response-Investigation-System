@@ -1,0 +1,67 @@
+import type { CanonicalEvent } from "../../api/types";
+
+export type SensorRollupState = "HEALTHY" | "DEGRADED" | "FAILED";
+
+export interface SensorRollupRow {
+  hostId: string;
+  sensorName: string;
+  state: SensorRollupState;
+  lastError: string | null;
+  lastEventAt: number | null;
+}
+
+interface SensorHealthEventDataShape {
+  sensor_name: string;
+  state: { state: SensorRollupState; last_error?: string };
+  last_event_at: number | null;
+}
+
+function isSensorHealthEventData(value: unknown): value is SensorHealthEventDataShape {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.sensor_name !== "string") {
+    return false;
+  }
+  if (typeof record.state !== "object" || record.state === null) {
+    return false;
+  }
+  const state = (record.state as Record<string, unknown>).state;
+  return state === "HEALTHY" || state === "DEGRADED" || state === "FAILED";
+}
+
+/**
+ * Reduces SensorHealth events (ARCHITECTURE.md §23) to one row per
+ * (host, sensor): the most recently reported event wins.
+ */
+export function rollupSensorHealth(events: CanonicalEvent[]): SensorRollupRow[] {
+  const latest = new Map<string, SensorRollupRow>();
+
+  for (const event of events) {
+    if (event.event_type !== "SENSOR_HEALTH") {
+      continue;
+    }
+    if (!isSensorHealthEventData(event.event_data)) {
+      continue;
+    }
+
+    const data = event.event_data;
+    const key = `${event.host.host_id}:${data.sensor_name}`;
+    const candidateTime = data.last_event_at ?? event.timestamp;
+    const candidate: SensorRollupRow = {
+      hostId: event.host.host_id,
+      sensorName: data.sensor_name,
+      state: data.state.state,
+      lastError: data.state.last_error ?? null,
+      lastEventAt: data.last_event_at,
+    };
+
+    const existing = latest.get(key);
+    if (!existing || candidateTime >= (existing.lastEventAt ?? 0)) {
+      latest.set(key, candidate);
+    }
+  }
+
+  return Array.from(latest.values()).sort((a, b) => a.sensorName.localeCompare(b.sensorName));
+}

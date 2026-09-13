@@ -4,6 +4,7 @@ import { ErrorBoundary } from "./app/ErrorBoundary";
 import { Shell } from "./app/Shell";
 import { ComingSoon } from "./screens/ComingSoon";
 import { Overview } from "./screens/overview/Overview";
+import { Sensors } from "./screens/sensors/Sensors";
 
 const queryClient = new QueryClient();
 
@@ -26,7 +27,7 @@ export function App() {
               <Route path="/hunting" element={<ComingSoon label="Threat Hunting" />} />
               <Route path="/graph" element={<ComingSoon label="Entity Graph" />} />
               <Route path="/evidence" element={<ComingSoon label="Evidence" />} />
-              <Route path="/sensors" element={<ComingSoon label="Sensors" />} />
+              <Route path="/sensors" element={<Sensors />} />
             </Route>
           </Routes>
         </ErrorBoundary>
