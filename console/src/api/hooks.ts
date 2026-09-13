@@ -16,10 +16,11 @@ export function useEvents(eventType?: string, options: { since?: number } = {}) 
   });
 }
 
-export function useAlerts() {
+export function useAlerts(params: { ruleId?: string; since?: number } = {}) {
+  const { ruleId, since } = params;
   return useQuery({
-    queryKey: ["alerts"],
-    queryFn: fetchAlerts,
+    queryKey: ["alerts", ruleId ?? "all", since ?? "all-time"],
+    queryFn: () => fetchAlerts({ ruleId, since }),
   });
 }
 

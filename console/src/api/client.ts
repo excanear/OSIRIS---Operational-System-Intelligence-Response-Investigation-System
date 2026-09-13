@@ -1,4 +1,4 @@
-import type { ApiHealth, CanonicalEvent, ProcessDetail, ProcessSummary, Story } from "./types";
+import type { Alert, ApiHealth, CanonicalEvent, ProcessDetail, ProcessSummary, Story } from "./types";
 
 const API_BASE = "/api/v1";
 
@@ -42,8 +42,16 @@ export function fetchEvents(
   return apiGet<CanonicalEvent[]>(`/events${queryString ? `?${queryString}` : ""}`);
 }
 
-export function fetchAlerts(): Promise<unknown[]> {
-  return apiGet<unknown[]>("/alerts");
+export function fetchAlerts(params: { ruleId?: string; since?: number } = {}): Promise<Alert[]> {
+  const search = new URLSearchParams();
+  if (params.ruleId) {
+    search.set("rule_id", params.ruleId);
+  }
+  if (params.since !== undefined) {
+    search.set("since", String(params.since));
+  }
+  const queryString = search.toString();
+  return apiGet<Alert[]>(`/alerts${queryString ? `?${queryString}` : ""}`);
 }
 
 export function fetchIncidents(): Promise<unknown[]> {

@@ -72,6 +72,30 @@ describe("api client", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/alerts");
   });
 
+  it("fetchAlerts with a ruleId adds the rule_id query param", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchAlerts({ ruleId: "rule_a" });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/alerts?rule_id=rule_a");
+  });
+
+  it("fetchAlerts with a since adds the since query param", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchAlerts({ since: 1000 });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/alerts?since=1000");
+  });
+
+  it("fetchAlerts with a ruleId and since combines both query params", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchAlerts({ ruleId: "rule_a", since: 1000 });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/alerts?rule_id=rule_a&since=1000");
+  });
+
   it("fetchIncidents calls /api/v1/incidents", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
 

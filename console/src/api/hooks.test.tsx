@@ -47,12 +47,33 @@ describe("api hooks", () => {
   });
 
   it("useAlerts resolves with fetchAlerts's result", async () => {
-    vi.spyOn(client, "fetchAlerts").mockResolvedValue([{ id: "a1" }]);
+    const alert = {
+      alert_id: "a1",
+      rule_id: "rule_a",
+      rule_version: 1,
+      rule_content_hash: "hash",
+      severity: "HIGH" as const,
+      status: "OPEN" as const,
+      timestamp: 1000,
+      host_id: "host-1",
+      reasons: ["suspicious activity"],
+      evidence: ["evt-1"],
+    };
+    vi.spyOn(client, "fetchAlerts").mockResolvedValue([alert]);
 
     const { result } = renderHook(() => useAlerts(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual([{ id: "a1" }]);
+    expect(result.current.data).toEqual([alert]);
+  });
+
+  it("useAlerts forwards ruleId and since to fetchAlerts", async () => {
+    const spy = vi.spyOn(client, "fetchAlerts").mockResolvedValue([]);
+
+    const { result } = renderHook(() => useAlerts({ ruleId: "rule_a", since: 1000 }), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith({ ruleId: "rule_a", since: 1000 });
   });
 
   it("useIncidents resolves with fetchIncidents's result", async () => {
