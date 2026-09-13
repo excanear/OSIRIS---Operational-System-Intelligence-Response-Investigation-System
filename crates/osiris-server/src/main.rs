@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_api::build_router;
+use osiris_api::{build_incident_evidence_router, IncidentEvidenceState};
+use osiris_audit::FileAuditLog;
 use osiris_baseline::BaselineEngine;
 use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
+use osiris_evidence::{SqliteEvidenceIncidentLinks, SqliteEvidenceStore, SqliteIncidentStore};
 use osiris_risk::RiskEngine;
 use osiris_server::{run_ingestion_loop, ServerConfig};
 use osiris_storage::Storage;
@@ -128,7 +131,22 @@ async fn main() {
         }
     };
 
-    let app = build_router(storage);
+    let incidents_db_path = config.incidents_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/incidents.db".to_string());
+    let evidence_db_path = config.evidence_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/evidence.db".to_string());
+    let links_db_path = config.links_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/links.db".to_string());
+    let investigate_audit_log_path = config
+        .investigate_audit_log_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/investigate-audit.jsonl".to_string());
+
+    let incident_evidence_state = IncidentEvidenceState {
+        incidents: Arc::new(SqliteIncidentStore::open(&incidents_db_path).unwrap()),
+        evidence: Arc::new(SqliteEvidenceStore::open(&evidence_db_path).unwrap()),
+        links: Arc::new(SqliteEvidenceIncidentLinks::open(&links_db_path).unwrap()),
+        audit_log: Arc::new(FileAuditLog::open(&investigate_audit_log_path).unwrap()),
+    };
+
+    let app = build_router(storage).merge(build_incident_evidence_router(incident_evidence_state));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

@@ -26,6 +26,8 @@ osiris-detect = { path = "../osiris-detect" }
 osiris-correlate = { path = "../osiris-correlate" }
 osiris-baseline = { path = "../osiris-baseline" }
 osiris-risk = { path = "../osiris-risk" }
+osiris-evidence = { path = "../osiris-evidence" }
+osiris-audit = { path = "../osiris-audit" }
 uuid = { workspace = true }
 
 [dev-dependencies]

@@ -1352,9 +1352,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "osiris-api",
+ "osiris-audit",
  "osiris-baseline",
  "osiris-correlate",
  "osiris-detect",
+ "osiris-evidence",
  "osiris-fileutil",
  "osiris-risk",
  "osiris-schema",

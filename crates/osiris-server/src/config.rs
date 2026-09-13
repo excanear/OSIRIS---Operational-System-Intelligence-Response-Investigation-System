@@ -32,6 +32,19 @@ pub struct ServerConfig {
     /// by default — see `main.rs`).
     #[serde(default)]
     pub risk_weights_path: Option<String>,
+    /// Phase 7a: the Incident/Evidence/link control-plane stores' own
+    /// SQLite files (ARCHITECTURE.md §10.3), independent of `db_path`'s
+    /// telemetry tables — same posture `baseline_db_path` already
+    /// established. All four are optional so an existing config keeps
+    /// loading unmodified; `main.rs` applies documented defaults.
+    #[serde(default)]
+    pub incidents_db_path: Option<String>,
+    #[serde(default)]
+    pub evidence_db_path: Option<String>,
+    #[serde(default)]
+    pub links_db_path: Option<String>,
+    #[serde(default)]
+    pub investigate_audit_log_path: Option<String>,
 }
 
 impl ServerConfig {
@@ -78,5 +91,34 @@ mod tests {
             config.risk_weights_path.as_deref(),
             Some("/etc/osiris/risk/weights.yaml")
         );
+    }
+
+    #[test]
+    fn loads_a_config_with_incident_evidence_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\nincidents_db_path: /tmp/incidents.db\nevidence_db_path: /tmp/evidence.db\nlinks_db_path: /tmp/links.db\ninvestigate_audit_log_path: /tmp/investigate-audit.jsonl\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert_eq!(config.incidents_db_path.as_deref(), Some("/tmp/incidents.db"));
+        assert_eq!(config.evidence_db_path.as_deref(), Some("/tmp/evidence.db"));
+        assert_eq!(config.links_db_path.as_deref(), Some("/tmp/links.db"));
+        assert_eq!(config.investigate_audit_log_path.as_deref(), Some("/tmp/investigate-audit.jsonl"));
+    }
+
+    #[test]
+    fn loads_a_minimal_config_without_the_new_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert!(config.incidents_db_path.is_none());
     }
 }
