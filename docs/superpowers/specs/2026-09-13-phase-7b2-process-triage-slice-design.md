@@ -114,9 +114,13 @@ mutation. Incident detail shows existing notes read-only.
 - **Data**: `GET /api/v1/alerts` with `rule_id` and `since` as optional
   filter controls (both server-supported).
 - **Read-only.** No mutation, no backend changes.
-- Columns: rule_id, entities (rendered compactly per `EntityRef` variant
-  — e.g. `IP 203.0.113.10`, `DOMAIN evil.example`), timestamp, evidence
-  count (`evidence.len()`). No pagination beyond whatever `/alerts`
+- Columns: rule_id, severity, status, host_id, reasons (joined, or the
+  first with a "+N more" suffix), timestamp, evidence count
+  (`evidence.len()`). Correction from an earlier design pass: `Alert`
+  (`crates/osiris-schema/src/alert.rs`) has no `entities` field — only
+  `rule_id`/`rule_version`/`rule_content_hash`/`severity`/`status`/
+  `timestamp`/`host_id`/`reasons`/`evidence` (the last being matched
+  `event_id`s, not entities). No pagination beyond whatever `/alerts`
   returns natively (matches 7b-1's Sensors screen precedent).
 
 ### Incidents (+ Evidence, folded in)
