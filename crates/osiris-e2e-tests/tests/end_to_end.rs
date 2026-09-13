@@ -1808,6 +1808,214 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-test-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let agent_config = AgentConfig {
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        systemd_audit_log_path: None,
+        persistence_watch_paths: vec![],
+        container_cgroup_roots: vec![],
+        proc_root: None,
+        enable_synthetic: true,
+        synthetic_scenario: Some("network_download_then_write".to_string()),
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string()).await.unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+    let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        Arc::new(DetectionEngine::new(vec![])),
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
+
+    let events = storage.query(&QueryPlan::new()).unwrap();
+    let curl_process_key = events
+        .iter()
+        .find(|e| e.process.as_ref().is_some_and(|p| p.exe_path == "/usr/bin/curl"))
+        .expect("scenario must produce a curl exec event")
+        .process
+        .as_ref()
+        .unwrap()
+        .process_key;
+    let seed_entity = EntityRef::Process { process_key: curl_process_key };
+
+    let incidents_db = dir.path().join("incidents.db");
+    let evidence_db = dir.path().join("evidence.db");
+    let links_db = dir.path().join("links.db");
+    let audit_log_path = dir.path().join("investigate-audit.jsonl");
+    let incident_evidence_state = osiris_api::IncidentEvidenceState {
+        incidents: Arc::new(osiris_evidence::SqliteIncidentStore::open(&incidents_db).unwrap()),
+        evidence: Arc::new(osiris_evidence::SqliteEvidenceStore::open(&evidence_db).unwrap()),
+        links: Arc::new(osiris_evidence::SqliteEvidenceIncidentLinks::open(&links_db).unwrap()),
+        audit_log: Arc::new(osiris_audit::FileAuditLog::open(&audit_log_path).unwrap()),
+    };
+
+    let app = build_router(storage.clone())
+        .merge(osiris_api::build_incident_evidence_router(incident_evidence_state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = reqwest::Client::new();
+
+    // 1. OQL hunting: GET /api/v1/events?q=... finds every event attributed
+    //    to the curl process. `process.exe_path` resolves against
+    //    `CanonicalEvent.process`, which the scenario (and pipeline
+    //    enrichment generally) populates for every event type the process
+    //    touches, not just its own exec — so this legitimately matches the
+    //    exec, the network connect, and the file create, all three
+    //    attributed to curl's `process_key` (verified against the actual
+    //    events returned, not merely asserted).
+    let hunted: Vec<serde_json::Value> = client
+        .get(format!(
+            "http://{}/api/v1/events?q={}",
+            addr,
+            urlencoding_lite("process.exe_path = \"/usr/bin/curl\"")
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        hunted.len(),
+        3,
+        "OQL query must find every event attributed to curl's process (exec, connect, file create)"
+    );
+    assert!(
+        hunted.iter().all(|e| e["process"]["exe_path"] == "/usr/bin/curl"),
+        "every hunted event must actually be attributed to curl's process"
+    );
+
+    // 2. Process Story: the curl process's own activity (exec + whatever
+    //    else it did — connect and/or file write, per the scenario).
+    let story: serde_json::Value = client
+        .get(format!("http://{}/api/v1/processes/{}/story", addr, curl_process_key.as_hex()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !story["events"].as_array().unwrap().is_empty(),
+        "process_story must include at least the curl process's own exec event"
+    );
+
+    // 3. Entity Graph v2 subgraph: bounded {nodes, edges} from the curl process.
+    let subgraph: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/graph/subgraph?entity={}&depth=5&max_nodes=50",
+            addr,
+            urlencoding_lite(&seed_entity.storage_key())
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!subgraph["nodes"].as_array().unwrap().is_empty());
+
+    // 4. reconstruct_incident buckets the chain by category.
+    let reconstruction: serde_json::Value = client
+        .get(format!(
+            "http://{}/api/v1/incidents/{}/reconstruct",
+            addr,
+            urlencoding_lite(&seed_entity.storage_key())
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!reconstruction["stages"].as_array().unwrap().is_empty());
+
+    // 5. Incident + Evidence lifecycle, over real HTTP.
+    let created_incident: serde_json::Value = client
+        .post(format!("http://{}/api/v1/incidents", addr))
+        .json(&serde_json::json!({ "entities": [seed_entity] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let incident_id = created_incident["incident_id"].as_str().unwrap().to_string();
+    assert_eq!(created_incident["status"], "NEW");
+
+    let created_evidence: serde_json::Value = client
+        .post(format!("http://{}/api/v1/evidence", addr))
+        .json(&serde_json::json!({
+            "source": "EVENT_CAPTURE",
+            "hash": "deadbeef",
+            "immutable_since": 1000,
+            "relationships": [],
+            "supersedes": null,
+            "incident_id": incident_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(created_evidence["evidence_id"].is_string());
+
+    let evidence_list: Vec<serde_json::Value> = client
+        .get(format!("http://{}/api/v1/evidence?incident_id={}", addr, incident_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(evidence_list.len(), 1);
+
+    let patched: serde_json::Value = client
+        .patch(format!("http://{}/api/v1/incidents/{}", addr, incident_id))
+        .json(&serde_json::json!({ "status": "INVESTIGATING", "why": "e2e test triage" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(patched["status"], "INVESTIGATING");
+}
+
 /// Minimal ad-hoc percent-encoding for the one query-string value this test
 /// needs to send (a `/`-containing path) — not a general URL encoder.
 /// `reqwest` does not percent-encode a raw string interpolated into a
