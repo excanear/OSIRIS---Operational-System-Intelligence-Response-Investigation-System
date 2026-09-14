@@ -11,6 +11,7 @@ import { Overview } from "./screens/overview/Overview";
 import { ProcessDetailScreen } from "./screens/processes/ProcessDetailScreen";
 import { ProcessList } from "./screens/processes/ProcessList";
 import { Sensors } from "./screens/sensors/Sensors";
+import { Timeline } from "./screens/timeline/Timeline";
 
 const queryClient = new QueryClient();
 
@@ -28,7 +29,7 @@ export function App() {
               <Route path="/files" element={<ComingSoon label="Filesystem" />} />
               <Route path="/network" element={<ComingSoon label="Network" />} />
               <Route path="/containers" element={<ComingSoon label="Containers" />} />
-              <Route path="/timeline" element={<ComingSoon label="Timeline" />} />
+              <Route path="/timeline" element={<Timeline />} />
               <Route path="/alerts" element={<Alerts />} />
               <Route path="/incidents" element={<IncidentList />} />
               <Route path="/incidents/:incidentId" element={<IncidentDetailScreen />} />
