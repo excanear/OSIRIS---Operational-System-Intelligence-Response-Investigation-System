@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as hooks from "../../api/hooks";
+import { useUiStore } from "../../store/uiStore";
 import { IncidentDetailScreen } from "./IncidentDetailScreen";
 
 vi.mock("../../api/hooks");
@@ -37,6 +38,10 @@ function renderAt(incidentId: string) {
 }
 
 describe("IncidentDetailScreen", () => {
+  beforeEach(() => {
+    useUiStore.setState({ selectedEntity: null }, false);
+  });
+
   it("shows loading states for incident and evidence", () => {
     vi.mocked(hooks.useIncident).mockReturnValue(mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useIncident>);
     vi.mocked(hooks.useEvidence).mockReturnValue(mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useEvidence>);
@@ -126,5 +131,31 @@ describe("IncidentDetailScreen", () => {
         expect.objectContaining({ source: "MANUAL_UPLOAD", hash: "abc123", relationships: [], supersedes: null })
       )
     );
+  });
+
+  it("renders each entity with a pivot link that writes its storage key to uiStore", () => {
+    vi.mocked(hooks.useIncident).mockReturnValue(
+      mockQueryResult({
+        data: {
+          incident_id: "i1",
+          status: "NEW",
+          entities: [{ kind: "IP", addr: "203.0.113.10" }],
+          alert_ids: [],
+          notes: [],
+        },
+      }) as ReturnType<typeof hooks.useIncident>
+    );
+    vi.mocked(hooks.useEvidence).mockReturnValue(mockQueryResult({ data: [] }) as ReturnType<typeof hooks.useEvidence>);
+    vi.mocked(hooks.usePatchIncidentStatus).mockReturnValue(mockMutationResult({}) as unknown as ReturnType<typeof hooks.usePatchIncidentStatus>);
+    vi.mocked(hooks.useCreateEvidence).mockReturnValue(mockMutationResult({}) as unknown as ReturnType<typeof hooks.useCreateEvidence>);
+    renderAt("i1");
+
+    expect(screen.getByText("IP 203.0.113.10")).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: "View in Entity Graph" });
+    expect(link).toHaveAttribute("href", "/graph");
+
+    link.click();
+
+    expect(useUiStore.getState().selectedEntity).toBe("IP:203.0.113.10");
   });
 });

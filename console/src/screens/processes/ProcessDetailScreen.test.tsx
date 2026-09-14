@@ -104,10 +104,21 @@ describe("ProcessDetailScreen", () => {
     );
     const { unmount } = renderAt("abc123");
 
-    expect(useUiStore.getState().selectedEntity).toBe("abc123");
+    expect(useUiStore.getState().selectedEntity).toBe("PROCESS:abc123");
 
     unmount();
 
     expect(useUiStore.getState().selectedEntity).toBeNull();
+  });
+
+  it("renders a link to view the process in Entity Graph", () => {
+    vi.mocked(hooks.useProcess).mockReturnValue(mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useProcess>);
+    vi.mocked(hooks.useProcessStory).mockReturnValue(
+      mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useProcessStory>
+    );
+    renderAt("abc123");
+
+    const link = screen.getByRole("link", { name: "View in Entity Graph" });
+    expect(link).toHaveAttribute("href", "/graph");
   });
 });

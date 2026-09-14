@@ -1,12 +1,14 @@
 import { useState, type FormEvent } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import {
   useCreateEvidence,
   useEvidence,
   useIncident,
   usePatchIncidentStatus,
 } from "../../api/hooks";
+import { describeEntityRef, entityRefToStorageKey } from "../../api/entityKey";
 import type { IncidentStatus } from "../../api/types";
+import { useUiStore } from "../../store/uiStore";
 
 const INCIDENT_STATUSES: IncidentStatus[] = [
   "NEW",
@@ -22,6 +24,7 @@ export function IncidentDetailScreen() {
   const evidence = useEvidence(incidentId);
   const patchStatus = usePatchIncidentStatus(incidentId);
   const createEvidence = useCreateEvidence(incidentId);
+  const selectEntity = useUiStore((state) => state.selectEntity);
 
   const [nextStatus, setNextStatus] = useState<IncidentStatus>("INVESTIGATING");
   const [why, setWhy] = useState("");
@@ -60,7 +63,22 @@ export function IncidentDetailScreen() {
             <dt>Status</dt>
             <dd>{incident.data.status}</dd>
             <dt>Entities</dt>
-            <dd>{incident.data.entities.length}</dd>
+            <dd>
+              {incident.data.entities.length === 0 ? (
+                "0"
+              ) : (
+                <ul>
+                  {incident.data.entities.map((entity, index) => (
+                    <li key={index}>
+                      {describeEntityRef(entity)}{" "}
+                      <Link to="/graph" onClick={() => selectEntity(entityRefToStorageKey(entity))}>
+                        View in Entity Graph
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </dd>
             <dt>Alerts</dt>
             <dd>{incident.data.alert_ids.length}</dd>
           </dl>

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { useProcess, useProcessStory } from "../../api/hooks";
 import { useUiStore } from "../../store/uiStore";
 
@@ -10,13 +10,17 @@ export function ProcessDetailScreen() {
   const selectEntity = useUiStore((state) => state.selectEntity);
 
   useEffect(() => {
-    selectEntity(processKey);
+    // uiStore.selectedEntity must always hold the full
+    // EntityRef::storage_key()-formatted string (KIND:value) — Entity
+    // Graph (§16.3) reads this value directly as its seed entity.
+    selectEntity(`PROCESS:${processKey}`);
     return () => selectEntity(null);
   }, [processKey, selectEntity]);
 
   return (
     <div>
       <h1>Process {processKey}</h1>
+      <Link to="/graph">View in Entity Graph</Link>
       {detail.isLoading && <p>Loading process…</p>}
       {detail.isError && <p role="alert">Failed to load process: {(detail.error as Error).message}</p>}
       {detail.data && (
