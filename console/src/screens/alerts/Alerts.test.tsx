@@ -70,6 +70,16 @@ describe("Alerts", () => {
 
     fireEvent.change(screen.getByLabelText("Filter by rule ID"), { target: { value: "rule_a" } });
 
-    expect(spy).toHaveBeenLastCalledWith({ ruleId: "rule_a" });
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1][0];
+    expect(lastCall).toMatchObject({ ruleId: "rule_a" });
+    expect(typeof lastCall?.since).toBe("number");
+  });
+
+  it("calls useAlerts with a since value to avoid staleness on busy deployments", () => {
+    const spy = vi.mocked(hooks.useAlerts).mockReturnValue(mockQueryResult({ data: [] }));
+    render(<Alerts />);
+
+    expect(spy.mock.calls[0][0]).toHaveProperty("since");
+    expect(typeof spy.mock.calls[0][0]?.since).toBe("number");
   });
 });

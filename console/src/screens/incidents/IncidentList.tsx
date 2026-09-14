@@ -9,10 +9,21 @@ export function IncidentList() {
   const navigate = useNavigate();
   const [rows, setRows] = useState<EntityRefRow[]>([{ kind: "IP", value: "" }]);
   const listRows = incidents.data ?? [];
+  // An incident created with zero entities can never have its status
+  // transitioned afterwards: IncidentStore::transition_status (in
+  // crates/osiris-evidence/src/incident.rs) requires at least one entity
+  // and returns a 500 error on any later PATCH. Compute this once per
+  // render and reuse it for both the button's disabled state and the
+  // submit guard, so a render/submit race can't slip an empty entity list
+  // through.
+  const entities = entityRefRowsToEntityRefs(rows);
+  const hasNoEntities = entities.length === 0;
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    const entities = entityRefRowsToEntityRefs(rows);
+    if (hasNoEntities) {
+      return;
+    }
     const created = await createIncident.mutateAsync(entities);
     navigate(`/incidents/${created.incident_id}`);
   }
@@ -23,7 +34,7 @@ export function IncidentList() {
       <form onSubmit={handleSubmit}>
         <h2>New incident</h2>
         <EntityRefInput rows={rows} onChange={setRows} />
-        <button type="submit" disabled={createIncident.isPending}>
+        <button type="submit" disabled={createIncident.isPending || hasNoEntities}>
           Create incident
         </button>
         {createIncident.isError && (

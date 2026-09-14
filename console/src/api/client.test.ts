@@ -109,10 +109,40 @@ describe("api client", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/incidents");
   });
 
-  it("throws ApiError when the response is not ok", async () => {
+  it("throws ApiError when the response is not ok, including the response body text", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response("boom", { status: 500 }));
 
-    await expect(fetchHealth()).rejects.toThrow(ApiError);
+    let caught: unknown;
+    try {
+      await fetchHealth();
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).message).toMatch(/boom/);
+  });
+
+  it("throws ApiError with the response body text on a POST failure", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response("incident has no associated entities to audit a transition against", {
+        status: 500,
+      })
+    );
+
+    await expect(createIncident([{ kind: "IP", addr: "203.0.113.10" }])).rejects.toThrow(
+      /incident has no associated entities to audit a transition against/
+    );
+  });
+
+  it("throws ApiError with the response body text on a PATCH failure", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response("invalid incident_id: not-a-real-id", { status: 400 })
+    );
+
+    await expect(patchIncidentStatus("not-a-real-id", "INVESTIGATING")).rejects.toThrow(
+      /invalid incident_id: not-a-real-id/
+    );
   });
 
   it("fetchProcesses calls /api/v1/processes", async () => {

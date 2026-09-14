@@ -3,6 +3,14 @@ import { Link } from "react-router-dom";
 import { useProcesses } from "../../api/hooks";
 
 export function ProcessList() {
+  // GET /api/v1/processes takes no query parameters at all: the handler
+  // (processes_handler in crates/osiris-api/src/lib.rs) always derives its
+  // rows from EventQueryPlan::effective_limit()'s 500-event cap, ordered
+  // ASC, so it only ever reflects the *oldest* 500 PROCESS_EXEC events once
+  // a host has produced more than that — this list can go stale forever on
+  // a busy host, with no way for the console to request a recent window.
+  // Fixing this requires adding a since/pagination param to the backend
+  // endpoint, which is out of scope for this phase (no backend changes).
   const processes = useProcesses();
   const [filter, setFilter] = useState("");
 

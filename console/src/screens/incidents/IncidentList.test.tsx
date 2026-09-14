@@ -73,4 +73,17 @@ describe("IncidentList", () => {
 
     await vi.waitFor(() => expect(mutateAsync).toHaveBeenCalledWith([{ kind: "IP", addr: "203.0.113.10" }]));
   });
+
+  it("disables the submit button when all entity rows are blank, enabling once a row has a value", () => {
+    vi.mocked(hooks.useIncidents).mockReturnValue(mockQueryResult({ data: [] }));
+    vi.mocked(hooks.useCreateIncident).mockReturnValue(mockMutationResult({}));
+    renderWithRouter();
+
+    const submitButton = screen.getByText("Create incident");
+    expect(submitButton).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Entity 1 value"), { target: { value: "203.0.113.10" } });
+
+    expect(submitButton).not.toBeDisabled();
+  });
 });

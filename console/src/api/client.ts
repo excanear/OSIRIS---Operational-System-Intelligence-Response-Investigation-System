@@ -24,36 +24,50 @@ export class ApiError extends Error {
   }
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`);
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const url = `${API_BASE}${path}`;
+  // Preserve the exact fetch() call shape each verb used before this helper
+  // existed (a bare `fetch(url)` for GET, an options object with a JSON
+  // body for POST/PATCH) so existing call-site tests keep working unchanged.
+  const response =
+    body !== undefined
+      ? await fetch(url, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        })
+      : method === "GET"
+        ? await fetch(url)
+        : await fetch(url, { method });
   if (!response.ok) {
-    throw new ApiError(response.status, `GET ${path} failed with status ${response.status}`);
+    // Backend-side validation errors (e.g. "incident has no associated
+    // entities to audit a transition against") arrive in the response
+    // body, not the status code — surface them so the UI can show the
+    // analyst *why* a mutation failed instead of a generic status string.
+    let detail = "";
+    try {
+      detail = await response.text();
+    } catch {
+      // ignore: fall back to the status-only message below
+    }
+    const message = detail
+      ? `${method} ${path} failed with status ${response.status}: ${detail}`
+      : `${method} ${path} failed with status ${response.status}`;
+    throw new ApiError(response.status, message);
   }
   return (await response.json()) as T;
 }
 
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new ApiError(response.status, `POST ${path} failed with status ${response.status}`);
-  }
-  return (await response.json()) as T;
+function apiGet<T>(path: string): Promise<T> {
+  return request<T>("GET", path);
 }
 
-async function apiPatch<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new ApiError(response.status, `PATCH ${path} failed with status ${response.status}`);
-  }
-  return (await response.json()) as T;
+function apiPost<T>(path: string, body: unknown): Promise<T> {
+  return request<T>("POST", path, body);
+}
+
+function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  return request<T>("PATCH", path, body);
 }
 
 export function fetchHealth(): Promise<ApiHealth> {

@@ -1,9 +1,17 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useAlerts } from "../../api/hooks";
+
+const ONE_HOUR_NS = 3_600 * 1_000_000_000;
 
 export function Alerts() {
   const [ruleId, setRuleId] = useState("");
-  const alerts = useAlerts({ ruleId: ruleId || undefined });
+  // GET /alerts defaults to ORDER BY timestamp ASC with a 100-row cap
+  // (AlertQueryPlan::new()'s default limit in osiris-storage), so an
+  // unbounded query only ever returns the *oldest* 100 alerts once a
+  // deployment has accumulated more than that — this screen would freeze on
+  // stale data forever. Bound the query to a recent window instead.
+  const since = useMemo(() => Date.now() * 1_000_000 - ONE_HOUR_NS, []);
+  const alerts = useAlerts({ ruleId: ruleId || undefined, since });
   const rows = alerts.data ?? [];
 
   return (
