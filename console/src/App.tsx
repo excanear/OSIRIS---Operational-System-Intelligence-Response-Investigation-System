@@ -5,6 +5,7 @@ import { Shell } from "./app/Shell";
 import { Alerts } from "./screens/alerts/Alerts";
 import { ComingSoon } from "./screens/ComingSoon";
 import { EntityGraph } from "./screens/graph/EntityGraph";
+import { EvidenceList } from "./screens/evidence/EvidenceList";
 import { IncidentDetailScreen } from "./screens/incidents/IncidentDetailScreen";
 import { IncidentList } from "./screens/incidents/IncidentList";
 import { Overview } from "./screens/overview/Overview";
@@ -36,7 +37,7 @@ export function App() {
               <Route path="/incidents/:incidentId" element={<IncidentDetailScreen />} />
               <Route path="/hunting" element={<ThreatHunting />} />
               <Route path="/graph" element={<EntityGraph />} />
-              <Route path="/evidence" element={<ComingSoon label="Evidence" />} />
+              <Route path="/evidence" element={<EvidenceList />} />
               <Route path="/sensors" element={<Sensors />} />
             </Route>
           </Routes>

@@ -16,6 +16,6 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Incidents", path: "/incidents", enabled: true },
   { label: "Threat Hunting", path: "/hunting", enabled: true },
   { label: "Entity Graph", path: "/graph", enabled: true },
-  { label: "Evidence", path: "/evidence", enabled: false },
+  { label: "Evidence", path: "/evidence", enabled: true },
   { label: "Sensors", path: "/sensors", enabled: true },
 ];
