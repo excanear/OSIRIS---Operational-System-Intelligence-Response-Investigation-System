@@ -13,6 +13,7 @@ import {
   fetchProcesses,
   fetchProcessStory,
   fetchSubgraph,
+  fetchSystemStory,
   patchIncidentStatus,
 } from "./client";
 
@@ -290,5 +291,21 @@ describe("api client", () => {
     await fetchSubgraph("IP:203.0.113.10");
 
     expect(fetch).toHaveBeenCalledWith("/api/v1/graph/subgraph?entity=IP%3A203.0.113.10");
+  });
+
+  it("fetchSystemStory calls /api/v1/system/story with host_id and optional since/until", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
+
+    await fetchSystemStory("host-1", { since: 1000, until: 2000 });
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/system/story?host_id=host-1&since=1000&until=2000");
+  });
+
+  it("fetchSystemStory with no optional params only sends host_id", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
+
+    await fetchSystemStory("host-1");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/system/story?host_id=host-1");
   });
 });

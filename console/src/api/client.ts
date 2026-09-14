@@ -165,3 +165,15 @@ export function fetchSubgraph(
   }
   return apiGet<Subgraph>(`/graph/subgraph?${search.toString()}`);
 }
+
+export function fetchSystemStory(hostId: string, params: { since?: number; until?: number } = {}): Promise<Story> {
+  const search = new URLSearchParams();
+  search.set("host_id", hostId);
+  if (params.since !== undefined) {
+    search.set("since", String(params.since));
+  }
+  if (params.until !== undefined) {
+    search.set("until", String(params.until));
+  }
+  return apiGet<Story>(`/system/story?${search.toString()}`);
+}

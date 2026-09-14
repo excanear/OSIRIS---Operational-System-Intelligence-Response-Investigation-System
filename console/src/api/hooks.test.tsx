@@ -17,6 +17,7 @@ import {
   useProcesses,
   useProcessStory,
   useSubgraph,
+  useSystemStory,
 } from "./hooks";
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -216,6 +217,24 @@ describe("api hooks", () => {
     const spy = vi.spyOn(client, "fetchSubgraph").mockResolvedValue({ nodes: [], edges: [], truncated: false });
 
     const { result } = renderHook(() => useSubgraph(""), { wrapper });
+
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("useSystemStory forwards hostId and params to fetchSystemStory", async () => {
+    const spy = vi.spyOn(client, "fetchSystemStory").mockResolvedValue({ events: [], alerts: [] });
+
+    const { result } = renderHook(() => useSystemStory("host-1", { since: 1000 }), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("host-1", { since: 1000 });
+  });
+
+  it("useSystemStory does not fire when hostId is an empty string", () => {
+    const spy = vi.spyOn(client, "fetchSystemStory").mockResolvedValue({ events: [], alerts: [] });
+
+    const { result } = renderHook(() => useSystemStory(""), { wrapper });
 
     expect(result.current.fetchStatus).toBe("idle");
     expect(spy).not.toHaveBeenCalled();

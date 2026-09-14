@@ -35,6 +35,7 @@ export interface CanonicalEvent {
   };
   process?: ProcessRef | null;
   parent_process?: ProcessRef | null;
+  category?: string;
   event_data: unknown;
 }
 

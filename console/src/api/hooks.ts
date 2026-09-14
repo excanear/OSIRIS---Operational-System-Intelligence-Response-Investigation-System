@@ -12,6 +12,7 @@ import {
   fetchProcesses,
   fetchProcessStory,
   fetchSubgraph,
+  fetchSystemStory,
   patchIncidentStatus,
 } from "./client";
 import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
@@ -129,5 +130,13 @@ export function useSubgraph(
     ],
     queryFn: () => fetchSubgraph(entity, params),
     enabled: entity.length > 0,
+  });
+}
+
+export function useSystemStory(hostId: string, params: { since?: number; until?: number } = {}) {
+  return useQuery({
+    queryKey: ["system-story", hostId, params.since ?? "all-time", params.until ?? "all-time"],
+    queryFn: () => fetchSystemStory(hostId, params),
+    enabled: hostId.length > 0,
   });
 }
