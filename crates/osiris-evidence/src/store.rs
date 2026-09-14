@@ -14,12 +14,24 @@ pub enum EvidenceStoreError {
     Serialize(String),
 }
 
+/// Matches `osiris_query::MAX_EVENT_LIMIT`'s value — evidence volume
+/// tracks event volume, so the same cap is a reasonable default.
+pub const MAX_EVIDENCE_LIMIT: usize = 5_000;
+
 /// No `update`/`delete` method exists on this trait anywhere in this
 /// crate — append-only is enforced by the trait's shape, not by
 /// convention (plan Global Constraint #7).
 pub trait EvidenceStore: Send + Sync {
     fn insert(&self, evidence: Evidence) -> Result<Evidence, EvidenceStoreError>;
     fn get(&self, evidence_id: Uuid) -> Result<Option<Evidence>, EvidenceStoreError>;
+    /// Every evidence record, newest first (`Evidence::timestamp()`
+    /// descending), bounded by `MAX_EVIDENCE_LIMIT`. There is no
+    /// `raw_json`-adjacent `timestamp` column in the schema (the table
+    /// has only `evidence_id`/`raw_json`), so sorting happens in Rust
+    /// after deserializing every row rather than via `ORDER BY` — an
+    /// acceptable cost at this cap, and avoids a schema migration for a
+    /// column that would otherwise duplicate data already in `raw_json`.
+    fn list(&self) -> Result<Vec<Evidence>, EvidenceStoreError>;
 }
 
 /// Evidence's own SQLite file, independent of `osiris-storage`
@@ -78,6 +90,30 @@ impl EvidenceStore for SqliteEvidenceStore {
             None => Ok(None),
         }
     }
+
+    fn list(&self) -> Result<Vec<Evidence>, EvidenceStoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EvidenceStoreError::Backend("poisoned lock".to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT raw_json FROM evidence")
+            .map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
+
+        let mut all = Vec::new();
+        for row in rows {
+            let raw_json = row.map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
+            let evidence: Evidence =
+                serde_json::from_str(&raw_json).map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
+            all.push(evidence);
+        }
+        all.sort_by_key(|e| std::cmp::Reverse(e.timestamp()));
+        all.truncate(MAX_EVIDENCE_LIMIT);
+        Ok(all)
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +161,42 @@ mod tests {
         store.insert(evidence.clone()).unwrap();
         let err = store.insert(evidence).unwrap_err();
         assert!(matches!(err, EvidenceStoreError::Backend(_)));
+    }
+
+    #[test]
+    fn list_returns_all_evidence_ordered_by_timestamp_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap();
+        let older = Evidence::new(
+            EvidenceSource::EventCapture,
+            1000,
+            Integrity { hash: "a".to_string(), immutable_since: 1000 },
+            vec![],
+            None,
+        )
+        .unwrap();
+        let newer = Evidence::new(
+            EvidenceSource::EventCapture,
+            2000,
+            Integrity { hash: "b".to_string(), immutable_since: 2000 },
+            vec![],
+            None,
+        )
+        .unwrap();
+        store.insert(older.clone()).unwrap();
+        store.insert(newer.clone()).unwrap();
+
+        let listed = store.list().unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].evidence_id(), newer.evidence_id());
+        assert_eq!(listed[1].evidence_id(), older.evidence_id());
+    }
+
+    #[test]
+    fn list_returns_empty_vec_when_no_evidence_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 }
