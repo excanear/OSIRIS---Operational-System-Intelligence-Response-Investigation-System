@@ -4,6 +4,7 @@ import { ErrorBoundary } from "./app/ErrorBoundary";
 import { Shell } from "./app/Shell";
 import { Alerts } from "./screens/alerts/Alerts";
 import { ComingSoon } from "./screens/ComingSoon";
+import { EntityGraph } from "./screens/graph/EntityGraph";
 import { IncidentDetailScreen } from "./screens/incidents/IncidentDetailScreen";
 import { IncidentList } from "./screens/incidents/IncidentList";
 import { Overview } from "./screens/overview/Overview";
@@ -32,7 +33,7 @@ export function App() {
               <Route path="/incidents" element={<IncidentList />} />
               <Route path="/incidents/:incidentId" element={<IncidentDetailScreen />} />
               <Route path="/hunting" element={<ComingSoon label="Threat Hunting" />} />
-              <Route path="/graph" element={<ComingSoon label="Entity Graph" />} />
+              <Route path="/graph" element={<EntityGraph />} />
               <Route path="/evidence" element={<ComingSoon label="Evidence" />} />
               <Route path="/sensors" element={<Sensors />} />
             </Route>
