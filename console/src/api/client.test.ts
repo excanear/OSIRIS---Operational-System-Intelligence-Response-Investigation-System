@@ -12,6 +12,7 @@ import {
   fetchProcess,
   fetchProcesses,
   fetchProcessStory,
+  fetchSubgraph,
   patchIncidentStatus,
 } from "./client";
 
@@ -267,5 +268,27 @@ describe("api client", () => {
     const incidents = await fetchIncidents();
 
     expect(incidents).toEqual([incident]);
+  });
+
+  it("fetchSubgraph calls /api/v1/graph/subgraph with the entity and optional params", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ nodes: [], edges: [], truncated: false }), { status: 200 })
+    );
+
+    await fetchSubgraph("IP:203.0.113.10", { depth: 3, maxNodes: 100, since: 1000, until: 2000 });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/graph/subgraph?entity=IP%3A203.0.113.10&depth=3&max_nodes=100&since=1000&until=2000"
+    );
+  });
+
+  it("fetchSubgraph with no optional params only sends entity", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ nodes: [], edges: [], truncated: false }), { status: 200 })
+    );
+
+    await fetchSubgraph("IP:203.0.113.10");
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/graph/subgraph?entity=IP%3A203.0.113.10");
   });
 });

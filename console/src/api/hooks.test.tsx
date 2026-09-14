@@ -16,6 +16,7 @@ import {
   useProcess,
   useProcesses,
   useProcessStory,
+  useSubgraph,
 } from "./hooks";
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -200,5 +201,23 @@ describe("api hooks", () => {
       supersedes: null,
       incident_id: "i1",
     });
+  });
+
+  it("useSubgraph forwards the entity and params to fetchSubgraph", async () => {
+    const spy = vi.spyOn(client, "fetchSubgraph").mockResolvedValue({ nodes: [], edges: [], truncated: false });
+
+    const { result } = renderHook(() => useSubgraph("IP:203.0.113.10", { depth: 2 }), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith("IP:203.0.113.10", { depth: 2 });
+  });
+
+  it("useSubgraph does not fire when the entity is an empty string", () => {
+    const spy = vi.spyOn(client, "fetchSubgraph").mockResolvedValue({ nodes: [], edges: [], truncated: false });
+
+    const { result } = renderHook(() => useSubgraph(""), { wrapper });
+
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(spy).not.toHaveBeenCalled();
   });
 });

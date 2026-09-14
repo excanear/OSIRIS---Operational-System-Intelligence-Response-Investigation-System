@@ -11,6 +11,7 @@ import {
   fetchProcess,
   fetchProcesses,
   fetchProcessStory,
+  fetchSubgraph,
   patchIncidentStatus,
 } from "./client";
 import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
@@ -110,5 +111,23 @@ export function useCreateEvidence(incidentId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["evidence", incidentId] });
     },
+  });
+}
+
+export function useSubgraph(
+  entity: string,
+  params: { depth?: number; maxNodes?: number; since?: number; until?: number } = {}
+) {
+  return useQuery({
+    queryKey: [
+      "subgraph",
+      entity,
+      params.depth ?? "default",
+      params.maxNodes ?? "default",
+      params.since ?? "all-time",
+      params.until ?? "all-time",
+    ],
+    queryFn: () => fetchSubgraph(entity, params),
+    enabled: entity.length > 0,
   });
 }

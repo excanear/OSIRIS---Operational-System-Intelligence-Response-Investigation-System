@@ -10,6 +10,7 @@ import type {
   ProcessDetail,
   ProcessSummary,
   Story,
+  Subgraph,
 } from "./types";
 
 const API_BASE = "/api/v1";
@@ -142,4 +143,25 @@ export function fetchEvidence(incidentId: string): Promise<Evidence[]> {
 
 export function createEvidence(body: CreateEvidenceBody): Promise<Evidence> {
   return apiPost<Evidence>("/evidence", body);
+}
+
+export function fetchSubgraph(
+  entity: string,
+  params: { depth?: number; maxNodes?: number; since?: number; until?: number } = {}
+): Promise<Subgraph> {
+  const search = new URLSearchParams();
+  search.set("entity", entity);
+  if (params.depth !== undefined) {
+    search.set("depth", String(params.depth));
+  }
+  if (params.maxNodes !== undefined) {
+    search.set("max_nodes", String(params.maxNodes));
+  }
+  if (params.since !== undefined) {
+    search.set("since", String(params.since));
+  }
+  if (params.until !== undefined) {
+    search.set("until", String(params.until));
+  }
+  return apiGet<Subgraph>(`/graph/subgraph?${search.toString()}`);
 }

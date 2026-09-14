@@ -114,3 +114,36 @@ export interface CreateEvidenceBody {
   supersedes?: string | null;
   incident_id?: string | null;
 }
+
+export type EntityKind = "PROCESS" | "FILE" | "IP" | "DOMAIN" | "USER" | "CONTAINER" | "SESSION";
+
+export type Relation =
+  | "SPAWNED"
+  | "EXECUTED_AS"
+  | "WROTE"
+  | "READ"
+  | "CONNECTED_TO"
+  | "RESOLVED_TO"
+  | "BELONGS_TO_CONTAINER"
+  | "BELONGS_TO_POD"
+  | "RUNS_IN_CGROUP"
+  | "TRIGGERED_BY_SESSION";
+
+export interface GraphNode {
+  id: string;
+  kind: EntityKind;
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  relation: Relation;
+  event_id: string;
+  timestamp: number;
+}
+
+export interface Subgraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  truncated: boolean;
+}
