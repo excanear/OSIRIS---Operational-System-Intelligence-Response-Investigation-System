@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as client from "./client";
 import {
   useAlerts,
+  useAllEvidence,
   useCreateEvidence,
   useCreateIncident,
   useEvents,
@@ -265,5 +266,25 @@ describe("api hooks", () => {
 
     expect(result.current.fetchStatus).toBe("idle");
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("useAllEvidence resolves with fetchAllEvidence's result", async () => {
+    const row = {
+      evidence: {
+        evidence_id: "e1",
+        source: "MANUAL_UPLOAD" as const,
+        timestamp: 1000,
+        integrity: { hash: "abc", immutable_since: 1000 },
+        relationships: [],
+        supersedes: null,
+      },
+      incident_ids: ["i1"],
+    };
+    vi.spyOn(client, "fetchAllEvidence").mockResolvedValue([row]);
+
+    const { result } = renderHook(() => useAllEvidence(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([row]);
   });
 });

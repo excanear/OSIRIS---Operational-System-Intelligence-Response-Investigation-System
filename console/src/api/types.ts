@@ -148,3 +148,8 @@ export interface Subgraph {
   edges: GraphEdge[];
   truncated: boolean;
 }
+
+export interface EvidenceWithIncidents {
+  evidence: Evidence;
+  incident_ids: string[];
+}

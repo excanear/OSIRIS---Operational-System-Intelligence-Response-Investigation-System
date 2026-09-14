@@ -5,6 +5,7 @@ import type {
   CreateEvidenceBody,
   EntityRef,
   Evidence,
+  EvidenceWithIncidents,
   Incident,
   IncidentStatus,
   ProcessDetail,
@@ -185,4 +186,8 @@ export function fetchSystemStory(hostId: string, params: { since?: number; until
     search.set("until", String(params.until));
   }
   return apiGet<Story>(`/system/story?${search.toString()}`);
+}
+
+export function fetchAllEvidence(): Promise<EvidenceWithIncidents[]> {
+  return apiGet<EvidenceWithIncidents[]>("/evidence");
 }

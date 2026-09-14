@@ -3,6 +3,7 @@ import {
   createEvidence,
   createIncident,
   fetchAlerts,
+  fetchAllEvidence,
   fetchEvents,
   fetchEvidence,
   fetchHealth,
@@ -149,5 +150,12 @@ export function useSystemStory(hostId: string, params: { since?: number; until?:
     queryKey: ["system-story", hostId, params.since ?? "all-time", params.until ?? "all-time"],
     queryFn: () => fetchSystemStory(hostId, params),
     enabled: hostId.length > 0,
+  });
+}
+
+export function useAllEvidence() {
+  return useQuery({
+    queryKey: ["evidence", "all"],
+    queryFn: fetchAllEvidence,
   });
 }

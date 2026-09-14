@@ -4,6 +4,7 @@ import {
   createEvidence,
   createIncident,
   fetchAlerts,
+  fetchAllEvidence,
   fetchEvents,
   fetchEvidence,
   fetchHealth,
@@ -317,5 +318,32 @@ describe("api client", () => {
     await fetchSystemStory("host-1");
 
     expect(fetch).toHaveBeenCalledWith("/api/v1/system/story?host_id=host-1");
+  });
+
+  it("fetchAllEvidence calls /api/v1/evidence with no query params", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchAllEvidence();
+
+    expect(fetch).toHaveBeenCalledWith("/api/v1/evidence");
+  });
+
+  it("fetchAllEvidence parses the {evidence, incident_ids} wire shape", async () => {
+    const row = {
+      evidence: {
+        evidence_id: "e1",
+        source: "MANUAL_UPLOAD",
+        timestamp: 1000,
+        integrity: { hash: "abc", immutable_since: 1000 },
+        relationships: [],
+        supersedes: null,
+      },
+      incident_ids: ["i1"],
+    };
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([row]), { status: 200 }));
+
+    const result = await fetchAllEvidence();
+
+    expect(result).toEqual([row]);
   });
 });
