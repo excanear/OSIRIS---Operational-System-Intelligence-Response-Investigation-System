@@ -20,7 +20,9 @@ export function ProcessDetailScreen() {
   return (
     <div>
       <h1>Process {processKey}</h1>
-      <Link to="/graph">View in Entity Graph</Link>
+      <Link to="/graph" onClick={() => selectEntity(`PROCESS:${processKey}`)}>
+        View in Entity Graph
+      </Link>
       {detail.isLoading && <p>Loading process…</p>}
       {detail.isError && <p role="alert">Failed to load process: {(detail.error as Error).message}</p>}
       {detail.data && (

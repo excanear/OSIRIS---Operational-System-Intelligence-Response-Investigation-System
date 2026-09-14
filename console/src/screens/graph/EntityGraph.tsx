@@ -1,8 +1,15 @@
-import { useEffect, useState, type FormEvent } from "react";
-import ForceGraph2D from "react-force-graph-2d";
+import { useEffect, useState, type ComponentProps, type FormEvent } from "react";
+import ForceGraph2D, { type NodeObject } from "react-force-graph-2d";
 import { useSubgraph } from "../../api/hooks";
 import { isValidEntityKey } from "../../api/entityKey";
 import { useUiStore } from "../../store/uiStore";
+
+// react-force-graph-2d's own .d.ts types a function nodeLabel's return as
+// React.ReactHTMLElement<HTMLElement> (a React element), but its runtime
+// (the float-tooltip dependency) actually expects and appends a real DOM
+// HTMLElement directly — the .d.ts is inaccurate here, so the cast below via
+// `unknown` is required to satisfy tsc while returning an actual HTMLElement.
+type NodeLabelProp = ComponentProps<typeof ForceGraph2D>["nodeLabel"];
 
 export function EntityGraph() {
   const selectedEntity = useUiStore((state) => state.selectedEntity);
@@ -63,7 +70,25 @@ export function EntityGraph() {
       )}
       {activeEntity && subgraph.data && (
         <div style={{ height: 600 }}>
-          <ForceGraph2D graphData={graphData} nodeId="id" nodeLabel="id" nodeAutoColorBy="kind" />
+          <ForceGraph2D
+            graphData={graphData}
+            nodeId="id"
+            nodeLabel={
+              // Build a plain-text tooltip element instead of returning a raw
+              // string: react-force-graph-2d's float-tooltip dependency
+              // .html()'s a string nodeLabel (innerHTML), and node.id here is
+              // a telemetry-derived EntityRef::storage_key() that a
+              // compromised monitored host could poison with markup — a
+              // stored-XSS vector. An HTMLElement return is appended via safe
+              // DOM APIs instead.
+              ((node: NodeObject) => {
+                const el = document.createElement("div");
+                el.textContent = String(node.id);
+                return el;
+              }) as unknown as NodeLabelProp
+            }
+            nodeAutoColorBy="kind"
+          />
         </div>
       )}
     </div>

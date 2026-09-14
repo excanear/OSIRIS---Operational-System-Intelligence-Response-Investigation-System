@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useEvents, useSystemStory } from "../../api/hooks";
+import { parseOptionalNumber } from "../../api/numeric";
 import { rollupSensorHealth } from "../sensors/rollup";
 
 const ONE_HOUR_NS = 3_600 * 1_000_000_000;
@@ -19,8 +20,8 @@ export function Timeline() {
     return Array.from(new Set(rows.map((row) => row.hostId))).sort();
   }, [healthEvents.data]);
 
-  const parsedSince = since ? Number(since) : undefined;
-  const parsedUntil = until ? Number(until) : undefined;
+  const parsedSince = parseOptionalNumber(since);
+  const parsedUntil = parseOptionalNumber(until);
   const story = useSystemStory(hostId, { since: parsedSince, until: parsedUntil });
 
   function setLastHour() {

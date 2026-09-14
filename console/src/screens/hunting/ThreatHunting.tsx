@@ -1,5 +1,6 @@
 import { useState, type ChangeEvent, type FormEvent } from "react";
 import { useEvents } from "../../api/hooks";
+import { parseOptionalNumber } from "../../api/numeric";
 import { HUNT_TEMPLATES } from "./templates";
 
 export function ThreatHunting() {
@@ -11,9 +12,9 @@ export function ThreatHunting() {
 
   const results = useEvents(undefined, {
     q: ranQuery || undefined,
-    since: since ? Number(since) : undefined,
-    until: until ? Number(until) : undefined,
-    limit: limit ? Number(limit) : undefined,
+    since: parseOptionalNumber(since),
+    until: parseOptionalNumber(until),
+    limit: parseOptionalNumber(limit),
     enabled: ranQuery.length > 0,
   });
 

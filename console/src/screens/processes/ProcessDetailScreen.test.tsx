@@ -121,4 +121,18 @@ describe("ProcessDetailScreen", () => {
     const link = screen.getByRole("link", { name: "View in Entity Graph" });
     expect(link).toHaveAttribute("href", "/graph");
   });
+
+  it("explicitly writes the processKey to uiStore.selectedEntity when the pivot link is clicked", () => {
+    vi.mocked(hooks.useProcess).mockReturnValue(mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useProcess>);
+    vi.mocked(hooks.useProcessStory).mockReturnValue(
+      mockQueryResult({ isLoading: true }) as ReturnType<typeof hooks.useProcessStory>
+    );
+    renderAt("abc123");
+
+    const link = screen.getByRole("link", { name: "View in Entity Graph" });
+
+    link.click();
+
+    expect(useUiStore.getState().selectedEntity).toBe("PROCESS:abc123");
+  });
 });

@@ -5,10 +5,16 @@ import { useUiStore } from "../../store/uiStore";
 import { EntityGraph } from "./EntityGraph";
 
 vi.mock("../../api/hooks");
+
+let lastNodeLabel: unknown;
+
 vi.mock("react-force-graph-2d", () => ({
-  default: (props: { graphData: { nodes: unknown[]; links: unknown[] } }) => (
-    <div data-testid="force-graph" data-node-count={props.graphData.nodes.length} data-link-count={props.graphData.links.length} />
-  ),
+  default: (props: { graphData: { nodes: unknown[]; links: unknown[] }; nodeLabel?: unknown }) => {
+    lastNodeLabel = props.nodeLabel;
+    return (
+      <div data-testid="force-graph" data-node-count={props.graphData.nodes.length} data-link-count={props.graphData.links.length} />
+    );
+  },
 }));
 
 function mockQueryResult(overrides: Record<string, unknown>) {
@@ -98,5 +104,27 @@ describe("EntityGraph", () => {
     const graph = screen.getByTestId("force-graph");
     expect(graph).toHaveAttribute("data-node-count", "2");
     expect(graph).toHaveAttribute("data-link-count", "1");
+  });
+
+  it("passes a nodeLabel function that builds a plain-text tooltip element instead of a raw string", () => {
+    vi.mocked(hooks.useSubgraph).mockReturnValue(
+      mockQueryResult({
+        data: {
+          nodes: [{ id: "IP:203.0.113.10", kind: "IP" }],
+          edges: [],
+          truncated: false,
+        },
+      })
+    );
+    useUiStore.setState({ selectedEntity: "IP:203.0.113.10" }, false);
+    render(<EntityGraph />);
+
+    expect(typeof lastNodeLabel).toBe("function");
+    const nodeLabelFn = lastNodeLabel as (node: { id?: string | number }) => unknown;
+    const result = nodeLabelFn({ id: "IP:203.0.113.10" });
+
+    expect(typeof result).not.toBe("string");
+    expect(result).toBeInstanceOf(HTMLElement);
+    expect((result as HTMLElement).textContent).toBe("IP:203.0.113.10");
   });
 });
