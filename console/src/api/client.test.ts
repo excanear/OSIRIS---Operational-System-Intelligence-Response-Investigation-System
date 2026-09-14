@@ -71,6 +71,16 @@ describe("api client", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/events?event_type=SENSOR_HEALTH&since=1000");
   });
 
+  it("fetchEvents with q, until, and limit adds all three query params", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    await fetchEvents({ q: 'event_type = "FILE_WRITE"', until: 2000, limit: 50 });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/events?q=event_type+%3D+%22FILE_WRITE%22&until=2000&limit=50'
+    );
+  });
+
   it("fetchAlerts calls /api/v1/alerts", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
 

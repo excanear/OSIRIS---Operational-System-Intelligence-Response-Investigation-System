@@ -76,18 +76,27 @@ export function fetchHealth(): Promise<ApiHealth> {
 }
 
 export function fetchEvents(
-  params: { eventType?: string; since?: number } = {}
+  params: { eventType?: string; since?: number; until?: number; limit?: number; q?: string } = {}
 ): Promise<CanonicalEvent[]> {
   const search = new URLSearchParams();
   if (params.eventType) {
     search.set("event_type", params.eventType);
   }
   if (params.since !== undefined) {
-    // `since` mirrors CanonicalEvent.timestamp (nanoseconds since the Unix
-    // epoch, per crates/osiris-schema/src/envelope.rs and every sensor's
-    // `SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`), not
-    // seconds or milliseconds.
+    // `since`/`until` mirror CanonicalEvent.timestamp (nanoseconds since
+    // the Unix epoch, per crates/osiris-schema/src/envelope.rs and every
+    // sensor's `SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`),
+    // not seconds or milliseconds.
     search.set("since", String(params.since));
+  }
+  if (params.q) {
+    search.set("q", params.q);
+  }
+  if (params.until !== undefined) {
+    search.set("until", String(params.until));
+  }
+  if (params.limit !== undefined) {
+    search.set("limit", String(params.limit));
   }
   const queryString = search.toString();
   return apiGet<CanonicalEvent[]>(`/events${queryString ? `?${queryString}` : ""}`);

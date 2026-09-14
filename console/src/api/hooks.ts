@@ -24,11 +24,22 @@ export function useHealth() {
   });
 }
 
-export function useEvents(eventType?: string, options: { since?: number } = {}) {
-  const { since } = options;
+export function useEvents(
+  eventType?: string,
+  options: { since?: number; until?: number; limit?: number; q?: string; enabled?: boolean } = {}
+) {
+  const { since, until, limit, q, enabled } = options;
   return useQuery({
-    queryKey: ["events", eventType ?? "all", since ?? "all-time"],
-    queryFn: () => fetchEvents({ eventType, since }),
+    queryKey: [
+      "events",
+      eventType ?? "all",
+      since ?? "all-time",
+      until ?? "all-time",
+      limit ?? "default",
+      q ?? "none",
+    ],
+    queryFn: () => fetchEvents({ eventType, since, until, limit, q }),
+    enabled: enabled ?? true,
   });
 }
 

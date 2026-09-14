@@ -61,6 +61,33 @@ describe("api hooks", () => {
     expect(spy).toHaveBeenCalledWith({ eventType: "SENSOR_HEALTH", since: 1_700_000_000 });
   });
 
+  it("useEvents forwards q, until, limit, and enabled to fetchEvents/useQuery", async () => {
+    const spy = vi.spyOn(client, "fetchEvents").mockResolvedValue([]);
+
+    const { result } = renderHook(
+      () => useEvents(undefined, { q: 'event_type = "FILE_WRITE"', until: 2000, limit: 50, enabled: true }),
+      { wrapper }
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).toHaveBeenCalledWith({
+      eventType: undefined,
+      since: undefined,
+      until: 2000,
+      limit: 50,
+      q: 'event_type = "FILE_WRITE"',
+    });
+  });
+
+  it("useEvents does not fire when enabled is explicitly false", () => {
+    const spy = vi.spyOn(client, "fetchEvents").mockResolvedValue([]);
+
+    const { result } = renderHook(() => useEvents(undefined, { enabled: false }), { wrapper });
+
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
   it("useAlerts resolves with fetchAlerts's result", async () => {
     const alert = {
       alert_id: "a1",
