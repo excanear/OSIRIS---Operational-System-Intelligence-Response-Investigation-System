@@ -88,6 +88,7 @@ pub async fn run_ingestion_loop(
     baseline_engine: Arc<BaselineEngine>,
     risk_engine: Arc<RiskEngine>,
     correlation_engine: Arc<CorrelationEngine>,
+    broadcaster: Arc<osiris_api::LiveEventBroadcaster>,
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
@@ -109,6 +110,7 @@ pub async fn run_ingestion_loop(
                     let risk_engine = risk_engine.clone();
                     let correlation_engine = correlation_engine.clone();
                     let event_count = events.len();
+                    let events_for_broadcast = events.clone();
                     match tokio::task::spawn_blocking(move || {
                         Ok::<_, osiris_storage::StorageError>({
                             let report = storage.batch_write(&events)?;
@@ -146,7 +148,7 @@ pub async fn run_ingestion_loop(
                     })
                     .await
                     {
-                        Ok(Ok(_report)) => {}
+                        Ok(Ok(_report)) => broadcaster.publish(&events_for_broadcast),
                         Ok(Err(storage_err)) => {
                             tracing::error!(
                                 error = %storage_err,
@@ -264,6 +266,7 @@ mod tests {
             baseline_engine,
             risk_engine,
             correlation_engine,
+            Arc::new(osiris_api::LiveEventBroadcaster::new()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -280,6 +283,48 @@ mod tests {
 
         let results = storage.query(&QueryPlan::new()).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingested_events_are_published_to_the_broadcaster() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        std::fs::write(&spool_path, "").unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let cancellation = CancellationToken::new();
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let broadcaster = Arc::new(osiris_api::LiveEventBroadcaster::new());
+        let (_id, mut receiver, _dropped) = broadcaster.subscribe(None);
+
+        let handle = tokio::spawn(run_ingestion_loop(
+            spool_path.clone(),
+            storage.clone(),
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster.clone(),
+            Duration::from_millis(20),
+            cancellation.clone(),
+        ));
+
+        let event = sample_event();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.event_id, event.event_id);
+
+        cancellation.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -300,6 +345,7 @@ mod tests {
             baseline_engine,
             risk_engine,
             correlation_engine,
+            Arc::new(osiris_api::LiveEventBroadcaster::new()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -425,6 +471,7 @@ match:
             baseline_engine,
             risk_engine,
             correlation_engine,
+            Arc::new(osiris_api::LiveEventBroadcaster::new()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -555,6 +602,7 @@ sequence:
             baseline_engine,
             risk_engine,
             correlation_engine,
+            Arc::new(osiris_api::LiveEventBroadcaster::new()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));

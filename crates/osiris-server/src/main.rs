@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_api::build_router;
-use osiris_api::{build_incident_evidence_router, IncidentEvidenceState};
+use osiris_api::{build_incident_evidence_router, build_stream_router, IncidentEvidenceState, LiveEventBroadcaster};
 use osiris_audit::FileAuditLog;
 use osiris_baseline::BaselineEngine;
 use osiris_correlate::CorrelationEngine;
@@ -109,6 +109,8 @@ async fn main() {
         CORRELATION_WINDOW_NS,
     ));
 
+    let live_event_broadcaster = Arc::new(LiveEventBroadcaster::new());
+
     let cancellation = CancellationToken::new();
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
@@ -119,6 +121,7 @@ async fn main() {
         baseline_engine,
         risk_engine,
         correlation_engine,
+        live_event_broadcaster.clone(),
         Duration::from_millis(200),
         cancellation.clone(),
     ));
@@ -192,7 +195,9 @@ async fn main() {
     };
 
     let app = osiris_server::apply_dev_cors(
-        build_router(storage).merge(build_incident_evidence_router(incident_evidence_state)),
+        build_router(storage)
+            .merge(build_incident_evidence_router(incident_evidence_state))
+            .merge(build_stream_router(live_event_broadcaster)),
         config.dev_cors,
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
