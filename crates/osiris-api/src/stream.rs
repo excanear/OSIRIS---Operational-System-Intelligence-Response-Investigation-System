@@ -1,8 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use osiris_query::{eval_ast, Ast};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::routing::get;
+use axum::Router;
+use osiris_query::{eval_ast, Ast, EventQueryPlan, Op, Value};
 use osiris_schema::CanonicalEvent;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -90,6 +97,70 @@ impl LiveEventBroadcaster {
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    pub host_id: Option<String>,
+    pub q: Option<String>,
+}
+
+pub fn build_stream_router(broadcaster: Arc<LiveEventBroadcaster>) -> Router {
+    Router::new()
+        .route("/api/v1/stream/events", get(stream_events_handler))
+        .with_state(broadcaster)
+}
+
+async fn stream_events_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<StreamQuery>,
+    State(broadcaster): State<Arc<LiveEventBroadcaster>>,
+) -> Result<Response, (StatusCode, String)> {
+    if params.host_id.is_some() && params.q.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "host_id and q are mutually exclusive".to_string(),
+        ));
+    }
+
+    let filter = if let Some(host_id) = params.host_id {
+        Some(Ast::Compare {
+            field: "host_id".to_string(),
+            op: Op::Eq,
+            value: Value::Str(host_id),
+        })
+    } else if let Some(q) = params.q {
+        let plan = EventQueryPlan::with_filter(&q)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        plan.filter
+    } else {
+        None
+    };
+
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter)))
+}
+
+async fn handle_socket(mut socket: WebSocket, broadcaster: Arc<LiveEventBroadcaster>, filter: Option<Ast>) {
+    let (id, mut receiver, _dropped_total) = broadcaster.subscribe(filter);
+    loop {
+        tokio::select! {
+            maybe_event = receiver.recv() => {
+                let Some(event) = maybe_event else { break; };
+                let Ok(payload) = serde_json::to_string(&event) else { continue; };
+                if socket.send(Message::Text(payload)).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+    broadcaster.unsubscribe(id);
 }
 
 #[cfg(test)]
@@ -204,5 +275,115 @@ mod tests {
         broadcaster.publish(&[sample_event(Uuid::new_v4(), EventType::ProcessExec)]);
 
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Disconnected);
+    }
+
+    async fn spawn_test_server(broadcaster: Arc<LiveEventBroadcaster>) -> std::net::SocketAddr {
+        let app = build_stream_router(broadcaster);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_client_receives_a_published_event_over_the_socket() {
+        use futures_util::StreamExt;
+
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster.clone()).await;
+
+        let (mut ws_stream, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/stream/events"))
+                .await
+                .unwrap();
+
+        let host_id = Uuid::new_v4();
+        let event = sample_event(host_id, EventType::ProcessExec);
+        broadcaster.publish(std::slice::from_ref(&event));
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let received: CanonicalEvent = match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str(&text).unwrap()
+            }
+            other => panic!("expected a text message, got {:?}", other),
+        };
+        assert_eq!(received.event_id, event.event_id);
+    }
+
+    #[tokio::test]
+    async fn a_host_id_filtered_client_only_receives_matching_events() {
+        use futures_util::StreamExt;
+
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster.clone()).await;
+
+        let matching_host = Uuid::new_v4();
+        let other_host = Uuid::new_v4();
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/v1/stream/events?host_id={matching_host}"
+        ))
+        .await
+        .unwrap();
+
+        broadcaster.publish(&[
+            sample_event(other_host, EventType::ProcessExec),
+            sample_event(matching_host, EventType::ProcessExec),
+        ]);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let received: CanonicalEvent = match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str(&text).unwrap()
+            }
+            other => panic!("expected a text message, got {:?}", other),
+        };
+        assert_eq!(received.host_id, matching_host);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_connection_with_both_host_id_and_q() {
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster).await;
+
+        let result = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/v1/stream/events?host_id=abc&q=event_type%20%3D%20%22PROCESS_EXEC%22"
+        ))
+        .await;
+
+        match result {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 400);
+            }
+            other => panic!("expected an HTTP 400 rejection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_connection_with_a_malformed_q() {
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster).await;
+
+        let result = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/v1/stream/events?q=event_type%20%3D"
+        ))
+        .await;
+
+        match result {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 400);
+            }
+            other => panic!("expected an HTTP 400 rejection, got {:?}", other),
+        }
     }
 }
