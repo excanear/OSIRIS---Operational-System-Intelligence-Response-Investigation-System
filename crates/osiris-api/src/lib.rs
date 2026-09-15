@@ -32,6 +32,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
+        .route("/api/v1/containers", get(containers_handler))
         .route("/api/v1/containers/story", get(container_story_handler))
         .route("/api/v1/system/story", get(system_story_handler))
         .route("/api/v1/graph", get(graph_handler))
@@ -648,6 +649,68 @@ struct ContainerStoryQuery {
 /// indexed column already spans both without a union query (the same
 /// "one indexed column already spans both" reasoning `systemd_story`
 /// established in Phase 4b).
+#[derive(Debug, Serialize)]
+struct ContainerSummary {
+    container_id: String,
+    host_id: String,
+    hostname: String,
+    image: String,
+    status: String,
+    timestamp: u64,
+}
+
+/// `GET /api/v1/containers` — ARCHITECTURE.md §16.3's Containers list
+/// screen. Bounded `category = "CONTAINER"` query + Rust-side dedup keyed
+/// by `container_id` alone (not host-scoped, matching
+/// `container_story_handler`'s own existing host-agnostic behavior).
+/// `status` is derived from the kept (most-recent) event's `event_type`.
+async fn containers_handler(
+    State(storage): State<Arc<dyn Storage>>,
+) -> Result<Json<Vec<ContainerSummary>>, (StatusCode, String)> {
+    let plan = osiris_query::EventQueryPlan {
+        filter: Some(osiris_query::ast::Ast::Compare {
+            field: "category".to_string(),
+            op: osiris_query::ast::Op::Eq,
+            value: osiris_query::ast::Value::Str("CONTAINER".to_string()),
+        }),
+        limit: 10_000,
+        export: true,
+        ..osiris_query::EventQueryPlan::new()
+    };
+    let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut seen: HashMap<String, ContainerSummary> = HashMap::new();
+    for event in events {
+        let Some(container) = &event.container else { continue };
+        let key = container.container_id.clone();
+        match seen.get(&key) {
+            Some(existing) if existing.timestamp >= event.timestamp => {}
+            _ => {
+                let status = match event.event_type {
+                    EventType::ContainerCreate | EventType::ContainerStart => "RUNNING",
+                    EventType::ContainerStop | EventType::ContainerDestroy => "STOPPED",
+                    _ => "UNKNOWN",
+                };
+                seen.insert(
+                    key.clone(),
+                    ContainerSummary {
+                        container_id: key,
+                        host_id: event.host_id.to_string(),
+                        hostname: event.host.hostname.clone(),
+                        image: container.image.clone(),
+                        status: status.to_string(),
+                        timestamp: event.timestamp,
+                    },
+                );
+            }
+        }
+    }
+    Ok(Json(seen.into_values().collect()))
+}
+
 async fn container_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<ContainerStoryQuery>,
@@ -1873,6 +1936,54 @@ mod tests {
             pod_ref: None,
         });
         event
+    }
+
+    #[tokio::test]
+    async fn containers_endpoint_derives_running_status_from_the_most_recent_event() {
+        let (_dir, storage) = test_storage();
+        let id = "c".repeat(64);
+        let create = container_event(&id, EventType::ContainerCreate, 1000);
+        let start = container_event(&id, EventType::ContainerStart, 2000);
+        storage.batch_write(&[create, start]).unwrap();
+
+        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].container_id, id);
+        assert_eq!(rows[0].status, "RUNNING");
+        assert_eq!(rows[0].timestamp, 2000);
+    }
+
+    #[tokio::test]
+    async fn containers_endpoint_derives_stopped_status_from_the_most_recent_event() {
+        let (_dir, storage) = test_storage();
+        let id = "d".repeat(64);
+        let start = container_event(&id, EventType::ContainerStart, 1000);
+        let stop = container_event(&id, EventType::ContainerStop, 2000);
+        storage.batch_write(&[start, stop]).unwrap();
+
+        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "STOPPED");
+    }
+
+    #[tokio::test]
+    async fn containers_endpoint_dedups_by_container_id_alone_not_host() {
+        let (_dir, storage) = test_storage();
+        let id = "e".repeat(64);
+        let mut on_host_a = container_event(&id, EventType::ContainerStart, 1000);
+        let mut on_host_b = container_event(&id, EventType::ContainerStart, 2000);
+        on_host_b.host_id = uuid::Uuid::new_v4();
+        on_host_b.host.host_id = on_host_b.host_id;
+        on_host_a.host_id = uuid::Uuid::new_v4();
+        on_host_a.host.host_id = on_host_a.host_id;
+        storage.batch_write(&[on_host_a, on_host_b]).unwrap();
+
+        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].timestamp, 2000);
     }
 
     #[tokio::test]
