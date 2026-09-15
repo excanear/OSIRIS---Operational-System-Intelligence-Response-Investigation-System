@@ -16,6 +16,7 @@ osiris-investigate = { path = "../osiris-investigate" }
 osiris-evidence = { path = "../osiris-evidence" }
 osiris-audit = { path = "../osiris-audit" }
 uuid = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
