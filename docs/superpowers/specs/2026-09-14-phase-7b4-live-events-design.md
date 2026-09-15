@@ -88,7 +88,7 @@ pub fn build_stream_router(broadcaster: Arc<LiveEventBroadcaster>) -> Router;
 
 **Channel capacity: 4096.** Matches `osiris-bus`'s VERBOSE lane (`crates/osiris-bus/src/bus.rs:21-29`) — the largest, most permissive capacity in that file. This stream is a single unified feed (not split into 5 priority lanes; a browser tab has no equivalent of the Agent's own drain-priority concept), so it takes the most generous existing capacity as its bound rather than inventing a new number.
 
-**`publish()` is synchronous and cheap** (mutex lock, iterate, `osiris_query::eval::eval_ast` filter check, `try_send`) — called directly from the async ingestion task, no `spawn_blocking` needed.
+**`publish()` is synchronous and cheap** (mutex lock, iterate, `osiris_query::eval::eval_ast` filter check, `try_send`) — called directly from the async ingestion task, no `spawn_blocking` needed. "Cheap" is relative to `spawn_blocking`, not free: each `eval_ast` field lookup does a full `serde_json::to_value(event)` serialization, so a connection whose filter compares multiple fields pays multiple full event serializations per event.
 
 ### Ingestion tap: `crates/osiris-server/src/ingest.rs`
 

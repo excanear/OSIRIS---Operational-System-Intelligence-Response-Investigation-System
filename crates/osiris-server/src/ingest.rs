@@ -110,7 +110,11 @@ pub async fn run_ingestion_loop(
                     let risk_engine = risk_engine.clone();
                     let correlation_engine = correlation_engine.clone();
                     let event_count = events.len();
-                    let events_for_broadcast = events.clone();
+                    let events_for_broadcast = if broadcaster.has_subscribers() {
+                        Some(events.clone())
+                    } else {
+                        None
+                    };
                     match tokio::task::spawn_blocking(move || {
                         Ok::<_, osiris_storage::StorageError>({
                             let report = storage.batch_write(&events)?;
@@ -148,7 +152,11 @@ pub async fn run_ingestion_loop(
                     })
                     .await
                     {
-                        Ok(Ok(_report)) => broadcaster.publish(&events_for_broadcast),
+                        Ok(Ok(_report)) => {
+                            if let Some(events) = events_for_broadcast {
+                                broadcaster.publish(&events);
+                            }
+                        }
                         Ok(Err(storage_err)) => {
                             tracing::error!(
                                 error = %storage_err,

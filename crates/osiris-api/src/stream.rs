@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
@@ -83,6 +83,13 @@ impl LiveEventBroadcaster {
     /// connection whose filter matches (or has no filter), `try_send`s the
     /// event. On `Err` (channel full), increments that connection's
     /// `dropped_total` and moves on.
+    /// True if at least one connection is currently registered. Lets
+    /// callers skip cloning an event batch when there is nobody to publish
+    /// it to.
+    pub fn has_subscribers(&self) -> bool {
+        !self.connections.lock().unwrap().is_empty()
+    }
+
     pub fn publish(&self, events: &[CanonicalEvent]) {
         let connections = self.connections.lock().unwrap();
         for event in events {
@@ -111,11 +118,47 @@ pub fn build_stream_router(broadcaster: Arc<LiveEventBroadcaster>) -> Router {
         .with_state(broadcaster)
 }
 
+/// Cross-site WebSocket hijacking (CSWSH) guard: WebSocket handshakes are
+/// not subject to Same-Origin Policy/CORS the way REST fetches are, so a
+/// malicious page could otherwise open a WebSocket to this endpoint from a
+/// victim's browser and read the live telemetry stream. If the request
+/// carries an `Origin` header, it must match the request's own `Host`
+/// header. Non-browser clients (tokio-tungstenite, websocat, Node `ws`,
+/// ...) typically send no `Origin` header at all and are unaffected.
+fn origin_is_same_site(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        // No Origin header: not a browser cross-origin request (e.g. a
+        // native WebSocket client). Nothing to check.
+        return true;
+    };
+    let Some(host) = headers.get(axum::http::header::HOST) else {
+        return false;
+    };
+    let (Ok(origin_str), Ok(host_str)) = (origin.to_str(), host.to_str()) else {
+        return false;
+    };
+    // Origin looks like "http://127.0.0.1:8080" or "https://example.com";
+    // Host looks like "127.0.0.1:8080". Compare the host:port portion only.
+    origin_str
+        .rsplit("://")
+        .next()
+        .map(|origin_host| origin_host == host_str)
+        .unwrap_or(false)
+}
+
 async fn stream_events_handler(
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     Query(params): Query<StreamQuery>,
     State(broadcaster): State<Arc<LiveEventBroadcaster>>,
 ) -> Result<Response, (StatusCode, String)> {
+    if !origin_is_same_site(&headers) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "cross-origin WebSocket connections are not allowed".to_string(),
+        ));
+    }
+
     if params.host_id.is_some() && params.q.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -277,6 +320,48 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Disconnected);
     }
 
+    #[test]
+    fn origin_is_same_site_allows_a_matching_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "http://127.0.0.1:8080".parse().unwrap());
+        headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
+        assert!(origin_is_same_site(&headers));
+    }
+
+    #[test]
+    fn origin_is_same_site_rejects_a_cross_origin_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "https://evil.example".parse().unwrap());
+        headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
+        assert!(!origin_is_same_site(&headers));
+    }
+
+    #[test]
+    fn origin_is_same_site_allows_a_request_with_no_origin_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
+        assert!(origin_is_same_site(&headers));
+    }
+
+    #[test]
+    fn origin_is_same_site_rejects_an_origin_with_no_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "http://127.0.0.1:8080".parse().unwrap());
+        assert!(!origin_is_same_site(&headers));
+    }
+
+    #[test]
+    fn has_subscribers_reflects_the_connection_list() {
+        let broadcaster = LiveEventBroadcaster::new();
+        assert!(!broadcaster.has_subscribers());
+
+        let (id, _receiver, _dropped) = broadcaster.subscribe(None);
+        assert!(broadcaster.has_subscribers());
+
+        broadcaster.unsubscribe(id);
+        assert!(!broadcaster.has_subscribers());
+    }
+
     async fn spawn_test_server(broadcaster: Arc<LiveEventBroadcaster>) -> std::net::SocketAddr {
         let app = build_stream_router(broadcaster);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,6 +469,31 @@ mod tests {
                 assert_eq!(response.status(), 400);
             }
             other => panic!("expected an HTTP 400 rejection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_cross_origin_websocket_upgrade() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster).await;
+
+        let mut request = format!("ws://{addr}/api/v1/stream/events")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::ORIGIN,
+            "https://evil.example".parse().unwrap(),
+        );
+
+        let result = tokio_tungstenite::connect_async(request).await;
+
+        match result {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 403);
+            }
+            other => panic!("expected an HTTP 403 rejection, got {:?}", other),
         }
     }
 }
