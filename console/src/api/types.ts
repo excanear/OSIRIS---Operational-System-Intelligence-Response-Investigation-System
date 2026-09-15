@@ -51,6 +51,34 @@ export interface ProcessDetail {
   children: CanonicalEvent[];
 }
 
+export interface FileSummary {
+  file_id: string;
+  path: string;
+  host_id: string;
+  hostname: string;
+  last_event_type: string;
+  timestamp: number;
+}
+
+export interface NetworkSummary {
+  host_id: string;
+  hostname: string;
+  dst_ip: string;
+  dst_port: number;
+  proto: string;
+  last_event_type: string;
+  timestamp: number;
+}
+
+export interface ContainerSummary {
+  container_id: string;
+  host_id: string;
+  hostname: string;
+  image: string;
+  status: "RUNNING" | "STOPPED";
+  timestamp: number;
+}
+
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 export type AlertStatus = "OPEN" | "ACKNOWLEDGED" | "SUPPRESSED";
 

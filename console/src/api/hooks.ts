@@ -4,11 +4,17 @@ import {
   createIncident,
   fetchAlerts,
   fetchAllEvidence,
+  fetchContainers,
+  fetchContainerStory,
   fetchEvents,
   fetchEvidence,
+  fetchFiles,
+  fetchFileStory,
   fetchHealth,
   fetchIncident,
   fetchIncidents,
+  fetchNetwork,
+  fetchNetworkStory,
   fetchProcess,
   fetchProcesses,
   fetchProcessStory,
@@ -77,6 +83,51 @@ export function useProcessStory(processKey: string) {
   return useQuery({
     queryKey: ["process-story", processKey],
     queryFn: () => fetchProcessStory(processKey),
+  });
+}
+
+export function useFiles() {
+  return useQuery({
+    queryKey: ["files"],
+    queryFn: fetchFiles,
+  });
+}
+
+export function useNetwork() {
+  return useQuery({
+    queryKey: ["network"],
+    queryFn: fetchNetwork,
+  });
+}
+
+export function useContainers() {
+  return useQuery({
+    queryKey: ["containers"],
+    queryFn: fetchContainers,
+  });
+}
+
+export function useFileStory(fileId: string) {
+  return useQuery({
+    queryKey: ["file-story", fileId],
+    queryFn: () => fetchFileStory(fileId),
+    enabled: fileId.length > 0,
+  });
+}
+
+export function useNetworkStory(ip: string) {
+  return useQuery({
+    queryKey: ["network-story", ip],
+    queryFn: () => fetchNetworkStory(ip),
+    enabled: ip.length > 0,
+  });
+}
+
+export function useContainerStory(containerId: string) {
+  return useQuery({
+    queryKey: ["container-story", containerId],
+    queryFn: () => fetchContainerStory(containerId),
+    enabled: containerId.length > 0,
   });
 }
 

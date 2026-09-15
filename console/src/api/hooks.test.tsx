@@ -6,13 +6,19 @@ import * as client from "./client";
 import {
   useAlerts,
   useAllEvidence,
+  useContainers,
+  useContainerStory,
   useCreateEvidence,
   useCreateIncident,
   useEvents,
   useEvidence,
+  useFiles,
+  useFileStory,
   useHealth,
   useIncident,
   useIncidents,
+  useNetwork,
+  useNetworkStory,
   usePatchIncidentStatus,
   useProcess,
   useProcesses,
@@ -286,5 +292,53 @@ describe("api hooks", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([row]);
+  });
+
+  it("useFiles resolves with fetchFiles's result", async () => {
+    vi.spyOn(client, "fetchFiles").mockResolvedValue([
+      { file_id: "1:100", path: "/etc/passwd", host_id: "h1", hostname: "host-a", last_event_type: "FILE_WRITE", timestamp: 1000 },
+    ]);
+    const { result } = renderHook(() => useFiles(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toHaveLength(1);
+  });
+
+  it("useNetwork resolves with fetchNetwork's result", async () => {
+    vi.spyOn(client, "fetchNetwork").mockResolvedValue([
+      { host_id: "h1", hostname: "host-a", dst_ip: "93.184.216.34", dst_port: 443, proto: "tcp", last_event_type: "NETWORK_CLOSE", timestamp: 1000 },
+    ]);
+    const { result } = renderHook(() => useNetwork(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toHaveLength(1);
+  });
+
+  it("useContainers resolves with fetchContainers's result", async () => {
+    vi.spyOn(client, "fetchContainers").mockResolvedValue([
+      { container_id: "abc", host_id: "h1", hostname: "host-a", image: "nginx", status: "RUNNING", timestamp: 1000 },
+    ]);
+    const { result } = renderHook(() => useContainers(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toHaveLength(1);
+  });
+
+  it("useFileStory is disabled until a non-empty fileId is given", () => {
+    const spy = vi.spyOn(client, "fetchFileStory");
+    const { result } = renderHook(() => useFileStory(""), { wrapper });
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("useNetworkStory resolves with fetchNetworkStory's result", async () => {
+    vi.spyOn(client, "fetchNetworkStory").mockResolvedValue({ events: [], alerts: [] });
+    const { result } = renderHook(() => useNetworkStory("93.184.216.34"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual({ events: [], alerts: [] });
+  });
+
+  it("useContainerStory resolves with fetchContainerStory's result", async () => {
+    vi.spyOn(client, "fetchContainerStory").mockResolvedValue({ events: [], alerts: [] });
+    const { result } = renderHook(() => useContainerStory("abc"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual({ events: [], alerts: [] });
   });
 });

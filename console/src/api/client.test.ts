@@ -5,11 +5,17 @@ import {
   createIncident,
   fetchAlerts,
   fetchAllEvidence,
+  fetchContainers,
+  fetchContainerStory,
   fetchEvents,
   fetchEvidence,
+  fetchFiles,
+  fetchFileStory,
   fetchHealth,
   fetchIncident,
   fetchIncidents,
+  fetchNetwork,
+  fetchNetworkStory,
   fetchProcess,
   fetchProcesses,
   fetchProcessStory,
@@ -345,5 +351,41 @@ describe("api client", () => {
     const result = await fetchAllEvidence();
 
     expect(result).toEqual([row]);
+  });
+
+  it("fetchFiles calls /api/v1/files", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchFiles();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/files");
+  });
+
+  it("fetchNetwork calls /api/v1/network", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchNetwork();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/network");
+  });
+
+  it("fetchContainers calls /api/v1/containers", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchContainers();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/containers");
+  });
+
+  it("fetchFileStory calls /api/v1/files/story with an encoded file_id", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
+    await fetchFileStory("1:100");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/files/story?file_id=1%3A100");
+  });
+
+  it("fetchNetworkStory calls /api/v1/network/story with the ip", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
+    await fetchNetworkStory("93.184.216.34");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/network/story?ip=93.184.216.34");
+  });
+
+  it("fetchContainerStory calls /api/v1/containers/story with the container_id", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
+    await fetchContainerStory("abc123");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/containers/story?container_id=abc123");
   });
 });

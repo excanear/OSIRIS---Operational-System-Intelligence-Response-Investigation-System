@@ -2,12 +2,15 @@ import type {
   Alert,
   ApiHealth,
   CanonicalEvent,
+  ContainerSummary,
   CreateEvidenceBody,
   EntityRef,
   Evidence,
   EvidenceWithIncidents,
+  FileSummary,
   Incident,
   IncidentStatus,
+  NetworkSummary,
   ProcessDetail,
   ProcessSummary,
   Story,
@@ -129,6 +132,30 @@ export function fetchProcess(processKey: string): Promise<ProcessDetail> {
 
 export function fetchProcessStory(processKey: string): Promise<Story> {
   return apiGet<Story>(`/processes/${encodeURIComponent(processKey)}/story`);
+}
+
+export function fetchFiles(): Promise<FileSummary[]> {
+  return apiGet<FileSummary[]>("/files");
+}
+
+export function fetchNetwork(): Promise<NetworkSummary[]> {
+  return apiGet<NetworkSummary[]>("/network");
+}
+
+export function fetchContainers(): Promise<ContainerSummary[]> {
+  return apiGet<ContainerSummary[]>("/containers");
+}
+
+export function fetchFileStory(fileId: string): Promise<Story> {
+  return apiGet<Story>(`/files/story?file_id=${encodeURIComponent(fileId)}`);
+}
+
+export function fetchNetworkStory(ip: string): Promise<Story> {
+  return apiGet<Story>(`/network/story?ip=${encodeURIComponent(ip)}`);
+}
+
+export function fetchContainerStory(containerId: string): Promise<Story> {
+  return apiGet<Story>(`/containers/story?container_id=${encodeURIComponent(containerId)}`);
 }
 
 export function fetchIncident(incidentId: string): Promise<Incident> {
