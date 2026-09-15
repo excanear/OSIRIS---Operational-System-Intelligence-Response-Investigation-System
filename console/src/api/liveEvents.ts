@@ -62,7 +62,13 @@ export function useLiveEvents(filter: LiveEventsFilter = {}): UseLiveEventsResul
       };
 
       socket.onmessage = (messageEvent) => {
-        const parsed = JSON.parse(messageEvent.data as string) as CanonicalEvent;
+        let parsed: CanonicalEvent;
+        try {
+          parsed = JSON.parse(messageEvent.data as string) as CanonicalEvent;
+        } catch {
+          console.warn("Live Events: received a non-JSON message, dropping it");
+          return;
+        }
         bufferRef.current = [parsed, ...bufferRef.current].slice(0, RING_BUFFER_CAPACITY);
         if (!pausedRef.current) {
           setEvents(bufferRef.current);

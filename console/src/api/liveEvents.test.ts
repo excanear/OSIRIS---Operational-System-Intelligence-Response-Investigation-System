@@ -78,6 +78,16 @@ describe("useLiveEvents", () => {
     expect(result.current.events.map((e) => e.event_id)).toEqual(["b", "a"]);
   });
 
+  it("drops a malformed message without crashing and keeps the valid one", () => {
+    const { result } = renderHook(() => useLiveEvents());
+    act(() => MockWebSocket.instances[0].simulateOpen());
+
+    act(() => MockWebSocket.instances[0].onmessage?.({ data: "not valid json" }));
+    act(() => MockWebSocket.instances[0].simulateMessage(makeEvent("a")));
+
+    expect(result.current.events.map((e) => e.event_id)).toEqual(["a"]);
+  });
+
   it("caps the buffer at 500 events", () => {
     const { result } = renderHook(() => useLiveEvents());
     act(() => MockWebSocket.instances[0].simulateOpen());
