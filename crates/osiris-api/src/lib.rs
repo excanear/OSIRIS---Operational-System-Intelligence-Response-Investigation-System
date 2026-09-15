@@ -26,6 +26,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         )
         .route("/api/v1/processes/:process_key/story", get(process_story_handler))
         .route("/api/v1/alerts", get(alerts_handler))
+        .route("/api/v1/files", get(files_handler))
         .route("/api/v1/files/story", get(file_story_handler))
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
@@ -44,6 +45,17 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
 /// full graph — always scoped to a seed entity + depth + time range" is
 /// enforced here, not just documented.
 const MAX_GRAPH_DEPTH: usize = 5;
+
+/// `EventType`'s wire form (`#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`,
+/// e.g. `FileWrite` -> `"FILE_WRITE"`) — used by the new Files/Network/
+/// Containers list endpoints' `last_event_type`/`status` fields so they
+/// match every other place `event_type` appears on the wire.
+fn event_type_label(event_type: EventType) -> String {
+    serde_json::to_value(event_type)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
 
 /// Adapts `Storage::query_relationships` to `osiris_correlate::EdgeSource`
 /// for one bounded API request. Unlike `osiris-server`'s own
@@ -368,6 +380,66 @@ async fn alerts_handler(
 struct FileStoryQuery {
     path: Option<String>,
     file_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileSummary {
+    file_id: String,
+    path: String,
+    host_id: String,
+    hostname: String,
+    last_event_type: String,
+    timestamp: u64,
+}
+
+/// `GET /api/v1/files` — ARCHITECTURE.md §16.3's Filesystem list screen.
+/// Bounded `category = "FILE"` query + Rust-side dedup keyed by
+/// `(host_id, FileIdentity)`, keeping the most-recent event per identity —
+/// see this phase's design spec for why this departs from `/processes`'s
+/// first-seen semantics. Events with no full `FileIdentity` (missing
+/// inode or device_id) are skipped, matching that type's existing
+/// `from_file_ref` semantics.
+async fn files_handler(
+    State(storage): State<Arc<dyn Storage>>,
+) -> Result<Json<Vec<FileSummary>>, (StatusCode, String)> {
+    let plan = osiris_query::EventQueryPlan {
+        filter: Some(osiris_query::ast::Ast::Compare {
+            field: "category".to_string(),
+            op: osiris_query::ast::Op::Eq,
+            value: osiris_query::ast::Value::Str("FILE".to_string()),
+        }),
+        limit: 10_000,
+        export: true,
+        ..osiris_query::EventQueryPlan::new()
+    };
+    let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut seen: HashMap<(uuid::Uuid, FileIdentity), FileSummary> = HashMap::new();
+    for event in events {
+        let Some(file) = &event.file else { continue };
+        let Some(identity) = FileIdentity::from_file_ref(file) else { continue };
+        let key = (event.host_id, identity);
+        match seen.get(&key) {
+            Some(existing) if existing.timestamp >= event.timestamp => {}
+            _ => {
+                seen.insert(
+                    key,
+                    FileSummary {
+                        file_id: identity.as_key(),
+                        path: file.path.clone(),
+                        host_id: event.host_id.to_string(),
+                        hostname: event.host.hostname.clone(),
+                        last_event_type: event_type_label(event.event_type),
+                        timestamp: event.timestamp,
+                    },
+                );
+            }
+        }
+    }
+    Ok(Json(seen.into_values().collect()))
 }
 
 async fn file_story_handler(
@@ -710,6 +782,55 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn files_endpoint_keeps_the_most_recent_event_per_identity() {
+        let (_dir, storage) = test_storage();
+        let older = file_event(EventType::FileCreate, "/etc/passwd", 100, 1, 1000);
+        let mut newer = older.clone();
+        newer.event_id = Uuid::now_v7();
+        newer.event_type = EventType::FileWrite;
+        newer.timestamp = 2000;
+        let host_id = older.host_id;
+        let hostname = older.host.hostname.clone();
+        storage.batch_write(&[older, newer]).unwrap();
+
+        let Json(files) = files_handler(State(storage)).await.unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_id, "1:100");
+        assert_eq!(files[0].path, "/etc/passwd");
+        assert_eq!(files[0].host_id, host_id.to_string());
+        assert_eq!(files[0].hostname, hostname);
+        assert_eq!(files[0].last_event_type, "FILE_WRITE");
+        assert_eq!(files[0].timestamp, 2000);
+    }
+
+    #[tokio::test]
+    async fn files_endpoint_skips_events_without_a_full_file_identity() {
+        let (_dir, storage) = test_storage();
+        let mut missing_inode = file_event(EventType::FileCreate, "/etc/shadow", 1, 1, 1000);
+        missing_inode.file.as_mut().unwrap().inode = None;
+        storage.write(&missing_inode).unwrap();
+
+        let Json(files) = files_handler(State(storage)).await.unwrap();
+
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn files_endpoint_treats_different_hosts_with_the_same_identity_as_distinct_rows() {
+        let (_dir, storage) = test_storage();
+        let a = file_event(EventType::FileCreate, "/etc/passwd", 100, 1, 1000);
+        let mut b = file_event(EventType::FileCreate, "/etc/passwd", 100, 1, 1000);
+        b.host_id = uuid::Uuid::new_v4();
+        b.host.host_id = b.host_id;
+        storage.batch_write(&[a, b]).unwrap();
+
+        let Json(files) = files_handler(State(storage)).await.unwrap();
+
+        assert_eq!(files.len(), 2);
     }
 
     fn sensor_health_event(host_id: Uuid, sensor_name: &str, timestamp: u64) -> CanonicalEvent {
