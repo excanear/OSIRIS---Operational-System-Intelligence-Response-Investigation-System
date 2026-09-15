@@ -1935,4 +1935,4 @@ pub mod evidence;
 pub mod incidents;
 pub use incidents::{build_incident_evidence_router, IncidentEvidenceState};
 pub mod stream;
-pub use stream::LiveEventBroadcaster;
+pub use stream::{build_stream_router, LiveEventBroadcaster};
