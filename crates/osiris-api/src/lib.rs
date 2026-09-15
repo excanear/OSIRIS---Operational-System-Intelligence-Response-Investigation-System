@@ -28,6 +28,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/alerts", get(alerts_handler))
         .route("/api/v1/files", get(files_handler))
         .route("/api/v1/files/story", get(file_story_handler))
+        .route("/api/v1/network", get(network_handler))
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
@@ -464,6 +465,70 @@ async fn file_story_handler(
     .unwrap()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(story))
+}
+
+#[derive(Debug, Serialize)]
+struct NetworkSummary {
+    host_id: String,
+    hostname: String,
+    dst_ip: String,
+    dst_port: u16,
+    proto: String,
+    last_event_type: String,
+    timestamp: u64,
+}
+
+/// `GET /api/v1/network` — ARCHITECTURE.md §16.3's Network list screen.
+/// Bounded `category = "NETWORK"` query + Rust-side dedup keyed by
+/// `(host_id, dst_ip, dst_port, proto)` — destination-only, deliberately
+/// excluding `src_ip`/`src_port` since source port is normally ephemeral
+/// (see this phase's design spec). Keeps the most-recent event per group.
+async fn network_handler(
+    State(storage): State<Arc<dyn Storage>>,
+) -> Result<Json<Vec<NetworkSummary>>, (StatusCode, String)> {
+    let plan = osiris_query::EventQueryPlan {
+        filter: Some(osiris_query::ast::Ast::Compare {
+            field: "category".to_string(),
+            op: osiris_query::ast::Op::Eq,
+            value: osiris_query::ast::Value::Str("NETWORK".to_string()),
+        }),
+        limit: 10_000,
+        export: true,
+        ..osiris_query::EventQueryPlan::new()
+    };
+    let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut seen: HashMap<(uuid::Uuid, String, u16, String), NetworkSummary> = HashMap::new();
+    for event in events {
+        let Some(network) = &event.network else { continue };
+        let key = (
+            event.host_id,
+            network.dst_ip.clone(),
+            network.dst_port,
+            network.proto.clone(),
+        );
+        match seen.get(&key) {
+            Some(existing) if existing.timestamp >= event.timestamp => {}
+            _ => {
+                seen.insert(
+                    key,
+                    NetworkSummary {
+                        host_id: event.host_id.to_string(),
+                        hostname: event.host.hostname.clone(),
+                        dst_ip: network.dst_ip.clone(),
+                        dst_port: network.dst_port,
+                        proto: network.proto.clone(),
+                        last_event_type: event_type_label(event.event_type),
+                        timestamp: event.timestamp,
+                    },
+                );
+            }
+        }
+    }
+    Ok(Json(seen.into_values().collect()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1300,6 +1365,42 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn network_endpoint_keeps_the_most_recent_event_per_destination() {
+        let (_dir, storage) = test_storage();
+        let older = network_event(EventType::NetworkConnect, "10.0.0.5", "93.184.216.34", 1000);
+        let mut newer = older.clone();
+        newer.event_id = Uuid::now_v7();
+        newer.event_type = EventType::NetworkClose;
+        newer.timestamp = 2000;
+        let host_id = older.host_id;
+        storage.batch_write(&[older, newer]).unwrap();
+
+        let Json(rows) = network_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dst_ip, "93.184.216.34");
+        assert_eq!(rows[0].dst_port, 443);
+        assert_eq!(rows[0].proto, "tcp");
+        assert_eq!(rows[0].host_id, host_id.to_string());
+        assert_eq!(rows[0].last_event_type, "NETWORK_CLOSE");
+        assert_eq!(rows[0].timestamp, 2000);
+    }
+
+    #[tokio::test]
+    async fn network_endpoint_treats_different_destination_ports_as_distinct_rows() {
+        let (_dir, storage) = test_storage();
+        let a = network_event(EventType::NetworkConnect, "10.0.0.5", "93.184.216.34", 1000);
+        let mut b = a.clone();
+        b.event_id = Uuid::now_v7();
+        b.network.as_mut().unwrap().dst_port = 8443;
+        storage.batch_write(&[a, b]).unwrap();
+
+        let Json(rows) = network_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 2);
     }
 
     fn dns_event(query: &str, response_ips: Vec<String>, timestamp: u64) -> CanonicalEvent {
