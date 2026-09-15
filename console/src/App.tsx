@@ -8,6 +8,7 @@ import { EntityGraph } from "./screens/graph/EntityGraph";
 import { EvidenceList } from "./screens/evidence/EvidenceList";
 import { IncidentDetailScreen } from "./screens/incidents/IncidentDetailScreen";
 import { IncidentList } from "./screens/incidents/IncidentList";
+import { LiveEvents } from "./screens/live/LiveEvents";
 import { Overview } from "./screens/overview/Overview";
 import { ProcessDetailScreen } from "./screens/processes/ProcessDetailScreen";
 import { ProcessList } from "./screens/processes/ProcessList";
@@ -25,7 +26,7 @@ export function App() {
           <Routes>
             <Route element={<Shell />}>
               <Route path="/" element={<Overview />} />
-              <Route path="/live-events" element={<ComingSoon label="Live Events" />} />
+              <Route path="/live-events" element={<LiveEvents />} />
               <Route path="/processes" element={<ProcessList />} />
               <Route path="/processes/:processKey" element={<ProcessDetailScreen />} />
               <Route path="/files" element={<ComingSoon label="Filesystem" />} />
