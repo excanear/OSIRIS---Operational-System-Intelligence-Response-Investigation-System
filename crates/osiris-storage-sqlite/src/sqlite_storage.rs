@@ -33,6 +33,7 @@ impl SqliteStorage {
                 host_id TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
+                category TEXT,
                 process_key TEXT,
                 parent_process_key TEXT,
                 file_path TEXT,
@@ -142,6 +143,16 @@ impl SqliteStorage {
         // before Phase 5 can contain an event with a populated
         // `container`, so pre-existing rows reading back NULL has no
         // practical impact either.
+        //
+        // Phase 7b-6 adds `category`, added the same guarded way — but
+        // unlike every column above, `category` is NOT a new fact: it has
+        // always existed on every event (`CanonicalEvent::category` is
+        // mandatory, never `Option`), just never had its own column. So a
+        // pre-existing row's `category` IS derivable from its own already-
+        // stored `event_type` via `EventType::category()`, and leaving it
+        // NULL would be wrong (not merely uninformative) — it's backfilled
+        // explicitly below instead of following the read-back-NULL
+        // precedent every earlier column here uses.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
@@ -165,6 +176,7 @@ impl SqliteStorage {
                 "container_id",
                 "ALTER TABLE events ADD COLUMN container_id TEXT",
             ),
+            ("category", "ALTER TABLE events ADD COLUMN category TEXT"),
         ] {
             if !column_exists(&conn, "events", column)? {
                 conn.execute(ddl, [])
@@ -180,9 +192,41 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
              CREATE INDEX IF NOT EXISTS idx_events_user_uid ON events(user_uid);
              CREATE INDEX IF NOT EXISTS idx_events_unit_name ON events(unit_name);
-             CREATE INDEX IF NOT EXISTS idx_events_container_id ON events(container_id);",
+             CREATE INDEX IF NOT EXISTS idx_events_container_id ON events(container_id);
+             CREATE INDEX IF NOT EXISTS idx_events_category_timestamp ON events(category, timestamp);",
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+        // Backfill `category` for any row that predates this column —
+        // grouped by distinct `event_type` (typically a handful of values,
+        // never one UPDATE per row) rather than a hand-maintained SQL
+        // CASE/WHEN mirroring `EventType::category()`'s ~49 branches, so
+        // the two mappings can never drift apart.
+        {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT event_type FROM events WHERE category IS NULL")
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            let distinct_event_types: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StorageError::Backend(e.to_string()))?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            drop(stmt);
+            for event_type_str in distinct_event_types {
+                let event_type: osiris_schema::EventType =
+                    serde_json::from_value(serde_json::Value::String(event_type_str.clone()))
+                        .map_err(|e| StorageError::Backend(e.to_string()))?;
+                let category = serde_json::to_string(&event_type.category())
+                    .map_err(|e| StorageError::Backend(e.to_string()))?
+                    .trim_matches('"')
+                    .to_string();
+                conn.execute(
+                    "UPDATE events SET category = ?1 WHERE event_type = ?2 AND category IS NULL",
+                    params![category, event_type_str],
+                )
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            }
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -264,9 +308,11 @@ impl SqliteStorage {
             .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
 
         // Pushdown: when the filter is a pure AND-conjunction (no OR/NOT),
-        // push every leaf this MVP has an indexed column for into SQL —
-        // exactly the same 8 columns `query()` already filters on above.
-        // Any leaf without a matching column, and the whole filter when it
+        // push every leaf this MVP has an indexed column for into SQL — the
+        // same 8 columns `query()` already filters on above, plus `category`
+        // (Phase 7b-6), which `query()`/`QueryPlan` has no field for since
+        // no caller of the older API needs it yet. Any leaf without a
+        // matching column, and the whole filter when it
         // contains OR/NOT, is left to the residual `eval_ast` pass below —
         // pushdown here is a pure performance optimization: every returned
         // row is re-checked against the *entire* original filter before
@@ -283,6 +329,7 @@ impl SqliteStorage {
                     }
                     let column = match field {
                         "event_type" => "event_type",
+                        "category" => "category",
                         "process.process_key" => "process_key",
                         "file.path" => "file_path",
                         "dns.query" => "dns_domain",
@@ -426,6 +473,10 @@ impl Storage for SqliteStorage {
                 .map_err(|e| StorageError::Serialize(e.to_string()))?
                 .trim_matches('"')
                 .to_string();
+            let category = serde_json::to_string(&event.category)
+                .map_err(|e| StorageError::Serialize(e.to_string()))?
+                .trim_matches('"')
+                .to_string();
             let file_path = event.file.as_ref().map(|f| f.path.clone());
             let file_identity = event.file.as_ref().and_then(FileIdentity::from_file_ref);
             let file_inode = file_identity.map(|i| i.inode as i64);
@@ -442,13 +493,14 @@ impl Storage for SqliteStorage {
             let container_id = event.container.as_ref().map(|c| c.container_id.clone());
             let changed = tx
                 .execute(
-                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, unit_name, container_id, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    "INSERT OR IGNORE INTO events (event_id, host_id, timestamp, event_type, category, process_key, parent_process_key, file_path, file_inode, file_device_id, network_src_ip, network_dst_ip, dns_domain, session_id, user_uid, unit_name, container_id, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                     params![
                         event.event_id.to_string(),
                         event.host_id.to_string(),
                         event.timestamp as i64,
                         event_type,
+                        category,
                         process_key,
                         parent_process_key,
                         file_path,
@@ -1131,6 +1183,51 @@ mod tests {
         assert_eq!(events.len(), 1);
         let plan_miss =
             osiris_query::EventQueryPlan::with_filter("event_type = \"PROCESS_FORK\"").unwrap();
+        assert_eq!(storage.query_events(&plan_miss).unwrap().len(), 0);
+    }
+
+    /// `query_events`'s residual `eval_ast` pass parses `raw_json` for
+    /// *any* field, so a round-trip test through `query_events` alone would
+    /// pass correctly even with no `category` column and no pushdown at
+    /// all — it would prove nothing about this phase's actual change. This
+    /// test instead inspects the stored SQL row directly, which can only
+    /// pass once `batch_write` actually populates a real `category` column.
+    #[test]
+    fn batch_write_populates_the_category_column_directly() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let mut file_event = sample_event(1, 100);
+        file_event.event_type = EventType::FileWrite;
+        file_event.category = Category::File;
+        storage.write(&file_event).unwrap();
+
+        let conn = storage.conn.lock().unwrap();
+        let category: String = conn
+            .query_row(
+                "SELECT category FROM events WHERE event_id = ?1",
+                [file_event.event_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, "FILE");
+    }
+
+    /// Phase 7b-6: `category` gets its own indexed column (Global
+    /// Constraint: same pushdown treatment as `event_type`), so a
+    /// `category = "..."` filter must be an exact-match SQL pushdown, not a
+    /// full-scan residual evaluation.
+    #[test]
+    fn query_events_pushes_down_an_exact_match_category_filter() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let mut file_event = sample_event(1, 100);
+        file_event.event_type = EventType::FileWrite;
+        file_event.category = Category::File;
+        storage.write(&file_event).unwrap();
+
+        let plan = osiris_query::EventQueryPlan::with_filter("category = \"FILE\"").unwrap();
+        let events = storage.query_events(&plan).unwrap();
+        assert_eq!(events.len(), 1);
+
+        let plan_miss = osiris_query::EventQueryPlan::with_filter("category = \"NETWORK\"").unwrap();
         assert_eq!(storage.query_events(&plan_miss).unwrap().len(), 0);
     }
 
@@ -2282,6 +2379,135 @@ mod tests {
     fn get_event_returns_none_for_an_unknown_id() {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
         assert!(storage.get_event(Uuid::new_v4()).unwrap().is_none());
+    }
+
+    /// Non-destructive/idempotent migration proof for Phase 7b-6's new
+    /// `category` column — unlike every earlier phase's added columns
+    /// (which read back NULL on pre-existing rows because the source data
+    /// genuinely didn't exist yet), `category` is derivable from the
+    /// already-stored `event_type` column for *any* row, old or new, via
+    /// `EventType::category()`. So this migration must backfill existing
+    /// rows, not just add the column — and must do so for more than one
+    /// distinct `event_type` value, proving the backfill loop (grouped by
+    /// distinct `event_type`) isn't hardcoded to a single case.
+    #[test]
+    fn migrates_a_pre_phase_7b6_database_by_backfilling_category_from_event_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let pre_migration_process_event = sample_event(300, 1000);
+        let mut pre_migration_container_event = sample_event(301, 2000);
+        // The raw SQL row below sets its `event_type` COLUMN to
+        // "CONTAINER_START" directly, but `query_events`'s residual
+        // `eval_ast` pass re-checks every match against the actual parsed
+        // `raw_json` — so the serialized event itself must agree, or a
+        // correct backfill would still (rightly) get filtered out here.
+        pre_migration_container_event.event_type = EventType::ContainerStart;
+        pre_migration_container_event.category = Category::Container;
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // The full current schema, minus `category` — exactly what a
+            // database created before this phase looks like.
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    file_path TEXT,
+                    file_inode INTEGER,
+                    file_device_id INTEGER,
+                    network_src_ip TEXT,
+                    network_dst_ip TEXT,
+                    dns_domain TEXT,
+                    session_id TEXT,
+                    user_uid INTEGER,
+                    unit_name TEXT,
+                    container_id TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            for (event, event_type) in [
+                (&pre_migration_process_event, "PROCESS_EXEC"),
+                (&pre_migration_container_event, "CONTAINER_START"),
+            ] {
+                conn.execute(
+                    "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        event.event_id.to_string(),
+                        event.host_id.to_string(),
+                        event.timestamp as i64,
+                        event_type,
+                        serde_json::to_string(event).unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.query(&QueryPlan::new()).unwrap().len(),
+            2,
+            "both pre-existing rows must survive migration"
+        );
+
+        // Direct column inspection, not a `query_events` round-trip: the
+        // residual `eval_ast` pass would derive the right answer from
+        // `raw_json` regardless of whether backfill ever ran, so only
+        // reading the raw SQL column proves the backfill itself happened.
+        let read_category = |conn: &rusqlite::Connection, event_id: Uuid| -> Option<String> {
+            conn.query_row(
+                "SELECT category FROM events WHERE event_id = ?1",
+                [event_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        {
+            let conn = reopened.conn.lock().unwrap();
+            assert_eq!(
+                read_category(&conn, pre_migration_process_event.event_id),
+                Some("PROCESS".to_string()),
+                "the PROCESS_EXEC row's category column must be backfilled to PROCESS"
+            );
+            assert_eq!(
+                read_category(&conn, pre_migration_container_event.event_id),
+                Some("CONTAINER".to_string()),
+                "the CONTAINER_START row's category column must be backfilled to CONTAINER, \
+                 proving the backfill loop handles more than one distinct event_type"
+            );
+        }
+
+        // The backfilled column must also be usable for pushdown filtering.
+        let process_plan =
+            osiris_query::EventQueryPlan::with_filter("category = \"PROCESS\"").unwrap();
+        assert_eq!(reopened.query_events(&process_plan).unwrap().len(), 1);
+        let container_plan =
+            osiris_query::EventQueryPlan::with_filter("category = \"CONTAINER\"").unwrap();
+        assert_eq!(reopened.query_events(&container_plan).unwrap().len(), 1);
+
+        // Idempotency: a second open must neither error nor re-run the
+        // backfill destructively, and everything must still be filterable.
+        let reopened_again = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened_again.query(&QueryPlan::new()).unwrap().len(), 2);
+        {
+            let conn = reopened_again.conn.lock().unwrap();
+            assert_eq!(
+                read_category(&conn, pre_migration_process_event.event_id),
+                Some("PROCESS".to_string())
+            );
+            assert_eq!(
+                read_category(&conn, pre_migration_container_event.event_id),
+                Some("CONTAINER".to_string())
+            );
+        }
+        assert_eq!(reopened_again.query_events(&process_plan).unwrap().len(), 1);
+        assert_eq!(reopened_again.query_events(&container_plan).unwrap().len(), 1);
     }
 
     /// Non-destructive/idempotent migration proof, matching Phase 2 Task 6's
