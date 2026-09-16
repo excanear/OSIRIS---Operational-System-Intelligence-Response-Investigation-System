@@ -54,7 +54,7 @@ describe("FileList", () => {
     renderWithRouter();
 
     const link = screen.getByRole("link", { name: "/etc/passwd" });
-    expect(link).toHaveAttribute("href", "/files/1:100?host_id=h1");
+    expect(link).toHaveAttribute("href", "/files/1%3A100?host_id=h1");
     expect(screen.getByText("host-a")).toBeInTheDocument();
     expect(screen.getByText("FILE_WRITE")).toBeInTheDocument();
   });

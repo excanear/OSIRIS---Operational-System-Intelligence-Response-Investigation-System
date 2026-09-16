@@ -4,11 +4,14 @@ import { useFiles } from "../../api/hooks";
 
 export function FileList() {
   // GET /api/v1/files (files_handler in crates/osiris-api/src/lib.rs) dedups
-  // by (host_id, FileIdentity) over a bounded 10_000-event query window,
-  // unordered by recency (query_events has no ORDER BY timestamp guarantee)
-  // — on a very high-volume host, a file whose events fall outside that
-  // window could be missing even if it's still active. Same posture
-  // ProcessList.tsx's own comment takes for /processes; not fixed here.
+  // by (host_id, FileIdentity) over a bounded query window capped at the
+  // query plan's effective limit (EventQueryPlan::effective_limit() in
+  // crates/osiris-query/src/plan.rs, currently 5,000 events), ordered ASC
+  // by timestamp — so it only ever reflects the *oldest* matching FILE
+  // events once a host has produced more than that many. On a very
+  // high-volume host, a file whose events fall outside that window could
+  // be missing even if it's still active. Same posture ProcessList.tsx's
+  // own comment takes for /processes; not fixed here.
   const files = useFiles();
   const [filter, setFilter] = useState("");
 
@@ -43,7 +46,7 @@ export function FileList() {
             {rows.map((file) => (
               <tr key={file.file_id}>
                 <td>
-                  <Link to={`/files/${file.file_id}?host_id=${file.host_id}`}>{file.path}</Link>
+                  <Link to={`/files/${encodeURIComponent(file.file_id)}?host_id=${encodeURIComponent(file.host_id)}`}>{file.path}</Link>
                 </td>
                 <td>{file.hostname}</td>
                 <td>{file.last_event_type}</td>

@@ -410,7 +410,7 @@ async fn files_handler(
             op: osiris_query::ast::Op::Eq,
             value: osiris_query::ast::Value::Str("FILE".to_string()),
         }),
-        limit: 10_000,
+        limit: osiris_query::MAX_EVENT_LIMIT,
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
@@ -441,7 +441,9 @@ async fn files_handler(
             }
         }
     }
-    Ok(Json(seen.into_values().collect()))
+    let mut rows: Vec<_> = seen.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+    Ok(Json(rows))
 }
 
 async fn file_story_handler(
@@ -493,7 +495,7 @@ async fn network_handler(
             op: osiris_query::ast::Op::Eq,
             value: osiris_query::ast::Value::Str("NETWORK".to_string()),
         }),
-        limit: 10_000,
+        limit: osiris_query::MAX_EVENT_LIMIT,
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
@@ -529,7 +531,9 @@ async fn network_handler(
             }
         }
     }
-    Ok(Json(seen.into_values().collect()))
+    let mut rows: Vec<_> = seen.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+    Ok(Json(rows))
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,16 +643,6 @@ struct ContainerStoryQuery {
     container_id: Option<String>,
 }
 
-/// Composed query implementing this phase's plan Task 10 and
-/// ARCHITECTURE.md §12.1's `*_story` shape. One `container_id` filter
-/// returns a container's whole observed history regardless of which
-/// mechanism produced which part of it — Task 2's Normalize populates
-/// `container.container_id` on the Container sensor's own lifecycle
-/// events, and Task 4's `NsCgroupResolver` populates it identically on
-/// every other category's events for a containerized process, so this one
-/// indexed column already spans both without a union query (the same
-/// "one indexed column already spans both" reasoning `systemd_story`
-/// established in Phase 4b).
 #[derive(Debug, Serialize)]
 struct ContainerSummary {
     container_id: String,
@@ -673,7 +667,7 @@ async fn containers_handler(
             op: osiris_query::ast::Op::Eq,
             value: osiris_query::ast::Value::Str("CONTAINER".to_string()),
         }),
-        limit: 10_000,
+        limit: osiris_query::MAX_EVENT_LIMIT,
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
@@ -708,9 +702,21 @@ async fn containers_handler(
             }
         }
     }
-    Ok(Json(seen.into_values().collect()))
+    let mut rows: Vec<_> = seen.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+    Ok(Json(rows))
 }
 
+/// Composed query implementing this phase's plan Task 10 and
+/// ARCHITECTURE.md §12.1's `*_story` shape. One `container_id` filter
+/// returns a container's whole observed history regardless of which
+/// mechanism produced which part of it — Task 2's Normalize populates
+/// `container.container_id` on the Container sensor's own lifecycle
+/// events, and Task 4's `NsCgroupResolver` populates it identically on
+/// every other category's events for a containerized process, so this one
+/// indexed column already spans both without a union query (the same
+/// "one indexed column already spans both" reasoning `systemd_story`
+/// established in Phase 4b).
 async fn container_story_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<ContainerStoryQuery>,

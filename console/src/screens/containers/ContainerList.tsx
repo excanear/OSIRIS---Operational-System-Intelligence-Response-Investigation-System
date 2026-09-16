@@ -5,10 +5,13 @@ import { useContainers } from "../../api/hooks";
 export function ContainerList() {
   // GET /api/v1/containers (containers_handler in
   // crates/osiris-api/src/lib.rs) dedups by container_id alone over a
-  // bounded 10_000-event query window, unordered by recency (query_events
-  // has no ORDER BY timestamp guarantee) — on a very high-volume host, a
-  // container whose events fall outside that window could be missing even
-  // if still active. Same posture ProcessList.tsx's own comment takes for
+  // bounded query window capped at the query plan's effective limit
+  // (EventQueryPlan::effective_limit() in crates/osiris-query/src/plan.rs,
+  // currently 5,000 events), ordered ASC by timestamp — so it only ever
+  // reflects the *oldest* matching CONTAINER events once a host has
+  // produced more than that many. On a very high-volume host, a container
+  // whose events fall outside that window could be missing even if still
+  // active. Same posture ProcessList.tsx's own comment takes for
   // /processes; not fixed here.
   const containers = useContainers();
   const [filter, setFilter] = useState("");

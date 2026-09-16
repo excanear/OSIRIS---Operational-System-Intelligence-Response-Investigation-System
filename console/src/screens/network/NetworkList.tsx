@@ -4,12 +4,15 @@ import { useNetwork } from "../../api/hooks";
 
 export function NetworkList() {
   // GET /api/v1/network (network_handler in crates/osiris-api/src/lib.rs)
-  // dedups by (host_id, dst_ip, dst_port, proto) over a bounded
-  // 10_000-event query window, unordered by recency (query_events has no
-  // ORDER BY timestamp guarantee) — on a very high-volume host, a
-  // destination whose events fall outside that window could be missing
-  // even if still active. Same posture ProcessList.tsx's own comment
-  // takes for /processes; not fixed here.
+  // dedups by (host_id, dst_ip, dst_port, proto) over a bounded query
+  // window capped at the query plan's effective limit
+  // (EventQueryPlan::effective_limit() in crates/osiris-query/src/plan.rs,
+  // currently 5,000 events), ordered ASC by timestamp — so it only ever
+  // reflects the *oldest* matching NETWORK events once a host has produced
+  // more than that many. On a very high-volume host, a destination whose
+  // events fall outside that window could be missing even if still
+  // active. Same posture ProcessList.tsx's own comment takes for
+  // /processes; not fixed here.
   const network = useNetwork();
   const [filter, setFilter] = useState("");
 
@@ -47,7 +50,7 @@ export function NetworkList() {
             {rows.map((row) => (
               <tr key={`${row.host_id}:${row.dst_ip}:${row.dst_port}:${row.proto}`}>
                 <td>
-                  <Link to={`/network/${row.dst_ip}`}>{`${row.dst_ip}:${row.dst_port}`}</Link>
+                  <Link to={`/network/${encodeURIComponent(row.dst_ip)}`}>{`${row.dst_ip}:${row.dst_port}`}</Link>
                 </td>
                 <td>{row.proto}</td>
                 <td>{row.hostname}</td>
