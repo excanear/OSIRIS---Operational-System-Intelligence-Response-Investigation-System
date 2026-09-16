@@ -75,7 +75,7 @@ export interface ContainerSummary {
   host_id: string;
   hostname: string;
   image: string;
-  status: "RUNNING" | "STOPPED";
+  status: "RUNNING" | "STOPPED" | "UNKNOWN";
   timestamp: number;
 }
 
