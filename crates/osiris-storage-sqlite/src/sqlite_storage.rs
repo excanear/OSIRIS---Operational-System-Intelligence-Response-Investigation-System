@@ -197,47 +197,23 @@ impl SqliteStorage {
         )
         .map_err(|e| StorageError::Backend(e.to_string()))?;
 
-        // Backfill `category` for any row that predates this column —
-        // grouped by distinct `event_type` (typically a handful of values,
-        // never one UPDATE per row) rather than a hand-maintained SQL
-        // CASE/WHEN mirroring `EventType::category()`'s ~49 branches, so
-        // the two mappings can never drift apart.
-        {
-            let mut stmt = conn
-                .prepare("SELECT DISTINCT event_type FROM events WHERE category IS NULL")
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            let distinct_event_types: Vec<String> = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| StorageError::Backend(e.to_string()))?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            drop(stmt);
-            for event_type_str in distinct_event_types {
-                let event_type: osiris_schema::EventType = match serde_json::from_value(
-                    serde_json::Value::String(event_type_str.clone()),
-                ) {
-                    Ok(event_type) => event_type,
-                    Err(e) => {
-                        tracing::warn!(
-                            event_type = %event_type_str,
-                            error = %e,
-                            "skipping category backfill for unrecognized event_type; \
-                             affected rows keep category = NULL"
-                        );
-                        continue;
-                    }
-                };
-                let category = serde_json::to_string(&event_type.category())
-                    .map_err(|e| StorageError::Backend(e.to_string()))?
-                    .trim_matches('"')
-                    .to_string();
-                conn.execute(
-                    "UPDATE events SET category = ?1 WHERE event_type = ?2 AND category IS NULL",
-                    params![category, event_type_str],
-                )
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            }
-        }
+        // Backfill `category` for any row that predates this column. Every
+        // row's `raw_json` already carries the authoritative, already-computed
+        // `category` field (`CanonicalEvent::category`) regardless of whether
+        // its `event_type` string is one this binary's `EventType` enum still
+        // recognizes — so this reads it straight out of the stored JSON via
+        // SQLite's `json_extract`, rather than re-deriving it from `event_type`
+        // through `EventType::category()`. That avoids needing a hand-maintained
+        // SQL CASE/WHEN mirroring `EventType::category()`'s ~49 branches (so the
+        // two can never drift apart), and it means a row with an unrecognized
+        // `event_type` (a renamed/removed variant, hand-edited data) still gets
+        // correctly backfilled instead of being permanently skipped.
+        conn.execute(
+            "UPDATE events SET category = json_extract(raw_json, '$.category') \
+             WHERE category IS NULL",
+            [],
+        )
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -2395,12 +2371,13 @@ mod tests {
     /// Non-destructive/idempotent migration proof for Phase 7b-6's new
     /// `category` column — unlike every earlier phase's added columns
     /// (which read back NULL on pre-existing rows because the source data
-    /// genuinely didn't exist yet), `category` is derivable from the
-    /// already-stored `event_type` column for *any* row, old or new, via
-    /// `EventType::category()`. So this migration must backfill existing
-    /// rows, not just add the column — and must do so for more than one
-    /// distinct `event_type` value, proving the backfill loop (grouped by
-    /// distinct `event_type`) isn't hardcoded to a single case.
+    /// genuinely didn't exist yet), `category` is already present as a
+    /// top-level field of every row's stored `raw_json` (`CanonicalEvent`
+    /// has always carried `category`), so this migration must backfill
+    /// existing rows via `json_extract`, not just add the column — and must
+    /// do so correctly for more than one row/event shape, proving the
+    /// single bulk `UPDATE ... json_extract(...)` isn't hardcoded to a
+    /// single case.
     #[test]
     fn migrates_a_pre_phase_7b6_database_by_backfilling_category_from_event_type() {
         let dir = tempfile::tempdir().unwrap();
@@ -2521,19 +2498,20 @@ mod tests {
         assert_eq!(reopened_again.query_events(&container_plan).unwrap().len(), 1);
     }
 
-    /// A row whose stored `event_type` string no longer deserializes to a
+    /// A row whose `event_type` COLUMN string no longer deserializes to a
     /// known `EventType` variant (a renamed/removed variant, hand-edited
     /// data, mild corruption) must not make the whole database permanently
-    /// unopenable — that row's `category` simply stays NULL and falls back
-    /// to residual `eval_ast` evaluation, exactly like every earlier
-    /// column's pre-existing-row behavior in this file.
+    /// unopenable, and — because the backfill reads `category` straight out
+    /// of `raw_json` via `json_extract` rather than re-deriving it from the
+    /// `event_type` column — that row still gets correctly backfilled, since
+    /// its `raw_json` carries a perfectly valid, already-computed `category`
+    /// regardless of what the `event_type` column says.
     #[test]
-    fn migration_skips_backfill_for_an_unrecognized_event_type_instead_of_failing_to_open() {
+    fn migration_backfills_from_raw_json_even_when_the_event_type_column_is_unrecognized() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("events.db");
 
-        let recognized = sample_event(300, 1000);
-        let unrecognized = sample_event(301, 2000);
+        let event = sample_event(300, 1000);
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -2548,48 +2526,104 @@ mod tests {
                 );",
             )
             .unwrap();
-            for (event, event_type) in [
-                (&recognized, "PROCESS_EXEC"),
-                (&unrecognized, "SOME_FUTURE_EVENT_TYPE_THIS_BINARY_DOES_NOT_KNOW"),
-            ] {
-                conn.execute(
-                    "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        event.event_id.to_string(),
-                        event.host_id.to_string(),
-                        event.timestamp as i64,
-                        event_type,
-                        serde_json::to_string(event).unwrap(),
-                    ],
-                )
-                .unwrap();
-            }
+            // The event_type COLUMN is a string this binary's EventType enum
+            // does not recognize, but raw_json (serialized from a real,
+            // valid CanonicalEvent) still has a correct top-level `category`.
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    event.event_id.to_string(),
+                    event.host_id.to_string(),
+                    event.timestamp as i64,
+                    "SOME_FUTURE_EVENT_TYPE_THIS_BINARY_DOES_NOT_KNOW",
+                    serde_json::to_string(&event).unwrap(),
+                ],
+            )
+            .unwrap();
         }
 
-        // Must not error, and must not lose the recognized row.
+        // Must not error, and must not lose the row.
         let reopened = SqliteStorage::open(&db_path).unwrap();
-        assert_eq!(reopened.query(&QueryPlan::new()).unwrap().len(), 2);
+        assert_eq!(reopened.query(&QueryPlan::new()).unwrap().len(), 1);
 
         let conn = reopened.conn.lock().unwrap();
-        let read_category = |event_id: Uuid| -> Option<String> {
-            conn.query_row(
+        let category: Option<String> = conn
+            .query_row(
                 "SELECT category FROM events WHERE event_id = ?1",
-                [event_id.to_string()],
+                [event.event_id.to_string()],
                 |row| row.get(0),
             )
-            .unwrap()
-        };
+            .unwrap();
         assert_eq!(
-            read_category(recognized.event_id),
+            category,
             Some("PROCESS".to_string()),
-            "the recognized row must still be backfilled"
+            "category must be backfilled from raw_json's own field, independent of whether \
+             the event_type column is recognized"
         );
-        assert_eq!(
-            read_category(unrecognized.event_id),
-            None,
-            "the unrecognized row's category must stay NULL rather than aborting the migration"
-        );
+    }
+
+    /// If `raw_json` itself is missing a `category` field entirely (deeper
+    /// corruption than an unrecognized `event_type`), `json_extract` returns
+    /// SQL NULL and the row's `category` simply stays NULL — falling back to
+    /// residual `eval_ast` evaluation, exactly like every earlier column's
+    /// pre-existing-row behavior in this file — rather than erroring.
+    #[test]
+    fn migration_leaves_category_null_when_raw_json_has_no_category_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let event = sample_event(300, 1000);
+        // A real, otherwise-valid event whose raw_json has had its
+        // `category` key removed (`residual eval_ast` re-parses raw_json
+        // for any field on every query anyway, so this doesn't need to stay
+        // a parseable CanonicalEvent for query() to still see the row —
+        // it only needs the object shape for json_extract's target key to
+        // genuinely be absent).
+        let mut raw_json = serde_json::to_value(&event).unwrap();
+        raw_json.as_object_mut().unwrap().remove("category");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    event.event_id.to_string(),
+                    event.host_id.to_string(),
+                    event.timestamp as i64,
+                    "PROCESS_EXEC",
+                    serde_json::to_string(&raw_json).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Must not error opening the database (json_extract on a missing
+        // key returns SQL NULL, not an error).
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+
+        let conn = reopened.conn.lock().unwrap();
+        let category: Option<String> = conn
+            .query_row(
+                "SELECT category FROM events WHERE event_id = ?1",
+                [event.event_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, None);
     }
 
     /// The backfill's `WHERE category IS NULL` guard is load-bearing: it's
