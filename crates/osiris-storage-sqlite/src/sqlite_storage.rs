@@ -148,11 +148,12 @@ impl SqliteStorage {
         // unlike every column above, `category` is NOT a new fact: it has
         // always existed on every event (`CanonicalEvent::category` is
         // mandatory, never `Option`), just never had its own column. So a
-        // pre-existing row's `category` IS derivable from its own already-
-        // stored `event_type` via `EventType::category()`, and leaving it
-        // NULL would be wrong (not merely uninformative) — it's backfilled
-        // explicitly below instead of following the read-back-NULL
-        // precedent every earlier column here uses.
+        // pre-existing row's `category` IS already present in its own
+        // stored `raw_json`, and leaving the column NULL would be wrong
+        // (not merely uninformative) — it's backfilled explicitly below,
+        // by reading `raw_json`'s own `category` field via `json_extract`,
+        // instead of following the read-back-NULL precedent every earlier
+        // column here uses.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
@@ -2379,7 +2380,7 @@ mod tests {
     /// single bulk `UPDATE ... json_extract(...)` isn't hardcoded to a
     /// single case.
     #[test]
-    fn migrates_a_pre_phase_7b6_database_by_backfilling_category_from_event_type() {
+    fn migrates_a_pre_phase_7b6_database_by_backfilling_category_from_raw_json() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("events.db");
 
