@@ -213,9 +213,20 @@ impl SqliteStorage {
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
             drop(stmt);
             for event_type_str in distinct_event_types {
-                let event_type: osiris_schema::EventType =
-                    serde_json::from_value(serde_json::Value::String(event_type_str.clone()))
-                        .map_err(|e| StorageError::Backend(e.to_string()))?;
+                let event_type: osiris_schema::EventType = match serde_json::from_value(
+                    serde_json::Value::String(event_type_str.clone()),
+                ) {
+                    Ok(event_type) => event_type,
+                    Err(e) => {
+                        tracing::warn!(
+                            event_type = %event_type_str,
+                            error = %e,
+                            "skipping category backfill for unrecognized event_type; \
+                             affected rows keep category = NULL"
+                        );
+                        continue;
+                    }
+                };
                 let category = serde_json::to_string(&event_type.category())
                     .map_err(|e| StorageError::Backend(e.to_string()))?
                     .trim_matches('"')
@@ -2508,6 +2519,159 @@ mod tests {
         }
         assert_eq!(reopened_again.query_events(&process_plan).unwrap().len(), 1);
         assert_eq!(reopened_again.query_events(&container_plan).unwrap().len(), 1);
+    }
+
+    /// A row whose stored `event_type` string no longer deserializes to a
+    /// known `EventType` variant (a renamed/removed variant, hand-edited
+    /// data, mild corruption) must not make the whole database permanently
+    /// unopenable — that row's `category` simply stays NULL and falls back
+    /// to residual `eval_ast` evaluation, exactly like every earlier
+    /// column's pre-existing-row behavior in this file.
+    #[test]
+    fn migration_skips_backfill_for_an_unrecognized_event_type_instead_of_failing_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let recognized = sample_event(300, 1000);
+        let unrecognized = sample_event(301, 2000);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            for (event, event_type) in [
+                (&recognized, "PROCESS_EXEC"),
+                (&unrecognized, "SOME_FUTURE_EVENT_TYPE_THIS_BINARY_DOES_NOT_KNOW"),
+            ] {
+                conn.execute(
+                    "INSERT INTO events (event_id, host_id, timestamp, event_type, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        event.event_id.to_string(),
+                        event.host_id.to_string(),
+                        event.timestamp as i64,
+                        event_type,
+                        serde_json::to_string(event).unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // Must not error, and must not lose the recognized row.
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened.query(&QueryPlan::new()).unwrap().len(), 2);
+
+        let conn = reopened.conn.lock().unwrap();
+        let read_category = |event_id: Uuid| -> Option<String> {
+            conn.query_row(
+                "SELECT category FROM events WHERE event_id = ?1",
+                [event_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read_category(recognized.event_id),
+            Some("PROCESS".to_string()),
+            "the recognized row must still be backfilled"
+        );
+        assert_eq!(
+            read_category(unrecognized.event_id),
+            None,
+            "the unrecognized row's category must stay NULL rather than aborting the migration"
+        );
+    }
+
+    /// The backfill's `WHERE category IS NULL` guard is load-bearing: it's
+    /// what makes the backfill idempotent and what stops it from ever
+    /// clobbering a value written by a normal `batch_write`. This locks
+    /// that guard in by pre-populating a row's category with a value that
+    /// disagrees with what the (correct) backfill would compute from its
+    /// `event_type`, and asserting it survives untouched.
+    #[test]
+    fn migration_never_overwrites_an_already_populated_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let event = sample_event(300, 1000);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    process_key TEXT,
+                    parent_process_key TEXT,
+                    category TEXT,
+                    raw_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            // event_type says PROCESS_EXEC (category would backfill to
+            // PROCESS), but category is already populated with a
+            // deliberately different value — the guard must leave it alone.
+            conn.execute(
+                "INSERT INTO events (event_id, host_id, timestamp, event_type, category, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    event.event_id.to_string(),
+                    event.host_id.to_string(),
+                    event.timestamp as i64,
+                    "PROCESS_EXEC",
+                    "SOME_PREEXISTING_VALUE",
+                    serde_json::to_string(&event).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let conn = reopened.conn.lock().unwrap();
+        let category: Option<String> = conn
+            .query_row(
+                "SELECT category FROM events WHERE event_id = ?1",
+                [event.event_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, Some("SOME_PREEXISTING_VALUE".to_string()));
+    }
+
+    /// The whole point of Phase 7b-6 is that `category = "..."` becomes an
+    /// indexed SQL seek instead of a full-table scan. Every other assertion
+    /// in this file only proves *results are correct* — which was already
+    /// true before this phase via the residual `eval_ast` fallback, so it
+    /// can't catch a regression that silently drops the pushdown mapping or
+    /// the index. This inspects `EXPLAIN QUERY PLAN` directly to prove the
+    /// index is actually used.
+    #[test]
+    fn query_events_category_filter_actually_uses_the_index() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT raw_json, timestamp, event_id FROM events \
+                 WHERE 1=1 AND category = ? ORDER BY timestamp ASC, event_id ASC LIMIT 100",
+                ["FILE"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_events_category_timestamp"),
+            "expected the category filter to use idx_events_category_timestamp, got: {plan}"
+        );
     }
 
     /// Non-destructive/idempotent migration proof, matching Phase 2 Task 6's
