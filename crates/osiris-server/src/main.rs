@@ -207,14 +207,11 @@ async fn main() {
         .users_db_path
         .clone()
         .unwrap_or_else(|| "/var/lib/osiris/users.db".to_string());
-    let (user_store, bootstrap_admin) = match SqliteUserStore::open(&users_db_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(path = %users_db_path, error = %e, "failed to open the user store");
-            eprintln!("fatal: failed to open user store at '{users_db_path}': {e}");
-            std::process::exit(1);
-        }
-    };
+    let (user_store, bootstrap_admin) = open_or_exit(
+        SqliteUserStore::open(&users_db_path),
+        &users_db_path,
+        "users_db_path",
+    );
     if let Some(admin) = bootstrap_admin {
         tracing::warn!(
             username = %admin.username,
