@@ -1058,6 +1058,7 @@ dependencies = [
  "osiris-evidence",
  "osiris-investigate",
  "osiris-query",
+ "osiris-response",
  "osiris-schema",
  "osiris-storage",
  "osiris-storage-sqlite",
