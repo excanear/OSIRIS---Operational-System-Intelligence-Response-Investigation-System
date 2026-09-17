@@ -76,7 +76,7 @@ fn percent_decode(value: &str) -> String {
 /// Analyst-only via `POST`/`PATCH`. And `/api/v1/incidents/:incident_id` is
 /// an axum *template* — a real request path carries a UUID there, never the
 /// literal `:incident_id` — so that route is matched by prefix, not equality.
-fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
+pub fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     use axum::http::Method;
 
     if path == "/api/v1/audit" || path == "/api/v1/auth/users" {

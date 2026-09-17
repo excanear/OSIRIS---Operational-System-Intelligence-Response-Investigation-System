@@ -32,6 +32,7 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/network/story", get(network_story_handler))
         .route("/api/v1/identity/story", get(identity_story_handler))
         .route("/api/v1/systemd/story", get(systemd_story_handler))
+        .route("/api/v1/hosts", get(hosts_handler))
         .route("/api/v1/containers", get(containers_handler))
         .route("/api/v1/containers/story", get(container_story_handler))
         .route("/api/v1/system/story", get(system_story_handler))
@@ -651,6 +652,94 @@ struct ContainerSummary {
     image: String,
     status: String,
     timestamp: u64,
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+const HOST_ONLINE_THRESHOLD_NS: u64 = 5 * 60 * 1_000_000_000;
+const HOST_REGISTRY_DEFAULT_WINDOW_NS: u64 = 24 * 3_600 * 1_000_000_000;
+
+#[derive(Debug, Deserialize)]
+struct HostsQuery {
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct HostSummary {
+    host_id: String,
+    hostname: String,
+    distro: String,
+    kernel_version: String,
+    last_seen: u64,
+    status: String,
+}
+
+/// `GET /api/v1/hosts` — ARCHITECTURE.md §21.2's Fleet Manager, scoped to
+/// its read-only v1 slice (2026-09-17 phase-8c-host-registry-design.md
+/// §1): one row per distinct `host_id` any recent event carried, dedup
+/// keyed by `host_id` keeping the most-recent event, `status` a recency
+/// heuristic (not a real heartbeat — no AGENT_HEALTH event is emitted by
+/// anything today). Time-windowed to `since`/`until` (default: the last
+/// 24h) rather than an unbounded historical scan, deliberately unlike
+/// `containers_handler`'s sibling shape — see this handler's own design
+/// doc §2 for why a fleet registry's correctness depends on recency, not
+/// full history.
+async fn hosts_handler(
+    State(storage): State<Arc<dyn Storage>>,
+    Query(q): Query<HostsQuery>,
+) -> Result<Json<Vec<HostSummary>>, (StatusCode, String)> {
+    let now = now_ns();
+    let since = q.since.unwrap_or_else(|| now.saturating_sub(HOST_REGISTRY_DEFAULT_WINDOW_NS));
+    let until = q.until.unwrap_or(u64::MAX);
+    let plan = osiris_query::EventQueryPlan {
+        filter: None,
+        since: Some(since),
+        until: Some(until),
+        limit: osiris_query::MAX_EVENT_LIMIT,
+        export: true,
+        ..osiris_query::EventQueryPlan::new()
+    };
+    let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut seen: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
+    for event in events {
+        match seen.get(&event.host_id) {
+            Some(existing) if existing.timestamp >= event.timestamp => {}
+            _ => {
+                seen.insert(event.host_id, event);
+            }
+        }
+    }
+
+    let mut rows: Vec<HostSummary> = seen
+        .into_values()
+        .map(|event| {
+            let status = if now.saturating_sub(event.timestamp) <= HOST_ONLINE_THRESHOLD_NS {
+                "ONLINE"
+            } else {
+                "STALE"
+            };
+            HostSummary {
+                host_id: event.host_id.to_string(),
+                hostname: event.host.hostname,
+                distro: event.host.distro,
+                kernel_version: event.host.kernel_version,
+                last_seen: event.timestamp,
+                status: status.to_string(),
+            }
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.last_seen));
+    Ok(Json(rows))
 }
 
 /// `GET /api/v1/containers` — ARCHITECTURE.md §16.3's Containers list
@@ -2267,6 +2356,124 @@ mod tests {
         let q = SubgraphQuery { entity: None, depth: None, max_nodes: None, since: None, until: None };
         let err = subgraph_handler(State(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    fn host_event(host_id: uuid::Uuid, hostname: &str, timestamp: u64) -> CanonicalEvent {
+        CanonicalEvent {
+            event_id: uuid::Uuid::now_v7(),
+            schema_version: osiris_schema::SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "b".to_string(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::ProcessExec,
+            category: osiris_schema::Category::Process,
+            severity: osiris_schema::Severity::Info,
+            host: osiris_schema::HostRef {
+                host_id,
+                hostname: hostname.to_string(),
+                distro: "ubuntu-22.04".to_string(),
+                kernel_version: "5.15.0".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: osiris_schema::Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    fn now_ns_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[tokio::test]
+    async fn hosts_endpoint_returns_one_row_per_host_most_recent_first() {
+        let (_dir, storage) = test_storage();
+        let host_a = uuid::Uuid::new_v4();
+        let host_b = uuid::Uuid::new_v4();
+        let now = now_ns_for_test();
+        // host_a: two events, keep the later one (5s ago).
+        storage.write(&host_event(host_a, "host-a", now - 10_000_000_000)).unwrap();
+        storage.write(&host_event(host_a, "host-a", now - 5_000_000_000)).unwrap();
+        // host_b: one event, 2s ago — more recent than host_a's kept event.
+        storage.write(&host_event(host_b, "host-b", now - 2_000_000_000)).unwrap();
+
+        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: None, until: None })).await.unwrap();
+
+        assert_eq!(rows.len(), 2, "one row per distinct host_id");
+        assert_eq!(rows[0].hostname, "host-b", "most-recently-active host first");
+        assert_eq!(rows[1].hostname, "host-a");
+        let kept_a = rows.iter().find(|r| r.hostname == "host-a").unwrap();
+        assert_eq!(kept_a.last_seen, now - 5_000_000_000, "kept the more recent of host_a's two events");
+    }
+
+    #[tokio::test]
+    async fn hosts_endpoint_excludes_events_outside_the_since_until_window() {
+        let (_dir, storage) = test_storage();
+        let host_id = uuid::Uuid::new_v4();
+        let now = now_ns_for_test();
+        storage.write(&host_event(host_id, "old-host", now - 48 * 3_600_000_000_000)).unwrap();
+
+        // Default window (no since/until given) is the last 24h — this
+        // event is 48h old, so it must not appear.
+        let Json(rows) = hosts_handler(State(storage.clone()), Query(HostsQuery { since: None, until: None })).await.unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // Explicitly widening the window includes it.
+        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hosts_endpoint_marks_status_online_within_five_minutes_and_stale_beyond_it() {
+        let (_dir, storage) = test_storage();
+        let online_host = uuid::Uuid::new_v4();
+        let stale_host = uuid::Uuid::new_v4();
+        let now = now_ns_for_test();
+        storage.write(&host_event(online_host, "online-host", now - 60 * 1_000_000_000)).unwrap(); // 60s ago
+        storage.write(&host_event(stale_host, "stale-host", now - 10 * 60 * 1_000_000_000)).unwrap(); // 10 min ago
+
+        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+
+        let online = rows.iter().find(|r| r.hostname == "online-host").unwrap();
+        let stale = rows.iter().find(|r| r.hostname == "stale-host").unwrap();
+        assert_eq!(online.status, "ONLINE");
+        assert_eq!(stale.status, "STALE");
+    }
+
+    #[test]
+    fn no_existing_min_role_for_rule_shadows_the_hosts_path() {
+        // Regression guard for this plan's own Global Constraint: /api/v1/hosts
+        // must fall through to the default Role::Viewer, not get accidentally
+        // caught by an existing more-specific rule (e.g. a prefix match).
+        // This test lives here (not auth_middleware.rs) because it's this
+        // task's own claim being checked, not a new RBAC rule being added.
+        use osiris_auth::Role;
+        assert_eq!(
+            crate::auth_middleware::min_role_for(&axum::http::Method::GET, "/api/v1/hosts"),
+            Role::Viewer
+        );
     }
 }
 
