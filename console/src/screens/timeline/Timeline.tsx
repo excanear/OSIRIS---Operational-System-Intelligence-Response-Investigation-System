@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useEvents, useSystemStory } from "../../api/hooks";
 import { parseOptionalNumber } from "../../api/numeric";
 import { rollupSensorHealth } from "../sensors/rollup";
@@ -6,7 +7,8 @@ import { rollupSensorHealth } from "../sensors/rollup";
 const ONE_HOUR_NS = 3_600 * 1_000_000_000;
 
 export function Timeline() {
-  const [hostId, setHostId] = useState("");
+  const [searchParams] = useSearchParams();
+  const [hostId, setHostId] = useState(searchParams.get("host") ?? "");
   const [since, setSince] = useState("");
   const [until, setUntil] = useState("");
 

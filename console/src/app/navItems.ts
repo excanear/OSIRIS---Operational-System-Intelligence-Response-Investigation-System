@@ -11,6 +11,7 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Filesystem", path: "/files", enabled: true },
   { label: "Network", path: "/network", enabled: true },
   { label: "Containers", path: "/containers", enabled: true },
+  { label: "Hosts", path: "/hosts", enabled: true },
   { label: "Timeline", path: "/timeline", enabled: true },
   { label: "Alerts", path: "/alerts", enabled: true },
   { label: "Incidents", path: "/incidents", enabled: true },

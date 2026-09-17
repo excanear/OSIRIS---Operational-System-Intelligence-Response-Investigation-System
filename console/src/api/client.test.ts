@@ -12,6 +12,7 @@ import {
   fetchFiles,
   fetchFileStory,
   fetchHealth,
+  fetchHosts,
   fetchIncident,
   fetchIncidents,
   fetchNetwork,
@@ -370,6 +371,12 @@ describe("api client", () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
     await fetchContainers();
     expect(fetch).toHaveBeenCalledWith("/api/v1/containers");
+  });
+
+  it("fetchHosts calls /api/v1/hosts", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchHosts();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/hosts");
   });
 
   it("fetchFileStory calls /api/v1/files/story with an encoded file_id", async () => {

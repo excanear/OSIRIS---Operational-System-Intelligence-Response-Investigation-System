@@ -8,6 +8,7 @@ import type {
   Evidence,
   EvidenceWithIncidents,
   FileSummary,
+  HostSummary,
   Incident,
   IncidentStatus,
   LoginResponse,
@@ -158,6 +159,10 @@ export function fetchNetwork(): Promise<NetworkSummary[]> {
 
 export function fetchContainers(): Promise<ContainerSummary[]> {
   return apiGet<ContainerSummary[]>("/containers");
+}
+
+export function fetchHosts(): Promise<HostSummary[]> {
+  return apiGet<HostSummary[]>("/hosts");
 }
 
 export function fetchFileStory(fileId: string): Promise<Story> {

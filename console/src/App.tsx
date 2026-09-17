@@ -9,6 +9,7 @@ import { FileDetailScreen } from "./screens/files/FileDetailScreen";
 import { FileList } from "./screens/files/FileList";
 import { EntityGraph } from "./screens/graph/EntityGraph";
 import { EvidenceList } from "./screens/evidence/EvidenceList";
+import { HostList } from "./screens/hosts/HostList";
 import { IncidentDetailScreen } from "./screens/incidents/IncidentDetailScreen";
 import { IncidentList } from "./screens/incidents/IncidentList";
 import { LiveEvents } from "./screens/live/LiveEvents";
@@ -49,6 +50,7 @@ export function App() {
                 <Route path="/network/:ip" element={<NetworkDetailScreen />} />
                 <Route path="/containers" element={<ContainerList />} />
                 <Route path="/containers/:containerId" element={<ContainerDetailScreen />} />
+                <Route path="/hosts" element={<HostList />} />
                 <Route path="/timeline" element={<Timeline />} />
                 <Route path="/alerts" element={<Alerts />} />
                 <Route path="/incidents" element={<IncidentList />} />

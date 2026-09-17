@@ -79,6 +79,15 @@ export interface ContainerSummary {
   timestamp: number;
 }
 
+export interface HostSummary {
+  host_id: string;
+  hostname: string;
+  distro: string;
+  kernel_version: string;
+  last_seen: number;
+  status: "ONLINE" | "STALE";
+}
+
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 export type AlertStatus = "OPEN" | "ACKNOWLEDGED" | "SUPPRESSED";
 

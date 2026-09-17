@@ -11,6 +11,7 @@ import {
   fetchFiles,
   fetchFileStory,
   fetchHealth,
+  fetchHosts,
   fetchIncident,
   fetchIncidents,
   fetchNetwork,
@@ -106,6 +107,13 @@ export function useContainers() {
   return useQuery({
     queryKey: ["containers"],
     queryFn: fetchContainers,
+  });
+}
+
+export function useHosts() {
+  return useQuery({
+    queryKey: ["hosts"],
+    queryFn: fetchHosts,
   });
 }
 

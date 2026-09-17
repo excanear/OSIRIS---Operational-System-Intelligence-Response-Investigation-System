@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import * as hooks from "../../api/hooks";
 import { Timeline } from "./Timeline";
@@ -13,6 +14,14 @@ function mockQueryResult(overrides: Record<string, unknown>) {
     error: null,
     ...overrides,
   };
+}
+
+function renderWithRouter(initialEntries: string[] = ["/timeline"]) {
+  return render(
+    <MemoryRouter initialEntries={initialEntries}>
+      <Timeline />
+    </MemoryRouter>
+  );
 }
 
 const sensorHealthEvent = (hostId: string) => ({
@@ -32,7 +41,7 @@ describe("Timeline", () => {
     );
     vi.mocked(hooks.useSystemStory).mockReturnValue(mockQueryResult({}) as ReturnType<typeof hooks.useSystemStory>);
 
-    render(<Timeline />);
+    renderWithRouter();
 
     expect(screen.getByLabelText("Host")).toHaveValue("");
     expect(screen.getByRole("option", { name: "host-a" })).toBeInTheDocument();
@@ -43,7 +52,7 @@ describe("Timeline", () => {
     vi.mocked(hooks.useEvents).mockReturnValue(mockQueryResult({ data: [] }) as ReturnType<typeof hooks.useEvents>);
     vi.mocked(hooks.useSystemStory).mockReturnValue(mockQueryResult({}) as ReturnType<typeof hooks.useSystemStory>);
 
-    render(<Timeline />);
+    renderWithRouter();
 
     expect(screen.getByText("Select a host to load its timeline.")).toBeInTheDocument();
   });
@@ -54,7 +63,7 @@ describe("Timeline", () => {
     );
     vi.mocked(hooks.useSystemStory).mockReturnValue(mockQueryResult({}) as ReturnType<typeof hooks.useSystemStory>);
 
-    render(<Timeline />);
+    renderWithRouter();
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "host-a" } });
     fireEvent.change(screen.getByLabelText("Since (nanoseconds)"), { target: { value: "1000" } });
     fireEvent.change(screen.getByLabelText("Until (nanoseconds)"), { target: { value: "2000" } });
@@ -78,7 +87,7 @@ describe("Timeline", () => {
       }) as ReturnType<typeof hooks.useSystemStory>
     );
 
-    render(<Timeline />);
+    renderWithRouter();
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "host-a" } });
 
     const items = screen.getAllByRole("listitem");
@@ -92,9 +101,18 @@ describe("Timeline", () => {
     vi.mocked(hooks.useEvents).mockReturnValue(mockQueryResult({ data: [] }) as ReturnType<typeof hooks.useEvents>);
     vi.mocked(hooks.useSystemStory).mockReturnValue(mockQueryResult({}) as ReturnType<typeof hooks.useSystemStory>);
 
-    render(<Timeline />);
+    renderWithRouter();
     fireEvent.click(screen.getByText("Last 1 hour"));
 
     expect(screen.getByLabelText("Since (nanoseconds)")).not.toHaveValue("");
+  });
+
+  it("pre-selects the host from a ?host= URL search param", () => {
+    vi.mocked(hooks.useEvents).mockReturnValue(mockQueryResult({ data: [] }) as ReturnType<typeof hooks.useEvents>);
+    vi.mocked(hooks.useSystemStory).mockReturnValue(mockQueryResult({}) as ReturnType<typeof hooks.useSystemStory>);
+
+    renderWithRouter(["/timeline?host=host-a"]);
+
+    expect(hooks.useSystemStory).toHaveBeenLastCalledWith("host-a", { since: undefined, until: undefined });
   });
 });

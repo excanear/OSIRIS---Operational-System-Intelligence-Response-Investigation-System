@@ -22,10 +22,10 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
   });
 
-  it("renders exactly thirteen nav links, for Overview, Live Events, Process Explorer, Filesystem, Network, Containers, Timeline, Alerts, Incidents, Threat Hunting, Entity Graph, Evidence, and Sensors", () => {
+  it("renders exactly fourteen nav links, for Overview, Live Events, Process Explorer, Filesystem, Network, Containers, Hosts, Timeline, Alerts, Incidents, Threat Hunting, Entity Graph, Evidence, and Sensors", () => {
     render(<App />);
     const links = screen.getAllByRole("link");
-    expect(links).toHaveLength(13);
+    expect(links).toHaveLength(14);
     expect(links.map((link) => link.textContent)).toEqual([
       "Overview",
       "Live Events",
@@ -33,6 +33,7 @@ describe("App", () => {
       "Filesystem",
       "Network",
       "Containers",
+      "Hosts",
       "Timeline",
       "Alerts",
       "Incidents",
