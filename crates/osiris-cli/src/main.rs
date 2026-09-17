@@ -75,6 +75,19 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Local session management (Phase 8a).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Log in and cache a session token at ~/.osiris/token.
+    Login { username: String },
+    /// Revoke the current session and delete the cached token.
+    Logout,
 }
 
 /// Sends the request, then treats a non-2xx HTTP status as a failure —
@@ -82,18 +95,45 @@ enum Command {
 /// on 4xx/5xx responses, which would otherwise let a `400`/`404`/`500` print
 /// its body and exit 0 (a broken contract for any script driving this CLI).
 fn get(client: &reqwest::blocking::Client, url: String) -> Result<String, String> {
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("request failed: {}", e))?;
+    let mut request = client.get(url);
+    if let Some(token) = osiris_cli::auth::read_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
     let body = response
         .text()
         .map_err(|e| format!("request failed: {}", e))?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("not authenticated — run `osiris-cli auth login <username>`".to_string());
+    }
     if !status.is_success() {
         return Err(format!("request failed: HTTP {}: {}", status, body));
     }
     Ok(body)
+}
+
+fn post_json(
+    client: &reqwest::blocking::Client,
+    url: String,
+    body: serde_json::Value,
+) -> Result<String, String> {
+    let mut request = client.post(url).json(&body);
+    if let Some(token) = osiris_cli::auth::read_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
+    let status = response.status();
+    let resp_body = response
+        .text()
+        .map_err(|e| format!("request failed: {}", e))?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("not authenticated — run `osiris-cli auth login <username>`".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("request failed: HTTP {}: {}", status, resp_body));
+    }
+    Ok(resp_body)
 }
 
 fn main() {
@@ -166,6 +206,40 @@ fn main() {
             let url = hunt_url(&cli.server, &resolved, since, until, limit);
             get(&client, url)
         }
+        Command::Auth { action } => match action {
+            AuthAction::Login { username } => {
+                let password = rpassword::prompt_password("Password: ").unwrap_or_default();
+                let url = format!("{}/api/v1/auth/login", cli.server.trim_end_matches('/'));
+                let body = serde_json::json!({ "username": username, "password": password });
+                match client.post(&url).json(&body).send() {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let text = resp.text().unwrap_or_default();
+                        if status.is_success() {
+                            match serde_json::from_str::<serde_json::Value>(&text) {
+                                Ok(v) => {
+                                    let token = v.get("token").and_then(|t| t.as_str()).unwrap_or_default();
+                                    match osiris_cli::auth::write_token(token) {
+                                        Ok(()) => Ok("logged in".to_string()),
+                                        Err(e) => Err(format!("login succeeded but failed to save token: {}", e)),
+                                    }
+                                }
+                                Err(e) => Err(format!("unexpected login response: {}", e)),
+                            }
+                        } else {
+                            Err(format!("login failed: HTTP {}: {}", status, text))
+                        }
+                    }
+                    Err(e) => Err(format!("request failed: {}", e)),
+                }
+            }
+            AuthAction::Logout => {
+                let url = format!("{}/api/v1/auth/logout", cli.server.trim_end_matches('/'));
+                let _ = post_json(&client, url, serde_json::json!({}));
+                osiris_cli::auth::delete_token();
+                Ok("logged out".to_string())
+            }
+        },
     };
 
     match result {
