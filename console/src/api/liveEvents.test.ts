@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useLiveEvents } from "./liveEvents";
+import { useAuthStore } from "../store/authStore";
 import type { CanonicalEvent } from "./types";
 
 class MockWebSocket {
@@ -52,11 +53,13 @@ describe("useLiveEvents", () => {
     MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
     vi.useFakeTimers();
+    useAuthStore.getState().clearSession();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    useAuthStore.getState().clearSession();
   });
 
   it("opens a socket and transitions to live on open", () => {
@@ -153,5 +156,24 @@ describe("useLiveEvents", () => {
   it("builds the socket URL with a q filter", () => {
     renderHook(() => useLiveEvents({ q: 'event_type = "PROCESS_EXEC"' }));
     expect(MockWebSocket.instances[0].url).toContain("q=");
+  });
+
+  it("includes the session token in the socket URL when a session exists", () => {
+    useAuthStore.getState().setSession({
+      token: "session-token-123",
+      role: "ANALYST",
+      username: "alice",
+    });
+
+    renderHook(() => useLiveEvents({ hostId: "host-1" }));
+
+    const url = new URL(MockWebSocket.instances[0].url.replace(/^ws/, "http"));
+    expect(url.searchParams.get("token")).toBe("session-token-123");
+    expect(url.searchParams.get("host_id")).toBe("host-1");
+  });
+
+  it("omits the token parameter entirely when there is no session", () => {
+    renderHook(() => useLiveEvents());
+    expect(MockWebSocket.instances[0].url).not.toContain("token=");
   });
 });

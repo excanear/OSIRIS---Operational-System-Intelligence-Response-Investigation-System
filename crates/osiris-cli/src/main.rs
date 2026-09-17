@@ -126,14 +126,37 @@ enum UsersAction {
     List,
 }
 
+/// Reads a password from the TTY, refusing to fall back to an empty string.
+/// A failed prompt (non-interactive shell, redirected stdin, CI) must abort,
+/// never silently create or attempt a login with an empty password.
+fn prompt_password_or_fail(prompt: &str) -> Result<String, String> {
+    rpassword::prompt_password(prompt).map_err(|e| {
+        format!(
+            "failed to read the password from the terminal ({e}) — \
+             this command requires an interactive TTY"
+        )
+    })
+}
+
 /// Sends the request, then treats a non-2xx HTTP status as a failure —
 /// `reqwest::send()` alone only errors on connection/transport failure, not
 /// on 4xx/5xx responses, which would otherwise let a `400`/`404`/`500` print
 /// its body and exit 0 (a broken contract for any script driving this CLI).
-fn get(client: &reqwest::blocking::Client, url: String) -> Result<String, String> {
+///
+/// `attach_token` selects whether the cached session token is sent. It is
+/// scoped to the `--server` API only: `--agent` is a different service, on a
+/// potentially different host in a fleet deployment, and must never receive
+/// an operator's OSIRIS server session token.
+fn get(
+    client: &reqwest::blocking::Client,
+    url: String,
+    attach_token: bool,
+) -> Result<String, String> {
     let mut request = client.get(url);
-    if let Some(token) = osiris_cli::auth::read_token() {
-        request = request.bearer_auth(token);
+    if attach_token {
+        if let Some(token) = osiris_cli::auth::read_token() {
+            request = request.bearer_auth(token);
+        }
     }
     let response = request.send().map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
@@ -153,10 +176,13 @@ fn post_json(
     client: &reqwest::blocking::Client,
     url: String,
     body: serde_json::Value,
+    attach_token: bool,
 ) -> Result<String, String> {
     let mut request = client.post(url).json(&body);
-    if let Some(token) = osiris_cli::auth::read_token() {
-        request = request.bearer_auth(token);
+    if attach_token {
+        if let Some(token) = osiris_cli::auth::read_token() {
+            request = request.bearer_auth(token);
+        }
     }
     let response = request.send().map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
@@ -177,13 +203,17 @@ fn main() {
     let client = reqwest::blocking::Client::new();
 
     let result = match &cli.command {
+        // `--agent` is a separate service (default port 9200), potentially on
+        // another host: the server session token is deliberately NOT attached.
         Command::Status => get(
             &client,
             format!("{}/status", cli.agent.trim_end_matches('/')),
+            false,
         ),
         Command::Health => get(
             &client,
             format!("{}/api/v1/health", cli.server.trim_end_matches('/')),
+            true,
         ),
         Command::Events {
             event_type,
@@ -192,7 +222,7 @@ fn main() {
             limit,
         } => {
             let url = events_url(&cli.server, event_type, since, until, limit);
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::Processes { process_key } => {
             let url = match process_key {
@@ -203,22 +233,22 @@ fn main() {
                 ),
                 None => format!("{}/api/v1/processes", cli.server.trim_end_matches('/')),
             };
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::ContainerStory { container_id } => {
             let url = container_story_url(&cli.server, container_id);
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::Chain { entity, depth } => {
             let url = chain_url(&cli.server, entity, depth);
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::Risk {
             process_key,
             event_id,
         } => {
             let url = risk_url(&cli.server, process_key, event_id);
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::Hunt { query, template: template_name, since, until, limit } => {
             let resolved = match (query, template_name) {
@@ -240,11 +270,17 @@ fn main() {
                 }
             };
             let url = hunt_url(&cli.server, &resolved, since, until, limit);
-            get(&client, url)
+            get(&client, url, true)
         }
         Command::Auth { action } => match action {
             AuthAction::Login { username } => {
-                let password = rpassword::prompt_password("Password: ").unwrap_or_default();
+                let password = match prompt_password_or_fail("Password: ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                };
                 let url = format!("{}/api/v1/auth/login", cli.server.trim_end_matches('/'));
                 let body = serde_json::json!({ "username": username, "password": password });
                 match client.post(&url).json(&body).send() {
@@ -271,25 +307,31 @@ fn main() {
             }
             AuthAction::Logout => {
                 let url = format!("{}/api/v1/auth/logout", cli.server.trim_end_matches('/'));
-                let _ = post_json(&client, url, serde_json::json!({}));
+                let _ = post_json(&client, url, serde_json::json!({}), true);
                 osiris_cli::auth::delete_token();
                 Ok("logged out".to_string())
             }
         },
         Command::Users { action } => match action {
             UsersAction::Create { username, role } => {
-                let password = rpassword::prompt_password("Password for new user: ").unwrap_or_default();
+                let password = match prompt_password_or_fail("Password for new user: ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                };
                 let url = format!("{}/api/v1/auth/users", cli.server.trim_end_matches('/'));
                 let body = serde_json::json!({
                     "username": username,
                     "password": password,
                     "role": role.wire(),
                 });
-                post_json(&client, url, body)
+                post_json(&client, url, body, true)
             }
             UsersAction::List => {
                 let url = format!("{}/api/v1/auth/users", cli.server.trim_end_matches('/'));
-                get(&client, url)
+                get(&client, url, true)
             }
         },
     };

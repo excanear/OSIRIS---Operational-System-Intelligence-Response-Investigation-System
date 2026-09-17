@@ -216,6 +216,9 @@ async fn me_handler(
     }))
 }
 
+/// Minimum accepted password length for a newly created account.
+pub const MIN_PASSWORD_LENGTH: usize = 8;
+
 #[derive(Debug, Deserialize)]
 struct CreateUserBody {
     username: String,
@@ -233,6 +236,16 @@ async fn create_user_handler(
     Extension(ctx): Extension<AuthContext>,
     Json(body): Json<CreateUserBody>,
 ) -> Result<Json<CreateUserResponse>, (StatusCode, String)> {
+    // Server-side floor, enforced before any hashing: a client (the CLI, the
+    // Console, or curl) must never be the only thing standing between a weak
+    // or empty password and a real account.
+    if body.password.len() < MIN_PASSWORD_LENGTH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("password must be at least {MIN_PASSWORD_LENGTH} characters"),
+        ));
+    }
+
     let password = body.password.clone();
     let password_hash = tokio::task::spawn_blocking(move || osiris_auth::hash_password(&password))
         .await
@@ -426,12 +439,12 @@ mod tests {
             token: "irrelevant".to_string(),
         };
 
-        create_user_handler(
+        let _ = create_user_handler(
             State(state.clone()),
             Extension(admin_ctx),
             Json(CreateUserBody {
                 username: "dave".to_string(),
-                password: "pw".to_string(),
+                password: "a-long-enough-password".to_string(),
                 role: Role::ResponseOperator,
             }),
         )
@@ -440,6 +453,36 @@ mod tests {
 
         let Json(users) = list_users_handler(State(state)).await.unwrap();
         assert!(users.iter().any(|u| u.username == "dave" && u.role == Role::ResponseOperator));
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_a_password_shorter_than_the_minimum() {
+        let (_d1, _d2, state) = test_state();
+        let admin_ctx = AuthContext {
+            user_id: Uuid::new_v4(),
+            role: Role::Admin,
+            token: "irrelevant".to_string(),
+        };
+
+        let result = create_user_handler(
+            State(state.clone()),
+            Extension(admin_ctx),
+            Json(CreateUserBody {
+                username: "shorty".to_string(),
+                password: "short".to_string(),
+                role: Role::Viewer,
+            }),
+        )
+        .await;
+
+        let (status, message) = result.err().expect("a 5-character password must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("at least 8 characters"), "got: {message}");
+
+        // ...and nothing was created.
+        assert!(state.users.get_user_by_username("shorty").unwrap().is_none());
+        let Json(users) = list_users_handler(State(state)).await.unwrap();
+        assert!(!users.iter().any(|u| u.username == "shorty"));
     }
 
     #[tokio::test]

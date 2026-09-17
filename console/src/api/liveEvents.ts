@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useAuthStore } from "../store/authStore";
 import type { CanonicalEvent } from "./types";
 
 const RING_BUFFER_CAPACITY = 500;
@@ -27,6 +28,15 @@ function buildStreamUrl(filter: LiveEventsFilter): string {
     search.set("host_id", filter.hostId);
   } else if (filter.q) {
     search.set("q", filter.q);
+  }
+  // The browser's native WebSocket constructor has no API for request
+  // headers, so the session token cannot be sent as `Authorization: Bearer`
+  // on the upgrade. The server accepts a `?token=` query parameter for this
+  // one route only. With no session the URL is built without it and the
+  // upgrade is rejected with 401, exactly as before.
+  const token = useAuthStore.getState().token;
+  if (token) {
+    search.set("token", token);
   }
   const queryString = search.toString();
   return `${protocol}//${window.location.host}/api/v1/stream/events${queryString ? `?${queryString}` : ""}`;
