@@ -1295,6 +1295,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-response"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "osiris-evidence",
+ "osiris-query",
+ "osiris-schema",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-risk"
 version = "0.1.0"
 dependencies = [

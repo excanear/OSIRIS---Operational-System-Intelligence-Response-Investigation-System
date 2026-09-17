@@ -1,0 +1,20 @@
+[package]
+name = "osiris-response"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-query = { path = "../osiris-query" }
+osiris-evidence = { path = "../osiris-evidence" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
