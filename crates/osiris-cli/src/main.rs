@@ -80,6 +80,11 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Admin-only user administration (Phase 8a).
+    Users {
+        #[command(subcommand)]
+        action: UsersAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -88,6 +93,37 @@ enum AuthAction {
     Login { username: String },
     /// Revoke the current session and delete the cached token.
     Logout,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum RoleArg {
+    Viewer,
+    Analyst,
+    ResponseOperator,
+    Admin,
+}
+
+impl RoleArg {
+    fn wire(&self) -> &'static str {
+        match self {
+            RoleArg::Viewer => "VIEWER",
+            RoleArg::Analyst => "ANALYST",
+            RoleArg::ResponseOperator => "RESPONSE_OPERATOR",
+            RoleArg::Admin => "ADMIN",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum UsersAction {
+    /// Create a new user (requires an Admin session).
+    Create {
+        username: String,
+        #[arg(long, value_enum)]
+        role: RoleArg,
+    },
+    /// List all users (requires an Admin session).
+    List,
 }
 
 /// Sends the request, then treats a non-2xx HTTP status as a failure —
@@ -238,6 +274,22 @@ fn main() {
                 let _ = post_json(&client, url, serde_json::json!({}));
                 osiris_cli::auth::delete_token();
                 Ok("logged out".to_string())
+            }
+        },
+        Command::Users { action } => match action {
+            UsersAction::Create { username, role } => {
+                let password = rpassword::prompt_password("Password for new user: ").unwrap_or_default();
+                let url = format!("{}/api/v1/auth/users", cli.server.trim_end_matches('/'));
+                let body = serde_json::json!({
+                    "username": username,
+                    "password": password,
+                    "role": role.wire(),
+                });
+                post_json(&client, url, body)
+            }
+            UsersAction::List => {
+                let url = format!("{}/api/v1/auth/users", cli.server.trim_end_matches('/'));
+                get(&client, url)
             }
         },
     };
