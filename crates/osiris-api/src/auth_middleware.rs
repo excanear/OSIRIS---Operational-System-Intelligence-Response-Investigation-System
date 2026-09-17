@@ -91,6 +91,9 @@ fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     if method == Method::POST && path == "/api/v1/evidence" {
         return Role::Analyst;
     }
+    if path.starts_with("/api/v1/response/") {
+        return Role::ResponseOperator;
+    }
     Role::Viewer
 }
 
@@ -217,6 +220,10 @@ mod tests {
             .route(
                 "/api/v1/evidence",
                 get(|| async { "list-ok" }).post(|| async { "create-ok" }),
+            )
+            .route(
+                "/api/v1/response/:action",
+                axum::routing::post(|| async { "response-ok" }),
             )
             .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth_gate))
             .with_state(state)
@@ -543,5 +550,57 @@ mod tests {
                 "{method} {uri} should be allowed for an Analyst"
             );
         }
+    }
+
+    #[test]
+    fn min_role_for_requires_response_operator_on_every_response_route() {
+        use axum::http::Method;
+        assert_eq!(
+            min_role_for(&Method::POST, "/api/v1/response/terminate_process"),
+            Role::ResponseOperator
+        );
+        assert_eq!(
+            min_role_for(&Method::POST, "/api/v1/response/collect_evidence"),
+            Role::ResponseOperator
+        );
+        assert_eq!(
+            min_role_for(&Method::GET, "/api/v1/response/collect_evidence"),
+            Role::ResponseOperator
+        );
+    }
+
+    #[tokio::test]
+    async fn an_analyst_is_forbidden_from_the_response_route_but_a_response_operator_is_not() {
+        let (_d1, _d2, state) = test_state();
+        let analyst_token = session_for_role(&state, "analyst1", Role::Analyst);
+        let operator_token = session_for_role(&state, "operator1", Role::ResponseOperator);
+        let app = protected_app(state);
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/response/terminate_process")
+                    .header("Authorization", format!("Bearer {}", analyst_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/response/terminate_process")
+                    .header("Authorization", format!("Bearer {}", operator_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 }
