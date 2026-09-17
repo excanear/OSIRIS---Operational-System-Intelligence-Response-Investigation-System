@@ -25,3 +25,4 @@ tempfile = { workspace = true }
 uuid = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+tower = { workspace = true }
