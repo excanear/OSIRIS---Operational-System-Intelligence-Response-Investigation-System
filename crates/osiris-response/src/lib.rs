@@ -2,6 +2,8 @@ use osiris_schema::EntityRef;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod query;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ResponseActionKind {
