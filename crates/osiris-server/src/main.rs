@@ -7,6 +7,7 @@ use std::time::Duration;
 use osiris_api::build_router;
 use osiris_api::{build_incident_evidence_router, build_stream_router, IncidentEvidenceState, LiveEventBroadcaster};
 use osiris_api::{build_auth_router, auth_gate, AuthState};
+use osiris_api::{build_response_router, ResponseState};
 use osiris_audit::FileAuditLog;
 use osiris_auth::SqliteUserStore;
 use osiris_baseline::BaselineEngine;
@@ -203,6 +204,13 @@ async fn main() {
         audit_log: audit_log.clone(),
     };
 
+    let response_state = ResponseState {
+        storage: storage.clone(),
+        evidence: incident_evidence_state.evidence.clone(),
+        links: incident_evidence_state.links.clone(),
+        audit_log: audit_log.clone(),
+    };
+
     let users_db_path = config
         .users_db_path
         .clone()
@@ -230,6 +238,7 @@ async fn main() {
     let app = osiris_server::apply_dev_cors(
         build_router(storage)
             .merge(build_incident_evidence_router(incident_evidence_state))
+            .merge(build_response_router(response_state))
             .merge(build_stream_router(live_event_broadcaster))
             .merge(build_auth_router(auth_state.clone()))
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
