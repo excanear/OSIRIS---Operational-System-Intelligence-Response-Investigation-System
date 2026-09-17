@@ -45,6 +45,21 @@ struct LoginResponse {
     expires_at: u64,
 }
 
+/// A fixed, precomputed Argon2id hash used to give a nonexistent-username
+/// login attempt the exact same per-request Argon2id cost (one
+/// `verify_password` call) as a wrong-password attempt against a real user —
+/// closing the timing side-channel in both directions. Computed once (on
+/// first use, across the process's lifetime) and cached, so it must never be
+/// regenerated per request: a fresh hash each call would itself reintroduce
+/// an asymmetry (hash + verify vs. verify alone).
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        osiris_auth::hash_password("dummy-password-for-timing-parity")
+            .expect("hashing a fixed constant string cannot fail")
+    })
+}
+
 fn audit_login_denied(state: &AuthState, username: &str) {
     let _ = state.audit_log.append(NewAuditEntry {
         who: ActorRef::System,
@@ -85,16 +100,17 @@ async fn login_handler(
 
     let Some(user) = user else {
         // No such user: still pay the same Argon2id cost a real verification
-        // would, against a fixed dummy hash, so this branch and the
-        // wrong-password branch below take (near enough) the same amount of
-        // time. Without this, an attacker could distinguish "no such user"
-        // (fast) from "wrong password" (slow, full Argon2id verify) purely
-        // by timing — the exact enumeration vector this endpoint must not
-        // expose.
+        // would, against a fixed *precomputed* dummy hash, so this branch and
+        // the wrong-password branch below do exactly one Argon2id operation
+        // each and take (near enough) the same amount of time. Without this,
+        // an attacker could distinguish "no such user" from "wrong password"
+        // purely by timing — the exact enumeration vector this endpoint must
+        // not expose. The hash itself MUST be precomputed/cached (see
+        // `dummy_password_hash`), not generated fresh per request: a fresh
+        // hash-then-verify here would cost 2 Argon2id operations against the
+        // real path's 1, reintroducing the asymmetry in the other direction.
         let _ = tokio::task::spawn_blocking(|| {
-            let dummy_hash = osiris_auth::hash_password("dummy-password-for-timing-parity")
-                .expect("hashing a fixed constant string cannot fail");
-            osiris_auth::verify_password("this-will-never-match", &dummy_hash)
+            osiris_auth::verify_password("this-will-never-match", dummy_password_hash())
         })
         .await;
         audit_login_denied(&state, &username);
