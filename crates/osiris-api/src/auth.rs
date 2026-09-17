@@ -1,0 +1,438 @@
+use std::sync::Arc;
+
+use axum::extract::{Extension, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use osiris_audit::{ActorRef, AuditLog, AuditResult, NewAuditEntry};
+use osiris_auth::{NewUser, Role, UserStore};
+use osiris_schema::EntityRef;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::auth_middleware::AuthContext;
+
+#[derive(Clone)]
+pub struct AuthState {
+    pub users: Arc<dyn UserStore>,
+    pub audit_log: Arc<dyn AuditLog + Send + Sync>,
+    pub session_ttl_seconds: u64,
+}
+
+pub fn build_auth_router(state: AuthState) -> Router {
+    Router::new()
+        .route("/api/v1/auth/login", post(login_handler))
+        .route("/api/v1/auth/logout", post(logout_handler))
+        .route("/api/v1/auth/me", get(me_handler))
+        .route(
+            "/api/v1/auth/users",
+            post(create_user_handler).get(list_users_handler),
+        )
+        .route("/api/v1/audit", get(audit_handler))
+        .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    token: String,
+    role: Role,
+    expires_at: u64,
+}
+
+fn audit_login_denied(state: &AuthState, username: &str) {
+    let _ = state.audit_log.append(NewAuditEntry {
+        who: ActorRef::System,
+        what: "login".to_string(),
+        target: EntityRef::Domain {
+            name: format!("user:{username}"),
+        },
+        why: Some("invalid credentials".to_string()),
+        result: AuditResult::Denied,
+    });
+}
+
+async fn login_handler(
+    State(state): State<AuthState>,
+    Json(body): Json<LoginBody>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let denied = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid credentials" })),
+        )
+    };
+
+    let username = body.username.clone();
+    let user = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        let username = username.clone();
+        move || users.get_user_by_username(&username)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let Some(user) = user else {
+        audit_login_denied(&state, &username);
+        return Err(denied());
+    };
+
+    let verified = osiris_auth::verify_password(&body.password, &user.password_hash).unwrap_or(false);
+    if !verified {
+        audit_login_denied(&state, &username);
+        return Err(denied());
+    }
+
+    let session = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        let user_id = user.user_id;
+        let ttl = state.session_ttl_seconds;
+        move || users.create_session(user_id, ttl)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let _ = state.audit_log.append(NewAuditEntry {
+        who: ActorRef::User {
+            user_id: user.user_id,
+        },
+        what: "login".to_string(),
+        target: EntityRef::Domain {
+            name: format!("user:{}", user.username),
+        },
+        why: None,
+        result: AuditResult::Success,
+    });
+
+    Ok(Json(LoginResponse {
+        token: session.token,
+        role: user.role,
+        expires_at: session.expires_at,
+    }))
+}
+
+async fn logout_handler(
+    State(state): State<AuthState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Json<serde_json::Value> {
+    let _ = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        let token = ctx.token.clone();
+        move || users.delete_session(&token)
+    })
+    .await;
+
+    let _ = state.audit_log.append(NewAuditEntry {
+        who: ActorRef::User {
+            user_id: ctx.user_id,
+        },
+        what: "logout".to_string(),
+        target: EntityRef::Domain {
+            name: format!("user:{}", ctx.user_id),
+        },
+        why: None,
+        result: AuditResult::Success,
+    });
+
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+#[derive(Debug, Serialize)]
+struct MeResponse {
+    user_id: Uuid,
+    username: String,
+    role: Role,
+}
+
+async fn me_handler(
+    State(state): State<AuthState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<MeResponse>, (StatusCode, String)> {
+    let user = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        let user_id = ctx.user_id;
+        move || users.get_user_by_id(user_id)
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or((StatusCode::NOT_FOUND, "user not found".to_string()))?;
+
+    Ok(Json(MeResponse {
+        user_id: user.user_id,
+        username: user.username,
+        role: user.role,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserBody {
+    username: String,
+    password: String,
+    role: Role,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateUserResponse {
+    user_id: Uuid,
+}
+
+async fn create_user_handler(
+    State(state): State<AuthState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(body): Json<CreateUserBody>,
+) -> Result<Json<CreateUserResponse>, (StatusCode, String)> {
+    let password_hash =
+        osiris_auth::hash_password(&body.password).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let created = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        let username = body.username.clone();
+        let role = body.role;
+        move || {
+            users.create_user(NewUser {
+                username,
+                password_hash,
+                role,
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let _ = state.audit_log.append(NewAuditEntry {
+        who: ActorRef::User {
+            user_id: ctx.user_id,
+        },
+        what: "user_create".to_string(),
+        target: EntityRef::Domain {
+            name: format!("user:{}", created.username),
+        },
+        why: None,
+        result: AuditResult::Success,
+    });
+
+    Ok(Json(CreateUserResponse {
+        user_id: created.user_id,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct UserSummary {
+    user_id: Uuid,
+    username: String,
+    role: Role,
+    created_at: u64,
+}
+
+async fn list_users_handler(
+    State(state): State<AuthState>,
+) -> Result<Json<Vec<UserSummary>>, (StatusCode, String)> {
+    let users = tokio::task::spawn_blocking({
+        let users = state.users.clone();
+        move || users.list_users()
+    })
+    .await
+    .unwrap()
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|u| UserSummary {
+                user_id: u.user_id,
+                username: u.username,
+                role: u.role,
+                created_at: u.created_at,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+async fn audit_handler(
+    State(state): State<AuthState>,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<Vec<osiris_audit::AuditEntry>>, (StatusCode, String)> {
+    let mut entries = state
+        .audit_log
+        .read_all()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    entries.reverse();
+    let limit = q.limit.unwrap_or(100).min(1000);
+    entries.truncate(limit);
+    Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osiris_audit::FileAuditLog;
+    use osiris_auth::SqliteUserStore;
+
+    fn test_state() -> (tempfile::TempDir, tempfile::TempDir, AuthState) {
+        let users_dir = tempfile::tempdir().unwrap();
+        let (store, _bootstrap) = SqliteUserStore::open(users_dir.path().join("users.db")).unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_log = FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap();
+        let state = AuthState {
+            users: Arc::new(store),
+            audit_log: Arc::new(audit_log),
+            session_ttl_seconds: 3600,
+        };
+        (users_dir, audit_dir, state)
+    }
+
+    #[tokio::test]
+    async fn login_with_correct_credentials_issues_a_session() {
+        let (_d1, _d2, state) = test_state();
+        state
+            .users
+            .create_user(NewUser {
+                username: "alice".to_string(),
+                password_hash: osiris_auth::hash_password("secret123").unwrap(),
+                role: Role::Analyst,
+            })
+            .unwrap();
+
+        let result = login_handler(
+            State(state.clone()),
+            Json(LoginBody {
+                username: "alice".to_string(),
+                password: "secret123".to_string(),
+            }),
+        )
+        .await;
+
+        let Json(response) = result.unwrap();
+        assert!(!response.token.is_empty());
+        assert_eq!(response.role, Role::Analyst);
+    }
+
+    #[tokio::test]
+    async fn login_with_wrong_password_is_denied_and_audited() {
+        let (_d1, _d2, state) = test_state();
+        state
+            .users
+            .create_user(NewUser {
+                username: "bob".to_string(),
+                password_hash: osiris_auth::hash_password("correct").unwrap(),
+                role: Role::Viewer,
+            })
+            .unwrap();
+
+        let result = login_handler(
+            State(state.clone()),
+            Json(LoginBody {
+                username: "bob".to_string(),
+                password: "wrong".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let entries = state.audit_log.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result, AuditResult::Denied);
+    }
+
+    #[tokio::test]
+    async fn me_returns_the_authenticated_users_own_profile() {
+        let (_d1, _d2, state) = test_state();
+        let user = state
+            .users
+            .create_user(NewUser {
+                username: "carol".to_string(),
+                password_hash: osiris_auth::hash_password("pw").unwrap(),
+                role: Role::Admin,
+            })
+            .unwrap();
+        let ctx = AuthContext {
+            user_id: user.user_id,
+            role: user.role,
+            token: "irrelevant-for-this-test".to_string(),
+        };
+
+        let Json(me) = me_handler(State(state), Extension(ctx)).await.unwrap();
+        assert_eq!(me.username, "carol");
+        assert_eq!(me.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn create_user_then_list_users_shows_the_new_user() {
+        let (_d1, _d2, state) = test_state();
+        let admin_ctx = AuthContext {
+            user_id: Uuid::new_v4(),
+            role: Role::Admin,
+            token: "irrelevant".to_string(),
+        };
+
+        create_user_handler(
+            State(state.clone()),
+            Extension(admin_ctx),
+            Json(CreateUserBody {
+                username: "dave".to_string(),
+                password: "pw".to_string(),
+                role: Role::ResponseOperator,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(users) = list_users_handler(State(state)).await.unwrap();
+        assert!(users.iter().any(|u| u.username == "dave" && u.role == Role::ResponseOperator));
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_returns_entries_most_recent_first() {
+        let (_d1, _d2, state) = test_state();
+        state
+            .audit_log
+            .append(NewAuditEntry {
+                who: ActorRef::System,
+                what: "first".to_string(),
+                target: EntityRef::Domain { name: "x".to_string() },
+                why: None,
+                result: AuditResult::Success,
+            })
+            .unwrap();
+        state
+            .audit_log
+            .append(NewAuditEntry {
+                who: ActorRef::System,
+                what: "second".to_string(),
+                target: EntityRef::Domain { name: "x".to_string() },
+                why: None,
+                result: AuditResult::Success,
+            })
+            .unwrap();
+
+        let Json(entries) = audit_handler(State(state), Query(AuditQuery { limit: None }))
+            .await
+            .unwrap();
+        assert_eq!(entries[0].what, "second");
+        assert_eq!(entries[1].what, "first");
+    }
+}

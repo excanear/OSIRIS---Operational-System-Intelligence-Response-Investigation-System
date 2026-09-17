@@ -15,6 +15,7 @@ osiris-query = { path = "../osiris-query" }
 osiris-investigate = { path = "../osiris-investigate" }
 osiris-evidence = { path = "../osiris-evidence" }
 osiris-audit = { path = "../osiris-audit" }
+osiris-auth = { path = "../osiris-auth" }
 uuid = { workspace = true }
 tracing = { workspace = true }
 

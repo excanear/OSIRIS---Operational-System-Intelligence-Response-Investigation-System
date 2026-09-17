@@ -1053,6 +1053,7 @@ dependencies = [
  "axum",
  "futures-util",
  "osiris-audit",
+ "osiris-auth",
  "osiris-correlate",
  "osiris-evidence",
  "osiris-investigate",
