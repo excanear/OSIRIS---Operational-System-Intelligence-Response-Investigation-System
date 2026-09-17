@@ -48,9 +48,41 @@ mod tests {
     // so they don't race each other under `cargo test`'s default parallelism.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Restores HOME/OSIRIS_TOKEN to their pre-test state on drop, even if the
+    /// test panics partway through — env vars are process-global, so a panic
+    /// mid-assertion must not leave them set for whatever test runs next in
+    /// this binary.
+    struct EnvGuard {
+        home_before: Option<String>,
+        osiris_token_before: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                home_before: std::env::var("HOME").ok(),
+                osiris_token_before: std::env::var("OSIRIS_TOKEN").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.home_before {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.osiris_token_before {
+                Some(v) => std::env::set_var("OSIRIS_TOKEN", v),
+                None => std::env::remove_var("OSIRIS_TOKEN"),
+            }
+        }
+    }
+
     #[test]
     fn write_then_read_round_trips_through_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("OSIRIS_TOKEN");
         std::env::set_var("HOME", dir.path());
@@ -60,21 +92,17 @@ mod tests {
 
         delete_token();
         assert_eq!(read_token(), None);
-
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn osiris_token_env_var_takes_priority_over_the_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
         write_token("from-file").unwrap();
         std::env::set_var("OSIRIS_TOKEN", "from-env");
 
         assert_eq!(read_token(), Some("from-env".to_string()));
-
-        std::env::remove_var("OSIRIS_TOKEN");
-        std::env::remove_var("HOME");
     }
 }
