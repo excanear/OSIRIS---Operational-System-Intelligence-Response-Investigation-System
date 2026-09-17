@@ -84,11 +84,29 @@ async fn login_handler(
     })?;
 
     let Some(user) = user else {
+        // No such user: still pay the same Argon2id cost a real verification
+        // would, against a fixed dummy hash, so this branch and the
+        // wrong-password branch below take (near enough) the same amount of
+        // time. Without this, an attacker could distinguish "no such user"
+        // (fast) from "wrong password" (slow, full Argon2id verify) purely
+        // by timing — the exact enumeration vector this endpoint must not
+        // expose.
+        let _ = tokio::task::spawn_blocking(|| {
+            let dummy_hash = osiris_auth::hash_password("dummy-password-for-timing-parity")
+                .expect("hashing a fixed constant string cannot fail");
+            osiris_auth::verify_password("this-will-never-match", &dummy_hash)
+        })
+        .await;
         audit_login_denied(&state, &username);
         return Err(denied());
     };
 
-    let verified = osiris_auth::verify_password(&body.password, &user.password_hash).unwrap_or(false);
+    let password = body.password.clone();
+    let password_hash = user.password_hash.clone();
+    let verified = tokio::task::spawn_blocking(move || osiris_auth::verify_password(&password, &password_hash))
+        .await
+        .unwrap()
+        .unwrap_or(false);
     if !verified {
         audit_login_denied(&state, &username);
         return Err(denied());
@@ -199,8 +217,11 @@ async fn create_user_handler(
     Extension(ctx): Extension<AuthContext>,
     Json(body): Json<CreateUserBody>,
 ) -> Result<Json<CreateUserResponse>, (StatusCode, String)> {
-    let password_hash =
-        osiris_auth::hash_password(&body.password).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let password = body.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || osiris_auth::hash_password(&password))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let created = tokio::task::spawn_blocking({
         let users = state.users.clone();
