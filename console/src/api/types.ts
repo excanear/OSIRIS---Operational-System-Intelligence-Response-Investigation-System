@@ -181,3 +181,11 @@ export interface EvidenceWithIncidents {
   evidence: Evidence;
   incident_ids: string[];
 }
+
+export type Role = "VIEWER" | "ANALYST" | "RESPONSE_OPERATOR" | "ADMIN";
+
+export interface LoginResponse {
+  token: string;
+  role: Role;
+  expires_at: number;
+}

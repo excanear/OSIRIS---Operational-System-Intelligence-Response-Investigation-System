@@ -23,6 +23,7 @@ import {
   fetchSystemStory,
   patchIncidentStatus,
 } from "./client";
+import { useAuthStore } from "../store/authStore";
 
 describe("api client", () => {
   beforeEach(() => {
@@ -387,5 +388,34 @@ describe("api client", () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
     await fetchContainerStory("abc123");
     expect(fetch).toHaveBeenCalledWith("/api/v1/containers/story?container_id=abc123");
+  });
+
+  describe("authenticated requests", () => {
+    beforeEach(() => {
+      sessionStorage.clear();
+      useAuthStore.getState().clearSession();
+    });
+
+    it("attaches an Authorization header when a token is present", async () => {
+      useAuthStore.getState().setSession({ token: "tok123", role: "ADMIN", username: "alice" });
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify({ healthy: true, event_count: 0, last_write_at: 0 }), { status: 200 })
+      );
+
+      await fetchHealth();
+
+      expect(fetch).toHaveBeenCalledWith("/api/v1/health", {
+        headers: { Authorization: "Bearer tok123" },
+      });
+    });
+
+    it("clears the session on a 401 response", async () => {
+      useAuthStore.getState().setSession({ token: "tok123", role: "ADMIN", username: "alice" });
+      vi.mocked(fetch).mockResolvedValueOnce(new Response("", { status: 401 }));
+
+      await expect(fetchHealth()).rejects.toThrow();
+
+      expect(useAuthStore.getState().token).toBeNull();
+    });
   });
 });

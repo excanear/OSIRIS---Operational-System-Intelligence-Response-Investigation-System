@@ -10,12 +10,14 @@ import type {
   FileSummary,
   Incident,
   IncidentStatus,
+  LoginResponse,
   NetworkSummary,
   ProcessDetail,
   ProcessSummary,
   Story,
   Subgraph,
 } from "./types";
+import { useAuthStore } from "../store/authStore";
 
 const API_BASE = "/api/v1";
 
@@ -31,20 +33,32 @@ export class ApiError extends Error {
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const url = `${API_BASE}${path}`;
-  // Preserve the exact fetch() call shape each verb used before this helper
-  // existed (a bare `fetch(url)` for GET, an options object with a JSON
-  // body for POST/PATCH) so existing call-site tests keep working unchanged.
+  const token = useAuthStore.getState().token;
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const hasHeaders = Object.keys(headers).length > 0;
+
+  // Preserve the exact fetch() call shape each verb used before headers
+  // existed (a bare `fetch(url)` for a headerless GET, `fetch(url,
+  // {method})` for a headerless non-GET) whenever there's genuinely nothing
+  // to attach — every existing call-site test runs with no token set and
+  // asserts on that exact bare shape.
   const response =
     body !== undefined
-      ? await fetch(url, {
-          method,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        })
+      ? await fetch(url, { method, headers, body: JSON.stringify(body) })
       : method === "GET"
-        ? await fetch(url)
-        : await fetch(url, { method });
+        ? hasHeaders
+          ? await fetch(url, { headers })
+          : await fetch(url)
+        : hasHeaders
+          ? await fetch(url, { method, headers })
+          : await fetch(url, { method });
+
   if (!response.ok) {
+    if (response.status === 401) {
+      useAuthStore.getState().clearSession();
+    }
     // Backend-side validation errors (e.g. "incident has no associated
     // entities to audit a transition against") arrive in the response
     // body, not the status code — surface them so the UI can show the
@@ -217,4 +231,8 @@ export function fetchSystemStory(hostId: string, params: { since?: number; until
 
 export function fetchAllEvidence(): Promise<EvidenceWithIncidents[]> {
   return apiGet<EvidenceWithIncidents[]>("/evidence");
+}
+
+export function login(credentials: { username: string; password: string }): Promise<LoginResponse> {
+  return apiPost<LoginResponse>("/auth/login", credentials);
 }

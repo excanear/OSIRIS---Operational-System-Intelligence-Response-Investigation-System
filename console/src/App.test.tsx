@@ -1,9 +1,14 @@
 import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { App } from "./App";
 import { NAV_ITEMS } from "./app/navItems";
+import { useAuthStore } from "./store/authStore";
 
 describe("App", () => {
+  beforeEach(() => {
+    useAuthStore.getState().setSession({ token: "test-token", role: "ADMIN", username: "test-user" });
+  });
+
   it("renders every nav item's label", () => {
     render(<App />);
     const nav = screen.getByRole("navigation", { name: "main" });

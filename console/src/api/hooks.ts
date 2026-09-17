@@ -20,8 +20,10 @@ import {
   fetchProcessStory,
   fetchSubgraph,
   fetchSystemStory,
+  login,
   patchIncidentStatus,
 } from "./client";
+import { useAuthStore } from "../store/authStore";
 import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
 
 export function useHealth() {
@@ -208,5 +210,15 @@ export function useAllEvidence() {
   return useQuery({
     queryKey: ["evidence", "all"],
     queryFn: fetchAllEvidence,
+  });
+}
+
+export function useLogin() {
+  const setSession = useAuthStore((s) => s.setSession);
+  return useMutation({
+    mutationFn: (credentials: { username: string; password: string }) => login(credentials),
+    onSuccess: (data, variables) => {
+      setSession({ token: data.token, role: data.role, username: variables.username });
+    },
   });
 }
