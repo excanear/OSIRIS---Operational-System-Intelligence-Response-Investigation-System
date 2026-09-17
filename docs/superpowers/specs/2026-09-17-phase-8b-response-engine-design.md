@@ -76,7 +76,7 @@ New `POST /api/v1/response/{action}` handler in a new `response.rs` module (mirr
 Request body:
 ```json
 {
-  "target": "<EntityRef, using EntityRef::parse_storage_key's KIND:value form>",
+  "target": { "kind": "DOMAIN", "name": "..." },
   "reason": "non-empty string",
   "dry_run": true,
   "since": 0,
@@ -84,22 +84,25 @@ Request body:
   "incident_id": null
 }
 ```
+`target` deserializes as a structured `osiris_schema::EntityRef` JSON object (its own `#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]` derive — `{"kind":"PROCESS","process_key":...}`, `{"kind":"FILE","host_id":...,"inode":...,"device_id":...}`, etc.), not a `KIND:value` string. This matches the existing precedent in `incidents.rs`'s `CreateIncidentBody { entities: Vec<EntityRef> }` rather than inventing a second, string-based encoding.
 `since`/`until`/`incident_id` are accepted but ignored for non-`CollectEvidence` actions (no error — a client sending them harmlessly is simpler than rejecting extra fields, matching this API's existing permissive-body convention elsewhere).
 
 Handler flow:
-1. Parse `{action}` path segment into `ResponseActionKind` (unknown → `404`, matching how an unknown route already 404s post-gate).
-2. Parse body; `reason.trim().is_empty()` → `400`, **no audit entry written** (nothing was meaningfully requested — matches `create_user_handler`'s existing pattern of validating before any store/audit write).
-3. Parse `target` via `EntityRef::parse_storage_key` → `400` on failure, no audit entry (same reasoning as 2).
-4. Write the **pre-execution** audit entry: `who: ActorRef::User{user_id}` (from `AuthContext`), `what: "response.<action>.dry_run" | "response.<action>.execute"`, `target: target.clone()`, `why: Some(reason.clone())`, `result: AuditResult::Success` (recording that the *request* was accepted and is proceeding — not yet its outcome).
-5. Call `osiris_response::dispatch(...)` inside `tokio::task::spawn_blocking` (matches every other `Storage`-touching handler's existing blocking-call convention).
-6. Write the **post-execution** audit entry based on the outcome:
-   - `DryRunPreview` → `result: Success`, `why: Some(description)` — recording what the preview said, for a reviewable trail of what an operator was shown before ever escalating to a real request.
-   - `EvidenceCollected` → `result: Success`, `target` stays the **original request's target** (`EntityRef` has no "evidence record" variant today — `Process`/`File`/`Ip`/`Domain`/`User`/`Container` only, per `osiris-schema::relationships`, and this phase does not add one just for an audit-trail convenience, matching this codebase's existing "schema-frozen" precedent), `why` is extended to include the new `evidence_id` (e.g. `"<reason> (evidence_id=<uuid>)"`) so the trail still names it.
+1. Parse `{action}` path segment into `ResponseActionKind` (unknown → `404`, matching how an unknown route already 404s post-gate). The path segment is ASCII-uppercased (`str::to_ascii_uppercase`, not `to_uppercase`) before decoding, so a Unicode-folding path segment can never decode to a canonical action while looking different from it.
+2. Parse body; `reason.trim().is_empty()` → `400`, **no audit entry written** (nothing was meaningfully requested — matches `create_user_handler`'s existing pattern of validating before any store/audit write). `target` deserializes as a structured `EntityRef` JSON object via axum's `Json` extractor; a malformed `target` fails inside the extractor itself, before the handler body runs, returning axum's own `422 Unprocessable Entity` — **not** a `400` from handler logic. Zero audit entries either way.
+3. (Dry-run path) Call `osiris_response::dispatch(...)` inside `tokio::task::spawn_blocking` directly — no pre-execution audit write. Dry-run has no side effects to protect (nothing is mutated), so there is no crash-survival argument for writing before dispatch runs. Write exactly **one** audit entry *after* `dispatch()` returns:
+   - `who: ActorRef::User{user_id}`, `what: "response.<canonical_action>.dry_run"` (built from `ResponseActionKind`'s canonical SCREAMING_SNAKE_CASE wire form, never from the raw path segment — the raw segment is attacker-controlled and must never leak its case/Unicode form into the audit trail), `target: target.clone()`.
+   - On `Ok(DryRunPreview{description})`: `why: Some(description)`, `result: Success`.
+   - On `Err(UnknownTarget(_))` or any other `Err`: `why: Some(format!("dry-run failed: {e}"))`, `result: Failure`. `UnknownTarget` maps to HTTP `400`; any other error maps to HTTP `500`.
+4. (Real/non-dry-run path) Write the **pre-execution** audit entry: `who`, `what: "response.<canonical_action>.execute"`, `target: target.clone()`, `why: Some(reason.clone())`, `result: Success` — recording that the *request* was accepted and is proceeding, not yet its outcome. **If this write fails, the handler returns `500` immediately and never calls `dispatch()`** — a real request has genuine side effects, so ARCHITECTURE.md §17.3's "no destructive Response action executes without the full authz+audit path" requires failing closed here.
+5. Call `osiris_response::dispatch(...)` inside `tokio::task::spawn_blocking`.
+6. Write the **post-execution** audit entry based on the outcome (a failure of this specific write is logged via `tracing::warn!` but does not fail the request — the action already happened):
+   - `EvidenceCollected` → `result: Success`, `target` stays the **original request's target** (`EntityRef` has no "evidence record" variant today — `Process`/`File`/`Ip`/`Domain`/`User`/`Container` only, per `osiris-schema::relationships`, and this phase does not add one just for an audit-trail convenience, matching this codebase's existing "schema-frozen" precedent), `why` folds in the operator's own `reason` plus the new `event_count`/`truncated` fields (e.g. `"<reason> (evidence_id=<uuid>, event_count=<n>, truncated=<bool>)"`).
    - `Rejected` → `result: Failure`, `why: Some(rejected_reason)`.
    - `dispatch()` returning `Err(ResponseError)` (a genuine internal failure — storage I/O error, etc.) → `result: Failure`, `why: Some(err.to_string())`, HTTP `500`.
 7. HTTP response:
    - dry-run → `200 { "dry_run": true, "preview": "<description>" }`
-   - CollectEvidence real → `200 { "dry_run": false, "evidence_id": "<uuid>" }`
+   - CollectEvidence real → `200 { "dry_run": false, "evidence_id": "<uuid>", "event_count": <n>, "truncated": <bool> }` (`truncated` is `true` when `event_count >= osiris_query::MAX_EVENT_LIMIT`, i.e. the query's cap was hit and the newest matching events beyond it were silently not collected)
    - destructive real (`Rejected`) → `501 { "error": "not_implemented", "message": "<rejected_reason>" }`
    - internal error → `500 { "error": "internal", "message": "<...>" }`
 
@@ -110,14 +113,15 @@ Handler flow:
 | Missing/invalid token | 401 | none (auth_gate rejects before the handler runs) |
 | Valid token, role < ResponseOperator | 403 | none (same) |
 | Empty `reason` | 400 | none |
-| Unparseable `target` | 400 | none |
+| Unparseable `target` (malformed JSON for `EntityRef`) | 422 (axum's `Json` extractor rejection, before the handler body runs) | none |
 | Unknown `{action}` | 404 | none |
-| Valid dry-run request | 200 | 1 (pre only — dry-run's pre-entry *is* its record; there is no separate "result" to distinguish, so a second identical entry would be pure duplication) |
+| Valid dry-run request | 200 | 1, written **after** `dispatch()` returns, `why` = the preview text, `result: Success` |
+| Dry-run against an unresolvable target | 400 | 1, written after `dispatch()` returns, `why` = a description of the failure, `result: Failure` |
 | Valid CollectEvidence execute | 200 | 2 (pre + post) |
 | Valid destructive execute | 501 | 2 (pre + post, post is `Failure`) |
-| `dispatch()` internal error | 500 | 2 (pre + post, post is `Failure`) |
+| `dispatch()` internal error | 500 | 2 (pre + post, post is `Failure`) — or, on the real-execution path, 0 and an immediate `500` if the *pre*-execution write itself fails (dispatch never runs) |
 
-Dry-run intentionally writes exactly **one** audit entry, not two — re-reading §13's "pre-execution … Dispatch … Result … post-execution" sequence, the two-phase design exists specifically to survive a crash *during* dispatch (so a record of intent still exists if the result never gets recorded). A dry-run has no dispatch step to crash during — `dispatch()` returns synchronously with the preview already in hand — so a second entry would only assert "yes, the preview above is what happened," which the single entry's `why` field already states. This asymmetry is called out here explicitly so it reads as a decision, not an inconsistency, when the implementation plan/tests reference it.
+Dry-run intentionally writes exactly **one** audit entry, not two — but unlike an earlier draft of this design, that single entry is written *after* `dispatch()` completes, not before. Re-reading §13's "pre-execution … Dispatch … Result … post-execution" sequence: the two-phase pre/post design exists specifically to survive a crash *during* dispatch, so a record of intent still exists if the result never gets recorded. A dry-run has no dispatch step with real side effects to crash during — `dispatch()` only reads and returns a preview or an error — so there is no crash-survival argument for a pre-write, and writing before would either duplicate the post-write's content (on success) or misrecord a failed preview as `Success` (on an unresolvable target, since the pre-write happens before the outcome is known). Deferring the single write until the outcome is in hand keeps it both singular and accurate.
 
 ## 5. Testing
 

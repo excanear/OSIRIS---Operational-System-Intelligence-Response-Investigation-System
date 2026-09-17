@@ -1,4 +1,5 @@
 use osiris_evidence::{Evidence, EvidenceIncidentLinks, EvidenceSource, Integrity};
+use osiris_query::MAX_EVENT_LIMIT;
 use osiris_schema::{CanonicalEvent, EntityRef};
 use osiris_storage::Storage;
 use sha2::{Digest, Sha256};
@@ -82,11 +83,17 @@ pub fn dispatch(
             vec![request.target.clone()],
             None,
         )?;
+        let event_count = events.len();
+        let truncated = event_count >= MAX_EVENT_LIMIT;
         let inserted = evidence_store.insert(evidence)?;
         if let Some(incident_id) = request.incident_id {
             links.link(incident_id, inserted.evidence_id())?;
         }
-        return Ok(ResponseOutcome::EvidenceCollected { evidence_id: inserted.evidence_id() });
+        return Ok(ResponseOutcome::EvidenceCollected {
+            evidence_id: inserted.evidence_id(),
+            event_count,
+            truncated,
+        });
     }
 
     Ok(ResponseOutcome::Rejected {
@@ -218,12 +225,14 @@ mod tests {
             incident_id: None,
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
-        let ResponseOutcome::EvidenceCollected { evidence_id } = outcome else {
+        let ResponseOutcome::EvidenceCollected { evidence_id, event_count, truncated } = outcome else {
             panic!("expected EvidenceCollected, got {outcome:?}");
         };
         let stored = h.evidence.get(evidence_id).unwrap().expect("evidence must be persisted");
         assert_eq!(stored.source(), EvidenceSource::EventCapture);
         assert!(!stored.integrity().hash.is_empty());
+        assert_eq!(event_count, 1);
+        assert!(!truncated);
     }
 
     #[test]
@@ -256,8 +265,47 @@ mod tests {
             incident_id: Some(incident_id),
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
-        let ResponseOutcome::EvidenceCollected { evidence_id } = outcome else { panic!("expected EvidenceCollected") };
+        let ResponseOutcome::EvidenceCollected { evidence_id, .. } = outcome else { panic!("expected EvidenceCollected") };
         assert_eq!(h.links.evidence_ids_for_incident(incident_id).unwrap(), vec![evidence_id]);
+    }
+
+    // NOTE (Fix 6): a live-threshold test that actually writes >= MAX_EVENT_LIMIT
+    // (5000) events to prove `truncated` flips to `true` at the real cap is
+    // impractically slow for a unit test. `truncated` is computed as
+    // `event_count >= MAX_EVENT_LIMIT` directly from the already-capped
+    // `events` Vec returned by `events_for_entity` (see the `CollectEvidence`
+    // branch above), so the logic is a one-line comparison against a
+    // constant already covered by `osiris-query`'s own `effective_limit`
+    // tests (`crates/osiris-query/src/plan.rs`) proving the cap is enforced.
+    // This is a deliberate scope decision, not an oversight — flagged in the
+    // fix-wave report.
+    #[test]
+    fn evidence_collected_reports_a_small_untruncated_event_count() {
+        let h = harness();
+        let host_id = Uuid::new_v4();
+        for i in 0..3u64 {
+            let mut e = base_event(host_id, 1000 + i);
+            e.event_type = EventType::DnsQuery;
+            e.category = Category::Dns;
+            e.dns = Some(DnsRef { query: "small-batch.example".to_string(), qtype: "A".to_string(), response_ips: vec![], ttl: None });
+            h.storage.write(&e).unwrap();
+        }
+
+        let req = ResponseRequest {
+            action: ResponseActionKind::CollectEvidence,
+            target: EntityRef::Domain { name: "small-batch.example".to_string() },
+            reason: "checking truncation flag on a small batch".to_string(),
+            dry_run: false,
+            since: None,
+            until: None,
+            incident_id: None,
+        };
+        let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
+        let ResponseOutcome::EvidenceCollected { event_count, truncated, .. } = outcome else {
+            panic!("expected EvidenceCollected");
+        };
+        assert_eq!(event_count, 3);
+        assert!(!truncated);
     }
 
     #[test]

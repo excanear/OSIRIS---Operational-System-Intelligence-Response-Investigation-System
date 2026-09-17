@@ -45,6 +45,24 @@ impl ResponseActionKind {
     pub fn supports_dry_run(&self) -> bool {
         true
     }
+
+    /// The canonical SCREAMING_SNAKE_CASE wire form (matches this enum's
+    /// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`). Used anywhere a
+    /// caller needs the decoded action's canonical string representation
+    /// rather than whatever raw text a client sent — e.g. building an audit
+    /// `what` field from a value that can't be spoofed by an unusual-case
+    /// or Unicode-folding path segment.
+    pub fn wire_form(&self) -> &'static str {
+        match self {
+            ResponseActionKind::TerminateProcess => "TERMINATE_PROCESS",
+            ResponseActionKind::StopService => "STOP_SERVICE",
+            ResponseActionKind::QuarantineFile => "QUARANTINE_FILE",
+            ResponseActionKind::BlockIndicator => "BLOCK_INDICATOR",
+            ResponseActionKind::IsolateNetwork => "ISOLATE_NETWORK",
+            ResponseActionKind::DisablePersistence => "DISABLE_PERSISTENCE",
+            ResponseActionKind::CollectEvidence => "COLLECT_EVIDENCE",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +79,7 @@ pub struct ResponseRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseOutcome {
     DryRunPreview { description: String },
-    EvidenceCollected { evidence_id: Uuid },
+    EvidenceCollected { evidence_id: Uuid, event_count: usize, truncated: bool },
     Rejected { reason: String },
 }
 
@@ -96,6 +114,22 @@ mod tests {
             ResponseActionKind::CollectEvidence,
         ] {
             assert!(action.supports_dry_run(), "{action:?} must support dry_run");
+        }
+    }
+
+    #[test]
+    fn wire_form_matches_the_serde_wire_form_for_every_variant() {
+        for action in [
+            ResponseActionKind::TerminateProcess,
+            ResponseActionKind::StopService,
+            ResponseActionKind::QuarantineFile,
+            ResponseActionKind::BlockIndicator,
+            ResponseActionKind::IsolateNetwork,
+            ResponseActionKind::DisablePersistence,
+            ResponseActionKind::CollectEvidence,
+        ] {
+            let via_serde = serde_json::to_value(action).unwrap().as_str().unwrap().to_string();
+            assert_eq!(action.wire_form(), via_serde);
         }
     }
 
