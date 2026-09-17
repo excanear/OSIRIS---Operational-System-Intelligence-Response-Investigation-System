@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use osiris_api::build_router;
 use osiris_api::{build_incident_evidence_router, build_stream_router, IncidentEvidenceState, LiveEventBroadcaster};
+use osiris_api::{build_auth_router, auth_gate, AuthState};
 use osiris_audit::FileAuditLog;
+use osiris_auth::SqliteUserStore;
 use osiris_baseline::BaselineEngine;
 use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
@@ -171,6 +173,17 @@ async fn main() {
         }
     }
 
+    // Exactly one FileAuditLog instance for this path in this process —
+    // FileAuditLog::append is not safe to call concurrently from two
+    // separate instances sharing a path (see its own doc comment), so this
+    // one Arc is shared between IncidentEvidenceState and AuthState below,
+    // never opened a second time.
+    let audit_log: Arc<dyn osiris_audit::AuditLog + Send + Sync> = Arc::new(open_or_exit(
+        FileAuditLog::open(&investigate_audit_log_path),
+        &investigate_audit_log_path,
+        "investigate_audit_log_path",
+    ));
+
     let incident_evidence_state = IncidentEvidenceState {
         incidents: Arc::new(open_or_exit(
             SqliteIncidentStore::open(&incidents_db_path),
@@ -187,17 +200,42 @@ async fn main() {
             &links_db_path,
             "links_db_path",
         )),
-        audit_log: Arc::new(open_or_exit(
-            FileAuditLog::open(&investigate_audit_log_path),
-            &investigate_audit_log_path,
-            "investigate_audit_log_path",
-        )),
+        audit_log: audit_log.clone(),
+    };
+
+    let users_db_path = config
+        .users_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/users.db".to_string());
+    let (user_store, bootstrap_admin) = match SqliteUserStore::open(&users_db_path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(path = %users_db_path, error = %e, "failed to open the user store");
+            eprintln!("fatal: failed to open user store at '{users_db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(admin) = bootstrap_admin {
+        tracing::warn!(
+            username = %admin.username,
+            password = %admin.password,
+            "created a bootstrap admin user — log in once with this one-time \
+             password (never shown again) and create a named account"
+        );
+    }
+    let session_ttl_seconds = config.session_ttl_seconds.unwrap_or(28800);
+    let auth_state = AuthState {
+        users: Arc::new(user_store),
+        audit_log: audit_log.clone(),
+        session_ttl_seconds,
     };
 
     let app = osiris_server::apply_dev_cors(
         build_router(storage)
             .merge(build_incident_evidence_router(incident_evidence_state))
-            .merge(build_stream_router(live_event_broadcaster)),
+            .merge(build_stream_router(live_event_broadcaster))
+            .merge(build_auth_router(auth_state.clone()))
+            .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

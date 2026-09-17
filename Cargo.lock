@@ -1432,6 +1432,7 @@ dependencies = [
  "axum",
  "osiris-api",
  "osiris-audit",
+ "osiris-auth",
  "osiris-baseline",
  "osiris-correlate",
  "osiris-detect",

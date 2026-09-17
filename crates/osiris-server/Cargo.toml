@@ -28,6 +28,7 @@ osiris-baseline = { path = "../osiris-baseline" }
 osiris-risk = { path = "../osiris-risk" }
 osiris-evidence = { path = "../osiris-evidence" }
 osiris-audit = { path = "../osiris-audit" }
+osiris-auth = { path = "../osiris-auth" }
 uuid = { workspace = true }
 tower-http = { workspace = true }
 

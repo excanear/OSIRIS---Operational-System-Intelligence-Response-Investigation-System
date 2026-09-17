@@ -52,6 +52,15 @@ pub struct ServerConfig {
     /// production deployment could inherit by omission.
     #[serde(default)]
     pub dev_cors: Option<bool>,
+    /// Phase 8a: the RBAC/Auth store's own SQLite file (ARCHITECTURE.md
+    /// §10.3), independent of `db_path`'s telemetry tables — same posture
+    /// `incidents_db_path` etc. already established.
+    #[serde(default)]
+    pub users_db_path: Option<String>,
+    /// Phase 8a: session token lifetime in seconds; `main.rs` defaults to
+    /// 28800 (8 hours) when absent.
+    #[serde(default)]
+    pub session_ttl_seconds: Option<u64>,
 }
 
 impl ServerConfig {
@@ -153,5 +162,33 @@ mod tests {
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert_eq!(config.dev_cors, Some(true));
+    }
+
+    #[test]
+    fn users_db_path_and_session_ttl_default_to_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert!(config.users_db_path.is_none());
+        assert!(config.session_ttl_seconds.is_none());
+    }
+
+    #[test]
+    fn users_db_path_and_session_ttl_parse_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(
+            &path,
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\nusers_db_path: /tmp/users.db\nsession_ttl_seconds: 3600\n",
+        )
+        .unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        assert_eq!(config.users_db_path.as_deref(), Some("/tmp/users.db"));
+        assert_eq!(config.session_ttl_seconds, Some(3600));
     }
 }
