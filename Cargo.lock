@@ -1187,6 +1187,7 @@ dependencies = [
  "osiris-agent",
  "osiris-api",
  "osiris-audit",
+ "osiris-auth",
  "osiris-baseline",
  "osiris-correlate",
  "osiris-detect",

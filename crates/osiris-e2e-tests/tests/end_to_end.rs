@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
-use osiris_api::build_router;
+use osiris_api::{auth_gate, build_auth_router, build_router, AuthState};
+use osiris_audit::FileAuditLog;
+use osiris_auth::{SqliteUserStore, UserStore};
 use osiris_baseline::BaselineEngine;
 use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
@@ -23,6 +25,30 @@ fn phase6_engines(
     let risk_engine = Arc::new(RiskEngine::new(Default::default()));
     let correlation_engine = Arc::new(CorrelationEngine::new(5, 60_000_000_000));
     (baseline_engine, risk_engine, correlation_engine)
+}
+
+/// Mints a bootstrap-admin session token backed by a fresh `SqliteUserStore`
+/// in this test's own tempdir, and builds the matching `AuthState` — the
+/// same bootstrap `osiris-api/tests/composed_router_auth.rs`'s `harness()`
+/// performs. Every scenario test below merges `build_auth_router` and layers
+/// `auth_gate` over its router using this, so these tests prove the *shipped*
+/// auth configuration actually gates the real server, not just that an
+/// unauthenticated router answers requests.
+fn mint_admin_session(dir: &std::path::Path) -> (AuthState, String) {
+    let (user_store, _bootstrap) = SqliteUserStore::open(dir.join("users.db")).unwrap();
+    let admin = user_store.get_user_by_username("admin").unwrap().unwrap();
+    let admin_token = user_store
+        .create_session(admin.user_id, 3600)
+        .unwrap()
+        .token;
+    let audit_log: Arc<dyn osiris_audit::AuditLog + Send + Sync> =
+        Arc::new(FileAuditLog::open(dir.join("auth-audit.jsonl")).unwrap());
+    let auth_state = AuthState {
+        users: Arc::new(user_store),
+        audit_log,
+        session_ttl_seconds: 3600,
+    };
+    (auth_state, admin_token)
 }
 
 /// Exercises ARCHITECTURE.md §26's worked trace, narrowed to the
@@ -112,8 +138,14 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     );
 
     // 2. The real HTTP API, bound to a real TCP listener: the same chain
-    //    is queryable over the wire, not just in-process.
-    let app = build_router(storage.clone());
+    //    is queryable over the wire, not just in-process. Composed with the
+    //    real auth layer (matching osiris-server/src/main.rs), and an admin
+    //    session token minted the same way, so this proves the shipped auth
+    //    configuration actually gates the wire, not an unauthenticated stub.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -124,6 +156,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     let client = reqwest::Client::new();
     let health: serde_json::Value = client
         .get(format!("http://{}/api/v1/health", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -137,6 +170,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
             "http://{}/api/v1/events?event_type=PROCESS_EXEC",
             addr
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -148,6 +182,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     let bash_key = bash.process.as_ref().unwrap().process_key.as_hex();
     let detail: serde_json::Value = client
         .get(format!("http://{}/api/v1/processes/{}", addr, bash_key))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -165,6 +200,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap_or_else(|e| {
             panic!(
@@ -283,8 +319,12 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
 
     // 3. Timeline: GET /api/v1/events?since=&until= interleaves file and
     //    process events correctly in (timestamp, event_id) order (Global
-    //    Constraint #13). Use the full scenario's time range.
-    let app = build_router(storage.clone());
+    //    Constraint #13). Use the full scenario's time range. Composed with
+    //    the real auth layer, mirroring osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -302,6 +342,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
             min_ts - 1,
             max_ts + 1
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -332,6 +373,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     //    /var/www/html/ per generator::scenarios::WEB_SHELL_TEMP_PATH).
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -368,6 +410,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
             addr,
             urlencoding_lite(final_path)
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -402,6 +445,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -493,7 +537,12 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         .unwrap()
         .process_key;
 
-    let app = build_router(storage.clone());
+    // Composed with the real auth layer, mirroring
+    // osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -507,6 +556,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
     //    shipped rule's positive fixture.
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -531,6 +581,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
             "http://{}/api/v1/graph?entity={}",
             addr, entity_key
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -554,6 +605,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
             "http://{}/api/v1/risk?process_key={}",
             addr, curl_process_key
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -732,7 +784,12 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
 
     // 3. Timeline: both DNS and NETWORK categories appear, correctly
     //    time-ordered alongside PROCESS, in one GET /api/v1/events response.
-    let app = build_router(storage.clone());
+    //    Composed with the real auth layer, mirroring
+    //    osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -750,6 +807,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
             min_ts - 1,
             max_ts + 1
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -775,6 +833,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     //    dns_query_to_suspicious_tld, citing the DNS_QUERY event.
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -807,6 +866,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
             "http://{}/api/v1/network/story?domain=cdn-assets.xyz",
             addr
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -836,6 +896,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
             "http://{}/api/v1/network/story?ip=203.0.113.50",
             addr
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -858,6 +919,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1100,7 +1162,12 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     );
 
     // 6. Over real HTTP: Timeline interleaving of all five categories.
-    let app = build_router(storage.clone());
+    //    Composed with the real auth layer, mirroring
+    //    osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1118,6 +1185,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
             min_ts - 1,
             max_ts + 1
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1150,6 +1218,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     //    silent on this scenario.
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1188,6 +1257,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     //    alert, in one response (Global Constraint #10's session form).
     let story: serde_json::Value = client
         .get(format!("http://{}/api/v1/identity/story?session_id=3", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1220,6 +1290,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     //    events carry no `user` at all. So exactly 2 events come back.
     let uid_story: serde_json::Value = client
         .get(format!("http://{}/api/v1/identity/story?uid=0", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1243,6 +1314,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1460,8 +1532,12 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
         "both the create and the start belong to backdoor.service"
     );
 
-    // 6. Over real HTTP: both alerts fired, and only those two.
-    let app = build_router(storage.clone());
+    // 6. Over real HTTP: both alerts fired, and only those two. Composed
+    //    with the real auth layer, mirroring osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1472,6 +1548,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     let client = reqwest::Client::new();
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1511,6 +1588,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     //    include).
     let story: serde_json::Value = client
         .get(format!("http://{}/api/v1/systemd/story?unit_name=backdoor.service", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1546,6 +1624,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
         .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1726,8 +1805,12 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
         "the create, the start, and the docker exec all carry the deployed container_id"
     );
 
-    // 6. Over real HTTP: both alerts fired, and only those two.
-    let app = build_router(storage.clone());
+    // 6. Over real HTTP: both alerts fired, and only those two. Composed
+    //    with the real auth layer, mirroring osiris-server/src/main.rs.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1738,6 +1821,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     let client = reqwest::Client::new();
     let alerts: serde_json::Value = client
         .get(format!("http://{}/api/v1/alerts", addr))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1769,6 +1853,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
             addr,
             osiris_generator::DEPLOYED_CONTAINER_ID
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1807,6 +1892,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
             "container-story",
             osiris_generator::DEPLOYED_CONTAINER_ID,
         ])
+        .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1886,8 +1972,13 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         audit_log: Arc::new(osiris_audit::FileAuditLog::open(&audit_log_path).unwrap()),
     };
 
+    // Composed with the real auth layer, mirroring
+    // osiris-server/src/main.rs's merge+layer order.
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
-        .merge(osiris_api::build_incident_evidence_router(incident_evidence_state));
+        .merge(osiris_api::build_incident_evidence_router(incident_evidence_state))
+        .merge(build_auth_router(auth_state.clone()))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1910,6 +2001,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
             addr,
             urlencoding_lite("process.exe_path = \"/usr/bin/curl\"")
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1930,6 +2022,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     //    else it did — connect and/or file write, per the scenario).
     let story: serde_json::Value = client
         .get(format!("http://{}/api/v1/processes/{}/story", addr, curl_process_key.as_hex()))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1948,6 +2041,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
             addr,
             urlencoding_lite(&seed_entity.storage_key())
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1963,6 +2057,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
             addr,
             urlencoding_lite(&seed_entity.storage_key())
         ))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1975,6 +2070,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     let created_incident: serde_json::Value = client
         .post(format!("http://{}/api/v1/incidents", addr))
         .json(&serde_json::json!({ "entities": [seed_entity] }))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -1994,6 +2090,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
             "supersedes": null,
             "incident_id": incident_id,
         }))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -2004,6 +2101,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
 
     let evidence_list: Vec<serde_json::Value> = client
         .get(format!("http://{}/api/v1/evidence?incident_id={}", addr, incident_id))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()
@@ -2015,6 +2113,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     let patched: serde_json::Value = client
         .patch(format!("http://{}/api/v1/incidents/{}", addr, incident_id))
         .json(&serde_json::json!({ "status": "INVESTIGATING", "why": "e2e test triage" }))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()

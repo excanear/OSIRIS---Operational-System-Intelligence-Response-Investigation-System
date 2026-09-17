@@ -18,6 +18,7 @@ osiris-schema = { path = "../osiris-schema" }
 osiris-agent = { path = "../osiris-agent" }
 osiris-server = { path = "../osiris-server" }
 osiris-api = { path = "../osiris-api" }
+osiris-auth = { path = "../osiris-auth" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
 osiris-query = { path = "../osiris-query" }
