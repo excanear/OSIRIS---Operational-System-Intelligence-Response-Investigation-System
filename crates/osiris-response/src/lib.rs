@@ -3,6 +3,22 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod query;
+mod dispatch;
+pub use dispatch::dispatch;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResponseError {
+    #[error("storage error: {0}")]
+    Storage(#[from] osiris_storage::StorageError),
+    #[error("evidence store error: {0}")]
+    Evidence(#[from] osiris_evidence::EvidenceStoreError),
+    #[error("evidence/incident link error: {0}")]
+    Link(#[from] osiris_evidence::LinkStoreError),
+    #[error("evidence construction error: {0}")]
+    EvidenceBuild(#[from] osiris_evidence::EvidenceError),
+    #[error("target entity does not resolve to any known data: {0:?}")]
+    UnknownTarget(EntityRef),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
