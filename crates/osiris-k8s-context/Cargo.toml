@@ -1,0 +1,10 @@
+[package]
+name = "osiris-k8s-context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+tracing = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-pipeline = { path = "../osiris-pipeline" }
