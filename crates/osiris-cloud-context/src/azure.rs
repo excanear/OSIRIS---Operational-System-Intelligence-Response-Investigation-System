@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use osiris_schema::CloudContext;
 
-use crate::{http_client, sanitize, CloudMetadataProvider};
+use crate::{http_client, read_capped, sanitize, CloudMetadataProvider};
 
 const DEFAULT_BASE: &str = "http://169.254.169.254";
 
 /// Azure Instance Metadata Service.
 pub struct AzureImds {
     base: String,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
 }
 
 impl AzureImds {
@@ -21,15 +21,18 @@ impl AzureImds {
     }
 
     async fn try_probe(&self) -> Result<Option<CloudContext>, reqwest::Error> {
-        let body = self
-            .client
+        let Some(client) = &self.client else {
+            return Ok(None);
+        };
+        let resp = client
             .get(format!("{}/metadata/instance?api-version=2021-02-01", self.base))
             .header("Metadata", "true")
             .send()
             .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            .error_for_status()?;
+        let Some(body) = read_capped(resp).await? else {
+            return Ok(None);
+        };
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
             tracing::debug!("azure imds returned malformed json");
             return Ok(None);
@@ -109,6 +112,26 @@ mod tests {
     async fn missing_compute_object_yields_none() {
         let base = serve(Router::new().route("/metadata/instance", get(|| async { r#"{"network":{}}"# }))).await;
         assert!(AzureImds::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_yields_none() {
+        let big = format!(r#"{{"compute":{{"vmId":"v","pad":"{}"}}}}"#, "x".repeat(crate::MAX_BODY_LEN));
+        let router = Router::new().route(
+            "/metadata/instance",
+            get(move || {
+                let big = big.clone();
+                async move { big }
+            }),
+        );
+        let base = serve(router).await;
+        assert!(AzureImds::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_client_yields_none() {
+        let p = AzureImds { base: "http://127.0.0.1:1".into(), client: None };
+        assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]

@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use osiris_schema::CloudContext;
 
-use crate::{http_client, sanitize, CloudMetadataProvider};
+use crate::{http_client, read_capped, sanitize, CloudMetadataProvider};
 
 const DEFAULT_BASE: &str = "http://169.254.169.254";
 
 /// AWS EC2 Instance Metadata Service, v2 (session-token) only.
 pub struct AwsImdsV2 {
     base: String,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
 }
 
 impl AwsImdsV2 {
@@ -21,30 +21,35 @@ impl AwsImdsV2 {
     }
 
     async fn try_probe(&self) -> Result<Option<CloudContext>, reqwest::Error> {
-        let token = self
-            .client
+        let Some(client) = &self.client else {
+            return Ok(None);
+        };
+        let resp = client
             .put(format!("{}/latest/api/token", self.base))
             .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
             .send()
             .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let body = self
-            .client
+            .error_for_status()?;
+        let Some(token) = read_capped(resp).await? else {
+            return Ok(None);
+        };
+        let resp = client
             .get(format!("{}/latest/dynamic/instance-identity/document", self.base))
             .header("X-aws-ec2-metadata-token", token.trim())
             .send()
             .await?
-            .error_for_status()?
-            .text()
-            .await?;
+            .error_for_status()?;
+        let Some(body) = read_capped(resp).await? else {
+            return Ok(None);
+        };
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+            tracing::debug!("aws imds returned malformed json");
             return Ok(None);
         };
         let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).and_then(sanitize);
         let (instance_id, region) = (field("instanceId"), field("region"));
         if instance_id.is_none() && region.is_none() {
+            tracing::debug!("aws imds response has no usable fields");
             return Ok(None);
         }
         Ok(Some(CloudContext { provider: "aws".to_string(), instance_id, region }))
@@ -59,6 +64,8 @@ impl Default for AwsImdsV2 {
 
 #[async_trait]
 impl CloudMetadataProvider for AwsImdsV2 {
+    /// The two-step flow's 1s budget is enforced by `detect()`'s outer
+    /// `PROBE_TIMEOUT` wrapper; calling `probe()` directly can take up to 2x.
     async fn probe(&self) -> Option<CloudContext> {
         match self.try_probe().await {
             Ok(ctx) => ctx,
@@ -155,6 +162,42 @@ mod tests {
             .route("/latest/dynamic/instance-identity/document", get(|| async { "{}" }));
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_document_yields_none() {
+        let big = format!(r#"{{"instanceId":"i-1","pad":"{}"}}"#, "x".repeat(crate::MAX_BODY_LEN));
+        let router = Router::new().route("/latest/api/token", put(|| async { "tok-123" })).route(
+            "/latest/dynamic/instance-identity/document",
+            get(move || {
+                let big = big.clone();
+                async move { big }
+            }),
+        );
+        let base = serve(router).await;
+        assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_token_yields_none() {
+        let big = "t".repeat(crate::MAX_BODY_LEN + 1);
+        let router = Router::new()
+            .route(
+                "/latest/api/token",
+                put(move || {
+                    let big = big.clone();
+                    async move { big }
+                }),
+            )
+            .route("/latest/dynamic/instance-identity/document", get(|| async { r#"{"instanceId":"i-1"}"# }));
+        let base = serve(router).await;
+        assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_client_yields_none() {
+        let p = AwsImdsV2 { base: "http://127.0.0.1:1".into(), client: None };
+        assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]

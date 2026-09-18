@@ -77,4 +77,17 @@ describe("HostList", () => {
     expect(screen.getByText("aws / us-east-1")).toBeInTheDocument();
     expect(screen.getByText("—")).toBeInTheDocument();
   });
+
+  it("renders just the provider when the cloud region is absent", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "33333333-3333-3333-3333-333333333333", hostname: "azure-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", last_seen: 800, status: "ONLINE", cloud_provider: "azure", cloud_instance_id: null, cloud_region: null },
+        ],
+      })
+    );
+    renderWithRouter();
+
+    expect(screen.getByText("azure")).toBeInTheDocument();
+  });
 });

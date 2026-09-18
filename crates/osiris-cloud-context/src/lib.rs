@@ -36,13 +36,38 @@ pub fn sanitize(raw: &str) -> Option<String> {
     Some(trimmed.chars().take(MAX_FIELD_LEN).collect())
 }
 
-/// IMDS must never go through an HTTP proxy, and must fail fast.
-pub(crate) fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .no_proxy()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// IMDS must never go through an HTTP proxy, and must fail fast. Never falls
+/// back to a default client (it would proxy and have no timeout, leaking the
+/// IMDS token): on build failure returns `None` and providers probe to `None`.
+pub(crate) fn http_client() -> Option<reqwest::Client> {
+    match reqwest::Client::builder().timeout(PROBE_TIMEOUT).no_proxy().build() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "cloud metadata http client build failed; probing disabled");
+            None
+        }
+    }
+}
+
+/// Largest metadata response body we will read.
+pub(crate) const MAX_BODY_LEN: usize = 64 * 1024;
+
+/// Reads a body, returning `None` (never a truncated prefix) when it exceeds
+/// `MAX_BODY_LEN`, so an oversized body is never parsed as if it were valid.
+pub(crate) async fn read_capped(mut resp: reqwest::Response) -> Result<Option<String>, reqwest::Error> {
+    if resp.content_length().is_some_and(|n| n > MAX_BODY_LEN as u64) {
+        tracing::debug!("metadata response exceeds size cap");
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > MAX_BODY_LEN {
+            tracing::debug!("metadata response exceeds size cap");
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 /// Probes every provider concurrently, each under `PROBE_TIMEOUT`, and
@@ -80,6 +105,11 @@ mod tests {
 
     fn ctx(provider: &str) -> CloudContext {
         CloudContext { provider: provider.to_string(), instance_id: Some("i-1".into()), region: None }
+    }
+
+    #[test]
+    fn http_client_builds_in_the_normal_case() {
+        assert!(http_client().is_some());
     }
 
     #[test]

@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use osiris_schema::CloudContext;
 
-use crate::{http_client, sanitize, CloudMetadataProvider};
+use crate::{http_client, read_capped, sanitize, CloudMetadataProvider};
 
 const DEFAULT_BASE: &str = "http://metadata.google.internal";
 
 /// GCP Compute Engine metadata server.
 pub struct GcpMetadata {
     base: String,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
 }
 
 /// `projects/<n>/zones/us-central1-a` (or a bare zone) -> `us-central1`.
@@ -29,22 +29,38 @@ impl GcpMetadata {
         Self { base: base.into().trim_end_matches('/').to_string(), client: http_client() }
     }
 
-    async fn get_text(&self, path: &str) -> Result<String, reqwest::Error> {
-        self.client
+    /// `Ok(None)`: no client, missing `Metadata-Flavor: Google` response
+    /// header, or an over-cap body.
+    async fn get_text(&self, path: &str) -> Result<Option<String>, reqwest::Error> {
+        let Some(client) = &self.client else {
+            return Ok(None);
+        };
+        let resp = client
             .get(format!("{}/computeMetadata/v1/instance/{path}", self.base))
             .header("Metadata-Flavor", "Google")
             .send()
             .await?
-            .error_for_status()?
-            .text()
-            .await
+            .error_for_status()?;
+        let flavored = resp
+            .headers()
+            .get("metadata-flavor")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("google"));
+        if !flavored {
+            tracing::debug!("gcp metadata response lacks Metadata-Flavor: Google");
+            return Ok(None);
+        }
+        read_capped(resp).await
     }
 
     async fn try_probe(&self) -> Result<Option<CloudContext>, reqwest::Error> {
-        let instance_id = sanitize(&self.get_text("id").await?);
+        let Some(id) = self.get_text("id").await? else {
+            return Ok(None);
+        };
+        let instance_id = sanitize(&id);
         // A zone failure must not discard an otherwise-valid instance id.
         let region = match self.get_text("zone").await {
-            Ok(zone) => gcp_region_from_zone(&zone).as_deref().and_then(sanitize),
+            Ok(zone) => zone.and_then(|z| gcp_region_from_zone(&z)).as_deref().and_then(sanitize),
             Err(e) => {
                 tracing::debug!(error = %e, "gcp zone lookup failed");
                 None
@@ -91,12 +107,12 @@ mod tests {
     }
 
     async fn id(headers: HeaderMap) -> impl IntoResponse {
-        if flavored(&headers) { (StatusCode::OK, "1234567890\n").into_response() } else { StatusCode::FORBIDDEN.into_response() }
+        if flavored(&headers) { ([("metadata-flavor", "Google")], "1234567890\n").into_response() } else { StatusCode::FORBIDDEN.into_response() }
     }
 
     async fn zone(headers: HeaderMap) -> impl IntoResponse {
         if flavored(&headers) {
-            (StatusCode::OK, "projects/123/zones/us-central1-a").into_response()
+            ([("metadata-flavor", "Google")], "projects/123/zones/us-central1-a").into_response()
         } else {
             StatusCode::FORBIDDEN.into_response()
         }
@@ -135,6 +151,35 @@ mod tests {
         let got = GcpMetadata::with_base_url(base).probe().await.unwrap();
         assert_eq!(got.instance_id.as_deref(), Some("1234567890"));
         assert_eq!(got.region, None);
+    }
+
+    #[tokio::test]
+    async fn response_without_metadata_flavor_header_yields_none() {
+        let router = Router::new()
+            .route("/computeMetadata/v1/instance/id", get(|| async { "1234567890" }))
+            .route("/computeMetadata/v1/instance/zone", get(|| async { "projects/1/zones/us-central1-a" }));
+        let base = serve(router).await;
+        assert!(GcpMetadata::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_id_yields_none() {
+        let big = "9".repeat(crate::MAX_BODY_LEN + 1);
+        let router = Router::new().route(
+            "/computeMetadata/v1/instance/id",
+            get(move || {
+                let big = big.clone();
+                async move { ([("metadata-flavor", "Google")], big) }
+            }),
+        );
+        let base = serve(router).await;
+        assert!(GcpMetadata::with_base_url(base).probe().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_client_yields_none() {
+        let p = GcpMetadata { base: "http://127.0.0.1:1".into(), client: None };
+        assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]

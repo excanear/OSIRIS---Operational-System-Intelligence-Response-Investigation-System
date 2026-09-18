@@ -708,6 +708,8 @@ struct HostSummary {
 /// truncated portion of the window.
 ///
 /// Cloud fields come from the latest event's `host.cloud` (Phase 8d); absent -> null.
+/// Latest event only: an agent that restarts while the IMDS is unreachable will
+/// show `—` until a later event carries cloud again.
 async fn hosts_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<HostsQuery>,
@@ -2499,21 +2501,6 @@ mod tests {
         assert_eq!(stale.status, "STALE");
     }
 
-    // NOTE (Fix 1): a live-threshold test that actually writes >= MAX_EVENT_LIMIT
-    // (5000) events to prove `truncated` flips to `true` at the real cap was
-    // measured at ~48s for this single test on this machine (each
-    // `SqliteStorage::write` call is its own committed transaction) —
-    // impractically slow to add to this suite, matching the precedent
-    // already accepted in `crates/osiris-response/src/dispatch.rs` for the
-    // identical issue class. Instead, `hosts_handler`'s dedup + status
-    // computation was split into the pure, directly-testable
-    // `build_host_rows` helper (see its definition above), so this proves
-    // the REAL production code's truncation behavior against a handful of
-    // in-memory events with `truncated` passed in directly, rather than
-    // duplicating the handler's logic in the test or paying for a slow
-    // real write of the actual cap. `osiris_query::plan`'s own
-    // `effective_limit` tests (`crates/osiris-query/src/plan.rs`) separately
-    // cover that the query layer actually enforces `MAX_EVENT_LIMIT`.
     #[test]
     fn build_host_rows_carries_cloud_fields_from_the_latest_event() {
         let now = now_ns_for_test();
@@ -2550,6 +2537,21 @@ mod tests {
         assert!(json["cloud_region"].is_null());
     }
 
+    // NOTE (Fix 1): a live-threshold test that actually writes >= MAX_EVENT_LIMIT
+    // (5000) events to prove `truncated` flips to `true` at the real cap was
+    // measured at ~48s for this single test on this machine (each
+    // `SqliteStorage::write` call is its own committed transaction) —
+    // impractically slow to add to this suite, matching the precedent
+    // already accepted in `crates/osiris-response/src/dispatch.rs` for the
+    // identical issue class. Instead, `hosts_handler`'s dedup + status
+    // computation was split into the pure, directly-testable
+    // `build_host_rows` helper (see its definition above), so this proves
+    // the REAL production code's truncation behavior against a handful of
+    // in-memory events with `truncated` passed in directly, rather than
+    // duplicating the handler's logic in the test or paying for a slow
+    // real write of the actual cap. `osiris_query::plan`'s own
+    // `effective_limit` tests (`crates/osiris-query/src/plan.rs`) separately
+    // cover that the query layer actually enforces `MAX_EVENT_LIMIT`.
     #[test]
     fn build_host_rows_reports_unknown_status_for_every_row_when_truncated() {
         let now = now_ns_for_test();
