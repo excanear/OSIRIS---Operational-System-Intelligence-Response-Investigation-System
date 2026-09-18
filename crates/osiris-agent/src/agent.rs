@@ -188,6 +188,13 @@ impl Agent {
         let bus = Arc::new(bus);
         let proc_root = config.proc_root.clone().unwrap_or_else(|| "/proc".to_string());
         let mut pipeline = Pipeline::new(host, boot_id).with_proc_root(proc_root);
+        let k8s_refresher = match crate::k8s::start_pod_cache(&config.k8s_context, &cancellation).await {
+            Some((cache, handle)) => {
+                pipeline = pipeline.with_pod_lookup(Arc::new(cache));
+                Some(handle)
+            }
+            None => None,
+        };
         let pipeline_cancellation = cancellation.clone();
         let pipeline_bus = bus.clone();
         let pipeline_handle = tokio::spawn(async move {
@@ -207,12 +214,15 @@ impl Agent {
             }
         });
 
+        let mut tasks = vec![pipeline_handle, drain_handle];
+        tasks.extend(k8s_refresher);
+
         Ok(Arc::new(Self {
             lifecycle: Mutex::new(AgentLifecycle::Running),
             sensors: tokio::sync::Mutex::new(running_sensors),
             skipped_sensors: Mutex::new(skipped),
             cancellation,
-            background_tasks: tokio::sync::Mutex::new(vec![pipeline_handle, drain_handle]),
+            background_tasks: tokio::sync::Mutex::new(tasks),
         }))
     }
 
@@ -291,6 +301,7 @@ mod tests {
             enable_synthetic: false,
             synthetic_scenario: None,
             cloud_metadata: crate::config::CloudMetadataConfig { enabled: false, ..Default::default() },
+            k8s_context: crate::config::K8sContextConfig { enabled: false, ..Default::default() },
             spool_path: dir
                 .path()
                 .join("spool.ndjson")
@@ -298,6 +309,66 @@ mod tests {
                 .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         }
+    }
+
+    async fn kubelet_mock_serving(container_id: &str) -> String {
+        use axum::routing::get;
+        let body = format!(
+            r#"{{"items":[{{"metadata":{{"name":"web-0","namespace":"prod"}},"status":{{"containerStatuses":[{{"containerID":"containerd://{container_id}"}}]}}}}]}}"#
+        );
+        let router = axum::Router::new().route("/pods", get(move || {
+            let body = body.clone();
+            async move { body }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn container_events_in_the_spool_carry_the_pod_ref_when_k8s_context_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "tok").unwrap();
+        let base = kubelet_mock_serving(&"d00d".repeat(16)).await;
+
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("container_deploy_in_remote_session".to_string());
+        config.k8s_context = crate::config::K8sContextConfig {
+            enabled: true,
+            kubelet_url: Some(base),
+            token_path: Some(token_path.to_string_lossy().to_string()),
+            refresh_secs: 3600,
+            ..Default::default()
+        };
+        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert!(contents.contains("\"pod_name\":\"web-0\""), "spool must carry the resolved pod: {contents}");
+        assert!(contents.contains("\"namespace\":\"prod\""));
+    }
+
+    #[tokio::test]
+    async fn without_k8s_context_the_spool_has_no_pod_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("container_deploy_in_remote_session".to_string());
+        // base_config leaves k8s_context disabled.
+        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        agent.shutdown().await;
+
+        let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
+        assert!(!contents.contains("\"pod_name\""));
     }
 
     #[tokio::test]

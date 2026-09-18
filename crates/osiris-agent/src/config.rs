@@ -40,6 +40,49 @@ impl Default for CloudMetadataConfig {
     }
 }
 
+/// Optional Kubernetes context (Phase 8e, ARCHITECTURE.md §21.3): resolves
+/// container -> pod from the node's kubelet. On by default but active only
+/// when a kubelet URL is configured or a service-account token exists, so a
+/// non-Kubernetes host makes no connection. TLS verification is on; use
+/// `ca_path` for the kubelet's CA, or `insecure_skip_verify` (a documented
+/// risk) as an explicit opt-in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct K8sContextConfig {
+    #[serde(default = "default_k8s_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub kubelet_url: Option<String>,
+    #[serde(default)]
+    pub token_path: Option<String>,
+    #[serde(default)]
+    pub ca_path: Option<String>,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default = "default_k8s_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+fn default_k8s_enabled() -> bool {
+    true
+}
+
+fn default_k8s_refresh_secs() -> u64 {
+    30
+}
+
+impl Default for K8sContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            kubelet_url: None,
+            token_path: None,
+            ca_path: None,
+            insecure_skip_verify: false,
+            refresh_secs: 30,
+        }
+    }
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
@@ -49,6 +92,10 @@ pub struct AgentConfig {
     /// so every pre-8d agent.yaml still loads.
     #[serde(default)]
     pub cloud_metadata: CloudMetadataConfig,
+    /// Kubernetes context (Phase 8e). Defaults to enabled-but-gated, so
+    /// every pre-8e agent.yaml still loads.
+    #[serde(default)]
+    pub k8s_context: K8sContextConfig,
     /// Path to a Linux auditd-style log file for the Process/Exec sensor's
     /// audit backend. If absent or the file doesn't exist, that sensor is
     /// skipped (capabilities()-driven, never silently).
@@ -295,6 +342,36 @@ mod tests {
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.cloud_metadata.enabled);
         assert!(config.cloud_metadata.aws_base_url.is_none());
+    }
+
+    #[test]
+    fn k8s_context_defaults_so_pre_8e_configs_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(&path, "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n").unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.k8s_context.enabled);
+        assert!(config.k8s_context.kubelet_url.is_none());
+        assert!(config.k8s_context.token_path.is_none());
+        assert!(config.k8s_context.ca_path.is_none());
+        assert!(!config.k8s_context.insecure_skip_verify);
+        assert_eq!(config.k8s_context.refresh_secs, 30);
+    }
+
+    #[test]
+    fn k8s_context_section_parses_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\nk8s_context:\n  enabled: false\n  kubelet_url: https://10.0.0.1:10250\n  ca_path: /ca.pem\n  refresh_secs: 5\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(!config.k8s_context.enabled);
+        assert_eq!(config.k8s_context.kubelet_url.as_deref(), Some("https://10.0.0.1:10250"));
+        assert_eq!(config.k8s_context.ca_path.as_deref(), Some("/ca.pem"));
+        assert_eq!(config.k8s_context.refresh_secs, 5);
     }
 
     #[test]

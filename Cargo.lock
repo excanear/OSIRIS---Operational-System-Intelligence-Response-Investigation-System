@@ -1025,6 +1025,7 @@ dependencies = [
  "osiris-config",
  "osiris-generator",
  "osiris-health",
+ "osiris-k8s-context",
  "osiris-pipeline",
  "osiris-schema",
  "osiris-selftelemetry",
