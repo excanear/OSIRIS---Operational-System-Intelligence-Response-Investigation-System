@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use osiris_schema::{CanonicalEvent, HostRef};
 use osiris_sensor_api::RawEvent;
@@ -7,6 +8,7 @@ use crate::enrich::enrich;
 use crate::normalize::normalize;
 use crate::ns_cgroup_resolver::NsCgroupResolver;
 use crate::prioritize::{prioritize, PriorityLane, PriorityTable};
+use crate::pod_lookup::{attach_pod_ref, PodLookup};
 use crate::process_resolver::ProcessResolver;
 use crate::session_resolver::SessionResolver;
 use crate::validate::validate;
@@ -30,6 +32,7 @@ pub struct Pipeline {
     sessions: SessionResolver,
     ns_cgroup: NsCgroupResolver,
     priority_table: PriorityTable,
+    pod_lookup: Option<Arc<dyn PodLookup>>,
 }
 
 impl Pipeline {
@@ -41,6 +44,7 @@ impl Pipeline {
             sessions: SessionResolver::new(),
             ns_cgroup: NsCgroupResolver::new("/proc"),
             priority_table: PriorityTable::default(),
+            pod_lookup: None,
         }
     }
 
@@ -51,6 +55,14 @@ impl Pipeline {
     /// (mirrors `PersistenceSensor::with_poll_interval`'s builder shape).
     pub fn with_proc_root(mut self, proc_root: impl Into<PathBuf>) -> Self {
         self.ns_cgroup = NsCgroupResolver::new(proc_root);
+        self
+    }
+
+    /// Attaches Kubernetes pod context to container events (Phase 8e) from
+    /// the given lookup. Without one, `pod_ref` is left exactly as
+    /// Normalize/Enrich produced it (builder shape of `with_proc_root`).
+    pub fn with_pod_lookup(mut self, lookup: Arc<dyn PodLookup>) -> Self {
+        self.pod_lookup = Some(lookup);
         self
     }
 
@@ -66,6 +78,9 @@ impl Pipeline {
             &mut self.sessions,
             &mut self.ns_cgroup,
         );
+        if let Some(lookup) = &self.pod_lookup {
+            attach_pod_ref(&mut event, lookup.as_ref());
+        }
         validate(&mut event);
         let lane = prioritize(&event, &self.priority_table);
         PrioritizedEvent { event, lane }
@@ -75,8 +90,47 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_sensor_api::{ProcessExecRaw, RawEventSource};
+    use osiris_schema::PodRef;
+    use osiris_sensor_api::{ContainerEventRaw, ContainerOperation, ProcessExecRaw, RawEventSource};
+    use std::collections::HashMap;
     use uuid::Uuid;
+
+    struct FakePods(HashMap<String, PodRef>);
+    impl PodLookup for FakePods {
+        fn pod_for(&self, container_id: &str) -> Option<PodRef> {
+            self.0.get(container_id).cloned()
+        }
+    }
+
+    fn container_raw(container_id: &str) -> RawEvent {
+        RawEvent::Container(ContainerEventRaw {
+            operation: ContainerOperation::Start,
+            container_id: container_id.to_string(),
+            image: String::new(),
+            runtime: "cgroup".to_string(),
+            cgroup_path: "/kubepods/x".to_string(),
+            pid: Some(10),
+            pod_name: None,
+            pod_namespace: None,
+            timestamp_ns: 1,
+            source: RawEventSource::Synthetic,
+        })
+    }
+
+    #[test]
+    fn pipeline_with_a_pod_lookup_attaches_pod_ref_and_without_one_leaves_it_none() {
+        let id = "c".repeat(64);
+        let mut pods = HashMap::new();
+        pods.insert(id.clone(), PodRef { pod_name: "web-0".to_string(), namespace: "prod".to_string() });
+
+        let mut with = Pipeline::new(test_host(), "boot-1".to_string()).with_pod_lookup(Arc::new(FakePods(pods)));
+        let got = with.process(container_raw(&id));
+        assert_eq!(got.event.container.unwrap().pod_ref.unwrap().pod_name, "web-0");
+
+        let mut without = Pipeline::new(test_host(), "boot-1".to_string());
+        let got = without.process(container_raw(&id));
+        assert!(got.event.container.unwrap().pod_ref.is_none());
+    }
 
     fn test_host() -> HostRef {
         HostRef {
