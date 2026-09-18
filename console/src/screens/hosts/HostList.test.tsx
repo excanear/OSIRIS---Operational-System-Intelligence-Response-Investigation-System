@@ -61,4 +61,20 @@ describe("HostList", () => {
     expect(screen.getByText("ubuntu-22.04")).toBeInTheDocument();
     expect(screen.getByText("ONLINE")).toBeInTheDocument();
   });
+
+  it("renders a Cloud column with provider and region, and a dash when absent", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "cloud-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", last_seen: 1000, status: "ONLINE", cloud_provider: "aws", cloud_instance_id: "i-0abc", cloud_region: "us-east-1" },
+          { host_id: "22222222-2222-2222-2222-222222222222", hostname: "onprem-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", last_seen: 900, status: "STALE", cloud_provider: null, cloud_instance_id: null, cloud_region: null },
+        ],
+      })
+    );
+    renderWithRouter();
+
+    expect(screen.getByRole("columnheader", { name: "Cloud" })).toBeInTheDocument();
+    expect(screen.getByText("aws / us-east-1")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
 });

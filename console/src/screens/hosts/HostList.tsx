@@ -1,5 +1,13 @@
 import { Link } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
+import type { HostSummary } from "../../api/types";
+
+// Phase 8d: provider (+ region when known) from the host's cloud metadata
+// probe, or a dash for on-prem/bare-metal hosts (cloud is null there).
+function formatCloud(row: HostSummary): string {
+  if (!row.cloud_provider) return "—";
+  return row.cloud_region ? `${row.cloud_provider} / ${row.cloud_region}` : row.cloud_provider;
+}
 
 // GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/lib.rs) queries
 // a bounded, time-windowed event scan capped at MAX_EVENT_LIMIT (5,000)
@@ -31,6 +39,7 @@ export function HostList() {
               <th>Kernel</th>
               <th>Last Seen</th>
               <th>Status</th>
+              <th>Cloud</th>
             </tr>
           </thead>
           <tbody>
@@ -43,6 +52,7 @@ export function HostList() {
                 <td>{row.kernel_version}</td>
                 <td>{new Date(row.last_seen / 1_000_000).toLocaleString()}</td>
                 <td>{row.status}</td>
+                <td>{formatCloud(row)}</td>
               </tr>
             ))}
           </tbody>

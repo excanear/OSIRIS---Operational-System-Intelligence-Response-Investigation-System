@@ -86,6 +86,9 @@ export interface HostSummary {
   kernel_version: string;
   last_seen: number;
   status: "ONLINE" | "STALE" | "UNKNOWN";
+  cloud_provider?: string | null;
+  cloud_instance_id?: string | null;
+  cloud_region?: string | null;
 }
 
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

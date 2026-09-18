@@ -678,6 +678,9 @@ struct HostSummary {
     kernel_version: String,
     last_seen: u64,
     status: String,
+    cloud_provider: Option<String>,
+    cloud_instance_id: Option<String>,
+    cloud_region: Option<String>,
 }
 
 /// `GET /api/v1/hosts` — ARCHITECTURE.md §21.2's Fleet Manager, scoped to
@@ -703,6 +706,8 @@ struct HostSummary {
 /// computation, since truncation makes it impossible to tell whether any
 /// given host's true most-recent event fell inside or outside the
 /// truncated portion of the window.
+///
+/// Cloud fields come from the latest event's `host.cloud` (Phase 8d); absent -> null.
 async fn hosts_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<HostsQuery>,
@@ -753,6 +758,10 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
             } else {
                 "STALE"
             };
+            let (cloud_provider, cloud_instance_id, cloud_region) = match event.host.cloud {
+                Some(c) => (Some(c.provider), c.instance_id, c.region),
+                None => (None, None, None),
+            };
             HostSummary {
                 host_id: event.host_id.to_string(),
                 hostname: event.host.hostname,
@@ -760,6 +769,9 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
                 kernel_version: event.host.kernel_version,
                 last_seen: event.timestamp,
                 status: status.to_string(),
+                cloud_provider,
+                cloud_instance_id,
+                cloud_region,
             }
         })
         .collect();
@@ -2502,6 +2514,42 @@ mod tests {
     // real write of the actual cap. `osiris_query::plan`'s own
     // `effective_limit` tests (`crates/osiris-query/src/plan.rs`) separately
     // cover that the query layer actually enforces `MAX_EVENT_LIMIT`.
+    #[test]
+    fn build_host_rows_carries_cloud_fields_from_the_latest_event() {
+        let now = now_ns_for_test();
+        let host_a = uuid::Uuid::new_v4();
+        let mut old = host_event(host_a, "h", now - 20 * 1_000_000_000);
+        old.host.cloud = Some(osiris_schema::CloudContext {
+            provider: "gcp".to_string(),
+            instance_id: Some("old-id".to_string()),
+            region: None,
+        });
+        let mut latest = host_event(host_a, "h", now - 5 * 1_000_000_000);
+        latest.host.cloud = Some(osiris_schema::CloudContext {
+            provider: "aws".to_string(),
+            instance_id: Some("i-0abc".to_string()),
+            region: Some("us-east-1".to_string()),
+        });
+
+        let rows = build_host_rows(vec![old, latest], now, false);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cloud_provider.as_deref(), Some("aws"));
+        assert_eq!(rows[0].cloud_instance_id.as_deref(), Some("i-0abc"));
+        assert_eq!(rows[0].cloud_region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn build_host_rows_cloud_fields_are_none_and_serialize_as_null_when_absent() {
+        let now = now_ns_for_test();
+        let rows = build_host_rows(vec![host_event(uuid::Uuid::new_v4(), "h", now - 1_000_000_000)], now, false);
+        assert!(rows[0].cloud_provider.is_none());
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert!(json["cloud_provider"].is_null());
+        assert!(json["cloud_instance_id"].is_null());
+        assert!(json["cloud_region"].is_null());
+    }
+
     #[test]
     fn build_host_rows_reports_unknown_status_for_every_row_when_truncated() {
         let now = now_ns_for_test();
