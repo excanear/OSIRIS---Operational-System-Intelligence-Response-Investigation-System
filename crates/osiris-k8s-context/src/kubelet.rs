@@ -67,7 +67,10 @@ impl KubeletClient {
         if url.scheme() != "http" && url.scheme() != "https" {
             return None;
         }
-        let mut builder = reqwest::Client::builder().timeout(FETCH_TIMEOUT).no_proxy();
+        let mut builder = reqwest::Client::builder().timeout(FETCH_TIMEOUT)
+            .no_proxy()
+            // A kubelet never redirects /pods; following one could carry the token elsewhere.
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(ca_path) = &cfg.ca_path {
             let pem = std::fs::read(ca_path).ok()?;
             builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem).ok()?);
@@ -274,6 +277,84 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let client = client_for("http://127.0.0.1:1", &token_file(&dir, "t"));
         assert!(client.fetch().await.is_none());
+    }
+
+    /// Spawns a server on `bind` whose `/pods` and `/target` routes count hits.
+    async fn counting_server(
+        bind: &str,
+        pods_redirects_to: Option<String>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pods_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let (p, t) = (pods_hits.clone(), target_hits.clone());
+        let router = Router::new()
+            .route(
+                "/pods",
+                get(move || {
+                    let p = p.clone();
+                    let redirect = pods_redirects_to.clone();
+                    async move {
+                        p.fetch_add(1, Ordering::SeqCst);
+                        match redirect {
+                            Some(loc) => (StatusCode::FOUND, [("location", loc)], String::new()).into_response(),
+                            None => POD_LIST.into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/target",
+                get(move || {
+                    let t = t.clone();
+                    async move {
+                        t.fetch_add(1, Ordering::SeqCst);
+                        POD_LIST
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (addr, pods_hits, target_hits)
+    }
+
+    #[tokio::test]
+    async fn the_token_is_never_sent_over_plain_http_to_a_non_loopback_host() {
+        use std::sync::atomic::Ordering;
+        // Find this machine's non-loopback address (no packet is sent).
+        let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
+            .and_then(|s| s.local_addr())
+            .ok()
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        else {
+            eprintln!("no non-loopback interface; skipping");
+            return;
+        };
+        let (addr, pods_hits, _) = counting_server("0.0.0.0:0", None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = client_for(&format!("http://{ip}:{}", addr.port()), &token_file(&dir, "secret"));
+        assert!(client.fetch().await.is_none());
+        assert_eq!(pods_hits.load(Ordering::SeqCst), 0, "no request may reach a non-loopback http kubelet");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (_, pods_hits, target_hits) =
+            counting_server(&format!("127.0.0.1:{port}"), Some(format!("http://127.0.0.1:{port}/target"))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = client_for(&format!("http://127.0.0.1:{port}"), &token_file(&dir, "t"));
+        assert!(client.fetch().await.is_none());
+        assert_eq!(pods_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0, "the redirect target must never be requested");
     }
 
     #[test]
