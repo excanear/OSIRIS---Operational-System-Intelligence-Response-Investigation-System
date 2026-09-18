@@ -85,7 +85,7 @@ export interface HostSummary {
   distro: string;
   kernel_version: string;
   last_seen: number;
-  status: "ONLINE" | "STALE";
+  status: "ONLINE" | "STALE" | "UNKNOWN";
 }
 
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

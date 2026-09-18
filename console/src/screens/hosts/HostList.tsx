@@ -1,6 +1,15 @@
 import { Link } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
 
+// GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/lib.rs) queries
+// a bounded, time-windowed event scan capped at MAX_EVENT_LIMIT (5,000)
+// events, ordered oldest-first, breaking once the cap is hit. If that cap is
+// hit, the handler cannot tell whether any given host's true most-recent
+// event fell inside or outside the truncated portion of the window, so it
+// reports `status: "UNKNOWN"` for EVERY row in the response rather than a
+// possibly-wrong ONLINE/STALE verdict. "UNKNOWN" therefore means "liveness
+// cannot currently be determined for any host in this response" (a
+// query-wide condition), not "these specific hosts are unknown."
 export function HostList() {
   const hosts = useHosts();
   const rows = hosts.data ?? [];
@@ -32,7 +41,7 @@ export function HostList() {
                 </td>
                 <td>{row.distro}</td>
                 <td>{row.kernel_version}</td>
-                <td>{row.last_seen}</td>
+                <td>{new Date(row.last_seen / 1_000_000).toLocaleString()}</td>
                 <td>{row.status}</td>
               </tr>
             ))}

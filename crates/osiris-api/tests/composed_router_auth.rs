@@ -137,6 +137,37 @@ async fn a_phase_1_route_is_401_without_a_token_and_200_with_one() {
     assert_eq!(authenticated.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn the_hosts_route_is_401_without_a_token_and_200_with_one_on_the_composed_router() {
+    let h = harness();
+
+    let anonymous = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/hosts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let authenticated = h
+        .app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/hosts")
+                .header("Authorization", format!("Bearer {}", h.admin_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), StatusCode::OK);
+}
+
 // --- Fix 2: the real Response Engine route, through the real composed router ---
 
 fn session_for_role(state: &AuthState, username: &str, role: Role) -> String {

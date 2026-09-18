@@ -19,8 +19,10 @@ export function Timeline() {
   const healthEvents = useEvents("SENSOR_HEALTH", { since: healthSince });
   const hostIds = useMemo(() => {
     const rows = healthEvents.data ? rollupSensorHealth(healthEvents.data) : [];
-    return Array.from(new Set(rows.map((row) => row.hostId))).sort();
-  }, [healthEvents.data]);
+    const discovered = new Set(rows.map((row) => row.hostId));
+    if (hostId) discovered.add(hostId);
+    return Array.from(discovered).sort();
+  }, [healthEvents.data, hostId]);
 
   const parsedSince = parseOptionalNumber(since);
   const parsedUntil = parseOptionalNumber(until);

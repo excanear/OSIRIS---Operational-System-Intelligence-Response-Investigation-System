@@ -690,6 +690,19 @@ struct HostSummary {
 /// `containers_handler`'s sibling shape — see this handler's own design
 /// doc §2 for why a fleet registry's correctness depends on recency, not
 /// full history.
+///
+/// Truncation caveat: the underlying storage scan is capped at
+/// `osiris_query::MAX_EVENT_LIMIT` rows and returns them oldest-first,
+/// breaking once the cap is hit. If a host in the window produces more
+/// than `MAX_EVENT_LIMIT` events, the query only sees the OLDEST events
+/// in the window, which would make every host's `last_seen` pin near the
+/// start of the window and falsely report `STALE` for actively-reporting
+/// hosts. To avoid reporting a confidently wrong liveness verdict, when
+/// the query is truncated (`events.len() >= MAX_EVENT_LIMIT`) every row's
+/// `status` is forced to `"UNKNOWN"` instead of the normal ONLINE/STALE
+/// computation, since truncation makes it impossible to tell whether any
+/// given host's true most-recent event fell inside or outside the
+/// truncated portion of the window.
 async fn hosts_handler(
     State(storage): State<Arc<dyn Storage>>,
     Query(q): Query<HostsQuery>,
@@ -710,6 +723,16 @@ async fn hosts_handler(
         .unwrap()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Captured before `events` is consumed by the dedup loop below.
+    let truncated = events.len() >= osiris_query::MAX_EVENT_LIMIT;
+    Ok(Json(build_host_rows(events, now, truncated)))
+}
+
+/// Pure dedup + status/order computation for `hosts_handler`, split out so
+/// the truncation behavior (Fix 1) and tie-break ordering (Fix 4) can be
+/// unit-tested against a handful of in-memory events instead of requiring a
+/// real `MAX_EVENT_LIMIT`-sized storage write in every test.
+fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Vec<HostSummary> {
     let mut seen: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
     for event in events {
         match seen.get(&event.host_id) {
@@ -723,7 +746,9 @@ async fn hosts_handler(
     let mut rows: Vec<HostSummary> = seen
         .into_values()
         .map(|event| {
-            let status = if now.saturating_sub(event.timestamp) <= HOST_ONLINE_THRESHOLD_NS {
+            let status = if truncated {
+                "UNKNOWN"
+            } else if now.saturating_sub(event.timestamp) <= HOST_ONLINE_THRESHOLD_NS {
                 "ONLINE"
             } else {
                 "STALE"
@@ -738,8 +763,8 @@ async fn hosts_handler(
             }
         })
         .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse(row.last_seen));
-    Ok(Json(rows))
+    rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.host_id.cmp(&b.host_id)));
+    rows
 }
 
 /// `GET /api/v1/containers` — ARCHITECTURE.md §16.3's Containers list
@@ -2460,6 +2485,73 @@ mod tests {
         let stale = rows.iter().find(|r| r.hostname == "stale-host").unwrap();
         assert_eq!(online.status, "ONLINE");
         assert_eq!(stale.status, "STALE");
+    }
+
+    // NOTE (Fix 1): a live-threshold test that actually writes >= MAX_EVENT_LIMIT
+    // (5000) events to prove `truncated` flips to `true` at the real cap was
+    // measured at ~48s for this single test on this machine (each
+    // `SqliteStorage::write` call is its own committed transaction) —
+    // impractically slow to add to this suite, matching the precedent
+    // already accepted in `crates/osiris-response/src/dispatch.rs` for the
+    // identical issue class. Instead, `hosts_handler`'s dedup + status
+    // computation was split into the pure, directly-testable
+    // `build_host_rows` helper (see its definition above), so this proves
+    // the REAL production code's truncation behavior against a handful of
+    // in-memory events with `truncated` passed in directly, rather than
+    // duplicating the handler's logic in the test or paying for a slow
+    // real write of the actual cap. `osiris_query::plan`'s own
+    // `effective_limit` tests (`crates/osiris-query/src/plan.rs`) separately
+    // cover that the query layer actually enforces `MAX_EVENT_LIMIT`.
+    #[test]
+    fn build_host_rows_reports_unknown_status_for_every_row_when_truncated() {
+        let now = now_ns_for_test();
+        let host_a = uuid::Uuid::new_v4();
+        let host_b = uuid::Uuid::new_v4();
+        let events = vec![
+            host_event(host_a, "recent-host", now - 60 * 1_000_000_000), // 60s ago: would be ONLINE if untruncated.
+            host_event(host_b, "old-host", now - 10 * 60 * 1_000_000_000), // 10min ago: would be STALE if untruncated.
+        ];
+
+        let rows = build_host_rows(events, now, true);
+
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.status == "UNKNOWN"),
+            "truncated must force every row's status to UNKNOWN regardless of recency: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn build_host_rows_computes_normal_online_stale_when_not_truncated() {
+        let now = now_ns_for_test();
+        let host_a = uuid::Uuid::new_v4();
+        let events = vec![host_event(host_a, "recent-host", now - 60 * 1_000_000_000)];
+
+        let rows = build_host_rows(events, now, false);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "ONLINE", "untruncated behavior is unchanged");
+    }
+
+    #[tokio::test]
+    async fn hosts_endpoint_orders_last_seen_ties_deterministically_by_host_id() {
+        let (_dir, storage) = test_storage();
+        let now = now_ns_for_test();
+        // Three hosts sharing the exact same last_seen timestamp.
+        let mut host_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+        for (i, host_id) in host_ids.iter().enumerate() {
+            storage.write(&host_event(*host_id, &format!("tie-host-{i}"), now - 1_000_000_000)).unwrap();
+        }
+        host_ids.sort();
+
+        for _ in 0..3 {
+            let Json(rows) = hosts_handler(State(storage.clone()), Query(HostsQuery { since: Some(0), until: None }))
+                .await
+                .unwrap();
+            let ordered_ids: Vec<uuid::Uuid> =
+                rows.iter().map(|r| uuid::Uuid::parse_str(&r.host_id).unwrap()).collect();
+            assert_eq!(ordered_ids, host_ids, "ties on last_seen must break by host_id ascending, every time");
+        }
     }
 
     #[test]
