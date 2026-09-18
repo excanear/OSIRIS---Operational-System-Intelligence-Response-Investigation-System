@@ -1145,6 +1145,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-cloud-context"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "osiris-schema",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "osiris-config"
 version = "0.1.0"
 dependencies = [
