@@ -1289,9 +1289,14 @@ dependencies = [
 name = "osiris-k8s-context"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "osiris-pipeline",
  "osiris-schema",
+ "reqwest",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
