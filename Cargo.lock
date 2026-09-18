@@ -1021,6 +1021,7 @@ dependencies = [
  "axum",
  "hostname",
  "osiris-bus",
+ "osiris-cloud-context",
  "osiris-config",
  "osiris-generator",
  "osiris-health",

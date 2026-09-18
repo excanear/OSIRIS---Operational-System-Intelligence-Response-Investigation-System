@@ -66,12 +66,17 @@ async fn main() {
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string());
+    let cloud = osiris_agent::cloud::detect_cloud_context(&config.cloud_metadata).await;
+    match &cloud {
+        Some(c) => tracing::info!(provider = %c.provider, "cloud metadata detected"),
+        None => tracing::debug!("no cloud metadata detected (on-prem, disabled, or unreachable)"),
+    }
     let host = HostRef {
         host_id,
         hostname,
         distro: "unknown".to_string(),
         kernel_version: "unknown".to_string(),
-        cloud: None,
+        cloud,
     };
 
     let status_addr = match std::net::SocketAddr::from_str(&config.status_addr) {

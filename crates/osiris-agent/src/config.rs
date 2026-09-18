@@ -15,11 +15,40 @@ pub enum ConfigError {
     Parse(#[from] serde_yaml::Error),
 }
 
+/// Optional Cloud metadata probe config (ARCHITECTURE.md §21.4). On by
+/// default; the per-provider base URLs exist for tests and proxied
+/// metadata services — they are not auto-discovery.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudMetadataConfig {
+    #[serde(default = "default_cloud_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub aws_base_url: Option<String>,
+    #[serde(default)]
+    pub azure_base_url: Option<String>,
+    #[serde(default)]
+    pub gcp_base_url: Option<String>,
+}
+
+fn default_cloud_enabled() -> bool {
+    true
+}
+
+impl Default for CloudMetadataConfig {
+    fn default() -> Self {
+        Self { enabled: true, aws_base_url: None, azure_base_url: None, gcp_base_url: None }
+    }
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
+    /// Cloud metadata probe (Phase 8d). Defaults to enabled, no overrides,
+    /// so every pre-8d agent.yaml still loads.
+    #[serde(default)]
+    pub cloud_metadata: CloudMetadataConfig,
     /// Path to a Linux auditd-style log file for the Process/Exec sensor's
     /// audit backend. If absent or the file doesn't exist, that sensor is
     /// skipped (capabilities()-driven, never silently).
@@ -256,5 +285,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = AgentConfig::load(&dir.path().join("missing.yaml"));
         assert!(matches!(result, Err(ConfigError::Read { .. })));
+    }
+
+    #[test]
+    fn cloud_metadata_defaults_to_enabled_with_no_overrides_so_old_configs_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(&path, "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n").unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.cloud_metadata.enabled);
+        assert!(config.cloud_metadata.aws_base_url.is_none());
+    }
+
+    #[test]
+    fn cloud_metadata_section_parses_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\ncloud_metadata:\n  enabled: false\n  gcp_base_url: http://127.0.0.1:9\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(!config.cloud_metadata.enabled);
+        assert_eq!(config.cloud_metadata.gcp_base_url.as_deref(), Some("http://127.0.0.1:9"));
     }
 }

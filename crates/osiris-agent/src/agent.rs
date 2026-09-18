@@ -290,6 +290,7 @@ mod tests {
             proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
+            cloud_metadata: Default::default(),
             spool_path: dir
                 .path()
                 .join("spool.ndjson")
