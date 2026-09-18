@@ -1,6 +1,15 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useContainers } from "../../api/hooks";
+import type { ContainerSummary } from "../../api/types";
+
+// Phase 8e: pod context from the node's kubelet, or a dash for containers
+// with no resolved pod (non-Kubernetes hosts, or a container the kubelet
+// cache does not know).
+function formatPod(row: ContainerSummary): string {
+  if (!row.pod_name) return "—";
+  return row.pod_namespace ? `${row.pod_namespace}/${row.pod_name}` : row.pod_name;
+}
 
 export function ContainerList() {
   // GET /api/v1/containers (containers_handler in
@@ -44,6 +53,7 @@ export function ContainerList() {
               <th>Image</th>
               <th>Host</th>
               <th>Status</th>
+              <th>Pod</th>
               <th>Timestamp</th>
             </tr>
           </thead>
@@ -56,6 +66,7 @@ export function ContainerList() {
                 <td>{row.image}</td>
                 <td>{row.hostname}</td>
                 <td>{row.status}</td>
+                <td>{formatPod(row)}</td>
                 <td>{row.timestamp}</td>
               </tr>
             ))}

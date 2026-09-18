@@ -73,4 +73,20 @@ describe("ContainerList", () => {
     expect(screen.getByText("abc123")).toBeInTheDocument();
     expect(screen.queryByText("def456")).not.toBeInTheDocument();
   });
+
+  it("renders a Pod column as namespace/pod, and a dash when there is no pod", () => {
+    vi.mocked(hooks.useContainers).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { container_id: "abc123", host_id: "h1", hostname: "host-a", image: "nginx:latest", status: "RUNNING", timestamp: 1000, pod_name: "web-0", pod_namespace: "prod" },
+          { container_id: "def456", host_id: "h1", hostname: "host-a", image: "redis:7", status: "RUNNING", timestamp: 900, pod_name: null, pod_namespace: null },
+        ],
+      })
+    );
+    renderWithRouter();
+
+    expect(screen.getByRole("columnheader", { name: "Pod" })).toBeInTheDocument();
+    expect(screen.getByText("prod/web-0")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
 });

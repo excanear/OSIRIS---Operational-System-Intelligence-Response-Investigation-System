@@ -77,6 +77,8 @@ export interface ContainerSummary {
   image: string;
   status: "RUNNING" | "STOPPED" | "UNKNOWN";
   timestamp: number;
+  pod_name?: string | null;
+  pod_namespace?: string | null;
 }
 
 export interface HostSummary {

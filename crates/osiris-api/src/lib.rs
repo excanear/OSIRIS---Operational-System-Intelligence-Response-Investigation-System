@@ -652,6 +652,8 @@ struct ContainerSummary {
     image: String,
     status: String,
     timestamp: u64,
+    pod_name: Option<String>,
+    pod_namespace: Option<String>,
 }
 
 fn now_ns() -> u64 {
@@ -786,6 +788,7 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
 /// by `container_id` alone (not host-scoped, matching
 /// `container_story_handler`'s own existing host-agnostic behavior).
 /// `status` is derived from the kept (most-recent) event's `event_type`.
+/// Pod fields (Phase 8e) come from the kept event's `container.pod_ref` only; a later event without one shows null until an event carrying it becomes the latest.
 async fn containers_handler(
     State(storage): State<Arc<dyn Storage>>,
 ) -> Result<Json<Vec<ContainerSummary>>, (StatusCode, String)> {
@@ -816,6 +819,10 @@ async fn containers_handler(
                     EventType::ContainerStop | EventType::ContainerDestroy => "STOPPED",
                     _ => "UNKNOWN",
                 };
+                let (pod_name, pod_namespace) = match &container.pod_ref {
+                    Some(pod) => (Some(pod.pod_name.clone()), Some(pod.namespace.clone())),
+                    None => (None, None),
+                };
                 seen.insert(
                     key.clone(),
                     ContainerSummary {
@@ -825,6 +832,8 @@ async fn containers_handler(
                         image: container.image.clone(),
                         status: status.to_string(),
                         timestamp: event.timestamp,
+                        pod_name,
+                        pod_namespace,
                     },
                 );
             }
@@ -2118,6 +2127,36 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].timestamp, 2000);
+    }
+
+    #[tokio::test]
+    async fn containers_endpoint_carries_pod_fields_from_the_kept_event() {
+        let (_dir, storage) = test_storage();
+        let mut event = container_event("abc", EventType::ContainerStart, 1000);
+        event.container.as_mut().unwrap().pod_ref = Some(osiris_schema::PodRef {
+            pod_name: "web-0".to_string(),
+            namespace: "prod".to_string(),
+        });
+        storage.write(&event).unwrap();
+
+        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pod_name.as_deref(), Some("web-0"));
+        assert_eq!(rows[0].pod_namespace.as_deref(), Some("prod"));
+    }
+
+    #[tokio::test]
+    async fn containers_endpoint_pod_fields_are_null_when_absent() {
+        let (_dir, storage) = test_storage();
+        storage.write(&container_event("abc", EventType::ContainerStart, 1000)).unwrap();
+
+        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+
+        assert!(rows[0].pod_name.is_none());
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert!(json["pod_name"].is_null());
+        assert!(json["pod_namespace"].is_null());
     }
 
     #[tokio::test]
