@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use osiris_k8s_context::{refresh_once, spawn_refresher, KubeletClient, KubeletConfig, PodCache};
+use osiris_k8s_context::{refresh_once_result, spawn_refresher, KubeletClient, KubeletConfig, PodCache};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::K8sContextConfig;
 
 pub const DEFAULT_SA_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+/// Lowest accepted `refresh_secs`; smaller values are raised to this.
+pub const MIN_REFRESH_SECS: u64 = 5;
 pub const DEFAULT_KUBELET_URL: &str = "https://127.0.0.1:10250";
 
 fn token_path(cfg: &K8sContextConfig) -> &str {
@@ -43,12 +45,18 @@ pub async fn start_pod_cache(
         return None;
     };
     let cache = PodCache::new();
-    if refresh_once(&client, &cache).await {
-        tracing::info!(pods = cache.len(), "kubernetes pod context loaded");
-    } else {
-        tracing::warn!("initial kubelet fetch failed; pod context will fill in when the kubelet becomes reachable");
+    // NOTE: this awaited initial fetch delays `Agent::start` (and `serve_status`)
+    // by up to `FETCH_TIMEOUT` (5s) when the kubelet is slow or unreachable.
+    // Sensors backpressure on the bounded mpsc meanwhile; events are not dropped.
+    match refresh_once_result(&client, &cache).await {
+        Ok(()) => tracing::info!(pods = cache.len(), "kubernetes pod context loaded"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "initial kubelet fetch failed; pod context will fill in when the kubelet becomes reachable"
+        ),
     }
-    let interval = Duration::from_secs(cfg.refresh_secs.max(1));
+    // Floor of MIN_REFRESH_SECS so a misconfigured 0/1 cannot hammer the kubelet.
+    let interval = Duration::from_secs(cfg.refresh_secs.max(MIN_REFRESH_SECS));
     let handle = spawn_refresher(client, cache.clone(), interval, cancellation.clone());
     Some((cache, handle))
 }

@@ -45,7 +45,10 @@ impl Default for CloudMetadataConfig {
 /// when a kubelet URL is configured or a service-account token exists, so a
 /// non-Kubernetes host makes no connection. TLS verification is on; use
 /// `ca_path` for the kubelet's CA, or `insecure_skip_verify` (a documented
-/// risk) as an explicit opt-in.
+/// risk) as an explicit opt-in. With `insecure_skip_verify` the service-account
+/// token is sent only to a loopback kubelet (a warning is logged at startup);
+/// for any other host it is withheld, as for plain http. `refresh_secs` is
+/// raised to a floor of 5.
 #[derive(Debug, Clone, Deserialize)]
 pub struct K8sContextConfig {
     #[serde(default = "default_k8s_enabled")]

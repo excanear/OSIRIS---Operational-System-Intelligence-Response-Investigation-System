@@ -32,16 +32,22 @@ pub struct KubeletClient {
     client: reqwest::Client,
 }
 
-/// The bearer token may go over `https`, or over `http` only to a loopback host.
-pub(crate) fn token_may_be_sent(url: &reqwest::Url) -> bool {
-    if url.scheme() == "https" {
-        return true;
-    }
+fn is_loopback_host(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host == "localhost" || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// The bearer token may go over verified `https`, or to a loopback host. Plain
+/// `http` and `https` with certificate verification disabled both count as
+/// unauthenticated transport, so they are loopback-only.
+pub(crate) fn token_may_be_sent(url: &reqwest::Url, insecure_skip_verify: bool) -> bool {
+    if url.scheme() == "https" && !insecure_skip_verify {
+        return true;
+    }
+    is_loopback_host(url)
 }
 
 async fn read_capped(mut resp: reqwest::Response) -> Result<Option<String>, reqwest::Error> {
@@ -77,6 +83,11 @@ impl KubeletClient {
         }
         if cfg.insecure_skip_verify {
             builder = builder.danger_accept_invalid_certs(true);
+            if is_loopback_host(&url) {
+                tracing::warn!("kubelet certificate verification is disabled (insecure_skip_verify); the token is sent only because the kubelet is on loopback");
+            } else {
+                tracing::warn!("kubelet certificate verification is disabled (insecure_skip_verify) for a non-loopback kubelet; the service-account token will NOT be sent");
+            }
         }
         let client = match builder.build() {
             Ok(client) => client,
@@ -87,61 +98,77 @@ impl KubeletClient {
         };
         Some(Self {
             pods_url: format!("{}/pods", url.as_str().trim_end_matches('/')),
-            send_token: token_may_be_sent(&url),
+            send_token: token_may_be_sent(&url, cfg.insecure_skip_verify),
             token_path: cfg.token_path,
             client,
         })
     }
 
-    /// `Some(map)` on success; `None` (with a debug log) on any failure.
+    /// `Some(map)` on success; `None` on any failure (see `fetch_result` for the cause).
     pub async fn fetch(&self) -> Option<HashMap<String, PodRef>> {
+        self.fetch_result().await.ok()
+    }
+
+    /// Like `fetch`, but the failure reason is returned. The error's `Display`
+    /// never contains the service-account token.
+    pub async fn fetch_result(&self) -> Result<HashMap<String, PodRef>, FetchError> {
         if !self.send_token {
-            tracing::debug!("refusing to send the service-account token over plain http to a non-loopback kubelet");
-            return None;
+            return Err(FetchError::TokenNotSendable);
         }
         let token = match std::fs::read_to_string(&self.token_path) {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-            Ok(_) => {
-                tracing::debug!("kubelet token file is empty");
-                return None;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "could not read the kubelet token file");
-                return None;
-            }
+            Ok(_) => return Err(FetchError::TokenFileEmpty),
+            Err(e) => return Err(FetchError::TokenFileUnreadable(e.kind().to_string())),
         };
-        let resp = match self.client.get(&self.pods_url).bearer_auth(&token).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "kubelet request failed");
-                return None;
-            }
-        };
-        let resp = match resp.error_for_status() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(error = %e, "kubelet returned an error status");
-                return None;
-            }
-        };
+        let resp = self
+            .client
+            .get(&self.pods_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| FetchError::Request(e.without_url().to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(FetchError::Status(status.as_u16()));
+        }
         let body = match read_capped(resp).await {
             Ok(Some(body)) => body,
-            Ok(None) => {
-                tracing::debug!("kubelet response exceeded the size cap");
-                return None;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "failed reading the kubelet response");
-                return None;
-            }
+            Ok(None) => return Err(FetchError::TooLarge),
+            Err(e) => return Err(FetchError::Request(e.without_url().to_string())),
         };
-        let parsed = parse_pod_list(&body);
-        if parsed.is_none() {
-            tracing::debug!("kubelet response was not a PodList");
-        }
-        parsed
+        parse_pod_list(&body).ok_or(FetchError::NotAPodList)
     }
 }
+
+/// Why a kubelet fetch failed. `Display` is safe to log: it never includes the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    TokenNotSendable,
+    TokenFileEmpty,
+    TokenFileUnreadable(String),
+    Request(String),
+    Status(u16),
+    TooLarge,
+    NotAPodList,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenNotSendable => f.write_str(
+                "refusing to send the service-account token (plain http to a non-loopback kubelet, or certificate verification disabled on a non-loopback kubelet)",
+            ),
+            Self::TokenFileEmpty => f.write_str("the service-account token file is empty"),
+            Self::TokenFileUnreadable(k) => write!(f, "could not read the service-account token file ({k})"),
+            Self::Request(e) => write!(f, "kubelet request failed: {e}"),
+            Self::Status(c) => write!(f, "kubelet returned HTTP status {c}"),
+            Self::TooLarge => f.write_str("kubelet response exceeded the size cap"),
+            Self::NotAPodList => f.write_str("kubelet response was not a PodList"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -281,9 +308,9 @@ pub(crate) mod tests {
 
     /// Spawns a server on `bind` whose `/pods` and `/target` routes count hits.
     async fn counting_server(
-        bind: &str,
+        listener: tokio::net::TcpListener,
         pods_redirects_to: Option<String>,
-    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let pods_hits = Arc::new(AtomicUsize::new(0));
         let target_hits = Arc::new(AtomicUsize::new(0));
@@ -313,12 +340,10 @@ pub(crate) mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
-        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        (addr, pods_hits, target_hits)
+        (pods_hits, target_hits)
     }
 
     #[tokio::test]
@@ -335,9 +360,11 @@ pub(crate) mod tests {
             eprintln!("no non-loopback interface; skipping");
             return;
         };
-        let (addr, pods_hits, _) = counting_server("0.0.0.0:0", None).await;
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (pods_hits, _) = counting_server(listener, None).await;
         let dir = tempfile::tempdir().unwrap();
-        let client = client_for(&format!("http://{ip}:{}", addr.port()), &token_file(&dir, "secret"));
+        let client = client_for(&format!("http://{ip}:{port}"), &token_file(&dir, "secret"));
         assert!(client.fetch().await.is_none());
         assert_eq!(pods_hits.load(Ordering::SeqCst), 0, "no request may reach a non-loopback http kubelet");
     }
@@ -345,11 +372,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn redirects_are_not_followed() {
         use std::sync::atomic::Ordering;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind once and reuse the same listener: no bind/drop/rebind port race.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let (_, pods_hits, target_hits) =
-            counting_server(&format!("127.0.0.1:{port}"), Some(format!("http://127.0.0.1:{port}/target"))).await;
+        let (pods_hits, target_hits) =
+            counting_server(listener, Some(format!("http://127.0.0.1:{port}/target"))).await;
         let dir = tempfile::tempdir().unwrap();
         let client = client_for(&format!("http://127.0.0.1:{port}"), &token_file(&dir, "t"));
         assert!(client.fetch().await.is_none());
@@ -359,7 +386,7 @@ pub(crate) mod tests {
 
     #[test]
     fn token_may_be_sent_over_https_or_to_loopback_only() {
-        let ok = |u: &str| token_may_be_sent(&reqwest::Url::parse(u).unwrap());
+        let ok = |u: &str| token_may_be_sent(&reqwest::Url::parse(u).unwrap(), false);
         assert!(ok("https://10.0.0.5:10250"));
         assert!(ok("https://kubelet.example:10250"));
         assert!(ok("http://127.0.0.1:10255"));
@@ -367,6 +394,43 @@ pub(crate) mod tests {
         assert!(ok("http://[::1]:10255"));
         assert!(!ok("http://10.0.0.5:10255"));
         assert!(!ok("http://kubelet.example:10255"));
+    }
+
+    fn client_with(url: &str, insecure: bool) -> KubeletClient {
+        KubeletClient::new(KubeletConfig {
+            url: url.to_string(),
+            token_path: "/t".into(),
+            ca_path: None,
+            insecure_skip_verify: insecure,
+        })
+        .expect("client")
+    }
+
+    #[test]
+    fn insecure_skip_verify_never_sends_the_token_to_a_non_loopback_host() {
+        assert!(!client_with("https://10.0.0.5:10250", true).send_token);
+        assert!(!client_with("https://kubelet.example:10250", true).send_token);
+        assert!(client_with("https://10.0.0.5:10250", false).send_token);
+    }
+
+    #[test]
+    fn insecure_skip_verify_on_loopback_still_sends_the_token() {
+        assert!(client_with("https://127.0.0.1:10250", true).send_token);
+        assert!(client_with("https://localhost:10250", true).send_token);
+    }
+
+    #[tokio::test]
+    async fn fetch_result_reports_a_cause_that_never_contains_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Mock::new("secret-token", POD_LIST);
+        let base = serve(mock.clone()).await;
+        *mock.status.lock().unwrap() = 500;
+        let client = client_for(&base, &token_file(&dir, "secret-token"));
+        let err = client.fetch_result().await.unwrap_err();
+        assert!(!err.to_string().contains("secret-token"));
+        assert!(err.to_string().contains("500"), "{err}");
+        let missing = client_for(&base, &dir.path().join("nope"));
+        assert!(missing.fetch_result().await.unwrap_err().to_string().contains("token file"));
     }
 
     #[test]

@@ -128,10 +128,11 @@ mod tests {
         let too_long = "x".repeat(MAX_NAME_LEN + 1);
         let statuses = r#""containerStatuses":[{"containerID":"containerd://k1"}]"#;
         let json = list(&format!(
-            "{},{},{},{}",
+            "{},{},{},{},{}",
             pod_json(&too_long, "ns", statuses),
             pod_json("bad\\u0007name", "ns", statuses),
             pod_json("", "ns", statuses),
+            pod_json("ok-name", "bad\\u0007ns", statuses),
             pod_json("ok", "ns", r#""containerStatuses":[{"containerID":"containerd://k2"}]"#),
         ));
         let map = parse_pod_list(&json).unwrap();

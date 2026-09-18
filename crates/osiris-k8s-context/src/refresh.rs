@@ -3,27 +3,26 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::KubeletClient;
+use crate::kubelet::{FetchError, KubeletClient};
 use crate::PodCache;
 
-/// One fetch: on success replaces the whole cache and returns `true`; on
-/// failure keeps the last good cache (stale-while-error) and returns `false`.
-pub async fn refresh_once(client: &KubeletClient, cache: &PodCache) -> bool {
-    match client.fetch().await {
-        Some(map) => {
-            cache.replace(map);
-            true
-        }
-        None => {
-            tracing::debug!("kubelet refresh failed; keeping the last good pod cache");
-            false
-        }
-    }
+/// One fetch: on success replaces the whole cache and returns `Ok`; on
+/// failure keeps the last good cache (stale-while-error) and returns the cause.
+pub async fn refresh_once_result(client: &KubeletClient, cache: &PodCache) -> Result<(), FetchError> {
+    let map = client.fetch_result().await?;
+    cache.replace(map);
+    Ok(())
 }
 
-/// Refreshes `cache` every `interval` until `cancellation` fires. Sleeps
-/// first: the caller does the initial fetch with `refresh_once` so it can
-/// await it before the pipeline starts consuming events.
+/// `refresh_once_result` as a bool (`true` on success).
+pub async fn refresh_once(client: &KubeletClient, cache: &PodCache) -> bool {
+    refresh_once_result(client, cache).await.is_ok()
+}
+
+/// Refreshes `cache` every `interval` until `cancellation` fires (also
+/// mid-fetch). Sleeps first: the caller does the initial fetch so it can await
+/// it before the pipeline starts consuming events. Logs at warn once when the
+/// kubelet goes from healthy to failing, and at info on recovery.
 pub fn spawn_refresher(
     client: KubeletClient,
     cache: PodCache,
@@ -31,12 +30,32 @@ pub fn spawn_refresher(
     cancellation: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut failing = false;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = cancellation.cancelled() => break,
             }
-            refresh_once(&client, &cache).await;
+            let result = tokio::select! {
+                r = refresh_once_result(&client, &cache) => r,
+                _ = cancellation.cancelled() => break,
+            };
+            match result {
+                Ok(()) => {
+                    if failing {
+                        tracing::info!("kubelet refresh recovered");
+                    }
+                    failing = false;
+                }
+                Err(e) => {
+                    if !failing {
+                        tracing::warn!(error = %e, "kubelet refresh failing; keeping the last good pod cache");
+                    } else {
+                        tracing::debug!(error = %e, "kubelet refresh still failing");
+                    }
+                    failing = true;
+                }
+            }
         }
     })
 }
@@ -93,6 +112,32 @@ mod tests {
         *mock.status.lock().unwrap() = 500;
         assert!(!refresh_once(&client, &cache).await);
         assert_eq!(cache.lookup("aaa").unwrap().pod_name, "pod-a", "stale-while-error");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_slow_fetch_returns_promptly() {
+        // A listener that accepts but never answers: the fetch hangs until its 5s timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("t");
+        std::fs::write(&token, "t").unwrap();
+        let cancel = CancellationToken::new();
+        let handle = spawn_refresher(
+            client_for(&format!("http://{addr}"), &token),
+            PodCache::new(),
+            Duration::from_millis(10),
+            cancel.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await; // fetch now in flight
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle).await.expect("cancel must not wait for the fetch").unwrap();
     }
 
     #[tokio::test]
