@@ -79,6 +79,17 @@ impl LiveEventBroadcaster {
         (id, receiver, dropped_total)
     }
 
+    /// Replaces a scoped connection's host set (a tenant's hosts changed).
+    /// No effect on an unscoped connection.
+    pub fn set_hosts(&self, id: Uuid, hosts: HashSet<Uuid>) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(conn) = connections.iter_mut().find(|c| c.id == id) {
+            if conn.hosts.is_some() {
+                conn.hosts = Some(hosts);
+            }
+        }
+    }
+
     /// Removes the connection. If its `dropped_total` is non-zero, emits
     /// one `tracing::warn!` summarizing the count for that connection's
     /// lifetime — not one log line per dropped event (which would itself
@@ -264,9 +275,37 @@ async fn stream_events_handler(
     };
 
     let keepalive = keepalive.map(|axum::Extension(k)| k).unwrap_or_default();
+    // A tenant connection re-reads its host set on every ping tick, so a host
+    // reassigned mid-connection stops (or starts) flowing within one interval.
+    let refresh = match (
+        parts.extensions.get::<crate::auth_middleware::AuthContext>().and_then(|c| c.tenant_id),
+        parts.extensions.get::<Arc<dyn osiris_tenancy::TenantStore>>().cloned(),
+    ) {
+        (Some(tenant_id), Some(tenants)) => Some(TenantRefresh { tenants, tenant_id }),
+        _ => None,
+    };
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive)
+        handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive, refresh)
     }))
+}
+
+/// What a tenant connection needs to re-read its host set.
+struct TenantRefresh {
+    tenants: Arc<dyn osiris_tenancy::TenantStore>,
+    tenant_id: Uuid,
+}
+
+/// Re-reads the tenant's hosts into the connection. On a registry error the
+/// previous set is kept (it was valid at the last successful read) and the
+/// failure is logged.
+async fn refresh_hosts(r: &TenantRefresh, broadcaster: &LiveEventBroadcaster, id: Uuid) {
+    let tenants = r.tenants.clone();
+    let tenant_id = r.tenant_id;
+    match tokio::task::spawn_blocking(move || tenants.hosts_of(tenant_id)).await {
+        Ok(Ok(hosts)) => broadcaster.set_hosts(id, hosts),
+        Ok(Err(e)) => tracing::warn!(error = %e, "live stream tenant host refresh failed; keeping the previous set"),
+        Err(e) => tracing::warn!(error = %e, "live stream tenant host refresh task failed"),
+    }
 }
 
 async fn handle_socket(
@@ -275,6 +314,7 @@ async fn handle_socket(
     filter: Option<Ast>,
     hosts: Option<HashSet<Uuid>>,
     keepalive: KeepAlive,
+    refresh: Option<TenantRefresh>,
 ) {
     let (id, mut receiver, _dropped_total) = broadcaster.subscribe_scoped(filter, hosts);
     let mut ping = tokio::time::interval(keepalive.ping_every);
@@ -290,6 +330,9 @@ async fn handle_socket(
                 }
             }
             _ = ping.tick() => {
+                if let Some(r) = &refresh {
+                    refresh_hosts(r, &broadcaster, id).await;
+                }
                 if last_seen.elapsed() >= keepalive.idle_timeout {
                     break;
                 }
@@ -674,6 +717,28 @@ mod tests {
             }
             other => panic!("expected an HTTP 403 rejection, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn a_reassigned_host_is_picked_up_by_the_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let tenants: Arc<dyn osiris_tenancy::TenantStore> =
+            Arc::new(osiris_tenancy::SqliteTenantStore::open(dir.path().join("t.db")).unwrap());
+        let tenant = tenants.create_tenant("acme").unwrap();
+        let (mine, later) = (Uuid::new_v4(), Uuid::new_v4());
+        tenants.assign_host(mine, tenant.tenant_id).unwrap();
+
+        let broadcaster = LiveEventBroadcaster::new();
+        let (id, mut receiver, _) =
+            broadcaster.subscribe_scoped(None, Some(HashSet::from([mine])));
+        broadcaster.publish(&[sample_event(later, EventType::ProcessExec)]);
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+        tenants.assign_host(later, tenant.tenant_id).unwrap();
+        let r = TenantRefresh { tenants, tenant_id: tenant.tenant_id };
+        refresh_hosts(&r, &broadcaster, id).await;
+        broadcaster.publish(&[sample_event(later, EventType::ProcessExec)]);
+        assert_eq!(receiver.try_recv().unwrap().host_id, later);
     }
 
     #[tokio::test]
