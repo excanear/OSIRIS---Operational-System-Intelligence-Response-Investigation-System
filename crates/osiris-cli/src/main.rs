@@ -91,6 +91,78 @@ enum Command {
         #[command(subcommand)]
         action: TenantsAction,
     },
+    /// Local private PKI for Agent->Server mTLS (Phase 9a). Offline: no
+    /// Server round trip, only files under `--dir`.
+    Pki {
+        #[command(subcommand)]
+        action: PkiAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PkiAction {
+    /// Create `<dir>/ca.pem` + `ca.key`.
+    InitCa {
+        #[arg(long, default_value = "pki")]
+        dir: std::path::PathBuf,
+    },
+    /// Issue `<dir>/server.pem` + `server.key` for the given DNS names / IPs.
+    IssueServer {
+        #[arg(long, default_value = "pki")]
+        dir: std::path::PathBuf,
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Issue `<dir>/agent-<host_id>.pem` + `.key`, bound to one host id.
+    IssueAgent {
+        #[arg(long, default_value = "pki")]
+        dir: std::path::PathBuf,
+        host_id: uuid::Uuid,
+    },
+}
+
+fn run_pki(action: &PkiAction) -> Result<String, String> {
+    use osiris_transport::pki;
+    let read = |p: std::path::PathBuf| {
+        std::fs::read_to_string(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))
+    };
+    let e = |err: pki::PkiError| err.to_string();
+    match action {
+        PkiAction::InitCa { dir } => {
+            if dir.join("ca.key").exists() {
+                return Err(format!(
+                    "{} already exists; refusing to overwrite the CA",
+                    dir.join("ca.key").display()
+                ));
+            }
+            let ca = pki::generate_ca("OSIRIS Agent CA").map_err(e)?;
+            pki::write_issued(dir, "ca", &ca).map_err(e)?;
+            Ok(format!("CA written to {}", dir.display()))
+        }
+        PkiAction::IssueServer { dir, names } => {
+            let issued = pki::issue_server(
+                &read(dir.join("ca.pem"))?,
+                &read(dir.join("ca.key"))?,
+                names,
+            )
+            .map_err(e)?;
+            pki::write_issued(dir, "server", &issued).map_err(e)?;
+            Ok(format!("server certificate written to {}", dir.display()))
+        }
+        PkiAction::IssueAgent { dir, host_id } => {
+            let issued = pki::issue_agent(
+                &read(dir.join("ca.pem"))?,
+                &read(dir.join("ca.key"))?,
+                *host_id,
+            )
+            .map_err(e)?;
+            pki::write_issued(dir, &format!("agent-{host_id}"), &issued).map_err(e)?;
+            Ok(format!(
+                "agent certificate for {host_id} written to {}",
+                dir.display()
+            ))
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -417,6 +489,7 @@ fn main() {
                 get(&client, url, true)
             }
         },
+        Command::Pki { action } => run_pki(action),
         Command::Tenants { action } => {
             let base = cli.server.trim_end_matches('/').to_string();
             match action {

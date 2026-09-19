@@ -1277,6 +1277,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "osiris-schema",
+ "osiris-transport",
  "reqwest",
  "rpassword",
  "serde_json",

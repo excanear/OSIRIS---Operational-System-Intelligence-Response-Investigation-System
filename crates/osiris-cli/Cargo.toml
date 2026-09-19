@@ -13,7 +13,8 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 rpassword = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
+osiris-transport = { path = "../osiris-transport" }
+uuid = { workspace = true }
 
 [dev-dependencies]
-uuid = { workspace = true }
 tempfile = { workspace = true }
