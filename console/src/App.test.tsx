@@ -43,4 +43,16 @@ describe("App", () => {
       "Sensors",
     ]);
   });
+
+  it("shows the tenant name and hides platform-only screens from a tenant user", () => {
+    useAuthStore.getState().setSession({
+      token: "t", role: "ADMIN", username: "u", tenantId: "t1", tenantName: "Acme",
+    });
+    render(<App />);
+    const nav = screen.getByRole("navigation", { name: "main" });
+    expect(within(nav).getByText("Acme")).toBeInTheDocument();
+    expect(within(nav).queryByText("Incidents")).not.toBeInTheDocument();
+    expect(within(nav).queryByText("Evidence")).not.toBeInTheDocument();
+    expect(within(nav).getByText("Alerts")).toBeInTheDocument();
+  });
 });

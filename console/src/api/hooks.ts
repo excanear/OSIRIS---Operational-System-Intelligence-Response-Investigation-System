@@ -226,7 +226,13 @@ export function useLogin() {
   return useMutation({
     mutationFn: (credentials: { username: string; password: string }) => login(credentials),
     onSuccess: (data, variables) => {
-      setSession({ token: data.token, role: data.role, username: variables.username });
+      setSession({
+        token: data.token,
+        role: data.role,
+        username: variables.username,
+        tenantId: data.tenant_id ?? null,
+        tenantName: data.tenant_name ?? null,
+      });
     },
   });
 }

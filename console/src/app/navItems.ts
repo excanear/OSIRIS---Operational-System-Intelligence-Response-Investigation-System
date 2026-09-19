@@ -2,6 +2,7 @@ export interface NavItem {
   label: string;
   path: string;
   enabled: boolean;
+  platformOnly?: boolean;
 }
 
 export const NAV_ITEMS: NavItem[] = [
@@ -14,9 +15,9 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "Hosts", path: "/hosts", enabled: true },
   { label: "Timeline", path: "/timeline", enabled: true },
   { label: "Alerts", path: "/alerts", enabled: true },
-  { label: "Incidents", path: "/incidents", enabled: true },
+  { label: "Incidents", path: "/incidents", enabled: true, platformOnly: true },
   { label: "Threat Hunting", path: "/hunting", enabled: true },
   { label: "Entity Graph", path: "/graph", enabled: true },
-  { label: "Evidence", path: "/evidence", enabled: true },
+  { label: "Evidence", path: "/evidence", enabled: true, platformOnly: true },
   { label: "Sensors", path: "/sensors", enabled: true },
 ];

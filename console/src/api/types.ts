@@ -202,4 +202,6 @@ export interface LoginResponse {
   token: string;
   role: Role;
   expires_at: number;
+  tenant_id?: string | null;
+  tenant_name?: string | null;
 }

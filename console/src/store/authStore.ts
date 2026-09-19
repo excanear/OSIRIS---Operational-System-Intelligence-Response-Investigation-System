@@ -6,6 +6,8 @@ interface StoredSession {
   token: string;
   role: Role;
   username: string;
+  tenantId?: string | null;
+  tenantName?: string | null;
 }
 
 const STORAGE_KEY = "osiris.session";
@@ -36,6 +38,8 @@ export interface AuthState {
   token: string | null;
   role: Role | null;
   username: string | null;
+  tenantId: string | null;
+  tenantName: string | null;
   setSession: (session: StoredSession) => void;
   clearSession: () => void;
 }
@@ -46,12 +50,20 @@ export const useAuthStore = create<AuthState>((set) => ({
   token: initial?.token ?? null,
   role: initial?.role ?? null,
   username: initial?.username ?? null,
+  tenantId: initial?.tenantId ?? null,
+  tenantName: initial?.tenantName ?? null,
   setSession: (session) => {
     writeStoredSession(session);
-    set({ token: session.token, role: session.role, username: session.username });
+    set({
+      token: session.token,
+      role: session.role,
+      username: session.username,
+      tenantId: session.tenantId ?? null,
+      tenantName: session.tenantName ?? null,
+    });
   },
   clearSession: () => {
     writeStoredSession(null);
-    set({ token: null, role: null, username: null });
+    set({ token: null, role: null, username: null, tenantId: null, tenantName: null });
   },
 }));

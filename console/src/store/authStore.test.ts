@@ -32,4 +32,15 @@ describe("authStore", () => {
     expect(useAuthStore.getState().token).toBeNull();
     expect(sessionStorage.getItem("osiris.session")).toBeNull();
   });
+
+  it("stores and clears the tenant alongside the session", () => {
+    useAuthStore.getState().setSession({
+      token: "abc", role: "ADMIN", username: "alice", tenantId: "t1", tenantName: "Acme",
+    });
+    expect(useAuthStore.getState().tenantId).toBe("t1");
+    expect(useAuthStore.getState().tenantName).toBe("Acme");
+    useAuthStore.getState().clearSession();
+    expect(useAuthStore.getState().tenantId).toBeNull();
+    expect(useAuthStore.getState().tenantName).toBeNull();
+  });
 });

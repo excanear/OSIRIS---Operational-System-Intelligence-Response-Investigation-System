@@ -85,6 +85,11 @@ enum Command {
         #[command(subcommand)]
         action: UsersAction,
     },
+    /// Platform-admin tenant management (Phase 8f).
+    Tenants {
+        #[command(subcommand)]
+        action: TenantsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,9 +126,24 @@ enum UsersAction {
         username: String,
         #[arg(long, value_enum)]
         role: RoleArg,
+        /// Bind the new user to this tenant (UUID).
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// List all users (requires an Admin session).
     List,
+}
+
+#[derive(Subcommand)]
+enum TenantsAction {
+    /// Create a tenant (requires a platform Admin session).
+    Create { name: String },
+    /// List tenants (requires a platform Admin session).
+    List,
+    /// Assign a host to a tenant (requires a platform Admin session).
+    AssignHost { tenant_id: String, host_id: String },
+    /// Remove a host's tenant assignment (requires a platform Admin session).
+    UnassignHost { tenant_id: String, host_id: String },
 }
 
 /// Reads a password from the TTY, refusing to fall back to an empty string.
@@ -196,6 +216,45 @@ fn post_json(
         return Err(format!("request failed: HTTP {}: {}", status, resp_body));
     }
     Ok(resp_body)
+}
+
+fn send_empty(
+    mut request: reqwest::blocking::RequestBuilder,
+    attach_token: bool,
+) -> Result<String, String> {
+    if attach_token {
+        if let Some(token) = osiris_cli::auth::read_token() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
+    let status = response.status();
+    let resp_body = response
+        .text()
+        .map_err(|e| format!("request failed: {}", e))?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("not authenticated — run `osiris-cli auth login <username>`".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("request failed: HTTP {}: {}", status, resp_body));
+    }
+    Ok("ok".to_string())
+}
+
+fn put_empty(
+    client: &reqwest::blocking::Client,
+    url: String,
+    attach_token: bool,
+) -> Result<String, String> {
+    send_empty(client.put(url), attach_token)
+}
+
+fn delete_empty(
+    client: &reqwest::blocking::Client,
+    url: String,
+    attach_token: bool,
+) -> Result<String, String> {
+    send_empty(client.delete(url), attach_token)
 }
 
 fn main() {
@@ -313,7 +372,7 @@ fn main() {
             }
         },
         Command::Users { action } => match action {
-            UsersAction::Create { username, role } => {
+            UsersAction::Create { username, role, tenant } => {
                 let password = match prompt_password_or_fail("Password for new user: ") {
                     Ok(p) => p,
                     Err(e) => {
@@ -322,11 +381,14 @@ fn main() {
                     }
                 };
                 let url = format!("{}/api/v1/auth/users", cli.server.trim_end_matches('/'));
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "username": username,
                     "password": password,
                     "role": role.wire(),
                 });
+                if let Some(t) = tenant {
+                    body["tenant_id"] = serde_json::Value::String(t.clone());
+                }
                 post_json(&client, url, body, true)
             }
             UsersAction::List => {
@@ -334,6 +396,28 @@ fn main() {
                 get(&client, url, true)
             }
         },
+        Command::Tenants { action } => {
+            let base = cli.server.trim_end_matches('/').to_string();
+            match action {
+                TenantsAction::Create { name } => post_json(
+                    &client,
+                    format!("{base}/api/v1/tenants"),
+                    serde_json::json!({ "name": name }),
+                    true,
+                ),
+                TenantsAction::List => get(&client, format!("{base}/api/v1/tenants"), true),
+                TenantsAction::AssignHost { tenant_id, host_id } => put_empty(
+                    &client,
+                    format!("{base}/api/v1/tenants/{tenant_id}/hosts/{host_id}"),
+                    true,
+                ),
+                TenantsAction::UnassignHost { tenant_id, host_id } => delete_empty(
+                    &client,
+                    format!("{base}/api/v1/tenants/{tenant_id}/hosts/{host_id}"),
+                    true,
+                ),
+            }
+        }
     };
 
     match result {
