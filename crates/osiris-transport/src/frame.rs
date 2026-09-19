@@ -3,9 +3,9 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest compressed frame accepted (bytes on the wire).
-pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 /// Largest decompressed payload accepted (zip-bomb bound).
-pub const MAX_DECOMPRESSED_LEN: usize = 64 * 1024 * 1024;
+pub const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -55,8 +55,19 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     }
     let mut compressed = vec![0u8; len];
     reader.read_exact(&mut compressed).await?;
-    let json = zstd::bulk::decompress(&compressed, MAX_DECOMPRESSED_LEN)
-        .map_err(|_| FrameError::Decompress)?;
+    // Stream-decode with a hard cap so an attacker-declared content size never
+    // drives a large up-front allocation.
+    let mut decoder =
+        zstd::stream::read::Decoder::new(&compressed[..]).map_err(|_| FrameError::Decompress)?;
+    let mut json = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut decoder, MAX_DECOMPRESSED_LEN as u64 + 1),
+        &mut json,
+    )
+    .map_err(|_| FrameError::Decompress)?;
+    if json.len() > MAX_DECOMPRESSED_LEN {
+        return Err(FrameError::Decompress);
+    }
     Ok(serde_json::from_slice(&json)?)
 }
 
@@ -104,6 +115,12 @@ mod tests {
         a.write_all(&bomb).await.unwrap();
         let err = read_frame::<_, ServerMsg>(&mut b).await.unwrap_err();
         assert!(matches!(err, FrameError::Decompress));
+    }
+
+    #[test]
+    fn limits_fit_agent_batches_but_stay_small() {
+        assert_eq!(MAX_FRAME_LEN, 8 * 1024 * 1024);
+        assert_eq!(MAX_DECOMPRESSED_LEN, 16 * 1024 * 1024);
     }
 
     #[tokio::test]

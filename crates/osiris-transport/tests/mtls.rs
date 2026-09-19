@@ -299,6 +299,40 @@ async fn events_claiming_another_host_are_rejected_and_skipped() {
 }
 
 #[tokio::test]
+async fn only_the_offending_events_of_a_mixed_batch_are_dropped() {
+    let pki = Pki::new();
+    let host = Uuid::new_v4();
+    pki.agent("agent", host);
+    let handler = Arc::new(Recorder::default());
+    let (addr, server_cancel) = start_server(&pki, handler.clone(), HashSet::new()).await;
+    let spool = pki.p("spool.ndjson");
+    let good = event(host, 1);
+    let mut cross = event(host, 2);
+    cross.host.host_id = Uuid::new_v4(); // envelope matches, host block does not
+    write_spool(&spool, &[good.clone(), cross, event(Uuid::new_v4(), 3)]);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
+    let len = std::fs::metadata(&spool).unwrap().len();
+    wait_for(|| {
+        std::fs::read_to_string(offset_path(&spool))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(len)
+    })
+    .await;
+    let got = handler.received.lock().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].event_id, good.event_id);
+    drop(got);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    server_cancel.cancel();
+}
+
+#[tokio::test]
 async fn a_revoked_host_is_refused() {
     let pki = Pki::new();
     let host = Uuid::new_v4();

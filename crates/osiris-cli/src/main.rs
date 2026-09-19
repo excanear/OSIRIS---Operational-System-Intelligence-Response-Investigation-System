@@ -129,11 +129,13 @@ fn run_pki(action: &PkiAction) -> Result<String, String> {
     let e = |err: pki::PkiError| err.to_string();
     match action {
         PkiAction::InitCa { dir } => {
-            if dir.join("ca.key").exists() {
-                return Err(format!(
-                    "{} already exists; refusing to overwrite the CA",
-                    dir.join("ca.key").display()
-                ));
+            for name in ["ca.pem", "ca.key"] {
+                if dir.join(name).exists() {
+                    return Err(format!(
+                        "{} already exists; refusing to overwrite the CA",
+                        dir.join(name).display()
+                    ));
+                }
             }
             let ca = pki::generate_ca("OSIRIS Agent CA").map_err(e)?;
             pki::write_issued(dir, "ca", &ca).map_err(e)?;
@@ -538,6 +540,28 @@ fn main() {
         Err(e) => {
             eprintln!("{}", e);
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pki_tests {
+    use super::*;
+
+    #[test]
+    fn init_ca_refuses_when_either_ca_file_exists() {
+        for existing in ["ca.pem", "ca.key"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(existing), "x").unwrap();
+            let action = PkiAction::InitCa {
+                dir: dir.path().to_path_buf(),
+            };
+            let err = run_pki(&action).unwrap_err();
+            assert!(err.contains("refusing to overwrite"), "{existing}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(existing)).unwrap(),
+                "x"
+            );
         }
     }
 }

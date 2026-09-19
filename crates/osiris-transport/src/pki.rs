@@ -124,16 +124,24 @@ pub fn write_issued(dir: &Path, name: &str, issued: &Issued) -> Result<(), PkiEr
         source,
     };
     std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
-    let cert_path = dir.join(format!("{name}.pem"));
-    std::fs::write(&cert_path, &issued.cert_pem).map_err(|e| io(&cert_path, e))?;
+    // Key first, created exclusively and (on unix) 0600 from the start, so it is
+    // never world-readable and an existing key is never clobbered.
     let key_path = dir.join(format!("{name}.key"));
-    std::fs::write(&key_path, &issued.key_pem).map_err(|e| io(&key_path, e))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut f = opts.open(&key_path).map_err(|e| io(&key_path, e))?;
+        f.write_all(issued.key_pem.as_bytes())
             .map_err(|e| io(&key_path, e))?;
     }
+    let cert_path = dir.join(format!("{name}.pem"));
+    std::fs::write(&cert_path, &issued.cert_pem).map_err(|e| io(&cert_path, e))?;
     Ok(())
 }
 
@@ -155,6 +163,28 @@ mod tests {
         let names = ["localhost".to_string(), "127.0.0.1".to_string()];
         let server = issue_server(&ca.cert_pem, &ca.key_pem, &names).unwrap();
         assert!(server.cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_issued_key_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ca = generate_ca("test-ca").unwrap();
+        write_issued(dir.path(), "ca", &ca).unwrap();
+        let mode = std::fs::metadata(dir.path().join("ca.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_issued_never_overwrites_an_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = generate_ca("test-ca").unwrap();
+        write_issued(dir.path(), "ca", &ca).unwrap();
+        assert!(write_issued(dir.path(), "ca", &ca).is_err());
     }
 
     #[test]
