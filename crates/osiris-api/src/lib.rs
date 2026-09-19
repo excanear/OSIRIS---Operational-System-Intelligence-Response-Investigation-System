@@ -280,6 +280,15 @@ async fn events_handler(
     Ok(Json(events))
 }
 
+/// Optional time window for the rolled-up list endpoints (nanosecond timestamps,
+/// like `/events`), so an operator can look past the oldest `MAX_EVENT_LIMIT`
+/// events.
+#[derive(Debug, Deserialize)]
+struct ListRange {
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct ProcessSummary {
     process_key: String,
@@ -405,8 +414,9 @@ struct FileSummary {
 /// `from_file_ref` semantics.
 async fn files_handler(
     ScopedStorage(storage): ScopedStorage,
+    Query(range): Query<ListRange>,
 ) -> Result<Json<Vec<FileSummary>>, (StatusCode, String)> {
-    let plan = osiris_query::EventQueryPlan {
+    let mut plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
             field: "category".to_string(),
             op: osiris_query::ast::Op::Eq,
@@ -416,6 +426,8 @@ async fn files_handler(
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
+    plan.since = range.since;
+    plan.until = range.until;
     let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
         .await
         .unwrap()
@@ -490,8 +502,9 @@ struct NetworkSummary {
 /// (see this phase's design spec). Keeps the most-recent event per group.
 async fn network_handler(
     ScopedStorage(storage): ScopedStorage,
+    Query(range): Query<ListRange>,
 ) -> Result<Json<Vec<NetworkSummary>>, (StatusCode, String)> {
-    let plan = osiris_query::EventQueryPlan {
+    let mut plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
             field: "category".to_string(),
             op: osiris_query::ast::Op::Eq,
@@ -501,6 +514,8 @@ async fn network_handler(
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
+    plan.since = range.since;
+    plan.until = range.until;
     let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
         .await
         .unwrap()
@@ -792,8 +807,9 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
 /// Pod fields (Phase 8e) come from the kept event's `container.pod_ref` only; a later event without one shows null until an event carrying it becomes the latest.
 async fn containers_handler(
     ScopedStorage(storage): ScopedStorage,
+    Query(range): Query<ListRange>,
 ) -> Result<Json<Vec<ContainerSummary>>, (StatusCode, String)> {
-    let plan = osiris_query::EventQueryPlan {
+    let mut plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
             field: "category".to_string(),
             op: osiris_query::ast::Op::Eq,
@@ -803,6 +819,8 @@ async fn containers_handler(
         export: true,
         ..osiris_query::EventQueryPlan::new()
     };
+    plan.since = range.since;
+    plan.until = range.until;
     let events = tokio::task::spawn_blocking(move || storage.query_events(&plan))
         .await
         .unwrap()
@@ -1057,6 +1075,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn files_endpoint_honours_the_since_and_until_window() {
+        let (_dir, storage) = test_storage();
+        let old = file_event(EventType::FileCreate, "/old", 100, 1, 1000);
+        let new = file_event(EventType::FileCreate, "/new", 200, 1, 5000);
+        storage.batch_write(&[old, new]).unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage.clone()), Query(ListRange { since: Some(2000), until: None })).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "/new");
+        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: Some(2000) })).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "/old");
+    }
+
+    #[tokio::test]
     async fn files_endpoint_keeps_the_most_recent_event_per_identity() {
         let (_dir, storage) = test_storage();
         let older = file_event(EventType::FileCreate, "/etc/passwd", 100, 1, 1000);
@@ -1068,7 +1100,7 @@ mod tests {
         let hostname = older.host.hostname.clone();
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_id, "1:100");
@@ -1086,7 +1118,7 @@ mod tests {
         missing_inode.file.as_mut().unwrap().inode = None;
         storage.write(&missing_inode).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert!(files.is_empty());
     }
@@ -1100,7 +1132,7 @@ mod tests {
         b.host.host_id = b.host_id;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(files.len(), 2);
     }
@@ -1585,7 +1617,7 @@ mod tests {
         let host_id = older.host_id;
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(rows) = network_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = network_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].dst_ip, "93.184.216.34");
@@ -1605,7 +1637,7 @@ mod tests {
         b.network.as_mut().unwrap().dst_port = 8443;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(rows) = network_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = network_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 2);
     }
@@ -2090,7 +2122,7 @@ mod tests {
         let start = container_event(&id, EventType::ContainerStart, 2000);
         storage.batch_write(&[create, start]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].container_id, id);
@@ -2106,7 +2138,7 @@ mod tests {
         let stop = container_event(&id, EventType::ContainerStop, 2000);
         storage.batch_write(&[start, stop]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "STOPPED");
@@ -2124,7 +2156,7 @@ mod tests {
         on_host_a.host.host_id = on_host_a.host_id;
         storage.batch_write(&[on_host_a, on_host_b]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].timestamp, 2000);
@@ -2140,7 +2172,7 @@ mod tests {
         });
         storage.write(&event).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pod_name.as_deref(), Some("web-0"));
@@ -2152,7 +2184,7 @@ mod tests {
         let (_dir, storage) = test_storage();
         storage.write(&container_event("abc", EventType::ContainerStart, 1000)).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
 
         assert!(rows[0].pod_name.is_none());
         let json = serde_json::to_value(&rows[0]).unwrap();
