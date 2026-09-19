@@ -1,0 +1,13 @@
+[package]
+name = "osiris-tenancy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

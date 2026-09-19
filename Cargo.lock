@@ -1534,6 +1534,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-tenancy"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "password-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
