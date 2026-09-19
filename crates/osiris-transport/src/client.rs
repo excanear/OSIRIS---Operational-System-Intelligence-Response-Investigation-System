@@ -59,6 +59,28 @@ impl ForwarderConfig {
     }
 }
 
+/// Exponential reconnect delay, 1s doubling to 30s; reset only once a batch is acked.
+struct Backoff(Duration);
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self(BACKOFF_MIN)
+    }
+}
+
+impl Backoff {
+    /// The delay to wait now; the next call returns double (capped).
+    fn next_delay(&mut self) -> Duration {
+        let d = self.0;
+        self.0 = (self.0 * 2).min(BACKOFF_MAX);
+        d
+    }
+
+    fn reset(&mut self) {
+        self.0 = BACKOFF_MIN;
+    }
+}
+
 /// Where the acknowledged offset lives: `<spool>.offset`.
 pub fn offset_path(spool: &Path) -> PathBuf {
     let mut name = spool.as_os_str().to_owned();
@@ -76,7 +98,12 @@ fn load_offset(spool: &Path) -> u64 {
 fn store_offset(spool: &Path, offset: u64) -> std::io::Result<()> {
     let path = offset_path(spool);
     let tmp = path.with_extension("offset.tmp");
-    std::fs::write(&tmp, offset.to_string())?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(offset.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)
 }
 
@@ -159,7 +186,8 @@ pub async fn run_forwarder(
 
     let mut offset = load_offset(&config.spool_path);
     let mut seq: u64 = 0;
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = Backoff::default();
+    let mut permanently_rejected: u64 = 0;
 
     'connect: loop {
         if cancel.is_cancelled() {
@@ -178,10 +206,9 @@ pub async fn run_forwarder(
                     _ => "connect timed out".to_string(),
                 };
                 tracing::warn!(addr = %config.server_addr, %why, "forwarder cannot reach the server");
-                if sleep_or_cancel(backoff, &cancel).await {
+                if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                     return Ok(());
                 }
-                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue 'connect;
             }
         };
@@ -198,14 +225,12 @@ pub async fn run_forwarder(
                     _ => "tls handshake timed out".to_string(),
                 };
                 tracing::warn!(%why, "forwarder tls handshake failed");
-                if sleep_or_cancel(backoff, &cancel).await {
+                if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                     return Ok(());
                 }
-                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue 'connect;
             }
         };
-        backoff = BACKOFF_MIN;
         tracing::info!(addr = %config.server_addr, "forwarder connected");
 
         loop {
@@ -228,7 +253,7 @@ pub async fn run_forwarder(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "forwarder cannot read the spool");
-                    if sleep_or_cancel(backoff, &cancel).await {
+                    if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                         return Ok(());
                     }
                     continue;
@@ -255,37 +280,43 @@ pub async fn run_forwarder(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "forwarder send failed; reconnecting");
-                        if sleep_or_cancel(backoff, &cancel).await {
+                        if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                             return Ok(());
                         }
                         continue 'connect;
                     }
                 };
                 match reply {
-                    Ok(Ok(ServerMsg::Ack { seq: acked })) if acked == seq => {}
+                    Ok(Ok(ServerMsg::Ack { seq: acked })) if acked == seq => {
+                        backoff.reset();
+                    }
                     Ok(Ok(ServerMsg::Nack {
                         permanent: true,
                         reason,
                         ..
                     })) => {
-                        tracing::error!(%reason, "server permanently rejected a batch; skipping it");
+                        permanently_rejected += 1;
+                        tracing::error!(%reason, permanently_rejected, "server permanently rejected a batch; skipping it");
                     }
                     Ok(Ok(other)) => {
                         tracing::warn!(?other, "batch not acknowledged; retrying");
-                        if sleep_or_cancel(backoff, &cancel).await {
+                        if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                             return Ok(());
                         }
                         continue 'connect;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "connection lost awaiting an ack; reconnecting");
-                        if sleep_or_cancel(backoff, &cancel).await {
+                        if sleep_or_cancel(backoff.next_delay(), &cancel).await {
                             return Ok(());
                         }
                         continue 'connect;
                     }
                     Err(_) => {
                         tracing::warn!("timed out awaiting an ack; reconnecting");
+                        if sleep_or_cancel(backoff.next_delay(), &cancel).await {
+                            return Ok(());
+                        }
                         continue 'connect;
                     }
                 }
@@ -303,5 +334,19 @@ async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(d) => false,
         _ = cancel.cancelled() => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_to_the_cap_and_resets_only_on_reset() {
+        let mut b = Backoff::default();
+        let got: Vec<u64> = (0..7).map(|_| b.next_delay().as_secs()).collect();
+        assert_eq!(got, [1, 2, 4, 8, 16, 30, 30]);
+        b.reset();
+        assert_eq!(b.next_delay(), BACKOFF_MIN);
     }
 }
