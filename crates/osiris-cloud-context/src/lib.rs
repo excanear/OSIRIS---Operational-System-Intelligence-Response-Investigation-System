@@ -132,9 +132,9 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_bidi_and_zero_width_characters() {
-        assert_eq!(sanitize("i-0{202E}abc"), None);
-        assert_eq!(sanitize("i-{200B}0abc"), None);
-        assert_eq!(sanitize("{FEFF}i-0abc"), None);
+        assert_eq!(sanitize("i-0\u{202E}abc"), None);
+        assert_eq!(sanitize("i-\u{200B}0abc"), None);
+        assert_eq!(sanitize("\u{FEFF}i-0abc"), None);
     }
 
     #[test]
