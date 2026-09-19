@@ -8,13 +8,22 @@ use osiris_schema::{CgroupRef, CgroupVersion, ContainerRef, NamespaceRef};
 /// `{proc_root}/{pid}/cgroup` and `{proc_root}/{pid}/ns/*`, the same
 /// "no dedicated sensor, resolution logic feeding Enrich" mechanism
 /// ARCHITECTURE.md §4.3's Namespace/Cgroup catalog rows describe (Phase 5
-/// plan Global Constraint #2). Caches by pid with no eviction (plan Global
-/// Constraint #8 — same MVP posture `ProcessResolver`/`SessionResolver`
-/// already have).
+/// plan Global Constraint #2). Caches by pid, but entries expire after `ttl`
+/// (a pid can be recycled by an unrelated process, or a container's cgroup can
+/// change) and the cache is cleared if it ever exceeds `MAX_CACHE_ENTRIES`, so
+/// it cannot grow without bound.
 pub struct NsCgroupResolver {
     proc_root: PathBuf,
-    cache: HashMap<u32, Option<(NamespaceRef, CgroupRef, Option<ContainerRef>)>>,
+    cache: HashMap<u32, (std::time::Instant, CachedContext)>,
+    ttl: std::time::Duration,
 }
+
+type CachedContext = Option<(NamespaceRef, CgroupRef, Option<ContainerRef>)>;
+
+/// Hard bound on cached pids (typical hosts use far fewer live pids).
+const MAX_CACHE_ENTRIES: usize = 65_536;
+/// Default lifetime of a cached resolution.
+const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 type NsSetter = fn(&mut NamespaceRef, u64);
 
@@ -33,7 +42,15 @@ impl NsCgroupResolver {
         Self {
             proc_root: proc_root.into(),
             cache: HashMap::new(),
+            ttl: DEFAULT_TTL,
         }
+    }
+
+    /// Like `new`, with an explicit cache lifetime (tests).
+    pub fn with_ttl(proc_root: impl Into<PathBuf>, ttl: std::time::Duration) -> Self {
+        let mut resolver = Self::new(proc_root);
+        resolver.ttl = ttl;
+        resolver
     }
 
     /// Resolves (and caches) `pid`'s namespace/cgroup/container context.
@@ -43,11 +60,17 @@ impl NsCgroupResolver {
     /// resolvable container is entirely normal (most processes' cgroups
     /// are not container cgroups) and is not itself a `None` case.
     pub fn resolve(&mut self, pid: u32) -> Option<(NamespaceRef, CgroupRef, Option<ContainerRef>)> {
-        if let Some(cached) = self.cache.get(&pid) {
-            return cached.clone();
+        if let Some((at, cached)) = self.cache.get(&pid) {
+            if at.elapsed() < self.ttl {
+                return cached.clone();
+            }
         }
         let resolved = self.resolve_uncached(pid);
-        self.cache.insert(pid, resolved.clone());
+        if self.cache.len() >= MAX_CACHE_ENTRIES {
+            self.cache.clear();
+        }
+        self.cache
+            .insert(pid, (std::time::Instant::now(), resolved.clone()));
         resolved
     }
 
@@ -135,6 +158,20 @@ mod tests {
         let dir = proc_root.join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cgroup"), contents).unwrap();
+    }
+
+    #[test]
+    fn a_cached_entry_expires_so_a_recycled_pid_is_re_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        write_cgroup(tmp.path(), 7, &format!("0::/system.slice/docker-{a}.scope\n"));
+        let mut r = NsCgroupResolver::with_ttl(tmp.path(), std::time::Duration::from_millis(40));
+        assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, a);
+        write_cgroup(tmp.path(), 7, &format!("0::/system.slice/docker-{b}.scope\n"));
+        assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, a, "cached within the ttl");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, b);
     }
 
     #[test]
