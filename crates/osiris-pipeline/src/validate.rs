@@ -13,6 +13,12 @@ pub fn validate(event: &mut CanonicalEvent) -> bool {
     if event.host_id.is_nil() {
         valid = false;
     }
+    // The SQLite `category` column is backfilled from `raw_json`, and the pushdown
+    // filter trusts it; a category that disagrees with the event type would make
+    // the indexed and residual evaluations diverge.
+    if event.category != event.event_type.category() {
+        valid = false;
+    }
     if event.timestamp == 0 {
         valid = false;
     }
@@ -159,6 +165,13 @@ mod tests {
             risk: None,
             event_data: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn a_category_that_disagrees_with_the_event_type_is_invalid() {
+        let mut event = valid_event();
+        event.category = osiris_schema::Category::Dns;
+        assert!(!validate(&mut event));
     }
 
     #[test]
