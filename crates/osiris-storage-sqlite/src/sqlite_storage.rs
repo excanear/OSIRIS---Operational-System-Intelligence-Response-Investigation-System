@@ -154,6 +154,17 @@ impl SqliteStorage {
         // by reading `raw_json`'s own `category` field via `json_extract`,
         // instead of following the read-back-NULL precedent every earlier
         // column here uses.
+        // Phase 9a: agent redelivery is at-least-once, so `relationships` must be
+        // idempotent. Guarded: dedupe pre-existing rows, then add the unique
+        // index (IF NOT EXISTS keeps re-opens no-ops; the DELETE is a no-op once unique).
+        conn.execute_batch(
+            "DELETE FROM relationships WHERE rowid NOT IN (
+                 SELECT MIN(rowid) FROM relationships
+                 GROUP BY from_key, to_key, relation, event_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_relationships_unique
+                 ON relationships(from_key, to_key, relation, event_id);",
+        )
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
             (
@@ -803,8 +814,8 @@ impl Storage for SqliteStorage {
                 .map_err(|e| StorageError::Serialize(e.to_string()))?
                 .trim_matches('"')
                 .to_string();
-            tx.execute(
-                "INSERT INTO relationships (from_key, to_key, relation, event_id, timestamp)
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO relationships (from_key, to_key, relation, event_id, timestamp)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     edge.from.storage_key(),
@@ -815,7 +826,7 @@ impl Storage for SqliteStorage {
                 ],
             )
             .map_err(|e| StorageError::Backend(e.to_string()))?;
-            report.written_count += 1;
+            report.written_count += inserted as u64;
         }
         tx.commit()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
@@ -1702,6 +1713,53 @@ mod tests {
             storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn writing_the_same_relationship_batch_twice_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let edge = EntityRelationship {
+            from: EntityRef::Process {
+                process_key: ProcessKey::new(Uuid::new_v4(), "b", 1, 1),
+            },
+            to: EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            },
+            relation: Relation::ConnectedTo,
+            event_id: Uuid::now_v7(),
+            timestamp: 5000,
+        };
+        storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
+        storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
+        let rows = storage.query_relationships(&RelationshipQueryPlan::new()).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn opening_dedupes_pre_existing_duplicate_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        {
+            let s = SqliteStorage::open(&path).unwrap();
+            drop(s);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("DROP INDEX idx_relationships_unique;").unwrap();
+            for _ in 0..3 {
+                conn.execute(
+                    "INSERT INTO relationships VALUES ('a','b','connected_to','e',1)",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        SqliteStorage::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        SqliteStorage::open(&path).unwrap(); // idempotent re-open
     }
 
     #[test]
