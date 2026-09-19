@@ -13,6 +13,9 @@ pub const MAX_CACHE_ENTRIES: usize = 10_000;
 #[derive(Clone, Default)]
 pub struct PodCache {
     inner: Arc<RwLock<HashMap<String, PodRef>>>,
+    /// Signalled on every lookup miss so the refresher can fetch sooner than its
+    /// interval (a pod that started since the last refresh).
+    miss: Arc<tokio::sync::Notify>,
 }
 
 impl PodCache {
@@ -40,11 +43,21 @@ impl PodCache {
     }
 
     pub fn lookup(&self, container_id: &str) -> Option<PodRef> {
-        self.inner
+        let found = self
+            .inner
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .get(container_id)
-            .cloned()
+            .cloned();
+        if found.is_none() {
+            self.miss.notify_one();
+        }
+        found
+    }
+
+    /// Resolves when a lookup has missed since the last call (coalesced).
+    pub async fn missed(&self) {
+        self.miss.notified().await;
     }
 }
 

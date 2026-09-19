@@ -32,32 +32,75 @@ pub fn spawn_refresher(
     interval: Duration,
     cancellation: CancellationToken,
 ) -> JoinHandle<()> {
+    spawn_refresher_with_gap(client, cache, interval, MISS_REFRESH_MIN_GAP, cancellation)
+}
+
+/// How a fetch outcome changes the refresher's health: it warns once on the
+/// healthy -> failing edge and informs once on recovery, never per failure.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HealthTransition {
+    StartedFailing,
+    StillFailing,
+    Recovered,
+    StillHealthy,
+}
+
+pub(crate) fn health_transition(failing: &mut bool, ok: bool) -> HealthTransition {
+    let t = match (*failing, ok) {
+        (false, false) => HealthTransition::StartedFailing,
+        (true, false) => HealthTransition::StillFailing,
+        (true, true) => HealthTransition::Recovered,
+        (false, true) => HealthTransition::StillHealthy,
+    };
+    *failing = !ok;
+    t
+}
+
+/// Minimum spacing between two fetches when a cache miss asks for an early one.
+pub const MISS_REFRESH_MIN_GAP: Duration = Duration::from_secs(10);
+
+/// `spawn_refresher` with an explicit miss-refresh spacing. A lookup miss (a pod
+/// that started after the last fetch) wakes the refresher early, but never more
+/// often than once per `miss_gap`.
+pub fn spawn_refresher_with_gap(
+    client: KubeletClient,
+    cache: PodCache,
+    interval: Duration,
+    miss_gap: Duration,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut failing = false;
+        let mut last_fetch = tokio::time::Instant::now();
         loop {
+            let deadline = last_fetch + interval;
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = cache.missed() => {
+                    // Fetch early, but not before `miss_gap` since the last fetch,
+                    // and never later than the regular interval would have.
+                    let target = (last_fetch + miss_gap).min(deadline);
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(target) => {}
+                        _ = cancellation.cancelled() => break,
+                    }
+                }
                 _ = cancellation.cancelled() => break,
             }
+            last_fetch = tokio::time::Instant::now();
             let result = tokio::select! {
                 r = refresh_once_result(&client, &cache) => r,
                 _ = cancellation.cancelled() => break,
             };
-            match result {
-                Ok(()) => {
-                    if failing {
-                        tracing::info!("kubelet refresh recovered");
-                    }
-                    failing = false;
+            match (health_transition(&mut failing, result.is_ok()), &result) {
+                (HealthTransition::Recovered, _) => tracing::info!("kubelet refresh recovered"),
+                (HealthTransition::StartedFailing, Err(e)) => {
+                    tracing::warn!(error = %e, "kubelet refresh failing; keeping the last good pod cache")
                 }
-                Err(e) => {
-                    if !failing {
-                        tracing::warn!(error = %e, "kubelet refresh failing; keeping the last good pod cache");
-                    } else {
-                        tracing::debug!(error = %e, "kubelet refresh still failing");
-                    }
-                    failing = true;
+                (HealthTransition::StillFailing, Err(e)) => {
+                    tracing::debug!(error = %e, "kubelet refresh still failing")
                 }
+                _ => {}
             }
         }
     })
@@ -148,6 +191,42 @@ mod tests {
             .await
             .expect("cancel must not wait for the fetch")
             .unwrap();
+    }
+
+    #[test]
+    fn health_transitions_warn_once_and_recover_once() {
+        let mut failing = false;
+        assert_eq!(health_transition(&mut failing, true), HealthTransition::StillHealthy);
+        assert_eq!(health_transition(&mut failing, false), HealthTransition::StartedFailing);
+        assert_eq!(health_transition(&mut failing, false), HealthTransition::StillFailing);
+        assert_eq!(health_transition(&mut failing, true), HealthTransition::Recovered);
+        assert_eq!(health_transition(&mut failing, true), HealthTransition::StillHealthy);
+    }
+
+    #[tokio::test]
+    async fn a_cache_miss_triggers_an_early_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("t");
+        std::fs::write(&token, "t").unwrap();
+        let mock = Mock::new("t", &one_pod("aaa", "pod-a"));
+        let base = serve(mock.clone()).await;
+        let cache = PodCache::new();
+        let cancel = CancellationToken::new();
+        // Interval is an hour: only a miss can cause the second fetch.
+        let handle = spawn_refresher_with_gap(
+            client_for(&base, &token),
+            cache.clone(),
+            Duration::from_secs(3600),
+            Duration::from_millis(30),
+            cancel.clone(),
+        );
+        assert!(cache.lookup("bbb").is_none()); // miss -> early refresh (pod-a only)
+        wait_until(|| cache.lookup("aaa").is_some()).await;
+        *mock.body.lock().unwrap() = one_pod("bbb", "pod-b");
+        assert!(cache.lookup("zzz").is_none()); // another miss
+        wait_until(|| cache.lookup("bbb").is_some()).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
     }
 
     #[tokio::test]
