@@ -52,6 +52,10 @@ pub struct QueryPlan {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+    /// Tenant scoping (Phase 8f): when `Some`, only rows whose `host_id` is in
+    /// this list are returned; `Some(vec![])` matches nothing. Hyphenated UUID
+    /// strings, exactly as stored.
+    pub host_ids: Option<Vec<String>>,
 }
 
 impl QueryPlan {
@@ -73,6 +77,10 @@ pub struct AlertQueryPlan {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+    /// Tenant scoping (Phase 8f): when `Some`, only rows whose `host_id` is in
+    /// this list are returned; `Some(vec![])` matches nothing. Hyphenated UUID
+    /// strings, exactly as stored.
+    pub host_ids: Option<Vec<String>>,
 }
 
 impl AlertQueryPlan {
@@ -97,6 +105,10 @@ pub struct RelationshipQueryPlan {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+    /// Tenant scoping (Phase 8f): when `Some`, only rows whose `host_id` is in
+    /// this list are returned; `Some(vec![])` matches nothing. Hyphenated UUID
+    /// strings, exactly as stored.
+    pub host_ids: Option<Vec<String>>,
 }
 
 impl RelationshipQueryPlan {
@@ -117,6 +129,10 @@ pub struct RiskQueryPlan {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+    /// Tenant scoping (Phase 8f): when `Some`, only rows whose `host_id` is in
+    /// this list are returned; `Some(vec![])` matches nothing. Hyphenated UUID
+    /// strings, exactly as stored.
+    pub host_ids: Option<Vec<String>>,
 }
 
 impl RiskQueryPlan {

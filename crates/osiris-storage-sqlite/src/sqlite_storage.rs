@@ -258,6 +258,26 @@ fn conjunction_leaves(
     }
 }
 
+/// Appends the tenant host restriction to a WHERE clause already in progress:
+/// ` AND <column> IN (?,..)`, or ` AND 1=0` for an empty list (an empty host
+/// set must match nothing, never everything).
+fn push_host_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    column: &str,
+    host_ids: &Option<Vec<String>>,
+) {
+    let Some(ids) = host_ids else { return };
+    if ids.is_empty() {
+        sql.push_str(" AND 1=0");
+        return;
+    }
+    sql.push_str(&format!(" AND {column} IN ({})", vec!["?"; ids.len()].join(",")));
+    for id in ids {
+        params.push(Box::new(id.clone()));
+    }
+}
+
 impl SqliteStorage {
     /// How many rows one SQL round-trip of `query_events`' scan pulls back
     /// before the residual `eval_ast` pass filters them. This is a *batch*
@@ -341,6 +361,7 @@ impl SqliteStorage {
                 }
             }
         }
+        push_host_filter(&mut base_sql, &mut base_params, "host_id", &plan.host_ids);
         if let Some(since) = plan.since {
             base_sql.push_str(" AND timestamp >= ?");
             base_params.push(Box::new(since.min(i64::MAX as u64) as i64));
@@ -570,6 +591,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND container_id = ?");
             sql_params.push(Box::new(container_id.clone()));
         }
+        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids);
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -704,6 +726,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND a.rule_id = ?");
             sql_params.push(Box::new(rule_id.clone()));
         }
+        push_host_filter(&mut sql, &mut sql_params, "a.host_id", &plan.host_ids);
         if let Some(since) = plan.since {
             sql.push_str(" AND a.timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -794,6 +817,19 @@ impl Storage for SqliteStorage {
             let key = entity.storage_key();
             sql_params.push(Box::new(key.clone()));
             sql_params.push(Box::new(key));
+        }
+        if let Some(ids) = &plan.host_ids {
+            if ids.is_empty() {
+                sql.push_str(" AND 1=0");
+            } else {
+                sql.push_str(&format!(
+                    " AND event_id IN (SELECT event_id FROM events WHERE host_id IN ({}))",
+                    vec!["?"; ids.len()].join(",")
+                ));
+                for id in ids {
+                    sql_params.push(Box::new(id.clone()));
+                }
+            }
         }
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
@@ -922,6 +958,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND event_id = ?");
             sql_params.push(Box::new(event_id.to_string()));
         }
+        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids);
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -2794,5 +2831,136 @@ mod tests {
         let mut plan = QueryPlan::new();
         plan.session_id = Some("3".to_string());
         assert_eq!(reopened_again.query(&plan).unwrap().len(), 1);
+    }
+
+    fn event_on(host: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
+        let mut e = sample_event(pid, timestamp);
+        e.host_id = host;
+        e.host.host_id = host;
+        e
+    }
+
+    #[test]
+    fn host_ids_restricts_query_and_query_events_and_empty_matches_nothing() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .batch_write(&[event_on(a, 1, 100), event_on(b, 2, 200), event_on(a, 3, 300)])
+            .unwrap();
+
+        let only_a = storage
+            .query(&QueryPlan { host_ids: Some(vec![a.to_string()]), ..QueryPlan::new() })
+            .unwrap();
+        assert_eq!(only_a.len(), 2);
+        assert!(only_a.iter().all(|e| e.host_id == a));
+
+        let none = storage
+            .query(&QueryPlan { host_ids: Some(vec![]), ..QueryPlan::new() })
+            .unwrap();
+        assert!(none.is_empty(), "an empty host set must match nothing, not everything");
+
+        let both = storage
+            .query(&QueryPlan {
+                host_ids: Some(vec![a.to_string(), b.to_string()]),
+                ..QueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(both.len(), 3);
+
+        let ev_a = storage
+            .query_events(&osiris_query::EventQueryPlan {
+                host_ids: Some(vec![a.to_string()]),
+                ..osiris_query::EventQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(ev_a.len(), 2);
+        assert!(ev_a.iter().all(|e| e.host_id == a));
+        let ev_none = storage
+            .query_events(&osiris_query::EventQueryPlan {
+                host_ids: Some(vec![]),
+                ..osiris_query::EventQueryPlan::new()
+            })
+            .unwrap();
+        assert!(ev_none.is_empty());
+    }
+
+    #[test]
+    fn host_ids_combines_with_an_or_filter_that_defeats_other_pushdown() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        storage.batch_write(&[event_on(a, 1, 100), event_on(b, 2, 200)]).unwrap();
+        let plan = osiris_query::EventQueryPlan {
+            host_ids: Some(vec![a.to_string()]),
+            ..osiris_query::EventQueryPlan::with_filter(
+                "event_type = \"PROCESS_EXEC\" OR event_type = \"FILE_WRITE\"",
+            )
+            .unwrap()
+        };
+        let got = storage.query_events(&plan).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_id, a);
+    }
+
+    #[test]
+    fn host_ids_restricts_alerts_and_risk_scores() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let alert = |host: Uuid| {
+            osiris_schema::Alert::new(
+                "r1", 1, "deadbeef", osiris_schema::Severity::High, 10, host,
+                vec!["x".to_string()], vec![Uuid::now_v7()],
+            )
+            .unwrap()
+        };
+        storage.write_alerts(&[alert(a), alert(b)]).unwrap();
+        let got = storage
+            .query_alerts(&AlertQueryPlan { host_ids: Some(vec![a.to_string()]), ..AlertQueryPlan::new() })
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_id(), a);
+        assert!(storage
+            .query_alerts(&AlertQueryPlan { host_ids: Some(vec![]), ..AlertQueryPlan::new() })
+            .unwrap()
+            .is_empty());
+
+        let mut ra = sample_risk_record(None, 10);
+        ra.host_id = a;
+        let mut rb = sample_risk_record(None, 20);
+        rb.host_id = b;
+        storage.write_risk_scores(&[ra, rb]).unwrap();
+        let got = storage
+            .query_risk_scores(&RiskQueryPlan { host_ids: Some(vec![b.to_string()]), ..RiskQueryPlan::new() })
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_id, b);
+    }
+
+    #[test]
+    fn host_ids_restricts_relationships_through_the_source_event() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ev_a = event_on(a, 1, 100);
+        let ev_b = event_on(b, 2, 200);
+        storage.batch_write(&[ev_a.clone(), ev_b.clone()]).unwrap();
+        let edge = |event: &CanonicalEvent| EntityRelationship {
+            from: EntityRef::Ip { addr: "10.0.0.1".to_string() },
+            to: EntityRef::Ip { addr: "203.0.113.10".to_string() },
+            relation: Relation::ConnectedTo,
+            event_id: event.event_id,
+            timestamp: event.timestamp,
+        };
+        storage.write_relationships(&[edge(&ev_a), edge(&ev_b)]).unwrap();
+        let got = storage
+            .query_relationships(&RelationshipQueryPlan {
+                host_ids: Some(vec![a.to_string()]),
+                ..RelationshipQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event_id, ev_a.event_id);
+        assert!(storage
+            .query_relationships(&RelationshipQueryPlan { host_ids: Some(vec![]), ..RelationshipQueryPlan::new() })
+            .unwrap()
+            .is_empty());
     }
 }

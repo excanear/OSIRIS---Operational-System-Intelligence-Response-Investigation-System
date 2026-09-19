@@ -93,6 +93,7 @@ pub(crate) fn events_for_entity(
         until: Some(until),
         limit,
         export,
+        host_ids: None,
     };
     storage.query_events(&plan)
 }

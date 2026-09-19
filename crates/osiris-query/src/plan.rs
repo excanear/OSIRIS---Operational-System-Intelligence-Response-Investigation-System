@@ -35,6 +35,10 @@ pub struct EventQueryPlan {
     pub until: Option<u64>,
     pub limit: usize,
     pub export: bool,
+    /// Tenant scoping (Phase 8f): when `Some`, only rows whose `host_id` is in
+    /// this list are returned; `Some(vec![])` matches nothing. Hyphenated UUID
+    /// strings, exactly as stored.
+    pub host_ids: Option<Vec<String>>,
 }
 
 impl EventQueryPlan {

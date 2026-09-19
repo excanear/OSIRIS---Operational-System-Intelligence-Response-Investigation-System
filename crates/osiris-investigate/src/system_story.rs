@@ -20,6 +20,7 @@ pub fn system_story(storage: &dyn Storage, host_id: Uuid, since: u64, until: u64
         until: Some(until),
         limit: 10_000,
         export: true,
+        host_ids: None,
     };
     let events = storage.query_events(&plan)?;
     assemble(storage, events)
