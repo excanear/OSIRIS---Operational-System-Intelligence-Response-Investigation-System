@@ -13,7 +13,10 @@ pub const DETECT_TIMEOUT: Duration = Duration::from_secs(2);
 fn override_ok(name: &str, url: &Option<String>) -> bool {
     match url {
         Some(u) if !osiris_cloud_context::valid_base_url(u) => {
-            tracing::warn!(provider = name, "ignoring invalid cloud_metadata base_url override; provider disabled");
+            tracing::warn!(
+                provider = name,
+                "ignoring invalid cloud_metadata base_url override; provider disabled"
+            );
             false
         }
         _ => true,

@@ -165,11 +165,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let a = "a".repeat(64);
         let b = "b".repeat(64);
-        write_cgroup(tmp.path(), 7, &format!("0::/system.slice/docker-{a}.scope\n"));
+        write_cgroup(
+            tmp.path(),
+            7,
+            &format!("0::/system.slice/docker-{a}.scope\n"),
+        );
         let mut r = NsCgroupResolver::with_ttl(tmp.path(), std::time::Duration::from_millis(40));
         assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, a);
-        write_cgroup(tmp.path(), 7, &format!("0::/system.slice/docker-{b}.scope\n"));
-        assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, a, "cached within the ttl");
+        write_cgroup(
+            tmp.path(),
+            7,
+            &format!("0::/system.slice/docker-{b}.scope\n"),
+        );
+        assert_eq!(
+            r.resolve(7).unwrap().2.unwrap().container_id,
+            a,
+            "cached within the ttl"
+        );
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert_eq!(r.resolve(7).unwrap().2.unwrap().container_id, b);
     }

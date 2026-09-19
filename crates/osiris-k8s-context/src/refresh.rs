@@ -196,11 +196,26 @@ mod tests {
     #[test]
     fn health_transitions_warn_once_and_recover_once() {
         let mut failing = false;
-        assert_eq!(health_transition(&mut failing, true), HealthTransition::StillHealthy);
-        assert_eq!(health_transition(&mut failing, false), HealthTransition::StartedFailing);
-        assert_eq!(health_transition(&mut failing, false), HealthTransition::StillFailing);
-        assert_eq!(health_transition(&mut failing, true), HealthTransition::Recovered);
-        assert_eq!(health_transition(&mut failing, true), HealthTransition::StillHealthy);
+        assert_eq!(
+            health_transition(&mut failing, true),
+            HealthTransition::StillHealthy
+        );
+        assert_eq!(
+            health_transition(&mut failing, false),
+            HealthTransition::StartedFailing
+        );
+        assert_eq!(
+            health_transition(&mut failing, false),
+            HealthTransition::StillFailing
+        );
+        assert_eq!(
+            health_transition(&mut failing, true),
+            HealthTransition::Recovered
+        );
+        assert_eq!(
+            health_transition(&mut failing, true),
+            HealthTransition::StillHealthy
+        );
     }
 
     #[tokio::test]
@@ -226,7 +241,10 @@ mod tests {
         assert!(cache.lookup("zzz").is_none()); // another miss
         wait_until(|| cache.lookup("bbb").is_some()).await;
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

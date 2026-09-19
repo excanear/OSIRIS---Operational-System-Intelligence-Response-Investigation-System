@@ -204,7 +204,9 @@ mod tests {
             links: Arc::new(
                 SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap(),
             ),
-            storage: Arc::new(osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap()),
+            storage: Arc::new(
+                osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap(),
+            ),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -239,10 +241,14 @@ mod tests {
                 addr: "203.0.113.10".to_string(),
             }],
         };
-        let Json(created) =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
-                .await
-                .unwrap();
+        let Json(created) = create_incident_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            None,
+            Json(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(created.status, IncidentStatus::New);
 
         let Json(found) = get_incident_handler(
@@ -271,10 +277,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
-                .await
-                .unwrap();
+        let _ = create_incident_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            None,
+            Json(body),
+        )
+        .await
+        .unwrap();
         let Json(list) = list_incidents_handler(State(state), Extension(platform_ctx())).await;
         assert_eq!(list.len(), 2);
     }
@@ -287,10 +297,14 @@ mod tests {
                 addr: "203.0.113.10".to_string(),
             }],
         };
-        let Json(created) =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
-                .await
-                .unwrap();
+        let Json(created) = create_incident_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            None,
+            Json(body),
+        )
+        .await
+        .unwrap();
 
         let patch = PatchIncidentBody {
             status: IncidentStatus::Investigating,

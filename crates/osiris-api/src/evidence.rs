@@ -225,7 +225,9 @@ mod tests {
             links: Arc::new(
                 SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap(),
             ),
-            storage: Arc::new(osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap()),
+            storage: Arc::new(
+                osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap(),
+            ),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -256,10 +258,14 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let Json(created) =
-            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
-                .await
-                .unwrap();
+        let Json(created) = create_evidence_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            None,
+            Json(body),
+        )
+        .await
+        .unwrap();
 
         let list_query = ListEvidenceQuery {
             incident_id: Some(incident.incident_id.to_string()),
@@ -286,9 +292,10 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let err = create_evidence_handler(State(state), Extension(platform_ctx()), None, Json(body))
-            .await
-            .unwrap_err();
+        let err =
+            create_evidence_handler(State(state), Extension(platform_ctx()), None, Json(body))
+                .await
+                .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -403,10 +410,14 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let _ =
-            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
-                .await
-                .unwrap();
+        let _ = create_evidence_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            None,
+            Json(body),
+        )
+        .await
+        .unwrap();
 
         let Json(response) = list_evidence_handler(
             State(state),

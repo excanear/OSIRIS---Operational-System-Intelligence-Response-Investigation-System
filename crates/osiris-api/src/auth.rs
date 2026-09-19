@@ -602,10 +602,16 @@ mod tests {
 
         let Json(entries) = audit_handler(
             State(state),
-            Extension(AuthContext { user_id: Uuid::new_v4(), role: Role::Admin, token: "t".to_string(), tenant_id: None }),
-            Query(AuditQuery { limit: None }))
-            .await
-            .unwrap();
+            Extension(AuthContext {
+                user_id: Uuid::new_v4(),
+                role: Role::Admin,
+                token: "t".to_string(),
+                tenant_id: None,
+            }),
+            Query(AuditQuery { limit: None }),
+        )
+        .await
+        .unwrap();
         assert_eq!(entries[0].what, "second");
         assert_eq!(entries[1].what, "first");
     }

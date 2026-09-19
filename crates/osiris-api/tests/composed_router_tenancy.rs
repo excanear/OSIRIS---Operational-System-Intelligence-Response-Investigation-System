@@ -611,7 +611,14 @@ async fn a_tenant_cannot_reference_entities_outside_its_own_data() {
     let t = tenancy();
     // Another tenant's process, and an entity that exists nowhere: both 400.
     for body in [process_incident(&t.globex_process_key), incident_body()] {
-        let (s, _) = call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(body)).await;
+        let (s, _) = call(
+            &t.app,
+            "POST",
+            "/api/v1/incidents",
+            Some(&t.acme_token),
+            Some(body),
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
     // Evidence relationships are held to the same rule.
@@ -619,10 +626,24 @@ async fn a_tenant_cannot_reference_entities_outside_its_own_data() {
         "source": "MANUAL_UPLOAD", "hash": "abc", "immutable_since": 1, "supersedes": null,
         "relationships": [{ "kind": "PROCESS", "process_key": t.globex_process_key }],
     });
-    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.acme_token), Some(ev)).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/evidence",
+        Some(&t.acme_token),
+        Some(ev),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     // The platform is not restricted.
-    let (s, _) = call(&t.app, "POST", "/api/v1/incidents", Some(&t.admin_token), Some(incident_body())).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/incidents",
+        Some(&t.admin_token),
+        Some(incident_body()),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
 }
 
@@ -882,15 +903,29 @@ async fn a_tenant_admin_sees_only_its_own_tenants_audit_entries() {
             "reason": "investigating", "dry_run": true,
         })
     };
-    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
-        Some(dry_run(&t.acme_process_key))).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.acme_token),
+        Some(dry_run(&t.acme_process_key)),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.globex_token),
-        Some(dry_run(&t.globex_process_key))).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.globex_token),
+        Some(dry_run(&t.globex_process_key)),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
 
     let actors = |body: &serde_json::Value| -> std::collections::HashSet<String> {
-        body.as_array().unwrap().iter()
+        body.as_array()
+            .unwrap()
+            .iter()
             .filter_map(|e| e["who"]["user_id"].as_str().map(str::to_string))
             .collect()
     };
@@ -902,5 +937,8 @@ async fn a_tenant_admin_sees_only_its_own_tenants_audit_entries() {
     assert_eq!(acme.as_array().unwrap().len(), 1);
     assert_eq!(globex.as_array().unwrap().len(), 1);
     assert!(actors(&acme).is_disjoint(&actors(&globex)));
-    assert!(all.as_array().unwrap().len() >= 2, "the platform sees everything");
+    assert!(
+        all.as_array().unwrap().len() >= 2,
+        "the platform sees everything"
+    );
 }

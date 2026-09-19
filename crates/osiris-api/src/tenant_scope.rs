@@ -199,8 +199,9 @@ pub(crate) async fn ensure_entities_in_scope(
 ) -> Result<(), (StatusCode, String)> {
     let outcome = tokio::task::spawn_blocking(move || {
         for entity in &entities {
-            let found = osiris_response::events_for_entity(scoped.as_ref(), entity, 0, u64::MAX, 1, false)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let found =
+                osiris_response::events_for_entity(scoped.as_ref(), entity, 0, u64::MAX, 1, false)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             if found.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,

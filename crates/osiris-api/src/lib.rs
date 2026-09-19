@@ -1480,17 +1480,32 @@ mod tests {
         let (_dir, storage) = test_storage();
         storage.write(&sample_event(100, None, 1000)).unwrap();
         storage.write(&sample_event(200, None, 9000)).unwrap();
-        let Json(rows) = processes_handler(ScopedStorage(storage), Query(ListRange { since: Some(5000), until: None })).await.unwrap();
+        let Json(rows) = processes_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: Some(5000),
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pid, 200);
     }
-
 
     #[tokio::test]
     async fn processes_endpoint_deduplicates_by_process_key() {
         let (_dir, storage) = test_storage();
         storage.write(&sample_event(100, None, 1000)).unwrap();
-        let Json(processes) = processes_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(processes) = processes_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 100);
     }

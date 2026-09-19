@@ -278,14 +278,27 @@ async fn stream_events_handler(
     // A tenant connection re-reads its host set on every ping tick, so a host
     // reassigned mid-connection stops (or starts) flowing within one interval.
     let refresh = match (
-        parts.extensions.get::<crate::auth_middleware::AuthContext>().and_then(|c| c.tenant_id),
-        parts.extensions.get::<Arc<dyn osiris_tenancy::TenantStore>>().cloned(),
+        parts
+            .extensions
+            .get::<crate::auth_middleware::AuthContext>()
+            .and_then(|c| c.tenant_id),
+        parts
+            .extensions
+            .get::<Arc<dyn osiris_tenancy::TenantStore>>()
+            .cloned(),
     ) {
         (Some(tenant_id), Some(tenants)) => Some(TenantRefresh { tenants, tenant_id }),
         _ => None,
     };
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive, refresh)
+        handle_socket(
+            socket,
+            broadcaster,
+            filter,
+            tenant_hosts,
+            keepalive,
+            refresh,
+        )
     }))
 }
 
@@ -303,7 +316,9 @@ async fn refresh_hosts(r: &TenantRefresh, broadcaster: &LiveEventBroadcaster, id
     let tenant_id = r.tenant_id;
     match tokio::task::spawn_blocking(move || tenants.hosts_of(tenant_id)).await {
         Ok(Ok(hosts)) => broadcaster.set_hosts(id, hosts),
-        Ok(Err(e)) => tracing::warn!(error = %e, "live stream tenant host refresh failed; keeping the previous set"),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "live stream tenant host refresh failed; keeping the previous set")
+        }
         Err(e) => tracing::warn!(error = %e, "live stream tenant host refresh task failed"),
     }
 }
@@ -729,13 +744,15 @@ mod tests {
         tenants.assign_host(mine, tenant.tenant_id).unwrap();
 
         let broadcaster = LiveEventBroadcaster::new();
-        let (id, mut receiver, _) =
-            broadcaster.subscribe_scoped(None, Some(HashSet::from([mine])));
+        let (id, mut receiver, _) = broadcaster.subscribe_scoped(None, Some(HashSet::from([mine])));
         broadcaster.publish(&[sample_event(later, EventType::ProcessExec)]);
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
         tenants.assign_host(later, tenant.tenant_id).unwrap();
-        let r = TenantRefresh { tenants, tenant_id: tenant.tenant_id };
+        let r = TenantRefresh {
+            tenants,
+            tenant_id: tenant.tenant_id,
+        };
         refresh_hosts(&r, &broadcaster, id).await;
         broadcaster.publish(&[sample_event(later, EventType::ProcessExec)]);
         assert_eq!(receiver.try_recv().unwrap().host_id, later);
