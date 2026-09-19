@@ -158,18 +158,7 @@ async fn login_handler(
         result: AuditResult::Success,
     });
 
-    let tenant_name = match user.tenant_id {
-        Some(tid) => {
-            let tenants = state.tenants.clone();
-            tokio::task::spawn_blocking(move || tenants.get_tenant(tid))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
-                .map(|t| t.name)
-        }
-        None => None,
-    };
+    let tenant_name = tenant_name_of(&state, user.tenant_id).await;
 
     Ok(Json(LoginResponse {
         token: session.token,
@@ -206,11 +195,25 @@ async fn logout_handler(
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Display name of a tenant; `None` for a platform user or an unresolvable id.
+async fn tenant_name_of(state: &AuthState, tenant_id: Option<Uuid>) -> Option<String> {
+    let tid = tenant_id?;
+    let tenants = state.tenants.clone();
+    tokio::task::spawn_blocking(move || tenants.get_tenant(tid))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .map(|t| t.name)
+}
+
 #[derive(Debug, Serialize)]
 struct MeResponse {
     user_id: Uuid,
     username: String,
     role: Role,
+    tenant_id: Option<Uuid>,
+    tenant_name: Option<String>,
 }
 
 async fn me_handler(
@@ -227,10 +230,13 @@ async fn me_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .ok_or((StatusCode::NOT_FOUND, "user not found".to_string()))?;
 
+    let tenant_name = tenant_name_of(&state, user.tenant_id).await;
     Ok(Json(MeResponse {
         user_id: user.user_id,
         username: user.username,
         role: user.role,
+        tenant_id: user.tenant_id,
+        tenant_name,
     }))
 }
 
@@ -474,6 +480,8 @@ mod tests {
         let Json(me) = me_handler(State(state), Extension(ctx)).await.unwrap();
         assert_eq!(me.username, "carol");
         assert_eq!(me.role, Role::Admin);
+        assert_eq!(me.tenant_id, None);
+        assert_eq!(me.tenant_name, None);
     }
 
     #[tokio::test]

@@ -124,7 +124,8 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
     if method == Method::PATCH {
         return one_segment("/api/v1/incidents/");
     }
-    if method != Method::GET {
+    // HEAD is served by axum on every GET route, so it needs the same allowlist.
+    if method != Method::GET && method != Method::HEAD {
         return false;
     }
     const EXACT: &[&str] = &[
@@ -702,6 +703,8 @@ mod tests {
             assert!(tenant_route_allowed(&Method::GET, path), "GET {path} must be allowed");
         }
         assert!(tenant_route_allowed(&Method::POST, "/api/v1/auth/logout"));
+        assert!(tenant_route_allowed(&Method::HEAD, "/api/v1/events"));
+        assert!(!tenant_route_allowed(&Method::HEAD, "/api/v1/audit"));
         for (m, path) in [
             (Method::POST, "/api/v1/incidents"),
             (Method::PATCH, "/api/v1/incidents/123"),

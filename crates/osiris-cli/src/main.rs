@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use osiris_cli::client::{
-    chain_url, container_story_url, events_url, format_events_table, hunt_url, risk_url,
+    chain_url, container_story_url, events_url, format_events_table, hunt_url, percent_encode, risk_url,
 };
 use osiris_cli::hunts::template;
 use osiris_schema::CanonicalEvent;
@@ -288,7 +288,7 @@ fn main() {
                 Some(key) => format!(
                     "{}/api/v1/processes/{}",
                     cli.server.trim_end_matches('/'),
-                    key
+                    percent_encode(&key)
                 ),
                 None => format!("{}/api/v1/processes", cli.server.trim_end_matches('/')),
             };
@@ -408,12 +408,20 @@ fn main() {
                 TenantsAction::List => get(&client, format!("{base}/api/v1/tenants"), true),
                 TenantsAction::AssignHost { tenant_id, host_id } => put_empty(
                     &client,
-                    format!("{base}/api/v1/tenants/{tenant_id}/hosts/{host_id}"),
+                    format!(
+                        "{base}/api/v1/tenants/{}/hosts/{}",
+                        percent_encode(&tenant_id),
+                        percent_encode(&host_id)
+                    ),
                     true,
                 ),
                 TenantsAction::UnassignHost { tenant_id, host_id } => delete_empty(
                     &client,
-                    format!("{base}/api/v1/tenants/{tenant_id}/hosts/{host_id}"),
+                    format!(
+                        "{base}/api/v1/tenants/{}/hosts/{}",
+                        percent_encode(&tenant_id),
+                        percent_encode(&host_id)
+                    ),
                     true,
                 ),
             }
