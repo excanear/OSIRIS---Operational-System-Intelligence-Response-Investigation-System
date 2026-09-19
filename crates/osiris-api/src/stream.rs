@@ -95,10 +95,6 @@ impl LiveEventBroadcaster {
         }
     }
 
-    /// Called once per successfully-persisted ingestion batch. For each
-    /// connection whose filter matches (or has no filter), `try_send`s the
-    /// event. On `Err` (channel full), increments that connection's
-    /// `dropped_total` and moves on.
     /// True if at least one connection is currently registered. Lets
     /// callers skip cloning an event batch when there is nobody to publish
     /// it to.
@@ -106,6 +102,10 @@ impl LiveEventBroadcaster {
         !self.connections.lock().unwrap().is_empty()
     }
 
+    /// Called once per successfully-persisted ingestion batch. For each
+    /// connection whose filter matches (or has no filter), `try_send`s the
+    /// event. On `Err` (channel full), increments that connection's
+    /// `dropped_total` and moves on.
     pub fn publish(&self, events: &[CanonicalEvent]) {
         let connections = self.connections.lock().unwrap();
         for event in events {
@@ -133,10 +133,36 @@ pub struct StreamQuery {
     pub q: Option<String>,
 }
 
+/// WebSocket liveness policy: the server pings every `ping_every`, and closes a
+/// connection that has sent nothing (a pong counts) for `idle_timeout`. Without
+/// this a half-open TCP connection would hold its 4096-slot channel forever.
+#[derive(Clone, Copy, Debug)]
+pub struct KeepAlive {
+    pub ping_every: std::time::Duration,
+    pub idle_timeout: std::time::Duration,
+}
+
+impl Default for KeepAlive {
+    fn default() -> Self {
+        Self {
+            ping_every: std::time::Duration::from_secs(30),
+            idle_timeout: std::time::Duration::from_secs(90),
+        }
+    }
+}
+
 pub fn build_stream_router(broadcaster: Arc<LiveEventBroadcaster>) -> Router {
+    build_stream_router_with_keepalive(broadcaster, KeepAlive::default())
+}
+
+pub fn build_stream_router_with_keepalive(
+    broadcaster: Arc<LiveEventBroadcaster>,
+    keepalive: KeepAlive,
+) -> Router {
     Router::new()
         .route("/api/v1/stream/events", get(stream_events_handler))
         .with_state(broadcaster)
+        .layer(axum::Extension(keepalive))
 }
 
 /// Cross-site WebSocket hijacking (CSWSH) guard: WebSocket handshakes are
@@ -184,6 +210,7 @@ async fn stream_events_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<StreamQuery>,
     State(broadcaster): State<Arc<LiveEventBroadcaster>>,
+    keepalive: Option<axum::Extension<KeepAlive>>,
 ) -> Result<Response, (StatusCode, String)> {
     let headers = parts.headers.clone();
     if !origin_is_same_site(&headers) {
@@ -200,6 +227,12 @@ async fn stream_events_handler(
         ));
     }
 
+    if let Some(host_id) = &params.host_id {
+        if normalize_host(host_id).is_none() {
+            return Err((StatusCode::BAD_REQUEST, "host_id must be a UUID".to_string()));
+        }
+    }
+
     // Tenant users are restricted to their tenant's hosts. The host set is a
     // snapshot taken at connect time: a reassignment mid-connection only
     // applies at the next connect. Platform / no-auth requests get `None`.
@@ -214,7 +247,7 @@ async fn stream_events_handler(
         Some(Ast::Compare {
             field: "host_id".to_string(),
             op: Op::Eq,
-            value: Value::Str(normalize_host(&host_id).unwrap_or(host_id)),
+            value: Value::Str(normalize_host(&host_id).expect("validated above")),
         })
     } else if let Some(q) = params.q {
         let plan = EventQueryPlan::with_filter(&q)
@@ -224,14 +257,21 @@ async fn stream_events_handler(
         None
     };
 
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter, tenant_hosts)))
+    let keepalive = keepalive.map(|axum::Extension(k)| k).unwrap_or_default();
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive)))
 }
 
-async fn handle_socket(mut socket: WebSocket, broadcaster: Arc<LiveEventBroadcaster>,
+async fn handle_socket(
+    mut socket: WebSocket,
+    broadcaster: Arc<LiveEventBroadcaster>,
     filter: Option<Ast>,
     hosts: Option<HashSet<Uuid>>,
+    keepalive: KeepAlive,
 ) {
     let (id, mut receiver, _dropped_total) = broadcaster.subscribe_scoped(filter, hosts);
+    let mut ping = tokio::time::interval(keepalive.ping_every);
+    ping.tick().await; // the first tick fires immediately
+    let mut last_seen = tokio::time::Instant::now();
     loop {
         tokio::select! {
             maybe_event = receiver.recv() => {
@@ -241,10 +281,18 @@ async fn handle_socket(mut socket: WebSocket, broadcaster: Arc<LiveEventBroadcas
                     break;
                 }
             }
+            _ = ping.tick() => {
+                if last_seen.elapsed() >= keepalive.idle_timeout {
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => last_seen = tokio::time::Instant::now(),
                     Some(Err(_)) => break,
                 }
             }
@@ -606,5 +654,47 @@ mod tests {
             }
             other => panic!("expected an HTTP 403 rejection, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_host_id_that_is_not_a_uuid() {
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let addr = spawn_test_server(broadcaster).await;
+        let err = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/v1/stream/events?host_id=not-a-uuid"
+        ))
+        .await
+        .unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 400),
+            other => panic!("expected an HTTP 400 rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_is_closed_and_unsubscribed() {
+        let broadcaster = Arc::new(LiveEventBroadcaster::new());
+        let app = build_stream_router_with_keepalive(
+            broadcaster.clone(),
+            KeepAlive {
+                ping_every: std::time::Duration::from_millis(20),
+                idle_timeout: std::time::Duration::from_millis(60),
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Connect, then never poll the client: it cannot answer pings.
+        let (_ws_stream, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/stream/events"))
+                .await
+                .unwrap();
+        assert!(broadcaster.has_subscribers());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while broadcaster.has_subscribers() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!broadcaster.has_subscribers(), "idle connection must be dropped");
     }
 }
