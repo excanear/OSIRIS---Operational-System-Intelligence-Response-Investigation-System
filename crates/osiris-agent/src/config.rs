@@ -91,11 +91,30 @@ impl Default for K8sContextConfig {
     }
 }
 
+/// Phase 9a: ship the spool to a remote Server over mutual TLS. Absent = the
+/// Agent only writes `spool_path` (a same-host Server tails it). Certificates
+/// come from `osiris pki issue-agent` (bound to this host's id).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForwardConfig {
+    /// `host:port` of the Server's agent listener.
+    pub server_addr: String,
+    /// The name the Server's certificate must be valid for.
+    pub server_name: String,
+    /// CA that signed the Server's certificate (PEM).
+    pub ca: String,
+    /// This Agent's certificate and private key (PEM).
+    pub cert: String,
+    pub key: String,
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
+    /// Remote delivery over mTLS (Phase 9a); `None` keeps spool-only behaviour.
+    #[serde(default)]
+    pub forward: Option<ForwardConfig>,
     /// Cloud metadata probe (Phase 8d). Defaults to enabled, no overrides,
     /// so every pre-8d agent.yaml still loads.
     #[serde(default)]
@@ -357,6 +376,32 @@ mod tests {
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.cloud_metadata.enabled);
         assert!(config.cloud_metadata.aws_base_url.is_none());
+    }
+
+    #[test]
+    fn forward_is_optional_and_parses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(&path, "spool_path: /tmp/s.ndjson
+status_addr: 127.0.0.1:9200
+").unwrap();
+        assert!(AgentConfig::load(&path).unwrap().forward.is_none());
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson
+status_addr: 127.0.0.1:9200
+forward:
+  server_addr: srv:9443
+  server_name: srv
+  ca: /ca.pem
+  cert: /a.pem
+  key: /a.key
+",
+        )
+        .unwrap();
+        let forward = AgentConfig::load(&path).unwrap().forward.unwrap();
+        assert_eq!(forward.server_addr, "srv:9443");
+        assert_eq!(forward.server_name, "srv");
     }
 
     #[test]

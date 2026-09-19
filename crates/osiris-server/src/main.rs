@@ -123,6 +123,14 @@ async fn main() {
     let cancellation = CancellationToken::new();
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
+    let ingest_context = osiris_server::IngestContext {
+        storage: storage.clone(),
+        detection_engine: detection_engine.clone(),
+        baseline_engine: baseline_engine.clone(),
+        risk_engine: risk_engine.clone(),
+        correlation_engine: correlation_engine.clone(),
+        broadcaster: live_event_broadcaster.clone(),
+    };
     tokio::spawn(run_ingestion_loop(
         spool_path,
         ingest_storage,
@@ -134,6 +142,39 @@ async fn main() {
         Duration::from_millis(200),
         cancellation.clone(),
     ));
+
+    if let Some(listener_cfg) = &config.agent_listener {
+        let tls = match osiris_transport::tls::server_config(
+            std::path::Path::new(&listener_cfg.cert),
+            std::path::Path::new(&listener_cfg.key),
+            std::path::Path::new(&listener_cfg.client_ca),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("agent_listener tls configuration is unusable: {e}");
+                std::process::exit(1);
+            }
+        };
+        let revoked = listener_cfg.revoked_hosts.iter().copied().collect();
+        let listener = match osiris_transport::server::Listener::bind(
+            &listener_cfg.listen_addr,
+            tls,
+            revoked,
+        )
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "cannot bind agent_listener on {}: {e}",
+                    listener_cfg.listen_addr
+                );
+                std::process::exit(1);
+            }
+        };
+        tracing::info!(addr = %listener_cfg.listen_addr, "agent mTLS listener started");
+        tokio::spawn(listener.run(Arc::new(ingest_context), cancellation.clone()));
+    }
 
     let addr = match SocketAddr::from_str(&config.listen_addr) {
         Ok(a) => a,

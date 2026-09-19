@@ -1173,6 +1173,7 @@ dependencies = [
  "osiris-sensors-persistence",
  "osiris-sensors-process",
  "osiris-sensors-systemd",
+ "osiris-transport",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1620,6 +1621,7 @@ dependencies = [
 name = "osiris-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "osiris-api",
  "osiris-audit",
@@ -1635,6 +1637,7 @@ dependencies = [
  "osiris-storage",
  "osiris-storage-sqlite",
  "osiris-tenancy",
+ "osiris-transport",
  "serde",
  "serde_json",
  "serde_yaml",

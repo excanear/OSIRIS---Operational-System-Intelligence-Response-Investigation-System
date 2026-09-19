@@ -21,6 +21,7 @@ tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-cloud-context = { path = "../osiris-cloud-context" }
 osiris-k8s-context = { path = "../osiris-k8s-context" }
+osiris-transport = { path = "../osiris-transport" }
 osiris-config = { path = "../osiris-config" }
 osiris-health = { path = "../osiris-health" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }

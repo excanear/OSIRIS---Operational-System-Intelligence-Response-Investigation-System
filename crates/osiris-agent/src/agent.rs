@@ -220,6 +220,27 @@ impl Agent {
 
         let mut tasks = vec![pipeline_handle, drain_handle];
         tasks.extend(k8s_refresher);
+        if let Some(forward) = &config.forward {
+            let forwarder_config = osiris_transport::client::ForwarderConfig::new(
+                forward.server_addr.clone(),
+                forward.server_name.clone(),
+                forward.ca.clone(),
+                forward.cert.clone(),
+                forward.key.clone(),
+                config.spool_path.clone(),
+            );
+            let forwarder_cancellation = cancellation.clone();
+            tasks.push(tokio::spawn(async move {
+                // Unusable TLS material must not take the Agent down: it keeps
+                // spooling and the operator sees this error.
+                if let Err(e) =
+                    osiris_transport::client::run_forwarder(forwarder_config, forwarder_cancellation)
+                        .await
+                {
+                    tracing::error!(error = %e, "forwarder not started; events stay in the local spool");
+                }
+            }));
+        }
 
         Ok(Arc::new(Self {
             lifecycle: Mutex::new(AgentLifecycle::Running),
@@ -294,6 +315,7 @@ mod tests {
 
     fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
         AgentConfig {
+            forward: None,
             audit_log_path: None,
             fs_audit_log_path: None,
             network_proc_root: None,

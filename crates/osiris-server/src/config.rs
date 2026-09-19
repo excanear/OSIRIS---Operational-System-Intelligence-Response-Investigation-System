@@ -64,6 +64,24 @@ pub struct ServerConfig {
     /// 28800 (8 hours) when absent.
     #[serde(default)]
     pub session_ttl_seconds: Option<u64>,
+    /// Phase 9a: mutual-TLS listener for remote Agents. Absent = the Server only
+    /// tails `spool_path` (same-host Agent), exactly as before.
+    #[serde(default)]
+    pub agent_listener: Option<AgentListenerConfig>,
+}
+
+/// Where remote Agents connect and how they are authenticated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentListenerConfig {
+    pub listen_addr: String,
+    /// The Server's certificate chain and private key (PEM).
+    pub cert: String,
+    pub key: String,
+    /// CA that must have signed every Agent certificate (PEM).
+    pub client_ca: String,
+    /// Host ids whose certificates are no longer accepted.
+    #[serde(default)]
+    pub revoked_hosts: Vec<uuid::Uuid>,
 }
 
 impl ServerConfig {
@@ -145,6 +163,34 @@ mod tests {
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert!(config.incidents_db_path.is_none());
+    }
+
+    #[test]
+    fn agent_listener_is_optional_and_parses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let base = "db_path: /tmp/e.db
+spool_path: /tmp/s
+listen_addr: 127.0.0.1:8080
+rules_dir: /r
+";
+        std::fs::write(&path, base).unwrap();
+        assert!(ServerConfig::load(&path).unwrap().agent_listener.is_none());
+        let host = uuid::Uuid::new_v4();
+        std::fs::write(
+            &path,
+            format!("{base}agent_listener:
+  listen_addr: 0.0.0.0:9443
+  cert: /s.pem
+  key: /s.key
+  client_ca: /ca.pem
+  revoked_hosts: [\"{host}\"]
+"),
+        )
+        .unwrap();
+        let l = ServerConfig::load(&path).unwrap().agent_listener.unwrap();
+        assert_eq!(l.listen_addr, "0.0.0.0:9443");
+        assert_eq!(l.revoked_hosts, vec![host]);
     }
 
     #[test]

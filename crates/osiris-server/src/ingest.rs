@@ -78,9 +78,94 @@ fn correlate_baseline_and_score(
     Ok(())
 }
 
-/// Tails the Agent's spool file and ingests each new line into Storage —
-/// the Phase 1 substitute for the UDS Agent→Server transport's server-side
-/// half (plan Global Constraints #3).
+/// Everything a batch of events flows through once it reaches the Server:
+/// storage, detection, baseline, risk, correlation, and the live-stream fan-out.
+/// Shared by the spool tailer and the mTLS Agent listener.
+#[derive(Clone)]
+pub struct IngestContext {
+    pub storage: Arc<dyn Storage>,
+    pub detection_engine: Arc<DetectionEngine>,
+    pub baseline_engine: Arc<BaselineEngine>,
+    pub risk_engine: Arc<RiskEngine>,
+    pub correlation_engine: Arc<CorrelationEngine>,
+    pub broadcaster: Arc<osiris_api::LiveEventBroadcaster>,
+}
+
+impl IngestContext {
+    /// Persists and analyses `events`, then publishes them to live-stream
+    /// subscribers. `Err` carries a human-readable cause; nothing is published on error.
+    pub async fn ingest(&self, events: Vec<CanonicalEvent>) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let storage = self.storage.clone();
+        let detection_engine = self.detection_engine.clone();
+        let baseline_engine = self.baseline_engine.clone();
+        let risk_engine = self.risk_engine.clone();
+        let correlation_engine = self.correlation_engine.clone();
+        let events_for_broadcast = if self.broadcaster.has_subscribers() {
+            Some(events.clone())
+        } else {
+            None
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            Ok::<_, osiris_storage::StorageError>({
+                let report = storage.batch_write(&events)?;
+                let alerts = detection_engine.evaluate_batch(&events);
+                if !alerts.is_empty() {
+                    storage.write_alerts(&alerts)?;
+                }
+
+                let edges: Vec<EntityRelationship> = events
+                    .iter()
+                    .flat_map(|e| e.relationships.clone())
+                    .collect();
+                if !edges.is_empty() {
+                    storage.write_relationships(&edges)?;
+                }
+
+                for event in &events {
+                    let alerts_for_event: Vec<Alert> = alerts
+                        .iter()
+                        .filter(|a| a.evidence().contains(&event.event_id))
+                        .cloned()
+                        .collect();
+                    correlate_baseline_and_score(
+                        storage.as_ref(),
+                        &baseline_engine,
+                        &risk_engine,
+                        &correlation_engine,
+                        event,
+                        &alerts_for_event,
+                    )?;
+                }
+
+                report
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(_report)) => {
+                if let Some(events) = events_for_broadcast {
+                    self.broadcaster.publish(&events);
+                }
+                Ok(())
+            }
+            Ok(Err(storage_err)) => Err(storage_err.to_string()),
+            Err(join_err) => Err(format!("ingest task panicked or was cancelled: {join_err}")),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl osiris_transport::server::BatchHandler for IngestContext {
+    async fn handle(&self, _host_id: uuid::Uuid, events: Vec<CanonicalEvent>) -> Result<(), String> {
+        self.ingest(events).await
+    }
+}
+
+/// Tails the Agent's spool file and ingests each new line - the same-host
+/// path (a remote Agent uses the mTLS listener instead).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ingestion_loop(
     spool_path: impl Into<std::path::PathBuf>,
@@ -93,6 +178,14 @@ pub async fn run_ingestion_loop(
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
+    let context = IngestContext {
+        storage,
+        detection_engine,
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
+        broadcaster,
+    };
     let mut tailer = LineTailer::new(spool_path);
     loop {
         if cancellation.is_cancelled() {
@@ -104,77 +197,14 @@ pub async fn run_ingestion_loop(
                     .iter()
                     .filter_map(|line| serde_json::from_str(line).ok())
                     .collect();
-                if !events.is_empty() {
-                    let storage = storage.clone();
-                    let detection_engine = detection_engine.clone();
-                    let baseline_engine = baseline_engine.clone();
-                    let risk_engine = risk_engine.clone();
-                    let correlation_engine = correlation_engine.clone();
-                    let event_count = events.len();
-                    let events_for_broadcast = if broadcaster.has_subscribers() {
-                        Some(events.clone())
-                    } else {
-                        None
-                    };
-                    match tokio::task::spawn_blocking(move || {
-                        Ok::<_, osiris_storage::StorageError>({
-                            let report = storage.batch_write(&events)?;
-                            let alerts = detection_engine.evaluate_batch(&events);
-                            if !alerts.is_empty() {
-                                storage.write_alerts(&alerts)?;
-                            }
-
-                            let edges: Vec<EntityRelationship> = events
-                                .iter()
-                                .flat_map(|e| e.relationships.clone())
-                                .collect();
-                            if !edges.is_empty() {
-                                storage.write_relationships(&edges)?;
-                            }
-
-                            for event in &events {
-                                let alerts_for_event: Vec<Alert> = alerts
-                                    .iter()
-                                    .filter(|a| a.evidence().contains(&event.event_id))
-                                    .cloned()
-                                    .collect();
-                                correlate_baseline_and_score(
-                                    storage.as_ref(),
-                                    &baseline_engine,
-                                    &risk_engine,
-                                    &correlation_engine,
-                                    event,
-                                    &alerts_for_event,
-                                )?;
-                            }
-
-                            report
-                        })
-                    })
-                    .await
-                    {
-                        Ok(Ok(_report)) => {
-                            if let Some(events) = events_for_broadcast {
-                                broadcaster.publish(&events);
-                            }
-                        }
-                        Ok(Err(storage_err)) => {
-                            tracing::error!(
-                                error = %storage_err,
-                                event_count,
-                                "batch_write or write_alerts failed; tailer offset already advanced past these events \
-                                 — they are permanently lost"
-                            );
-                        }
-                        Err(join_err) => {
-                            tracing::error!(
-                                error = %join_err,
-                                event_count,
-                                "batch_write task panicked or was cancelled; tailer offset already \
-                                 advanced past these events — they are permanently lost"
-                            );
-                        }
-                    }
+                let event_count = events.len();
+                if let Err(error) = context.ingest(events).await {
+                    tracing::error!(
+                        %error,
+                        event_count,
+                        "batch ingest failed; tailer offset already advanced past these events \
+                         — they are permanently lost"
+                    );
                 }
             }
             Err(io_err) => {
@@ -292,6 +322,72 @@ mod tests {
 
         let results = storage.query(&QueryPlan::new()).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_remote_agent_over_mtls_lands_in_storage_through_the_same_pipeline() {
+        use osiris_transport::client::{run_forwarder, ForwarderConfig};
+        use osiris_transport::pki::{generate_ca, issue_agent, issue_server, write_issued};
+        use osiris_transport::server::Listener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = generate_ca("t").unwrap();
+        write_issued(dir.path(), "ca", &ca).unwrap();
+        let server = issue_server(&ca.cert_pem, &ca.key_pem, &["localhost".into()]).unwrap();
+        write_issued(dir.path(), "server", &server).unwrap();
+        let mut event = sample_event();
+        let host = event.host_id;
+        event.host.host_id = host;
+        let agent = issue_agent(&ca.cert_pem, &ca.key_pem, host).unwrap();
+        write_issued(dir.path(), "agent", &agent).unwrap();
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        };
+        let tls = osiris_transport::tls::server_config(
+            &dir.path().join("server.pem"),
+            &dir.path().join("server.key"),
+            &dir.path().join("ca.pem"),
+        )
+        .unwrap();
+        let listener = Listener::bind("127.0.0.1:0", tls, Default::default())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cancel = CancellationToken::new();
+        tokio::spawn(listener.run(Arc::new(context), cancel.clone()));
+
+        let spool = dir.path().join("spool.ndjson");
+        std::fs::write(&spool, format!("{}\n", serde_json::to_string(&event).unwrap())).unwrap();
+        let forwarder = tokio::spawn(run_forwarder(
+            ForwarderConfig::new(
+                addr,
+                "localhost",
+                dir.path().join("ca.pem"),
+                dir.path().join("agent.pem"),
+                dir.path().join("agent.key"),
+                &spool,
+            ),
+            cancel.clone(),
+        ));
+
+        for _ in 0..100 {
+            if storage.query(&QueryPlan::new()).unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(storage.query(&QueryPlan::new()).unwrap().len(), 1);
+        cancel.cancel();
+        forwarder.await.unwrap().unwrap();
     }
 
     #[tokio::test]
