@@ -159,7 +159,11 @@ impl IngestContext {
 
 #[async_trait::async_trait]
 impl osiris_transport::server::BatchHandler for IngestContext {
-    async fn handle(&self, _host_id: uuid::Uuid, events: Vec<CanonicalEvent>) -> Result<(), String> {
+    async fn handle(
+        &self,
+        _host_id: uuid::Uuid,
+        events: Vec<CanonicalEvent>,
+    ) -> Result<(), String> {
         self.ingest(events).await
     }
 }
@@ -366,7 +370,11 @@ mod tests {
         tokio::spawn(listener.run(Arc::new(context), cancel.clone()));
 
         let spool = dir.path().join("spool.ndjson");
-        std::fs::write(&spool, format!("{}\n", serde_json::to_string(&event).unwrap())).unwrap();
+        std::fs::write(
+            &spool,
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
         let forwarder = tokio::spawn(run_forwarder(
             ForwarderConfig::new(
                 addr,

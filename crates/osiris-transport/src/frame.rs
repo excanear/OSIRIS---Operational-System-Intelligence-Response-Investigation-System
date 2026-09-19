@@ -31,7 +31,9 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     if compressed.len() > MAX_FRAME_LEN {
         return Err(FrameError::TooLarge(compressed.len()));
     }
-    writer.write_all(&(compressed.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(compressed.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(&compressed).await?;
     writer.flush().await?;
     Ok(())
@@ -66,7 +68,11 @@ mod tests {
     #[tokio::test]
     async fn a_frame_round_trips() {
         let (mut a, mut b) = tokio::io::duplex(1 << 16);
-        let sent = ServerMsg::Nack { seq: 7, reason: "x".into(), permanent: true };
+        let sent = ServerMsg::Nack {
+            seq: 7,
+            reason: "x".into(),
+            permanent: true,
+        };
         write_frame(&mut a, &sent).await.unwrap();
         let got: ServerMsg = read_frame(&mut b).await.unwrap();
         assert_eq!(got, sent);
@@ -92,7 +98,9 @@ mod tests {
     async fn a_decompression_bomb_is_rejected() {
         let (mut a, mut b) = tokio::io::duplex(1 << 20);
         let bomb = zstd::bulk::compress(&vec![0u8; MAX_DECOMPRESSED_LEN + 1024], 3).unwrap();
-        a.write_all(&(bomb.len() as u32).to_be_bytes()).await.unwrap();
+        a.write_all(&(bomb.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
         a.write_all(&bomb).await.unwrap();
         let err = read_frame::<_, ServerMsg>(&mut b).await.unwrap_err();
         assert!(matches!(err, FrameError::Decompress));

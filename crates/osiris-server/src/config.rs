@@ -179,13 +179,15 @@ rules_dir: /r
         let host = uuid::Uuid::new_v4();
         std::fs::write(
             &path,
-            format!("{base}agent_listener:
+            format!(
+                "{base}agent_listener:
   listen_addr: 0.0.0.0:9443
   cert: /s.pem
   key: /s.key
   client_ca: /ca.pem
   revoked_hosts: [\"{host}\"]
-"),
+"
+            ),
         )
         .unwrap();
         let l = ServerConfig::load(&path).unwrap().agent_listener.unwrap();

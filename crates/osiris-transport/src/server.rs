@@ -146,9 +146,15 @@ async fn serve(
         } else {
             match handler.handle(host_id, events).await {
                 Ok(()) => ServerMsg::Ack { seq },
-                Err(reason) => ServerMsg::Nack { seq, reason, permanent: false },
+                Err(reason) => ServerMsg::Nack {
+                    seq,
+                    reason,
+                    permanent: false,
+                },
             }
         };
-        write_frame(&mut tls, &reply).await.map_err(|e| e.to_string())?;
+        write_frame(&mut tls, &reply)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 }

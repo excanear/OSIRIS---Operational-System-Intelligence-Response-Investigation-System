@@ -62,10 +62,7 @@ pub fn generate_ca(common_name: &str) -> Result<Issued, PkiError> {
     })
 }
 
-fn load_ca(
-    ca_cert_pem: &str,
-    ca_key_pem: &str,
-) -> Result<(rcgen::Certificate, KeyPair), PkiError> {
+fn load_ca(ca_cert_pem: &str, ca_key_pem: &str) -> Result<(rcgen::Certificate, KeyPair), PkiError> {
     let key = KeyPair::from_pem(ca_key_pem)?;
     let params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
     let cert = params.self_signed(&key)?;
@@ -104,11 +101,7 @@ pub fn issue_server(
 }
 
 /// An Agent certificate bound to exactly one host id (SAN URI).
-pub fn issue_agent(
-    ca_cert_pem: &str,
-    ca_key_pem: &str,
-    host_id: Uuid,
-) -> Result<Issued, PkiError> {
+pub fn issue_agent(ca_cert_pem: &str, ca_key_pem: &str, host_id: Uuid) -> Result<Issued, PkiError> {
     let (ca, ca_key) = load_ca(ca_cert_pem, ca_key_pem)?;
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;

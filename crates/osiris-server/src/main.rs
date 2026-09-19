@@ -156,22 +156,19 @@ async fn main() {
             }
         };
         let revoked = listener_cfg.revoked_hosts.iter().copied().collect();
-        let listener = match osiris_transport::server::Listener::bind(
-            &listener_cfg.listen_addr,
-            tls,
-            revoked,
-        )
-        .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "cannot bind agent_listener on {}: {e}",
-                    listener_cfg.listen_addr
-                );
-                std::process::exit(1);
-            }
-        };
+        let listener =
+            match osiris_transport::server::Listener::bind(&listener_cfg.listen_addr, tls, revoked)
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "cannot bind agent_listener on {}: {e}",
+                        listener_cfg.listen_addr
+                    );
+                    std::process::exit(1);
+                }
+            };
         tracing::info!(addr = %listener_cfg.listen_addr, "agent mTLS listener started");
         tokio::spawn(listener.run(Arc::new(ingest_context), cancellation.clone()));
     }

@@ -134,15 +134,24 @@ fn read_batch(spool: &Path, offset: u64) -> std::io::Result<ReadOutcome> {
         if chunk.len() >= BATCH_MAX_BYTES {
             // One line longer than the whole read window: skip it rather than stall.
             tracing::error!("spool line exceeds {BATCH_MAX_BYTES} bytes; skipping the window");
-            return Ok(ReadOutcome::Batch(Batch { events: vec![], consumed: chunk.len() as u64 }));
+            return Ok(ReadOutcome::Batch(Batch {
+                events: vec![],
+                consumed: chunk.len() as u64,
+            }));
         }
         return Ok(ReadOutcome::Idle); // a partial last line: wait for the rest
     }
-    Ok(ReadOutcome::Batch(Batch { events, consumed: consumed as u64 }))
+    Ok(ReadOutcome::Batch(Batch {
+        events,
+        consumed: consumed as u64,
+    }))
 }
 
 /// Runs until `cancel` fires. Returns an error only if the TLS material is unusable.
-pub async fn run_forwarder(config: ForwarderConfig, cancel: CancellationToken) -> Result<(), TlsError> {
+pub async fn run_forwarder(
+    config: ForwarderConfig,
+    cancel: CancellationToken,
+) -> Result<(), TlsError> {
     let tls = client_config(&config.ca, &config.cert, &config.key)?;
     let server_name = ServerName::try_from(config.server_name.clone())
         .map_err(|e| TlsError::Rustls(format!("invalid server_name: {e}")))?;
@@ -156,7 +165,12 @@ pub async fn run_forwarder(config: ForwarderConfig, cancel: CancellationToken) -
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&config.server_addr)).await {
+        let stream = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            TcpStream::connect(&config.server_addr),
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
             other => {
                 let why = match other {
@@ -171,7 +185,12 @@ pub async fn run_forwarder(config: ForwarderConfig, cancel: CancellationToken) -
                 continue 'connect;
             }
         };
-        let mut conn = match tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name.clone(), stream)).await {
+        let mut conn = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connector.connect(server_name.clone(), stream),
+        )
+        .await
+        {
             Ok(Ok(c)) => c,
             other => {
                 let why = match other {
@@ -218,9 +237,22 @@ pub async fn run_forwarder(config: ForwarderConfig, cancel: CancellationToken) -
 
             if !batch.events.is_empty() {
                 seq += 1;
-                let sent = write_frame(&mut conn, &ClientMsg::Batch { seq, events: batch.events }).await;
+                let sent = write_frame(
+                    &mut conn,
+                    &ClientMsg::Batch {
+                        seq,
+                        events: batch.events,
+                    },
+                )
+                .await;
                 let reply = match sent {
-                    Ok(()) => tokio::time::timeout(config.ack_timeout, read_frame::<_, ServerMsg>(&mut conn)).await,
+                    Ok(()) => {
+                        tokio::time::timeout(
+                            config.ack_timeout,
+                            read_frame::<_, ServerMsg>(&mut conn),
+                        )
+                        .await
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "forwarder send failed; reconnecting");
                         if sleep_or_cancel(backoff, &cancel).await {
@@ -231,7 +263,11 @@ pub async fn run_forwarder(config: ForwarderConfig, cancel: CancellationToken) -
                 };
                 match reply {
                     Ok(Ok(ServerMsg::Ack { seq: acked })) if acked == seq => {}
-                    Ok(Ok(ServerMsg::Nack { permanent: true, reason, .. })) => {
+                    Ok(Ok(ServerMsg::Nack {
+                        permanent: true,
+                        reason,
+                        ..
+                    })) => {
                         tracing::error!(%reason, "server permanently rejected a batch; skipping it");
                     }
                     Ok(Ok(other)) => {

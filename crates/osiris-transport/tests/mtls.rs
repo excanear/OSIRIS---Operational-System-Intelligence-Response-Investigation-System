@@ -92,7 +92,12 @@ impl Pki {
         let dir = tempfile::tempdir().unwrap();
         let ca = generate_ca("test-ca").unwrap();
         write_issued(dir.path(), "ca", &ca).unwrap();
-        let server = issue_server(&ca.cert_pem, &ca.key_pem, &["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let server = issue_server(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &["localhost".into(), "127.0.0.1".into()],
+        )
+        .unwrap();
         write_issued(dir.path(), "server", &server).unwrap();
         Self { dir }
     }
@@ -107,8 +112,13 @@ impl Pki {
     }
 }
 
-async fn start_server(pki: &Pki, handler: Arc<Recorder>, revoked: HashSet<Uuid>) -> (String, CancellationToken) {
-    let cfg = tls::server_config(&pki.p("server.pem"), &pki.p("server.key"), &pki.p("ca.pem")).unwrap();
+async fn start_server(
+    pki: &Pki,
+    handler: Arc<Recorder>,
+    revoked: HashSet<Uuid>,
+) -> (String, CancellationToken) {
+    let cfg =
+        tls::server_config(&pki.p("server.pem"), &pki.p("server.key"), &pki.p("ca.pem")).unwrap();
     let listener = Listener::bind("127.0.0.1:0", cfg, revoked).await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let cancel = CancellationToken::new();
@@ -118,7 +128,11 @@ async fn start_server(pki: &Pki, handler: Arc<Recorder>, revoked: HashSet<Uuid>)
 
 fn write_spool(path: &Path, events: &[CanonicalEvent]) {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
     for e in events {
         writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
     }
@@ -158,11 +172,20 @@ async fn an_enrolled_agents_spool_is_delivered_and_the_offset_persisted() {
     let spool = pki.p("spool.ndjson");
     write_spool(&spool, &[event(host, 1), event(host, 2), event(host, 3)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
 
     wait_for(|| handler.received.lock().unwrap().len() == 3).await;
     let len = std::fs::metadata(&spool).unwrap().len();
-    wait_for(|| std::fs::read_to_string(offset_path(&spool)).ok().and_then(|s| s.parse::<u64>().ok()) == Some(len)).await;
+    wait_for(|| {
+        std::fs::read_to_string(offset_path(&spool))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(len)
+    })
+    .await;
 
     cancel.cancel();
     task.await.unwrap().unwrap();
@@ -180,20 +203,36 @@ async fn a_restarted_forwarder_resumes_from_the_acknowledged_offset() {
 
     write_spool(&spool, &[event(host, 1), event(host, 2)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
     wait_for(|| handler.received.lock().unwrap().len() == 2).await;
     let len = std::fs::metadata(&spool).unwrap().len();
-    wait_for(|| std::fs::read_to_string(offset_path(&spool)).ok().and_then(|s| s.parse::<u64>().ok()) == Some(len)).await;
+    wait_for(|| {
+        std::fs::read_to_string(offset_path(&spool))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(len)
+    })
+    .await;
     cancel.cancel();
     task.await.unwrap().unwrap();
 
     // A new process: only the new event may be sent.
     write_spool(&spool, &[event(host, 3)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
     wait_for(|| handler.received.lock().unwrap().len() == 3).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(handler.received.lock().unwrap().len(), 3, "nothing may be redelivered");
+    assert_eq!(
+        handler.received.lock().unwrap().len(),
+        3,
+        "nothing may be redelivered"
+    );
     cancel.cancel();
     task.await.unwrap().unwrap();
     server_cancel.cancel();
@@ -210,10 +249,16 @@ async fn a_failed_batch_is_retried_and_eventually_delivered() {
     let spool = pki.p("spool.ndjson");
     write_spool(&spool, &[event(host, 1)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
 
     wait_for(|| handler.received.lock().unwrap().len() == 1).await;
-    assert!(handler.calls.load(Ordering::SeqCst) >= 2, "the first attempt failed");
+    assert!(
+        handler.calls.load(Ordering::SeqCst) >= 2,
+        "the first attempt failed"
+    );
     cancel.cancel();
     task.await.unwrap().unwrap();
     server_cancel.cancel();
@@ -229,11 +274,24 @@ async fn events_claiming_another_host_are_rejected_and_skipped() {
     let spool = pki.p("spool.ndjson");
     write_spool(&spool, &[event(Uuid::new_v4(), 1)]); // a different host id
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
 
     let len = std::fs::metadata(&spool).unwrap().len();
-    wait_for(|| std::fs::read_to_string(offset_path(&spool)).ok().and_then(|s| s.parse::<u64>().ok()) == Some(len)).await;
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 0, "the handler must never see a spoofed batch");
+    wait_for(|| {
+        std::fs::read_to_string(offset_path(&spool))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(len)
+    })
+    .await;
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        0,
+        "the handler must never see a spoofed batch"
+    );
     assert!(handler.received.lock().unwrap().is_empty());
     cancel.cancel();
     task.await.unwrap().unwrap();
@@ -250,11 +308,17 @@ async fn a_revoked_host_is_refused() {
     let spool = pki.p("spool.ndjson");
     write_spool(&spool, &[event(host, 1)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "agent", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "agent", &spool),
+        cancel.clone(),
+    ));
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
-    assert!(std::fs::read_to_string(offset_path(&spool)).is_err(), "nothing acknowledged");
+    assert!(
+        std::fs::read_to_string(offset_path(&spool)).is_err(),
+        "nothing acknowledged"
+    );
     cancel.cancel();
     task.await.unwrap().unwrap();
     server_cancel.cancel();
@@ -274,7 +338,10 @@ async fn a_certificate_from_a_foreign_ca_is_refused() {
     let spool = pki.p("spool.ndjson");
     write_spool(&spool, &[event(host, 1)]);
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(run_forwarder(forwarder(&pki, &addr, "rogue", &spool), cancel.clone()));
+    let task = tokio::spawn(run_forwarder(
+        forwarder(&pki, &addr, "rogue", &spool),
+        cancel.clone(),
+    ));
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
@@ -296,11 +363,13 @@ async fn a_client_with_no_certificate_cannot_send_anything() {
     for c in tls::load_certs(&pki.p("ca.pem")).unwrap() {
         roots.add(c).unwrap();
     }
-    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -314,7 +383,10 @@ async fn a_client_with_no_certificate_cannot_send_anything() {
         Ok::<usize, std::io::Error>(n)
     }
     .await;
-    assert!(matches!(outcome, Err(_) | Ok(0)), "server must not talk to an unauthenticated client");
+    assert!(
+        matches!(outcome, Err(_) | Ok(0)),
+        "server must not talk to an unauthenticated client"
+    );
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
     server_cancel.cancel();
 }

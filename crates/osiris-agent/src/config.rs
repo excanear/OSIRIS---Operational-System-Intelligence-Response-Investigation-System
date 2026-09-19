@@ -382,9 +382,13 @@ mod tests {
     fn forward_is_optional_and_parses_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.yaml");
-        std::fs::write(&path, "spool_path: /tmp/s.ndjson
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson
 status_addr: 127.0.0.1:9200
-").unwrap();
+",
+        )
+        .unwrap();
         assert!(AgentConfig::load(&path).unwrap().forward.is_none());
         std::fs::write(
             &path,
