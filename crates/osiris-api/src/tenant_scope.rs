@@ -19,21 +19,26 @@ fn read_only() -> StorageError {
 pub struct TenantScopedStorage {
     inner: Arc<dyn Storage>,
     hosts: HashSet<Uuid>,
+    /// Precomputed once: the tenant's hosts as strings, and as a set for the
+    /// intersection with a caller-supplied host list.
+    allowed: Vec<String>,
+    allowed_set: HashSet<String>,
 }
 
 impl TenantScopedStorage {
     pub fn new(inner: Arc<dyn Storage>, hosts: HashSet<Uuid>) -> Self {
-        Self { inner, hosts }
+        let allowed: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let allowed_set: HashSet<String> = allowed.iter().cloned().collect();
+        Self { inner, hosts, allowed, allowed_set }
     }
 
     /// The effective host list for a plan: the tenant's hosts, intersected
     /// with whatever the caller already asked for. The decorator can only
     /// narrow a query, never widen it.
     fn effective(&self, requested: &Option<Vec<String>>) -> Option<Vec<String>> {
-        let allowed: Vec<String> = self.hosts.iter().map(|h| h.to_string()).collect();
         match requested {
-            None => Some(allowed),
-            Some(want) => Some(want.iter().filter(|h| allowed.contains(h)).cloned().collect()),
+            None => Some(self.allowed.clone()),
+            Some(want) => Some(want.iter().filter(|h| self.allowed_set.contains(*h)).cloned().collect()),
         }
     }
 }
@@ -126,10 +131,14 @@ pub(crate) async fn tenant_hosts(
             "tenant registry unavailable".to_string(),
         ));
     };
+    let lookup_failed = |cause: String| {
+        tracing::error!(error = %cause, "tenant host lookup failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string())
+    };
     let hosts = tokio::task::spawn_blocking(move || tenants.hosts_of(tenant_id))
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string()))?
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string()))?;
+        .map_err(|e| lookup_failed(e.to_string()))?
+        .map_err(|e| lookup_failed(e.to_string()))?;
     Ok(Some(hosts))
 }
 
@@ -212,9 +221,9 @@ mod tests {
         inner: Arc<dyn Storage>,
         a: Uuid,
         b: Uuid,
-        unassigned: Uuid,
         ev_a: CanonicalEvent,
         ev_b: CanonicalEvent,
+        ev_u: CanonicalEvent,
     }
 
     fn fixture() -> Fixture {
@@ -224,8 +233,8 @@ mod tests {
         let ev_a = event_on(a, 1, 100);
         let ev_b = event_on(b, 2, 200);
         let ev_u = event_on(unassigned, 3, 300);
-        storage.batch_write(&[ev_a.clone(), ev_b.clone(), ev_u]).unwrap();
-        Fixture { _dir: dir, inner: Arc::new(storage), a, b, unassigned, ev_a, ev_b }
+        storage.batch_write(&[ev_a.clone(), ev_b.clone(), ev_u.clone()]).unwrap();
+        Fixture { _dir: dir, inner: Arc::new(storage), a, b, ev_a, ev_b, ev_u }
     }
 
     fn scoped(f: &Fixture, hosts: &[Uuid]) -> TenantScopedStorage {
@@ -282,7 +291,7 @@ mod tests {
         assert!(s.get_event(f.ev_a.event_id).unwrap().is_some());
         assert!(s.get_event(f.ev_b.event_id).unwrap().is_none());
         assert!(s.get_event(Uuid::new_v4()).unwrap().is_none());
-        assert!(f.unassigned != f.a);
+        assert!(s.get_event(f.ev_u.event_id).unwrap().is_none());
     }
 
     #[test]

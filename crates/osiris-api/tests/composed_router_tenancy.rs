@@ -437,6 +437,25 @@ async fn a_tenant_user_cannot_manage_tenants() {
     let (status, _) = call(&t.app, "PUT", &uri, Some(&t.acme_token), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(t.tenants.tenant_of(host).unwrap(), None);
+    assert!(
+        !t.tenants.list_tenants().unwrap().iter().any(|x| x.name == "sneaky"),
+        "a tenant user must not have been able to create a tenant"
+    );
+}
+
+#[tokio::test]
+async fn unassigning_through_the_wrong_tenants_url_is_a_404_and_changes_nothing() {
+    let t = tenancy();
+    let host = t.globex_host; // assigned to globex
+    let wrong = format!("/api/v1/tenants/{}/hosts/{host}", t.acme_tenant);
+    let (status, _) = call(&t.app, "DELETE", &wrong, Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(t.tenants.tenant_of(host).unwrap(), Some(t.globex_tenant));
+
+    let right = format!("/api/v1/tenants/{}/hosts/{host}", t.globex_tenant);
+    let (status, _) = call(&t.app, "DELETE", &right, Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(t.tenants.tenant_of(host).unwrap(), None);
 }
 
 #[tokio::test]
@@ -470,6 +489,20 @@ async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() 
     assert_eq!(login["tenant_name"], "acme");
 
     // A platform user's login carries no tenant.
+    let (status, _) = call(
+        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
+        Some(serde_json::json!({ "username": "plat", "password": "password123", "role": "VIEWER" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, login) = call(
+        &t.app, "POST", "/api/v1/auth/login", None,
+        Some(serde_json::json!({ "username": "plat", "password": "password123" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(login["tenant_id"].is_null(), "platform login must carry a null tenant_id: {login}");
+
     let (status, unknown) = call(
         &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
         Some(serde_json::json!({

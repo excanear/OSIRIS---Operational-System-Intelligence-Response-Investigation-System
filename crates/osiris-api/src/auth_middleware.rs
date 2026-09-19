@@ -699,6 +699,11 @@ mod tests {
             (Method::PUT, "/api/v1/tenants/x/hosts/y"),
             (Method::POST, "/api/v1/events"),
             (Method::GET, "/api/v1/something-new"),
+            (Method::GET, "/api/v1/processes/"),
+            (Method::GET, "/api/v1/incidents//reconstruct"),
+            (Method::GET, "/api/v1/incidents/x/reconstruct/extra"),
+            (Method::GET, "/api/v1/events/"),
+            (Method::GET, "/api/v1/incidents/x"),
         ] {
             assert!(!tenant_route_allowed(&m, path), "{m} {path} must be denied");
         }

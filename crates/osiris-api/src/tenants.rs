@@ -106,6 +106,17 @@ async fn unassign_host_handler(
 ) -> Result<StatusCode, (StatusCode, String)> {
     platform_only(&ctx)?;
     let tenants = state.tenants.clone();
+    // The host must actually belong to the tenant named in the URL.
+    let owner = {
+        let tenants = tenants.clone();
+        tokio::task::spawn_blocking(move || tenants.tenant_of(host_id))
+            .await
+            .unwrap()
+            .map_err(store_error)?
+    };
+    if owner != Some(tenant_id) {
+        return Err((StatusCode::NOT_FOUND, "host is not assigned to that tenant".to_string()));
+    }
     tokio::task::spawn_blocking(move || tenants.unassign_host(host_id))
         .await
         .unwrap()

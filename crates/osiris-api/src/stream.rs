@@ -27,6 +27,9 @@ const LIVE_EVENT_CHANNEL_CAPACITY: usize = 4096;
 struct Connection {
     id: Uuid,
     filter: Option<Ast>,
+    /// Tenant host restriction, checked in O(1) before any AST evaluation.
+    /// `Some(empty)` delivers nothing.
+    hosts: Option<HashSet<Uuid>>,
     sender: mpsc::Sender<CanonicalEvent>,
     dropped_total: Arc<AtomicU64>,
 }
@@ -51,12 +54,22 @@ impl LiveEventBroadcaster {
     /// receiver half a WebSocket handler forwards to the socket, and a
     /// shared drop counter for observability.
     pub fn subscribe(&self, filter: Option<Ast>) -> (Uuid, mpsc::Receiver<CanonicalEvent>, Arc<AtomicU64>) {
+        self.subscribe_scoped(filter, None)
+    }
+
+    /// Like `subscribe`, but restricted to `hosts` when `Some`.
+    pub fn subscribe_scoped(
+        &self,
+        filter: Option<Ast>,
+        hosts: Option<HashSet<Uuid>>,
+    ) -> (Uuid, mpsc::Receiver<CanonicalEvent>, Arc<AtomicU64>) {
         let id = Uuid::new_v4();
         let (sender, receiver) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
         let dropped_total = Arc::new(AtomicU64::new(0));
         self.connections.lock().unwrap().push(Connection {
             id,
             filter,
+            hosts,
             sender,
             dropped_total: dropped_total.clone(),
         });
@@ -97,6 +110,11 @@ impl LiveEventBroadcaster {
         let connections = self.connections.lock().unwrap();
         for event in events {
             for conn in connections.iter() {
+                if let Some(hosts) = &conn.hosts {
+                    if !hosts.contains(&event.host_id) {
+                        continue;
+                    }
+                }
                 let matches = match &conn.filter {
                     Some(ast) => eval_ast(event, ast),
                     None => true,
@@ -149,19 +167,9 @@ fn origin_is_same_site(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// `AND`s the tenant's host restriction onto the caller's own filter. An empty
-/// host set yields `host_id IN []`, which `eval_ast` evaluates to false for
-/// every event (`items.iter().any(..)` over nothing), so it matches nothing.
-pub(crate) fn tenant_filter(user_filter: Option<Ast>, hosts: &HashSet<Uuid>) -> Ast {
-    let host_ast = Ast::Compare {
-        field: "host_id".to_string(),
-        op: Op::In,
-        value: Value::List(hosts.iter().map(|h| Value::Str(h.to_string())).collect()),
-    };
-    match user_filter {
-        Some(user) => Ast::And(Box::new(user), Box::new(host_ast)),
-        None => host_ast,
-    }
+/// Canonical spelling of a requested `host_id` (None if not a UUID).
+pub(crate) fn normalize_host(requested: &str) -> Option<String> {
+    Uuid::parse_str(requested).ok().map(|id| id.to_string())
 }
 
 /// Whether a `host_id` the client asked for belongs to the tenant.
@@ -206,7 +214,7 @@ async fn stream_events_handler(
         Some(Ast::Compare {
             field: "host_id".to_string(),
             op: Op::Eq,
-            value: Value::Str(host_id),
+            value: Value::Str(normalize_host(&host_id).unwrap_or(host_id)),
         })
     } else if let Some(q) = params.q {
         let plan = EventQueryPlan::with_filter(&q)
@@ -216,16 +224,14 @@ async fn stream_events_handler(
         None
     };
 
-    let filter = match &tenant_hosts {
-        Some(hosts) => Some(tenant_filter(filter, hosts)),
-        None => filter,
-    };
-
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter, tenant_hosts)))
 }
 
-async fn handle_socket(mut socket: WebSocket, broadcaster: Arc<LiveEventBroadcaster>, filter: Option<Ast>) {
-    let (id, mut receiver, _dropped_total) = broadcaster.subscribe(filter);
+async fn handle_socket(mut socket: WebSocket, broadcaster: Arc<LiveEventBroadcaster>,
+    filter: Option<Ast>,
+    hosts: Option<HashSet<Uuid>>,
+) {
+    let (id, mut receiver, _dropped_total) = broadcaster.subscribe_scoped(filter, hosts);
     loop {
         tokio::select! {
             maybe_event = receiver.recv() => {
@@ -403,34 +409,59 @@ mod tests {
         assert!(!broadcaster.has_subscribers());
     }
 
-    #[test]
-    fn tenant_filter_ands_the_hosts_onto_the_callers_filter() {
-        let a = Uuid::new_v4();
-        let hosts: HashSet<Uuid> = [a].into_iter().collect();
+    #[tokio::test]
+    async fn a_scoped_connection_only_receives_its_hosts_events() {
+        let broadcaster = LiveEventBroadcaster::new();
+        let (mine, foreign) = (Uuid::new_v4(), Uuid::new_v4());
+        let hosts: HashSet<Uuid> = [mine].into_iter().collect();
+        let (_id, mut receiver, _d) = broadcaster.subscribe_scoped(None, Some(hosts));
+
+        broadcaster.publish(&[
+            sample_event(foreign, EventType::ProcessExec),
+            sample_event(mine, EventType::ProcessExec),
+        ]);
+
+        assert_eq!(receiver.try_recv().unwrap().host_id, mine);
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_connection_applies_the_callers_filter_after_the_host_check() {
+        let broadcaster = LiveEventBroadcaster::new();
+        let mine = Uuid::new_v4();
+        let hosts: HashSet<Uuid> = [mine].into_iter().collect();
         let user = Ast::Compare {
             field: "event_type".to_string(),
             op: Op::Eq,
             value: Value::Str("PROCESS_EXEC".to_string()),
         };
-        let combined = tenant_filter(Some(user), &hosts);
-        assert!(eval_ast(&sample_event(a, EventType::ProcessExec), &combined));
-        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
-        assert!(!eval_ast(&sample_event(a, EventType::FileWrite), &combined));
+        let (_id, mut receiver, _d) = broadcaster.subscribe_scoped(Some(user), Some(hosts));
+
+        broadcaster.publish(&[
+            sample_event(mine, EventType::FileWrite),
+            sample_event(mine, EventType::ProcessExec),
+        ]);
+
+        assert_eq!(receiver.try_recv().unwrap().event_type, EventType::ProcessExec);
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[tokio::test]
+    async fn an_empty_scoped_host_set_delivers_nothing() {
+        let broadcaster = LiveEventBroadcaster::new();
+        let (_id, mut receiver, _d) = broadcaster.subscribe_scoped(None, Some(HashSet::new()));
+        broadcaster.publish(&[sample_event(Uuid::new_v4(), EventType::ProcessExec)]);
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
     #[test]
-    fn an_empty_tenant_host_set_matches_nothing() {
-        // `Op::In` against an empty list is `items.iter().any(..)` == false.
-        let combined = tenant_filter(None, &HashSet::new());
-        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
-        // Also with a caller filter that would match on its own.
-        let user = Ast::Compare {
-            field: "event_type".to_string(),
-            op: Op::Eq,
-            value: Value::Str("PROCESS_EXEC".to_string()),
-        };
-        let combined = tenant_filter(Some(user), &HashSet::new());
-        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
+    fn a_requested_host_is_normalized_through_the_parsed_uuid() {
+        let a = Uuid::new_v4();
+        let upper = a.to_string().to_uppercase();
+        let braced = format!("{{{a}}}");
+        assert_eq!(normalize_host(&upper), Some(a.to_string()));
+        assert_eq!(normalize_host(&braced), Some(a.to_string()));
+        assert_eq!(normalize_host("nope"), None);
     }
 
     #[test]

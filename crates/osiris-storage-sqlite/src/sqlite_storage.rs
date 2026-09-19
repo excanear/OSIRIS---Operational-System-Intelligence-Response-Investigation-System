@@ -261,21 +261,31 @@ fn conjunction_leaves(
 /// Appends the tenant host restriction to a WHERE clause already in progress:
 /// ` AND <column> IN (?,..)`, or ` AND 1=0` for an empty list (an empty host
 /// set must match nothing, never everything).
+const MAX_TENANT_HOSTS: usize = 30_000;
+
+fn host_set_too_large() -> StorageError {
+    StorageError::Backend("tenant host set too large (limit 30000)".to_string())
+}
+
 fn push_host_filter(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::ToSql>>,
     column: &str,
     host_ids: &Option<Vec<String>>,
-) {
-    let Some(ids) = host_ids else { return };
+) -> Result<(), StorageError> {
+    let Some(ids) = host_ids else { return Ok(()) };
+    if ids.len() > MAX_TENANT_HOSTS {
+        return Err(host_set_too_large());
+    }
     if ids.is_empty() {
         sql.push_str(" AND 1=0");
-        return;
+        return Ok(());
     }
     sql.push_str(&format!(" AND {column} IN ({})", vec!["?"; ids.len()].join(",")));
     for id in ids {
         params.push(Box::new(id.clone()));
     }
+    Ok(())
 }
 
 impl SqliteStorage {
@@ -288,7 +298,7 @@ impl SqliteStorage {
 
     /// Worst-case bound on how many rows a single `query_events` call will
     /// scan when pushdown covers little or none of the filter (e.g. an
-    /// `OR`, a `!=`, or a field with no indexed column such as `host_id`).
+    /// `OR`, a `!=`, or a field with no indexed column such as `process_name`).
     /// A query matching nothing over a huge table stops here rather than
     /// scanning unboundedly; the result is then bounded-incomplete, which
     /// is the same class of behavior the old fixed 20k prefetch had, only
@@ -361,7 +371,7 @@ impl SqliteStorage {
                 }
             }
         }
-        push_host_filter(&mut base_sql, &mut base_params, "host_id", &plan.host_ids);
+        push_host_filter(&mut base_sql, &mut base_params, "host_id", &plan.host_ids)?;
         if let Some(since) = plan.since {
             base_sql.push_str(" AND timestamp >= ?");
             base_params.push(Box::new(since.min(i64::MAX as u64) as i64));
@@ -591,7 +601,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND container_id = ?");
             sql_params.push(Box::new(container_id.clone()));
         }
-        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids);
+        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids)?;
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -726,7 +736,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND a.rule_id = ?");
             sql_params.push(Box::new(rule_id.clone()));
         }
-        push_host_filter(&mut sql, &mut sql_params, "a.host_id", &plan.host_ids);
+        push_host_filter(&mut sql, &mut sql_params, "a.host_id", &plan.host_ids)?;
         if let Some(since) = plan.since {
             sql.push_str(" AND a.timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -819,6 +829,9 @@ impl Storage for SqliteStorage {
             sql_params.push(Box::new(key));
         }
         if let Some(ids) = &plan.host_ids {
+            if ids.len() > MAX_TENANT_HOSTS {
+                return Err(host_set_too_large());
+            }
             if ids.is_empty() {
                 sql.push_str(" AND 1=0");
             } else {
@@ -958,7 +971,7 @@ impl Storage for SqliteStorage {
             sql.push_str(" AND event_id = ?");
             sql_params.push(Box::new(event_id.to_string()));
         }
-        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids);
+        push_host_filter(&mut sql, &mut sql_params, "host_id", &plan.host_ids)?;
         if let Some(since) = plan.since {
             sql.push_str(" AND timestamp >= ?");
             // Clamp rather than cast directly: a caller-supplied window can
@@ -2962,5 +2975,31 @@ mod tests {
             .query_relationships(&RelationshipQueryPlan { host_ids: Some(vec![]), ..RelationshipQueryPlan::new() })
             .unwrap()
             .is_empty());
+    }
+
+    fn too_many_hosts() -> Vec<String> {
+        (0..30_001).map(|_| Uuid::new_v4().to_string()).collect()
+    }
+
+    fn assert_too_large<T: std::fmt::Debug>(result: Result<T, StorageError>) {
+        match result {
+            Err(StorageError::Backend(msg)) => assert!(msg.contains("tenant host set too large"), "{msg}"),
+            other => panic!("expected the host-set-too-large error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_host_set_is_a_clear_error_on_the_events_path() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        assert_too_large(storage.query(&QueryPlan { host_ids: Some(too_many_hosts()), ..QueryPlan::new() }));
+    }
+
+    #[test]
+    fn an_oversized_host_set_is_a_clear_error_on_the_relationships_path() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        assert_too_large(storage.query_relationships(&RelationshipQueryPlan {
+            host_ids: Some(too_many_hosts()),
+            ..RelationshipQueryPlan::new()
+        }));
     }
 }
