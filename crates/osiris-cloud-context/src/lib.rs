@@ -89,20 +89,44 @@ pub(crate) async fn read_capped(
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-/// Probes every provider concurrently, each under `PROBE_TIMEOUT`, and
-/// returns the first `Some` in list order (deterministic when several answer).
+/// Whether `raw` is an acceptable metadata endpoint override: an http(s) URL
+/// with a host, no embedded credentials, query or fragment.
+pub fn valid_base_url(raw: &str) -> bool {
+    match reqwest::Url::parse(raw) {
+        Ok(u) => {
+            (u.scheme() == "http" || u.scheme() == "https")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.query().is_none()
+                && u.fragment().is_none()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Probes every provider concurrently, each under `PROBE_TIMEOUT`, and returns
+/// as soon as ANY provider answers: a non-cloud host still waits out the
+/// timeouts, but a cloud host no longer waits for the slower non-matching
+/// providers. Only one cloud's metadata service can genuinely answer, so which
+/// responder wins when several do is unspecified.
 pub async fn detect(providers: Vec<Box<dyn CloudMetadataProvider>>) -> Option<CloudContext> {
-    let probes = providers.iter().map(|p| async move {
-        tokio::time::timeout(PROBE_TIMEOUT, p.probe())
-            .await
-            .ok()
-            .flatten()
-    });
-    futures_util::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
-        .next()
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    let mut probes: FuturesUnordered<_> = providers
+        .iter()
+        .map(|p| async move {
+            tokio::time::timeout(PROBE_TIMEOUT, p.probe())
+                .await
+                .ok()
+                .flatten()
+        })
+        .collect();
+    while let Some(result) = probes.next().await {
+        if result.is_some() {
+            return result;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -135,6 +159,26 @@ mod tests {
             instance_id: Some("i-1".into()),
             region: None,
         }
+    }
+
+    #[test]
+    fn valid_base_url_accepts_plain_http_urls_and_rejects_the_rest() {
+        assert!(valid_base_url("http://169.254.169.254"));
+        assert!(valid_base_url("https://imds.internal:8443/base"));
+        assert!(!valid_base_url("ftp://x"));
+        assert!(!valid_base_url("not a url"));
+        assert!(!valid_base_url("http://user:pw@host"));
+        assert!(!valid_base_url("http://host/?q=1"));
+        assert!(!valid_base_url("file:///etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn detect_returns_without_waiting_for_a_slow_non_answering_provider() {
+        let providers: Vec<Box<dyn CloudMetadataProvider>> =
+            vec![Box::new(Slow), Box::new(Fixed(Some(ctx("aws"))))];
+        let start = std::time::Instant::now();
+        assert_eq!(detect(providers).await.unwrap().provider, "aws");
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
@@ -187,12 +231,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_prefers_list_order_when_several_answer() {
+    async fn detect_returns_one_of_the_answering_providers() {
         let providers: Vec<Box<dyn CloudMetadataProvider>> = vec![
             Box::new(Fixed(Some(ctx("aws")))),
             Box::new(Fixed(Some(ctx("gcp")))),
         ];
-        assert_eq!(detect(providers).await.unwrap().provider, "aws");
+        let got = detect(providers).await.unwrap().provider;
+        assert!(got == "aws" || got == "gcp");
     }
 
     #[tokio::test]

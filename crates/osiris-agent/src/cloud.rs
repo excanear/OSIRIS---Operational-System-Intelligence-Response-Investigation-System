@@ -8,6 +8,18 @@ use crate::config::CloudMetadataConfig;
 /// Outer bound on the whole startup probe so boot is never blocked longer.
 pub const DETECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// An override is used only if it is a sane http(s) URL; an invalid one is
+/// logged and that provider is left out (never silently redirected).
+fn override_ok(name: &str, url: &Option<String>) -> bool {
+    match url {
+        Some(u) if !osiris_cloud_context::valid_base_url(u) => {
+            tracing::warn!(provider = name, "ignoring invalid cloud_metadata base_url override; provider disabled");
+            false
+        }
+        _ => true,
+    }
+}
+
 pub fn build_providers(cfg: &CloudMetadataConfig) -> Vec<Box<dyn CloudMetadataProvider>> {
     if !cfg.enabled {
         return vec![];
@@ -24,7 +36,17 @@ pub fn build_providers(cfg: &CloudMetadataConfig) -> Vec<Box<dyn CloudMetadataPr
         Some(url) => GcpMetadata::with_base_url(url.clone()),
         None => GcpMetadata::new(),
     };
-    vec![Box::new(aws), Box::new(azure), Box::new(gcp)]
+    let mut providers: Vec<Box<dyn CloudMetadataProvider>> = Vec::new();
+    if override_ok("aws", &cfg.aws_base_url) {
+        providers.push(Box::new(aws));
+    }
+    if override_ok("azure", &cfg.azure_base_url) {
+        providers.push(Box::new(azure));
+    }
+    if override_ok("gcp", &cfg.gcp_base_url) {
+        providers.push(Box::new(gcp));
+    }
+    providers
 }
 
 /// `None` when disabled, on-prem/bare-metal, or the probe times out —
@@ -108,5 +130,21 @@ mod tests {
         let got = detect_cloud_context(&cfg).await.unwrap();
         assert_eq!(got.provider, "aws");
         assert_eq!(got.instance_id.as_deref(), Some("i-9"));
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn an_invalid_base_url_override_disables_only_that_provider() {
+        let cfg = CloudMetadataConfig {
+            enabled: true,
+            aws_base_url: Some("file:///etc/passwd".into()),
+            azure_base_url: None,
+            gcp_base_url: Some("http://127.0.0.1:1".into()),
+        };
+        assert_eq!(build_providers(&cfg).len(), 2);
     }
 }
