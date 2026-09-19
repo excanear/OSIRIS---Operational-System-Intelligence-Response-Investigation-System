@@ -102,15 +102,27 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     Role::Viewer
 }
 
-/// Routes a TENANT user (a user bound to a tenant) may call. Everything not
-/// listed is platform-only until Phase 8g scopes incidents/evidence/audit/
-/// response: the default is DENY, so a route added later stays platform-only
-/// until someone deliberately allowlists it (and makes it tenant-aware).
+/// Routes a TENANT user (a user bound to a tenant) may call. The default is
+/// DENY: a route added later stays platform-only until someone deliberately
+/// allowlists it AND makes its handler tenant-aware. Still platform-only:
+/// `/api/v1/audit` (one hash-chained log spanning all tenants), user
+/// administration and tenant administration.
 pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
 
-    if method == Method::POST && path == "/api/v1/auth/logout" {
-        return true;
+    // A single non-empty path segment after `prefix` (no further `/`).
+    let one_segment = |prefix: &str| {
+        path.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    };
+
+    if method == Method::POST {
+        return path == "/api/v1/auth/logout"
+            || path == "/api/v1/incidents"
+            || path == "/api/v1/evidence"
+            || one_segment("/api/v1/response/");
+    }
+    if method == Method::PATCH {
+        return one_segment("/api/v1/incidents/");
     }
     if method != Method::GET {
         return false;
@@ -135,6 +147,8 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
         "/api/v1/graph/subgraph",
         "/api/v1/risk",
         "/api/v1/stream/events",
+        "/api/v1/incidents",
+        "/api/v1/evidence",
     ];
     if EXACT.contains(&path) {
         return true;
@@ -143,10 +157,13 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
     if let Some(rest) = path.strip_prefix("/api/v1/processes/") {
         return !rest.is_empty();
     }
-    // /api/v1/incidents/:seed_entity/reconstruct is event-derived (a graph walk),
-    // unlike the incident CRUD routes, which stay platform-only.
+    // /api/v1/incidents/:incident_id (tenant-checked in the handler) and
+    // /api/v1/incidents/:seed_entity/reconstruct (event-derived, storage-scoped).
     if let Some(rest) = path.strip_prefix("/api/v1/incidents/") {
-        return rest.ends_with("/reconstruct") && rest.len() > "/reconstruct".len();
+        if let Some(seed) = rest.strip_suffix("/reconstruct") {
+            return !seed.is_empty();
+        }
+        return !rest.is_empty() && !rest.contains('/');
     }
     false
 }
@@ -680,19 +697,27 @@ mod tests {
             "/api/v1/containers", "/api/v1/containers/story", "/api/v1/system/story",
             "/api/v1/graph", "/api/v1/graph/subgraph", "/api/v1/risk",
             "/api/v1/incidents/PROCESS:abc/reconstruct", "/api/v1/stream/events",
+            "/api/v1/incidents", "/api/v1/incidents/123", "/api/v1/evidence",
         ] {
             assert!(tenant_route_allowed(&Method::GET, path), "GET {path} must be allowed");
         }
         assert!(tenant_route_allowed(&Method::POST, "/api/v1/auth/logout"));
         for (m, path) in [
-            (Method::GET, "/api/v1/incidents"),
-            (Method::GET, "/api/v1/incidents/123"),
             (Method::POST, "/api/v1/incidents"),
             (Method::PATCH, "/api/v1/incidents/123"),
-            (Method::GET, "/api/v1/evidence"),
             (Method::POST, "/api/v1/evidence"),
-            (Method::GET, "/api/v1/audit"),
             (Method::POST, "/api/v1/response/collect_evidence"),
+        ] {
+            assert!(tenant_route_allowed(&m, path), "{m} {path} must be allowed");
+        }
+        for (m, path) in [
+            (Method::GET, "/api/v1/audit"),
+            (Method::POST, "/api/v1/response/"),
+            (Method::POST, "/api/v1/response/a/b"),
+            (Method::PATCH, "/api/v1/incidents/"),
+            (Method::PATCH, "/api/v1/incidents/a/b"),
+            (Method::DELETE, "/api/v1/incidents/1"),
+            (Method::GET, "/api/v1/incidents/a/b"),
             (Method::GET, "/api/v1/auth/users"),
             (Method::POST, "/api/v1/auth/users"),
             (Method::GET, "/api/v1/tenants"),
@@ -703,7 +728,6 @@ mod tests {
             (Method::GET, "/api/v1/incidents//reconstruct"),
             (Method::GET, "/api/v1/incidents/x/reconstruct/extra"),
             (Method::GET, "/api/v1/events/"),
-            (Method::GET, "/api/v1/incidents/x"),
         ] {
             assert!(!tenant_route_allowed(&m, path), "{m} {path} must be denied");
         }
@@ -743,8 +767,8 @@ mod tests {
         let app = protected_app(state);
         assert_eq!(status_of(&app, "/api/v1/events", &token).await, StatusCode::OK);
         // Tenant-ness, not role, is what denies these: the caller is an Admin.
+        // (the audit log spans all tenants and platform events: platform-only)
         assert_eq!(status_of(&app, "/api/v1/audit", &token).await, StatusCode::FORBIDDEN);
-        assert_eq!(status_of(&app, "/api/v1/incidents", &token).await, StatusCode::FORBIDDEN);
         assert_eq!(
             status_of(&app, "/api/v1/protected", &token).await,
             StatusCode::FORBIDDEN,

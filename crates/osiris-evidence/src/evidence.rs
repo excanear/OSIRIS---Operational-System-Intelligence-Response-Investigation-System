@@ -37,6 +37,8 @@ pub struct Evidence {
     integrity: Integrity,
     relationships: Vec<EntityRef>,
     supersedes: Option<Uuid>,
+    /// Owning tenant; `None` = platform-owned. Set once, before insertion.
+    tenant_id: Option<Uuid>,
 }
 
 impl Evidence {
@@ -55,7 +57,14 @@ impl Evidence {
             integrity,
             relationships,
             supersedes,
+            tenant_id: None,
         })
+    }
+
+    /// Tags this (not yet inserted) record with its owning tenant.
+    pub fn with_tenant(mut self, tenant_id: Option<Uuid>) -> Self {
+        self.tenant_id = tenant_id;
+        self
     }
 
     fn validate(integrity: &Integrity) -> Result<(), EvidenceError> {
@@ -83,6 +92,9 @@ impl Evidence {
     pub fn supersedes(&self) -> Option<Uuid> {
         self.supersedes
     }
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        self.tenant_id
+    }
 }
 
 #[derive(Deserialize)]
@@ -93,6 +105,8 @@ struct EvidenceWire {
     integrity: Integrity,
     relationships: Vec<EntityRef>,
     supersedes: Option<Uuid>,
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
 }
 
 impl<'de> Deserialize<'de> for Evidence {
@@ -106,6 +120,7 @@ impl<'de> Deserialize<'de> for Evidence {
             integrity: wire.integrity,
             relationships: wire.relationships,
             supersedes: wire.supersedes,
+            tenant_id: wire.tenant_id,
         })
     }
 }

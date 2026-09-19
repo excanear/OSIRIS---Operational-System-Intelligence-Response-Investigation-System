@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use osiris_audit::{ActorRef, AuditLog, AuditResult, NewAuditEntry};
-use osiris_evidence::{EvidenceIncidentLinks, EvidenceStore};
+use osiris_evidence::{EvidenceIncidentLinks, EvidenceStore, IncidentStore};
 use osiris_response::{dispatch, ResponseActionKind, ResponseError, ResponseOutcome, ResponseRequest};
 use osiris_schema::EntityRef;
 use osiris_storage::Storage;
@@ -19,6 +19,7 @@ pub struct ResponseState {
     pub storage: Arc<dyn Storage>,
     pub evidence: Arc<dyn EvidenceStore>,
     pub links: Arc<dyn EvidenceIncidentLinks>,
+    pub incidents: Arc<dyn IncidentStore>,
     pub audit_log: Arc<dyn AuditLog + Send + Sync>,
 }
 
@@ -55,6 +56,7 @@ fn parse_action(raw: &str) -> Option<ResponseActionKind> {
 async fn response_handler(
     State(state): State<ResponseState>,
     Extension(ctx): Extension<AuthContext>,
+    tenants: Option<Extension<Arc<dyn osiris_tenancy::TenantStore>>>,
     Path(action_raw): Path<String>,
     Json(body): Json<ResponseRequestBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
@@ -65,6 +67,29 @@ async fn response_handler(
         return Err((StatusCode::BAD_REQUEST, "reason must not be empty".to_string()));
     }
 
+    // A tenant's target resolution and evidence collection only ever see its own
+    // hosts' events; a foreign/platform-owned incident answers 404.
+    let storage: Arc<dyn Storage> = match crate::tenant_scope::hosts_of_tenant(
+        ctx.tenant_id,
+        tenants.map(|Extension(t)| t),
+    )
+    .await?
+    {
+        None => state.storage.clone(),
+        Some(hosts) => Arc::new(crate::tenant_scope::TenantScopedStorage::new(state.storage.clone(), hosts)),
+    };
+    if let (Some(tenant), Some(incident_id)) = (ctx.tenant_id, body.incident_id) {
+        let incidents = state.incidents.clone();
+        let owned = tokio::task::spawn_blocking(move || incidents.get(incident_id))
+            .await
+            .unwrap()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .is_some_and(|i| i.tenant_id == Some(tenant));
+        if !owned {
+            return Err((StatusCode::NOT_FOUND, "incident not found".to_string()));
+        }
+    }
+
     let request = ResponseRequest {
         action,
         target: body.target,
@@ -73,6 +98,7 @@ async fn response_handler(
         since: body.since,
         until: body.until,
         incident_id: body.incident_id,
+        tenant_id: ctx.tenant_id,
     };
     let original_target = request.target.clone();
     let original_reason = request.reason.clone();
@@ -93,7 +119,7 @@ async fn response_handler(
         // Exactly one audit entry is written, after the outcome is known,
         // so its `why`/`result` reflect what actually happened rather than
         // the operator's a-priori justification (Fix 3).
-        let storage = state.storage.clone();
+        let storage = storage.clone();
         let evidence = state.evidence.clone();
         let links = state.links.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -167,7 +193,7 @@ async fn response_handler(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("audit log write failed: {e}")));
     }
 
-    let storage = state.storage.clone();
+    let storage = storage.clone();
     let evidence = state.evidence.clone();
     let links = state.links.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -270,6 +296,7 @@ mod tests {
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: Arc::new(SqliteEvidenceStore::open(dir.path().join("evidence.db").to_str().unwrap()).unwrap()),
             links: Arc::new(SqliteEvidenceIncidentLinks::open(dir.path().join("links.db").to_str().unwrap()).unwrap()),
+            incidents: Arc::new(osiris_evidence::SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap()),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -369,7 +396,7 @@ mod tests {
         };
         let (status, Json(resp)) = response_handler(
             State(state),
-            Extension(ctx()),
+            Extension(ctx()), None,
             Path("collect_evidence".to_string()),
             Json(body),
         )
@@ -400,7 +427,7 @@ mod tests {
             until: None,
             incident_id: None,
         };
-        let err = response_handler(State(state), Extension(ctx()), Path("collect_evidence".to_string()), Json(body))
+        let err = response_handler(State(state), Extension(ctx()), None, Path("collect_evidence".to_string()), Json(body))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -428,7 +455,7 @@ mod tests {
         // Mixed-case / non-canonical path segment — must not leak into `what`.
         let (status, _resp) = response_handler(
             State(state),
-            Extension(ctx()),
+            Extension(ctx()), None,
             Path("CoLLect_Evidence".to_string()),
             Json(body),
         )
@@ -456,7 +483,7 @@ mod tests {
         };
         let (status, Json(resp)) = response_handler(
             State(state),
-            Extension(ctx()),
+            Extension(ctx()), None,
             Path("collect_evidence".to_string()),
             Json(body),
         )
@@ -493,6 +520,7 @@ mod tests {
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: evidence.clone(),
             links: Arc::new(SqliteEvidenceIncidentLinks::open(dir.path().join("links.db").to_str().unwrap()).unwrap()),
+            incidents: Arc::new(osiris_evidence::SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap()),
             audit_log: Arc::new(failing_log),
         };
         let host_id = Uuid::new_v4();
@@ -506,7 +534,7 @@ mod tests {
             until: None,
             incident_id: None,
         };
-        let err = response_handler(State(state), Extension(ctx()), Path("collect_evidence".to_string()), Json(body))
+        let err = response_handler(State(state), Extension(ctx()), None, Path("collect_evidence".to_string()), Json(body))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
@@ -530,6 +558,7 @@ mod tests {
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: evidence.clone(),
             links: Arc::new(SqliteEvidenceIncidentLinks::open(dir.path().join("links.db").to_str().unwrap()).unwrap()),
+            incidents: Arc::new(osiris_evidence::SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap()),
             audit_log: Arc::new(failing_log),
         };
         let host_id = Uuid::new_v4();
@@ -545,7 +574,7 @@ mod tests {
         };
         let (status, Json(resp)) = response_handler(
             State(state),
-            Extension(ctx()),
+            Extension(ctx()), None,
             Path("collect_evidence".to_string()),
             Json(body),
         )
@@ -574,7 +603,7 @@ mod tests {
         };
         let (status, Json(resp)) = response_handler(
             State(state),
-            Extension(ctx()),
+            Extension(ctx()), None,
             Path("block_indicator".to_string()),
             Json(body),
         )
@@ -596,7 +625,7 @@ mod tests {
             until: None,
             incident_id: None,
         };
-        let err = response_handler(State(state), Extension(ctx()), Path("collect_evidence".to_string()), Json(body))
+        let err = response_handler(State(state), Extension(ctx()), None, Path("collect_evidence".to_string()), Json(body))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -614,7 +643,7 @@ mod tests {
             until: None,
             incident_id: None,
         };
-        let err = response_handler(State(state), Extension(ctx()), Path("not_a_real_action".to_string()), Json(body))
+        let err = response_handler(State(state), Extension(ctx()), None, Path("not_a_real_action".to_string()), Json(body))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);

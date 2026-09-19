@@ -29,6 +29,9 @@ pub struct Incident {
     pub entities: Vec<EntityRef>,
     pub alert_ids: Vec<Uuid>,
     pub notes: Vec<String>,
+    /// Owning tenant; `None` = platform-owned (invisible to tenant users).
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +52,8 @@ pub trait IncidentStore: Send + Sync {
     fn create(&self, incident: Incident) -> Result<Incident, IncidentStoreError>;
     fn get(&self, incident_id: Uuid) -> Result<Option<Incident>, IncidentStoreError>;
     fn list(&self) -> Result<Vec<Incident>, IncidentStoreError>;
+    /// Only the incidents owned by `tenant_id`.
+    fn list_for_tenant(&self, tenant_id: Uuid) -> Result<Vec<Incident>, IncidentStoreError>;
 
     /// Writes an audit entry via `audit_log` *before* persisting the new
     /// status (plan Global Constraint #8) — if the audit write fails, this
@@ -152,6 +157,14 @@ impl IncidentStore for SqliteIncidentStore {
         Ok(incidents)
     }
 
+    fn list_for_tenant(&self, tenant_id: Uuid) -> Result<Vec<Incident>, IncidentStoreError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|i| i.tenant_id == Some(tenant_id))
+            .collect())
+    }
+
     fn transition_status(
         &self,
         incident_id: Uuid,
@@ -196,6 +209,7 @@ mod tests {
             entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
             alert_ids: vec![],
             notes: vec![],
+            tenant_id: None,
         }
     }
 
@@ -265,11 +279,49 @@ mod tests {
             entities: vec![],
             alert_ids: vec![],
             notes: vec![],
+            tenant_id: None,
         };
         let created = store.create(no_entities).unwrap();
         let err = store
             .transition_status(created.incident_id, IncidentStatus::Investigating, ActorRef::System, None, &audit_log)
             .unwrap_err();
         assert!(matches!(err, IncidentStoreError::NoEntities));
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+
+    fn inc(tenant: Option<Uuid>) -> Incident {
+        Incident {
+            incident_id: Uuid::now_v7(),
+            status: IncidentStatus::New,
+            entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+            alert_ids: vec![],
+            notes: vec![],
+            tenant_id: tenant,
+        }
+    }
+
+    #[test]
+    fn list_for_tenant_excludes_other_tenants_and_platform_incidents() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let mine = store.create(inc(Some(a))).unwrap();
+        store.create(inc(Some(b))).unwrap();
+        store.create(inc(None)).unwrap();
+        let listed = store.list_for_tenant(a).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].incident_id, mine.incident_id);
+    }
+
+    #[test]
+    fn a_row_without_tenant_id_deserializes_as_platform_owned() {
+        let mut v = serde_json::to_value(inc(None)).unwrap();
+        v.as_object_mut().unwrap().remove("tenant_id");
+        let i: Incident = serde_json::from_value(v).unwrap();
+        assert_eq!(i.tenant_id, None);
     }
 }

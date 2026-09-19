@@ -68,6 +68,7 @@ fn harness() -> Harness {
         storage: incident_evidence_storage_for_response,
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),
+        incidents: incident_evidence_state.incidents.clone(),
         audit_log: audit_log.clone(),
     };
 

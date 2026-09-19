@@ -122,10 +122,20 @@ pub(crate) async fn tenant_hosts(
     let Some(ctx) = parts.extensions.get::<AuthContext>() else {
         return Ok(None);
     };
-    let Some(tenant_id) = ctx.tenant_id else {
+    let tenants = parts.extensions.get::<Arc<dyn TenantStore>>().cloned();
+    hosts_of_tenant(ctx.tenant_id, tenants).await
+}
+
+/// Same contract as `tenant_hosts`, for handlers that already hold the caller's
+/// tenant id and the registry (the response handler).
+pub(crate) async fn hosts_of_tenant(
+    tenant_id: Option<Uuid>,
+    tenants: Option<Arc<dyn TenantStore>>,
+) -> Result<Option<HashSet<Uuid>>, (StatusCode, String)> {
+    let Some(tenant_id) = tenant_id else {
         return Ok(None);
     };
-    let Some(tenants) = parts.extensions.get::<Arc<dyn TenantStore>>().cloned() else {
+    let Some(tenants) = tenants else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "tenant registry unavailable".to_string(),

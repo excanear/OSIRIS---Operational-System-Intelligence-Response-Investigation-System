@@ -74,6 +74,8 @@ pub struct ResponseRequest {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub incident_id: Option<Uuid>,
+    /// Owning tenant of the caller; evidence collected is tagged with it.
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

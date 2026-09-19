@@ -82,7 +82,8 @@ pub fn dispatch(
             integrity,
             vec![request.target.clone()],
             None,
-        )?;
+        )?
+        .with_tenant(request.tenant_id);
         let event_count = events.len();
         let truncated = event_count >= MAX_EVENT_LIMIT;
         let inserted = evidence_store.insert(evidence)?;
@@ -171,6 +172,7 @@ mod tests {
             since: None,
             until: None,
             incident_id: None,
+            tenant_id: None,
         }
     }
 
@@ -223,6 +225,7 @@ mod tests {
             since: None,
             until: None,
             incident_id: None,
+            tenant_id: None,
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
         let ResponseOutcome::EvidenceCollected { evidence_id, event_count, truncated } = outcome else {
@@ -246,6 +249,7 @@ mod tests {
             since: None,
             until: None,
             incident_id: None,
+            tenant_id: None,
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
         assert!(matches!(outcome, ResponseOutcome::EvidenceCollected { .. }));
@@ -263,6 +267,7 @@ mod tests {
             since: None,
             until: None,
             incident_id: Some(incident_id),
+            tenant_id: None,
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
         let ResponseOutcome::EvidenceCollected { evidence_id, .. } = outcome else { panic!("expected EvidenceCollected") };
@@ -299,6 +304,7 @@ mod tests {
             since: None,
             until: None,
             incident_id: None,
+            tenant_id: None,
         };
         let outcome = dispatch(&req, &h.storage, &h.evidence, &h.links).unwrap();
         let ResponseOutcome::EvidenceCollected { event_count, truncated, .. } = outcome else {

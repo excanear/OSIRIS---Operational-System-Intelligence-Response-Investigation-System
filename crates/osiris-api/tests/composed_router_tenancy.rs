@@ -93,6 +93,7 @@ struct Tenancy {
     globex_host: Uuid,
     unassigned_host: Uuid,
     globex_process_key: String,
+    acme_process_key: String,
 }
 
 fn build_app(
@@ -118,11 +119,13 @@ fn tenancy() -> Tenancy {
     let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(p("events.db")).unwrap());
     let (acme_host, globex_host, unassigned_host) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let t = now_ns();
+    let acme_event = event_on(acme_host, 1, t);
+    let acme_process_key = acme_event.process.as_ref().unwrap().process_key.as_hex();
     let globex_event = event_on(globex_host, 2, t);
     let globex_process_key = globex_event.process.as_ref().unwrap().process_key.as_hex();
     storage
         .batch_write(&[
-            event_on(acme_host, 1, t),
+            acme_event,
             globex_event,
             event_on(unassigned_host, 3, t),
         ])
@@ -140,6 +143,7 @@ fn tenancy() -> Tenancy {
         storage: storage.clone(),
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),
+        incidents: incident_evidence_state.incidents.clone(),
         audit_log: audit_log.clone(),
     };
 
@@ -196,6 +200,7 @@ fn tenancy() -> Tenancy {
         globex_host,
         unassigned_host,
         globex_process_key,
+        acme_process_key,
     }
 }
 
@@ -272,11 +277,8 @@ async fn the_hosts_endpoint_lists_only_the_tenants_hosts() {
 async fn a_tenant_user_cannot_read_platform_only_routes_even_as_a_tenant_admin() {
     let t = tenancy();
     for (method, uri) in [
-        ("GET", "/api/v1/incidents"),
-        ("GET", "/api/v1/evidence"),
         ("GET", "/api/v1/audit"),
         ("GET", "/api/v1/auth/users"),
-        ("POST", "/api/v1/response/collect_evidence"),
     ] {
         let body = (method == "POST").then(|| serde_json::json!({}));
         let (status, _) = call(&t.app, method, uri, Some(&t.acme_token), body).await;
@@ -520,4 +522,137 @@ async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() 
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+fn incident_body() -> serde_json::Value {
+    serde_json::json!({ "entities": [{ "kind": "IP", "addr": "203.0.113.10" }] })
+}
+
+#[tokio::test]
+async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
+    let t = tenancy();
+    let (status, created) =
+        call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(incident_body())).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["incident_id"].as_str().unwrap().to_string();
+    assert_eq!(created["tenant_id"], t.acme_tenant.to_string());
+    let (_, platform) =
+        call(&t.app, "POST", "/api/v1/incidents", Some(&t.admin_token), Some(incident_body())).await;
+    let platform_id = platform["incident_id"].as_str().unwrap().to_string();
+
+    let uri = format!("/api/v1/incidents/{id}");
+    let (s, _) = call(&t.app, "GET", &uri, Some(&t.acme_token), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&t.app, "GET", &uri, Some(&t.globex_token), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = call(
+        &t.app,
+        "PATCH",
+        &uri,
+        Some(&t.globex_token),
+        Some(serde_json::json!({ "status": "RESOLVED" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // A platform-owned incident is invisible to a tenant.
+    let (s, _) = call(&t.app, "GET", &format!("/api/v1/incidents/{platform_id}"), Some(&t.acme_token), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    let (_, mine) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.acme_token), None).await;
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    let (_, theirs) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.globex_token), None).await;
+    assert!(theirs.as_array().unwrap().is_empty());
+    let (_, all) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.admin_token), None).await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+
+    // The owning tenant can still transition it.
+    let (s, updated) = call(
+        &t.app,
+        "PATCH",
+        &uri,
+        Some(&t.acme_token),
+        Some(serde_json::json!({ "status": "INVESTIGATING" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{updated}");
+}
+
+#[tokio::test]
+async fn evidence_and_links_never_cross_tenants() {
+    let t = tenancy();
+    let (_, inc) =
+        call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(incident_body())).await;
+    let inc_id = inc["incident_id"].as_str().unwrap().to_string();
+    let ev = |incident: Option<&str>| {
+        serde_json::json!({
+            "source": "MANUAL_UPLOAD", "hash": "abc", "immutable_since": 1,
+            "relationships": [], "supersedes": null, "incident_id": incident,
+        })
+    };
+    // Globex cannot attach evidence to acme's incident.
+    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.globex_token), Some(ev(Some(&inc_id)))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Acme can, and the record is tenant-tagged.
+    let (s, created) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.acme_token), Some(ev(Some(&inc_id)))).await;
+    assert_eq!(s, StatusCode::OK, "{created}");
+    let acme_ev = created["evidence_id"].as_str().unwrap().to_string();
+    // A tenant cannot supersede another tenant's evidence.
+    let mut supersede = ev(None);
+    supersede["supersedes"] = serde_json::json!(acme_ev);
+    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.globex_token), Some(supersede)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    let (_, mine) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.acme_token), None).await;
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    assert_eq!(mine[0]["incident_ids"][0], inc_id);
+    let (_, theirs) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.globex_token), None).await;
+    assert!(theirs.as_array().unwrap().is_empty());
+    let (s, _) = call(
+        &t.app,
+        "GET",
+        &format!("/api/v1/evidence?incident_id={inc_id}"),
+        Some(&t.globex_token),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, all) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.admin_token), None).await;
+    assert_eq!(all.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_response_engine_only_sees_the_tenants_own_hosts() {
+    let t = tenancy();
+    let body = |key: &str| {
+        serde_json::json!({
+            "target": { "kind": "PROCESS", "process_key": key },
+            "reason": "investigating", "dry_run": true,
+        })
+    };
+    // Own process resolves; another tenant's process is "unknown" (400).
+    let (s, resp) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
+        Some(body(&t.acme_process_key))).await;
+    assert_eq!(s, StatusCode::OK, "{resp}");
+    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
+        Some(body(&t.globex_process_key))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Real collection is tagged with the tenant and invisible to the other one.
+    let mut real = body(&t.acme_process_key);
+    real["dry_run"] = serde_json::json!(false);
+    let (s, resp) =
+        call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token), Some(real.clone())).await;
+    assert_eq!(s, StatusCode::OK, "{resp}");
+    let (_, mine) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.acme_token), None).await;
+    assert_eq!(mine.as_array().unwrap().len(), 1);
+    let (_, theirs) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.globex_token), None).await;
+    assert!(theirs.as_array().unwrap().is_empty());
+
+    // A foreign incident cannot be used as a link target.
+    let (_, inc) =
+        call(&t.app, "POST", "/api/v1/incidents", Some(&t.globex_token), Some(incident_body())).await;
+    real["incident_id"] = inc["incident_id"].clone();
+    let (s, _) =
+        call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token), Some(real)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 }

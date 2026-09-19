@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -11,6 +11,21 @@ use osiris_evidence::{
 use osiris_schema::EntityRef;
 use serde::Deserialize;
 use uuid::Uuid;
+
+use crate::auth_middleware::AuthContext;
+
+/// The calling user's tenant (`None` for a platform user, or in unit tests that
+/// call a handler without the auth gate).
+pub(crate) fn caller_tenant(ctx: &Option<Extension<AuthContext>>) -> Option<Uuid> {
+    ctx.as_ref().and_then(|Extension(c)| c.tenant_id)
+}
+
+/// Whether a record owned by `owner` is visible to a caller in `caller`'s
+/// tenant. Platform callers (`None`) see everything; a tenant caller sees only
+/// its own records — platform-owned (`None`) records are invisible to it.
+pub(crate) fn visible_to(owner: Option<Uuid>, caller: Option<Uuid>) -> bool {
+    caller.is_none() || owner == caller
+}
 
 #[derive(Clone)]
 pub struct IncidentEvidenceState {
@@ -39,8 +54,33 @@ pub struct CreateIncidentBody {
     pub entities: Vec<EntityRef>,
 }
 
+fn not_found() -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, "incident not found".to_string())
+}
+
+/// Loads an incident the caller may see; foreign/platform-owned ones answer
+/// exactly like a missing one (no existence oracle across tenants).
+pub(crate) async fn visible_incident(
+    state: &IncidentEvidenceState,
+    incident_id: Uuid,
+    caller: Option<Uuid>,
+) -> Result<Incident, (StatusCode, String)> {
+    let incidents = state.incidents.clone();
+    let incident = tokio::task::spawn_blocking(move || incidents.get(incident_id))
+        .await
+        .unwrap()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(not_found)?;
+    if visible_to(incident.tenant_id, caller) {
+        Ok(incident)
+    } else {
+        Err(not_found())
+    }
+}
+
 async fn create_incident_handler(
     State(state): State<IncidentEvidenceState>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<CreateIncidentBody>,
 ) -> Result<Json<Incident>, (StatusCode, String)> {
     let incident = Incident {
@@ -49,6 +89,7 @@ async fn create_incident_handler(
         entities: body.entities,
         alert_ids: vec![],
         notes: vec![],
+        tenant_id: caller_tenant(&ctx),
     };
     let created = tokio::task::spawn_blocking(move || state.incidents.create(incident))
         .await
@@ -57,26 +98,32 @@ async fn create_incident_handler(
     Ok(Json(created))
 }
 
-async fn get_incident_handler(
-    State(state): State<IncidentEvidenceState>,
-    Path(incident_id): Path<String>,
-) -> Result<Json<Incident>, (StatusCode, String)> {
-    let incident_id: Uuid = incident_id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", incident_id)))?;
-    let incident = tokio::task::spawn_blocking(move || state.incidents.get(incident_id))
-        .await
-        .unwrap()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "incident not found".to_string()))?;
-    Ok(Json(incident))
+fn parse_incident_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
+    raw.parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", raw)))
 }
 
-async fn list_incidents_handler(State(state): State<IncidentEvidenceState>) -> Json<Vec<Incident>> {
-    let incidents = tokio::task::spawn_blocking(move || state.incidents.list())
-        .await
-        .unwrap()
-        .unwrap_or_default();
+async fn get_incident_handler(
+    State(state): State<IncidentEvidenceState>,
+    ctx: Option<Extension<AuthContext>>,
+    Path(incident_id): Path<String>,
+) -> Result<Json<Incident>, (StatusCode, String)> {
+    let incident_id = parse_incident_id(&incident_id)?;
+    Ok(Json(visible_incident(&state, incident_id, caller_tenant(&ctx)).await?))
+}
+
+async fn list_incidents_handler(
+    State(state): State<IncidentEvidenceState>,
+    ctx: Option<Extension<AuthContext>>,
+) -> Json<Vec<Incident>> {
+    let caller = caller_tenant(&ctx);
+    let incidents = tokio::task::spawn_blocking(move || match caller {
+        Some(tenant) => state.incidents.list_for_tenant(tenant),
+        None => state.incidents.list(),
+    })
+    .await
+    .unwrap()
+    .unwrap_or_default();
     Json(incidents)
 }
 
@@ -88,12 +135,12 @@ pub struct PatchIncidentBody {
 
 async fn patch_incident_handler(
     State(state): State<IncidentEvidenceState>,
+    ctx: Option<Extension<AuthContext>>,
     Path(incident_id): Path<String>,
     Json(body): Json<PatchIncidentBody>,
 ) -> Result<Json<Incident>, (StatusCode, String)> {
-    let incident_id: Uuid = incident_id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", incident_id)))?;
+    let incident_id = parse_incident_id(&incident_id)?;
+    visible_incident(&state, incident_id, caller_tenant(&ctx)).await?;
     let updated = tokio::task::spawn_blocking(move || {
         state.incidents.transition_status(
             incident_id,
@@ -107,9 +154,7 @@ async fn patch_incident_handler(
     .unwrap();
     match updated {
         Ok(incident) => Ok(Json(incident)),
-        Err(osiris_evidence::IncidentStoreError::NotFound) => {
-            Err((StatusCode::NOT_FOUND, "incident not found".to_string()))
-        }
+        Err(osiris_evidence::IncidentStoreError::NotFound) => Err(not_found()),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
@@ -159,10 +204,10 @@ mod tests {
         let body = CreateIncidentBody {
             entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
         };
-        let Json(created) = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
+        let Json(created) = create_incident_handler(State(state.clone()), None, Json(body)).await.unwrap();
         assert_eq!(created.status, IncidentStatus::New);
 
-        let Json(found) = get_incident_handler(State(state), Path(created.incident_id.to_string())).await.unwrap();
+        let Json(found) = get_incident_handler(State(state), None, Path(created.incident_id.to_string())).await.unwrap();
         assert_eq!(found.incident_id, created.incident_id);
     }
 
@@ -170,9 +215,9 @@ mod tests {
     async fn list_incidents_returns_every_created_incident() {
         let (_dir, state) = test_state();
         let body = CreateIncidentBody { entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }] };
-        let _ = create_incident_handler(State(state.clone()), Json(body.clone())).await.unwrap();
-        let _ = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
-        let Json(list) = list_incidents_handler(State(state)).await;
+        let _ = create_incident_handler(State(state.clone()), None, Json(body.clone())).await.unwrap();
+        let _ = create_incident_handler(State(state.clone()), None, Json(body)).await.unwrap();
+        let Json(list) = list_incidents_handler(State(state), None).await;
         assert_eq!(list.len(), 2);
     }
 
@@ -180,10 +225,10 @@ mod tests {
     async fn patch_incident_transitions_status_and_audits_it() {
         let (_dir, state) = test_state();
         let body = CreateIncidentBody { entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }] };
-        let Json(created) = create_incident_handler(State(state.clone()), Json(body)).await.unwrap();
+        let Json(created) = create_incident_handler(State(state.clone()), None, Json(body)).await.unwrap();
 
         let patch = PatchIncidentBody { status: IncidentStatus::Investigating, why: Some("starting triage".to_string()) };
-        let Json(updated) = patch_incident_handler(State(state), Path(created.incident_id.to_string()), Json(patch))
+        let Json(updated) = patch_incident_handler(State(state), None, Path(created.incident_id.to_string()), Json(patch))
             .await
             .unwrap();
         assert_eq!(updated.status, IncidentStatus::Investigating);
@@ -193,7 +238,7 @@ mod tests {
     async fn patch_incident_returns_404_for_an_unknown_id() {
         let (_dir, state) = test_state();
         let patch = PatchIncidentBody { status: IncidentStatus::Resolved, why: None };
-        let err = patch_incident_handler(State(state), Path(uuid::Uuid::now_v7().to_string()), Json(patch))
+        let err = patch_incident_handler(State(state), None, Path(uuid::Uuid::now_v7().to_string()), Json(patch))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);

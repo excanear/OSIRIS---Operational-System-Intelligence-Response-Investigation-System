@@ -32,6 +32,9 @@ pub trait EvidenceStore: Send + Sync {
     /// acceptable cost at this cap, and avoids a schema migration for a
     /// column that would otherwise duplicate data already in `raw_json`.
     fn list(&self) -> Result<Vec<Evidence>, EvidenceStoreError>;
+    /// Like `list`, but only records owned by `tenant_id`, filtered BEFORE the
+    /// `MAX_EVIDENCE_LIMIT` cap so other tenants' volume cannot starve it.
+    fn list_for_tenant(&self, tenant_id: Uuid) -> Result<Vec<Evidence>, EvidenceStoreError>;
 }
 
 /// Evidence's own SQLite file, independent of `osiris-storage`
@@ -92,6 +95,16 @@ impl EvidenceStore for SqliteEvidenceStore {
     }
 
     fn list(&self) -> Result<Vec<Evidence>, EvidenceStoreError> {
+        self.list_filtered(None)
+    }
+
+    fn list_for_tenant(&self, tenant_id: Uuid) -> Result<Vec<Evidence>, EvidenceStoreError> {
+        self.list_filtered(Some(tenant_id))
+    }
+}
+
+impl SqliteEvidenceStore {
+    fn list_filtered(&self, tenant: Option<Uuid>) -> Result<Vec<Evidence>, EvidenceStoreError> {
         let conn = self
             .conn
             .lock()
@@ -108,7 +121,9 @@ impl EvidenceStore for SqliteEvidenceStore {
             let raw_json = row.map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
             let evidence: Evidence =
                 serde_json::from_str(&raw_json).map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
-            all.push(evidence);
+            if tenant.is_none() || evidence.tenant_id() == tenant {
+                all.push(evidence);
+            }
         }
         all.sort_by_key(|e| std::cmp::Reverse(e.timestamp()));
         all.truncate(MAX_EVIDENCE_LIMIT);
@@ -198,5 +213,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    use crate::evidence::{Evidence, EvidenceSource, Integrity};
+
+    fn tagged(ts: u64, tenant: Option<Uuid>) -> Evidence {
+        Evidence::new(
+            EvidenceSource::EventCapture,
+            ts,
+            Integrity { hash: "h".to_string(), immutable_since: ts },
+            vec![],
+            None,
+        )
+        .unwrap()
+        .with_tenant(tenant)
+    }
+
+    #[test]
+    fn tenant_tag_round_trips_and_defaults_to_none_for_legacy_rows() {
+        let t = Uuid::now_v7();
+        let e = tagged(1, Some(t));
+        let back: Evidence = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.tenant_id(), Some(t));
+        let mut v = serde_json::to_value(&e).unwrap();
+        v.as_object_mut().unwrap().remove("tenant_id");
+        let legacy: Evidence = serde_json::from_value(v).unwrap();
+        assert_eq!(legacy.tenant_id(), None);
+    }
+
+    #[test]
+    fn list_for_tenant_returns_only_that_tenants_records_and_is_not_starved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let mine = store.insert(tagged(1, Some(a))).unwrap();
+        store.insert(tagged(2, Some(b))).unwrap();
+        store.insert(tagged(3, None)).unwrap();
+        let listed = store.list_for_tenant(a).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].evidence_id(), mine.evidence_id());
+        assert_eq!(store.list().unwrap().len(), 3);
     }
 }
