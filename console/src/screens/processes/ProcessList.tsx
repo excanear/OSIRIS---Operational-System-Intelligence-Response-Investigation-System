@@ -1,3 +1,5 @@
+import type { TimeRange } from "../../api/timeRange";
+import { TimeRangeFilter } from "../TimeRangeFilter";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useProcesses } from "../../api/hooks";
@@ -11,7 +13,8 @@ export function ProcessList() {
   // a busy host, with no way for the console to request a recent window.
   // Fixing this requires adding a since/pagination param to the backend
   // endpoint, which is out of scope for this phase (no backend changes).
-  const processes = useProcesses();
+  const [range, setRange] = useState<TimeRange>({});
+  const processes = useProcesses(range);
   const [filter, setFilter] = useState("");
 
   const rows = (processes.data ?? []).filter((process) =>
@@ -28,6 +31,7 @@ export function ProcessList() {
         value={filter}
         onChange={(event) => setFilter(event.target.value)}
       />
+      <TimeRangeFilter onChange={setRange} />
       {processes.isLoading && <p>Loading processes…</p>}
       {processes.isError && (
         <p role="alert">Failed to load processes: {(processes.error as Error).message}</p>

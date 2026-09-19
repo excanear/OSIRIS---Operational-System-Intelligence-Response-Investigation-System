@@ -1,3 +1,4 @@
+import { timeRangeQuery, type TimeRange } from "./timeRange";
 import type {
   Alert,
   ApiHealth,
@@ -137,8 +138,8 @@ export function fetchIncidents(): Promise<Incident[]> {
   return apiGet<Incident[]>("/incidents");
 }
 
-export function fetchProcesses(): Promise<ProcessSummary[]> {
-  return apiGet<ProcessSummary[]>("/processes");
+export function fetchProcesses(range?: TimeRange): Promise<ProcessSummary[]> {
+  return apiGet<ProcessSummary[]>(`/processes${timeRangeQuery(range)}`);
 }
 
 export function fetchProcess(processKey: string): Promise<ProcessDetail> {
@@ -149,16 +150,16 @@ export function fetchProcessStory(processKey: string): Promise<Story> {
   return apiGet<Story>(`/processes/${encodeURIComponent(processKey)}/story`);
 }
 
-export function fetchFiles(): Promise<FileSummary[]> {
-  return apiGet<FileSummary[]>("/files");
+export function fetchFiles(range?: TimeRange): Promise<FileSummary[]> {
+  return apiGet<FileSummary[]>(`/files${timeRangeQuery(range)}`);
 }
 
-export function fetchNetwork(): Promise<NetworkSummary[]> {
-  return apiGet<NetworkSummary[]>("/network");
+export function fetchNetwork(range?: TimeRange): Promise<NetworkSummary[]> {
+  return apiGet<NetworkSummary[]>(`/network${timeRangeQuery(range)}`);
 }
 
-export function fetchContainers(): Promise<ContainerSummary[]> {
-  return apiGet<ContainerSummary[]>("/containers");
+export function fetchContainers(range?: TimeRange): Promise<ContainerSummary[]> {
+  return apiGet<ContainerSummary[]>(`/containers${timeRangeQuery(range)}`);
 }
 
 export function fetchHosts(): Promise<HostSummary[]> {

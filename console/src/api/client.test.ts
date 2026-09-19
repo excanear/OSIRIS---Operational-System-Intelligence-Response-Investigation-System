@@ -355,6 +355,12 @@ describe("api client", () => {
     expect(result).toEqual([row]);
   });
 
+  it("fetchFiles appends the since/until window when given", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchFiles({ since: 5, until: 9 });
+    expect(fetch).toHaveBeenCalledWith("/api/v1/files?since=5&until=9");
+  });
+
   it("fetchFiles calls /api/v1/files", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
     await fetchFiles();

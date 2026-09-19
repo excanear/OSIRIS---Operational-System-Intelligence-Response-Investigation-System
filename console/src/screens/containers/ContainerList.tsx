@@ -1,3 +1,5 @@
+import type { TimeRange } from "../../api/timeRange";
+import { TimeRangeFilter } from "../TimeRangeFilter";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useContainers } from "../../api/hooks";
@@ -22,7 +24,8 @@ export function ContainerList() {
   // whose events fall outside that window could be missing even if still
   // active. Same posture ProcessList.tsx's own comment takes for
   // /processes; not fixed here.
-  const containers = useContainers();
+  const [range, setRange] = useState<TimeRange>({});
+  const containers = useContainers(range);
   const [filter, setFilter] = useState("");
 
   const rows = (containers.data ?? []).filter((row) => {
@@ -40,6 +43,7 @@ export function ContainerList() {
         value={filter}
         onChange={(event) => setFilter(event.target.value)}
       />
+      <TimeRangeFilter onChange={setRange} />
       {containers.isLoading && <p>Loading containers…</p>}
       {containers.isError && (
         <p role="alert">Failed to load containers: {(containers.error as Error).message}</p>

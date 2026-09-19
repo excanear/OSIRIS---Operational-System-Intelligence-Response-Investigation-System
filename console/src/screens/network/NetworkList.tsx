@@ -1,3 +1,5 @@
+import type { TimeRange } from "../../api/timeRange";
+import { TimeRangeFilter } from "../TimeRangeFilter";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useNetwork } from "../../api/hooks";
@@ -13,7 +15,8 @@ export function NetworkList() {
   // events fall outside that window could be missing even if still
   // active. Same posture ProcessList.tsx's own comment takes for
   // /processes; not fixed here.
-  const network = useNetwork();
+  const [range, setRange] = useState<TimeRange>({});
+  const network = useNetwork(range);
   const [filter, setFilter] = useState("");
 
   const rows = (network.data ?? []).filter((row) =>
@@ -30,6 +33,7 @@ export function NetworkList() {
         value={filter}
         onChange={(event) => setFilter(event.target.value)}
       />
+      <TimeRangeFilter onChange={setRange} />
       {network.isLoading && <p>Loading network connections…</p>}
       {network.isError && (
         <p role="alert">Failed to load network connections: {(network.error as Error).message}</p>

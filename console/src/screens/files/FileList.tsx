@@ -1,3 +1,5 @@
+import type { TimeRange } from "../../api/timeRange";
+import { TimeRangeFilter } from "../TimeRangeFilter";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useFiles } from "../../api/hooks";
@@ -12,7 +14,8 @@ export function FileList() {
   // high-volume host, a file whose events fall outside that window could
   // be missing even if it's still active. Same posture ProcessList.tsx's
   // own comment takes for /processes; not fixed here.
-  const files = useFiles();
+  const [range, setRange] = useState<TimeRange>({});
+  const files = useFiles(range);
   const [filter, setFilter] = useState("");
 
   const rows = (files.data ?? []).filter((file) =>
@@ -29,6 +32,7 @@ export function FileList() {
         value={filter}
         onChange={(event) => setFilter(event.target.value)}
       />
+      <TimeRangeFilter onChange={setRange} />
       {files.isLoading && <p>Loading files…</p>}
       {files.isError && <p role="alert">Failed to load files: {(files.error as Error).message}</p>}
       {!files.isLoading && !files.isError && rows.length === 0 && <p>No files found.</p>}

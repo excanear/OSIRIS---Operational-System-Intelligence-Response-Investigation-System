@@ -75,4 +75,12 @@ describe("FileList", () => {
     expect(screen.getByText("/etc/passwd")).toBeInTheDocument();
     expect(screen.queryByText("/tmp/x")).not.toBeInTheDocument();
   });
+
+  it("passes the since/until window to useFiles", () => {
+    vi.mocked(hooks.useFiles).mockReturnValue(mockQueryResult({ data: [] }));
+    renderWithRouter();
+    fireEvent.change(screen.getByLabelText("Since"), { target: { value: "1000" } });
+    fireEvent.change(screen.getByLabelText("Until"), { target: { value: "2000" } });
+    expect(hooks.useFiles).toHaveBeenLastCalledWith({ since: 1000, until: 2000 });
+  });
 });

@@ -1,3 +1,4 @@
+import type { TimeRange } from "./timeRange";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createEvidence,
@@ -68,10 +69,10 @@ export function useIncidents() {
   });
 }
 
-export function useProcesses() {
+export function useProcesses(range?: TimeRange) {
   return useQuery({
-    queryKey: ["processes"],
-    queryFn: fetchProcesses,
+    queryKey: ["processes", range ?? null],
+    queryFn: () => fetchProcesses(range),
   });
 }
 
@@ -89,24 +90,24 @@ export function useProcessStory(processKey: string) {
   });
 }
 
-export function useFiles() {
+export function useFiles(range?: TimeRange) {
   return useQuery({
-    queryKey: ["files"],
-    queryFn: fetchFiles,
+    queryKey: ["files", range ?? null],
+    queryFn: () => fetchFiles(range),
   });
 }
 
-export function useNetwork() {
+export function useNetwork(range?: TimeRange) {
   return useQuery({
-    queryKey: ["network"],
-    queryFn: fetchNetwork,
+    queryKey: ["network", range ?? null],
+    queryFn: () => fetchNetwork(range),
   });
 }
 
-export function useContainers() {
+export function useContainers(range?: TimeRange) {
   return useQuery({
-    queryKey: ["containers"],
-    queryFn: fetchContainers,
+    queryKey: ["containers", range ?? null],
+    queryFn: () => fetchContainers(range),
   });
 }
 
