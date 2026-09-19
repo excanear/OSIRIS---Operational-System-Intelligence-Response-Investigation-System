@@ -27,10 +27,16 @@ pub trait CloudMetadataProvider: Send + Sync {
     async fn probe(&self) -> Option<CloudContext>;
 }
 
-/// Trims, rejects control characters (-> `None`), truncates to `MAX_FIELD_LEN`.
+/// Invisible/bidirectional formatting characters that can make a value render
+/// differently from what it contains (spoofing in the Console).
+fn is_invisible_format(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Trims, rejects control and invisible/bidi characters (-> `None`), truncates to `MAX_FIELD_LEN`.
 pub fn sanitize(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || is_invisible_format(c)) {
         return None;
     }
     Some(trimmed.chars().take(MAX_FIELD_LEN).collect())
@@ -122,6 +128,13 @@ mod tests {
         assert_eq!(sanitize("   "), None);
         assert_eq!(sanitize("a\u{0007}b"), None);
         assert_eq!(sanitize("a\nb"), None, "an embedded newline is a control char");
+    }
+
+    #[test]
+    fn sanitize_rejects_bidi_and_zero_width_characters() {
+        assert_eq!(sanitize("i-0{202E}abc"), None);
+        assert_eq!(sanitize("i-{200B}0abc"), None);
+        assert_eq!(sanitize("{FEFF}i-0abc"), None);
     }
 
     #[test]
