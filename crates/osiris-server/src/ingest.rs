@@ -18,8 +18,13 @@ use osiris_fileutil::LineTailer;
 /// query failure degrades to "no edges found" rather than panicking the
 /// ingestion loop — correlation is best-effort enrichment, not a
 /// correctness-critical path.
+///
+/// Edges are attributed to a host through their source event, and lookups are
+/// restricted to the ingesting event's host so one host cannot inject edges
+/// into another host's chains.
 struct StorageEdgeSource<'s> {
     storage: &'s dyn Storage,
+    host_id: String,
 }
 
 impl EdgeSource for StorageEdgeSource<'_> {
@@ -28,6 +33,7 @@ impl EdgeSource for StorageEdgeSource<'_> {
             entity: Some(entity.clone()),
             since: Some(since),
             until: Some(until),
+            host_ids: Some(vec![self.host_id.clone()]),
             ..RelationshipQueryPlan::new()
         };
         match self.storage.query_relationships(&plan) {
@@ -68,7 +74,10 @@ fn correlate_baseline_and_score(
     let seed = EntityRef::Process {
         process_key: process.process_key,
     };
-    let edge_source = StorageEdgeSource { storage };
+    let edge_source = StorageEdgeSource {
+        storage,
+        host_id: event.host_id.to_string(),
+    };
     let chain: BehavioralChain =
         correlation_engine.build_chain(&edge_source, seed, event.timestamp);
 
@@ -396,6 +405,36 @@ mod tests {
         assert_eq!(storage.query(&QueryPlan::new()).unwrap().len(), 1);
         cancel.cancel();
         forwarder.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn edge_lookups_are_restricted_to_the_ingesting_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let (a, b) = (sample_event(), sample_event());
+        storage.batch_write(&[a.clone(), b.clone()]).unwrap();
+        let process = EntityRef::Process {
+            process_key: ProcessKey::new(a.host_id, "b", 1, 1),
+        };
+        let edge = |ev: &CanonicalEvent, ip: &str| EntityRelationship {
+            from: process.clone(),
+            to: EntityRef::Ip {
+                addr: ip.to_string(),
+            },
+            relation: osiris_schema::Relation::ConnectedTo,
+            event_id: ev.event_id,
+            timestamp: 10,
+        };
+        storage
+            .write_relationships(&[edge(&a, "10.0.0.1"), edge(&b, "10.0.0.2")])
+            .unwrap();
+        let source = StorageEdgeSource {
+            storage: &storage,
+            host_id: a.host_id.to_string(),
+        };
+        let edges = source.edges_for(&process, 0, 100);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].event_id, a.event_id);
     }
 
     #[tokio::test]

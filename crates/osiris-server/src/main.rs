@@ -169,6 +169,11 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+        tracing::warn!(
+            spool = %config.spool_path,
+            "both the agent mTLS listener and the local spool tailer are active; \
+             a co-located agent must use one path only, or events are ingested twice"
+        );
         tracing::info!(addr = %listener_cfg.listen_addr, "agent mTLS listener started");
         tokio::spawn(listener.run(Arc::new(ingest_context), cancellation.clone()));
     }

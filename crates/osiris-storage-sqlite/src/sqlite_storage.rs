@@ -1730,9 +1730,15 @@ mod tests {
             event_id: Uuid::now_v7(),
             timestamp: 5000,
         };
-        storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
-        storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
-        let rows = storage.query_relationships(&RelationshipQueryPlan::new()).unwrap();
+        storage
+            .write_relationships(std::slice::from_ref(&edge))
+            .unwrap();
+        storage
+            .write_relationships(std::slice::from_ref(&edge))
+            .unwrap();
+        let rows = storage
+            .query_relationships(&RelationshipQueryPlan::new())
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -1744,7 +1750,8 @@ mod tests {
             let s = SqliteStorage::open(&path).unwrap();
             drop(s);
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch("DROP INDEX idx_relationships_unique;").unwrap();
+            conn.execute_batch("DROP INDEX idx_relationships_unique;")
+                .unwrap();
             for _ in 0..3 {
                 conn.execute(
                     "INSERT INTO relationships VALUES ('a','b','connected_to','e',1)",

@@ -323,10 +323,11 @@ async fn only_the_offending_events_of_a_mixed_batch_are_dropped() {
             == Some(len)
     })
     .await;
-    let got = handler.received.lock().unwrap();
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].event_id, good.event_id);
-    drop(got);
+    {
+        let got = handler.received.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event_id, good.event_id);
+    }
     cancel.cancel();
     task.await.unwrap().unwrap();
     server_cancel.cancel();
