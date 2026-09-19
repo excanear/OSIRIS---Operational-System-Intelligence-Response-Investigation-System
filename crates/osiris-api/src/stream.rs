@@ -1,4 +1,7 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::http::request::Parts;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -146,12 +149,35 @@ fn origin_is_same_site(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// `AND`s the tenant's host restriction onto the caller's own filter. An empty
+/// host set yields `host_id IN []`, which `eval_ast` evaluates to false for
+/// every event (`items.iter().any(..)` over nothing), so it matches nothing.
+pub(crate) fn tenant_filter(user_filter: Option<Ast>, hosts: &HashSet<Uuid>) -> Ast {
+    let host_ast = Ast::Compare {
+        field: "host_id".to_string(),
+        op: Op::In,
+        value: Value::List(hosts.iter().map(|h| Value::Str(h.to_string())).collect()),
+    };
+    match user_filter {
+        Some(user) => Ast::And(Box::new(user), Box::new(host_ast)),
+        None => host_ast,
+    }
+}
+
+/// Whether a `host_id` the client asked for belongs to the tenant.
+pub(crate) fn host_allowed(hosts: &HashSet<Uuid>, requested: &str) -> bool {
+    Uuid::parse_str(requested)
+        .map(|id| hosts.contains(&id))
+        .unwrap_or(false)
+}
+
 async fn stream_events_handler(
-    headers: HeaderMap,
+    parts: Parts,
     ws: WebSocketUpgrade,
     Query(params): Query<StreamQuery>,
     State(broadcaster): State<Arc<LiveEventBroadcaster>>,
 ) -> Result<Response, (StatusCode, String)> {
+    let headers = parts.headers.clone();
     if !origin_is_same_site(&headers) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -166,6 +192,16 @@ async fn stream_events_handler(
         ));
     }
 
+    // Tenant users are restricted to their tenant's hosts. The host set is a
+    // snapshot taken at connect time: a reassignment mid-connection only
+    // applies at the next connect. Platform / no-auth requests get `None`.
+    let tenant_hosts = crate::tenant_scope::tenant_hosts(&parts).await?;
+    if let (Some(hosts), Some(requested)) = (&tenant_hosts, &params.host_id) {
+        if !host_allowed(hosts, requested) {
+            return Err((StatusCode::FORBIDDEN, "host not in your tenant".to_string()));
+        }
+    }
+
     let filter = if let Some(host_id) = params.host_id {
         Some(Ast::Compare {
             field: "host_id".to_string(),
@@ -178,6 +214,11 @@ async fn stream_events_handler(
         plan.filter
     } else {
         None
+    };
+
+    let filter = match &tenant_hosts {
+        Some(hosts) => Some(tenant_filter(filter, hosts)),
+        None => filter,
     };
 
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter)))
@@ -360,6 +401,45 @@ mod tests {
 
         broadcaster.unsubscribe(id);
         assert!(!broadcaster.has_subscribers());
+    }
+
+    #[test]
+    fn tenant_filter_ands_the_hosts_onto_the_callers_filter() {
+        let a = Uuid::new_v4();
+        let hosts: HashSet<Uuid> = [a].into_iter().collect();
+        let user = Ast::Compare {
+            field: "event_type".to_string(),
+            op: Op::Eq,
+            value: Value::Str("PROCESS_EXEC".to_string()),
+        };
+        let combined = tenant_filter(Some(user), &hosts);
+        assert!(eval_ast(&sample_event(a, EventType::ProcessExec), &combined));
+        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
+        assert!(!eval_ast(&sample_event(a, EventType::FileWrite), &combined));
+    }
+
+    #[test]
+    fn an_empty_tenant_host_set_matches_nothing() {
+        // `Op::In` against an empty list is `items.iter().any(..)` == false.
+        let combined = tenant_filter(None, &HashSet::new());
+        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
+        // Also with a caller filter that would match on its own.
+        let user = Ast::Compare {
+            field: "event_type".to_string(),
+            op: Op::Eq,
+            value: Value::Str("PROCESS_EXEC".to_string()),
+        };
+        let combined = tenant_filter(Some(user), &HashSet::new());
+        assert!(!eval_ast(&sample_event(Uuid::new_v4(), EventType::ProcessExec), &combined));
+    }
+
+    #[test]
+    fn a_requested_host_outside_the_tenant_is_rejected() {
+        let a = Uuid::new_v4();
+        let hosts: HashSet<Uuid> = [a].into_iter().collect();
+        assert!(host_allowed(&hosts, &a.to_string()));
+        assert!(!host_allowed(&hosts, &Uuid::new_v4().to_string()));
+        assert!(!host_allowed(&hosts, "not-a-uuid"));
     }
 
     async fn spawn_test_server(broadcaster: Arc<LiveEventBroadcaster>) -> std::net::SocketAddr {

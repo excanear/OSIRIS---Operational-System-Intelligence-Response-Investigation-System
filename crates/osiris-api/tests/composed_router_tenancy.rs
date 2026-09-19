@@ -337,3 +337,47 @@ async fn a_tenant_with_no_hosts_sees_nothing_not_everything() {
     let (_, hosts) = call(&t.app, "GET", "/api/v1/hosts", Some(&token), None).await;
     assert!(hosts.as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_tenants_websocket_receives_only_its_hosts_events_and_rejects_foreign_host_ids() {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    let t = tenancy();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = t.app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/api/v1/stream/events?token={}", t.acme_token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    // Let the server register the subscription before publishing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    t.broadcaster.publish(&[
+        event_on(t.globex_host, 10, now_ns()),
+        event_on(t.acme_host, 11, now_ns()),
+    ]);
+    let message = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("the acme event must arrive")
+        .unwrap()
+        .unwrap();
+    let event: CanonicalEvent = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(event.host_id, t.acme_host);
+    // The globex event was filtered out: nothing else arrives.
+    assert!(tokio::time::timeout(Duration::from_millis(300), ws.next()).await.is_err());
+
+    // Asking for another tenant's host is rejected at the handshake with 403.
+    let url = format!(
+        "ws://{addr}/api/v1/stream/events?token={}&host_id={}",
+        t.acme_token, t.globex_host
+    );
+    match tokio_tungstenite::connect_async(url).await.unwrap_err() {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), 403)
+        }
+        other => panic!("expected an HTTP 403 handshake error, got {other:?}"),
+    }
+}
