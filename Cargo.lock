@@ -1064,6 +1064,7 @@ dependencies = [
  "osiris-schema",
  "osiris-storage",
  "osiris-storage-sqlite",
+ "osiris-tenancy",
  "serde",
  "serde_json",
  "tempfile",

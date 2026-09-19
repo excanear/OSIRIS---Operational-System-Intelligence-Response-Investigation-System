@@ -2669,3 +2669,4 @@ pub mod stream;
 pub use stream::{build_stream_router, LiveEventBroadcaster};
 pub mod response;
 pub use response::{build_response_router, ResponseState};
+pub mod tenant_scope;
