@@ -236,6 +236,7 @@ mod tests {
                 username: username.to_string(),
                 password_hash: osiris_auth::hash_password("password123").unwrap(),
                 role,
+                tenant_id: None,
             })
             .unwrap();
         state
@@ -293,6 +294,7 @@ mod tests {
                 username: "viewer1".to_string(),
                 password_hash: osiris_auth::hash_password("pw").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
         let session = state.users.create_session(viewer.user_id, 3600).unwrap();

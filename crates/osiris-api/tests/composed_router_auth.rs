@@ -177,6 +177,7 @@ fn session_for_role(state: &AuthState, username: &str, role: Role) -> String {
             username: username.to_string(),
             password_hash: osiris_auth::hash_password("password123").unwrap(),
             role,
+            tenant_id: None,
         })
         .unwrap();
     state.users.create_session(user.user_id, 3600).unwrap().token

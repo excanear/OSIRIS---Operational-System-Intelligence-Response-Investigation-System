@@ -54,12 +54,14 @@ fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
     let password_hash: String = row.get(2)?;
     let role: String = row.get(3)?;
     let created_at: i64 = row.get(4)?;
+    let tenant_id: Option<String> = row.get(5)?;
     Ok(User {
         user_id: Uuid::parse_str(&user_id).unwrap_or_else(|_| Uuid::nil()),
         username,
         password_hash,
         role: role_from_string(&role),
         created_at: created_at as u64,
+        tenant_id: tenant_id.and_then(|s| Uuid::parse_str(&s).ok()),
     })
 }
 
@@ -81,7 +83,8 @@ impl SqliteUserStore {
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                tenant_id TEXT
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
@@ -91,6 +94,26 @@ impl SqliteUserStore {
             );",
         )
         .map_err(|e| UserStoreError::Backend(e.to_string()))?;
+
+        let has_tenant_column: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(users)")
+                .map_err(|e| UserStoreError::Backend(e.to_string()))?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| UserStoreError::Backend(e.to_string()))?;
+            let mut found = false;
+            for name in names {
+                if name.map_err(|e| UserStoreError::Backend(e.to_string()))? == "tenant_id" {
+                    found = true;
+                }
+            }
+            found
+        };
+        if !has_tenant_column {
+            conn.execute("ALTER TABLE users ADD COLUMN tenant_id TEXT", [])
+                .map_err(|e| UserStoreError::Backend(e.to_string()))?;
+        }
 
         let store = Self { conn: Mutex::new(conn) };
 
@@ -110,6 +133,7 @@ impl SqliteUserStore {
                 username: "admin".to_string(),
                 password_hash,
                 role: Role::Admin,
+                tenant_id: None,
             })?;
             Some(BootstrapAdmin {
                 username: "admin".to_string(),
@@ -130,14 +154,15 @@ impl UserStore for SqliteUserStore {
         let role_str = role_to_string(new_user.role);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, role, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO users (user_id, username, password_hash, role, created_at, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 user_id.to_string(),
                 new_user.username,
                 new_user.password_hash,
                 role_str,
-                created_at as i64
+                created_at as i64,
+                new_user.tenant_id.map(|t| t.to_string())
             ],
         )
         .map_err(|e| {
@@ -153,13 +178,14 @@ impl UserStore for SqliteUserStore {
             password_hash: new_user.password_hash,
             role: new_user.role,
             created_at,
+            tenant_id: new_user.tenant_id,
         })
     }
 
     fn get_user_by_username(&self, username: &str) -> Result<Option<User>, UserStoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT user_id, username, password_hash, role, created_at FROM users WHERE username = ?1",
+            "SELECT user_id, username, password_hash, role, created_at, tenant_id FROM users WHERE username = ?1",
             params![username],
             row_to_user,
         )
@@ -170,7 +196,7 @@ impl UserStore for SqliteUserStore {
     fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<User>, UserStoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT user_id, username, password_hash, role, created_at FROM users WHERE user_id = ?1",
+            "SELECT user_id, username, password_hash, role, created_at, tenant_id FROM users WHERE user_id = ?1",
             params![user_id.to_string()],
             row_to_user,
         )
@@ -182,7 +208,7 @@ impl UserStore for SqliteUserStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT user_id, username, password_hash, role, created_at \
+                "SELECT user_id, username, password_hash, role, created_at, tenant_id \
                  FROM users ORDER BY created_at ASC",
             )
             .map_err(|e| UserStoreError::Backend(e.to_string()))?;
@@ -286,6 +312,7 @@ mod tests {
                 username: "alice".to_string(),
                 password_hash: hash_password("pw1").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -294,6 +321,7 @@ mod tests {
                 username: "alice".to_string(),
                 password_hash: hash_password("pw2").unwrap(),
                 role: Role::Analyst,
+                tenant_id: None,
             })
             .unwrap_err();
         assert!(matches!(err, UserStoreError::DuplicateUsername(_)));
@@ -308,6 +336,7 @@ mod tests {
                 username: "bob".to_string(),
                 password_hash: hash_password("pw").unwrap(),
                 role: Role::Analyst,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -326,6 +355,7 @@ mod tests {
                 username: "carol".to_string(),
                 password_hash: hash_password("pw").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -351,6 +381,7 @@ mod tests {
                 username: "dave".to_string(),
                 password_hash: hash_password("pw").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
         let session = store.create_session(user.user_id, 3600).unwrap();
@@ -369,6 +400,7 @@ mod tests {
                 username: "erin".to_string(),
                 password_hash: hash_password("pw").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -377,5 +409,66 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].username, "admin");
         assert_eq!(users[1].username, "erin");
+    }
+
+    #[test]
+    fn a_user_created_with_a_tenant_round_trips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = SqliteUserStore::open(dir.path().join("users.db")).unwrap();
+        let tenant = Uuid::new_v4();
+        let created = store
+            .create_user(NewUser {
+                username: "alice".to_string(),
+                password_hash: "h".to_string(),
+                role: Role::Analyst,
+                tenant_id: Some(tenant),
+            })
+            .unwrap();
+        assert_eq!(created.tenant_id, Some(tenant));
+        let fetched = store.get_user_by_id(created.user_id).unwrap().unwrap();
+        assert_eq!(fetched.tenant_id, Some(tenant));
+        let by_name = store.get_user_by_username("alice").unwrap().unwrap();
+        assert_eq!(by_name.tenant_id, Some(tenant));
+    }
+
+    #[test]
+    fn the_bootstrap_admin_is_a_platform_user_without_a_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = SqliteUserStore::open(dir.path().join("users.db")).unwrap();
+        let admin = store.get_user_by_username("admin").unwrap().unwrap();
+        assert_eq!(admin.tenant_id, None);
+    }
+
+    #[test]
+    fn opening_a_pre_tenant_database_adds_the_column_and_keeps_users_as_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        {
+            // The schema exactly as Phase 8a created it (no tenant_id column).
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    issued_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                INSERT INTO users VALUES ('11111111-1111-1111-1111-111111111111','legacy','h','ADMIN',1);",
+            )
+            .unwrap();
+        }
+        let (store, bootstrap) = SqliteUserStore::open(&path).unwrap();
+        assert!(bootstrap.is_none(), "an existing user means no bootstrap admin");
+        let legacy = store.get_user_by_username("legacy").unwrap().unwrap();
+        assert_eq!(legacy.tenant_id, None);
+        // And reopening again (column already present) is a no-op.
+        let (_store2, _) = SqliteUserStore::open(&path).unwrap();
     }
 }

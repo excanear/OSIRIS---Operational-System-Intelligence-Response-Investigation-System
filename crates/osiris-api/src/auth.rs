@@ -261,6 +261,7 @@ async fn create_user_handler(
                 username,
                 password_hash,
                 role,
+                tenant_id: None,
             })
         }
     })
@@ -364,6 +365,7 @@ mod tests {
                 username: "alice".to_string(),
                 password_hash: osiris_auth::hash_password("secret123").unwrap(),
                 role: Role::Analyst,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -390,6 +392,7 @@ mod tests {
                 username: "bob".to_string(),
                 password_hash: osiris_auth::hash_password("correct").unwrap(),
                 role: Role::Viewer,
+                tenant_id: None,
             })
             .unwrap();
 
@@ -417,6 +420,7 @@ mod tests {
                 username: "carol".to_string(),
                 password_hash: osiris_auth::hash_password("pw").unwrap(),
                 role: Role::Admin,
+                tenant_id: None,
             })
             .unwrap();
         let ctx = AuthContext {

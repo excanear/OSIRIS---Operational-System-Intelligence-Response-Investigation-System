@@ -20,6 +20,10 @@ pub struct User {
     pub password_hash: String,
     pub role: Role,
     pub created_at: u64,
+    /// `None` = platform user (sees every tenant). `Some` = belongs to
+    /// exactly one tenant (Phase 8f).
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Fields needed to create a user — `SqliteUserStore::create_user` fills in
@@ -29,6 +33,7 @@ pub struct NewUser {
     pub username: String,
     pub password_hash: String,
     pub role: Role,
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
