@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth_middleware::AuthContext;
-use crate::incidents::{caller_tenant, visible_incident, visible_to, IncidentEvidenceState};
+use crate::incidents::{visible_incident, visible_to, IncidentEvidenceState};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateEvidenceBody {
@@ -21,10 +21,10 @@ pub struct CreateEvidenceBody {
 
 pub async fn create_evidence_handler(
     State(state): State<IncidentEvidenceState>,
-    ctx: Option<Extension<AuthContext>>,
+    Extension(ctx): Extension<AuthContext>,
     Json(body): Json<CreateEvidenceBody>,
 ) -> Result<Json<Evidence>, (StatusCode, String)> {
-    let caller = caller_tenant(&ctx);
+    let caller = ctx.tenant_id;
     let integrity = Integrity { hash: body.hash, immutable_since: body.immutable_since };
     let evidence = Evidence::new(body.source, body.immutable_since, integrity, body.relationships, body.supersedes)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
@@ -90,10 +90,10 @@ pub enum ListEvidenceResponse {
 
 pub async fn list_evidence_handler(
     State(state): State<IncidentEvidenceState>,
-    ctx: Option<Extension<AuthContext>>,
+    Extension(ctx): Extension<AuthContext>,
     Query(q): Query<ListEvidenceQuery>,
 ) -> Result<Json<ListEvidenceResponse>, (StatusCode, String)> {
-    let caller = caller_tenant(&ctx);
+    let caller = ctx.tenant_id;
     match q.incident_id {
         Some(incident_id_str) => {
             let incident_id: Uuid = incident_id_str
@@ -134,14 +134,14 @@ pub async fn list_evidence_handler(
                         state.links.incident_ids_for_evidence(evidence.evidence_id()).map_err(|e| e.to_string())?;
                     if caller.is_some() {
                         // Never disclose the id of an incident the caller cannot see.
-                        incident_ids.retain(|id| {
-                            state
-                                .incidents
-                                .get(*id)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|i| visible_to(i.tenant_id, caller))
-                        });
+                        let mut kept = Vec::with_capacity(incident_ids.len());
+                        for id in incident_ids {
+                            let owner = state.incidents.get(id).map_err(|e| e.to_string())?;
+                            if owner.is_some_and(|i| visible_to(i.tenant_id, caller)) {
+                                kept.push(id);
+                            }
+                        }
+                        incident_ids = kept;
                     }
                     out.push(EvidenceWithIncidents { evidence, incident_ids });
                 }
@@ -159,6 +159,10 @@ pub async fn list_evidence_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn platform_ctx() -> AuthContext {
+        AuthContext { user_id: Uuid::now_v7(), role: osiris_auth::Role::Admin, token: "t".to_string(), tenant_id: None }
+    }
     use std::sync::Arc;
 
     use crate::incidents::IncidentEvidenceState;
@@ -200,10 +204,10 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let Json(created) = create_evidence_handler(State(state.clone()), None, Json(body)).await.unwrap();
+        let Json(created) = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body)).await.unwrap();
 
         let list_query = ListEvidenceQuery { incident_id: Some(incident.incident_id.to_string()) };
-        let Json(response) = list_evidence_handler(State(state), None, Query(list_query)).await.unwrap();
+        let Json(response) = list_evidence_handler(State(state), Extension(platform_ctx()), Query(list_query)).await.unwrap();
         let ListEvidenceResponse::Scoped(list) = response else {
             panic!("expected a scoped response");
         };
@@ -222,7 +226,7 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let err = create_evidence_handler(State(state), None, Json(body)).await.unwrap_err();
+        let err = create_evidence_handler(State(state), Extension(platform_ctx()), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -230,7 +234,7 @@ mod tests {
     async fn list_evidence_requires_a_valid_incident_id() {
         let (_dir, state) = test_state();
         let q = ListEvidenceQuery { incident_id: Some("not-a-uuid".to_string()) };
-        let err = list_evidence_handler(State(state), None, Query(q)).await.unwrap_err();
+        let err = list_evidence_handler(State(state), Extension(platform_ctx()), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -257,7 +261,7 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let _ = create_evidence_handler(State(state.clone()), None, Json(linked_body)).await.unwrap();
+        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(linked_body)).await.unwrap();
 
         let unlinked_body = CreateEvidenceBody {
             source: EvidenceSource::ManualUpload,
@@ -267,10 +271,10 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let _ = create_evidence_handler(State(state.clone()), None, Json(unlinked_body)).await.unwrap();
+        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(unlinked_body)).await.unwrap();
 
         let Json(response) =
-            list_evidence_handler(State(state), None, Query(ListEvidenceQuery { incident_id: None }))
+            list_evidence_handler(State(state), Extension(platform_ctx()), Query(ListEvidenceQuery { incident_id: None }))
                 .await
                 .unwrap();
         let ListEvidenceResponse::All(all) = response else {
@@ -306,11 +310,11 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let _ = create_evidence_handler(State(state.clone()), None, Json(body)).await.unwrap();
+        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body)).await.unwrap();
 
         let Json(response) = list_evidence_handler(
             State(state),
-            None,
+            Extension(platform_ctx()),
             Query(ListEvidenceQuery { incident_id: Some(incident.incident_id.to_string()) }),
         )
         .await
