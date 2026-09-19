@@ -53,7 +53,10 @@ impl LiveEventBroadcaster {
     /// Registers a new connection. Returns its id (for `unsubscribe`), the
     /// receiver half a WebSocket handler forwards to the socket, and a
     /// shared drop counter for observability.
-    pub fn subscribe(&self, filter: Option<Ast>) -> (Uuid, mpsc::Receiver<CanonicalEvent>, Arc<AtomicU64>) {
+    pub fn subscribe(
+        &self,
+        filter: Option<Ast>,
+    ) -> (Uuid, mpsc::Receiver<CanonicalEvent>, Arc<AtomicU64>) {
         self.subscribe_scoped(filter, None)
     }
 
@@ -229,7 +232,10 @@ async fn stream_events_handler(
 
     if let Some(host_id) = &params.host_id {
         if normalize_host(host_id).is_none() {
-            return Err((StatusCode::BAD_REQUEST, "host_id must be a UUID".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "host_id must be a UUID".to_string(),
+            ));
         }
     }
 
@@ -258,7 +264,9 @@ async fn stream_events_handler(
     };
 
     let keepalive = keepalive.map(|axum::Extension(k)| k).unwrap_or_default();
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_socket(socket, broadcaster, filter, tenant_hosts, keepalive)
+    }))
 }
 
 async fn handle_socket(
@@ -306,7 +314,7 @@ mod tests {
     use super::*;
     use osiris_query::{Ast, Op, Value};
     use osiris_schema::{
-        Category, EventType, HostRef, Severity, Source, CanonicalEvent, SCHEMA_VERSION,
+        CanonicalEvent, Category, EventType, HostRef, Severity, Source, SCHEMA_VERSION,
     };
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
@@ -418,7 +426,10 @@ mod tests {
     #[test]
     fn origin_is_same_site_allows_a_matching_origin() {
         let mut headers = HeaderMap::new();
-        headers.insert(axum::http::header::ORIGIN, "http://127.0.0.1:8080".parse().unwrap());
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://127.0.0.1:8080".parse().unwrap(),
+        );
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
         assert!(origin_is_same_site(&headers));
     }
@@ -426,7 +437,10 @@ mod tests {
     #[test]
     fn origin_is_same_site_rejects_a_cross_origin_request() {
         let mut headers = HeaderMap::new();
-        headers.insert(axum::http::header::ORIGIN, "https://evil.example".parse().unwrap());
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://evil.example".parse().unwrap(),
+        );
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
         assert!(!origin_is_same_site(&headers));
     }
@@ -441,7 +455,10 @@ mod tests {
     #[test]
     fn origin_is_same_site_rejects_an_origin_with_no_host_header() {
         let mut headers = HeaderMap::new();
-        headers.insert(axum::http::header::ORIGIN, "http://127.0.0.1:8080".parse().unwrap());
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://127.0.0.1:8080".parse().unwrap(),
+        );
         assert!(!origin_is_same_site(&headers));
     }
 
@@ -490,7 +507,10 @@ mod tests {
             sample_event(mine, EventType::ProcessExec),
         ]);
 
-        assert_eq!(receiver.try_recv().unwrap().event_type, EventType::ProcessExec);
+        assert_eq!(
+            receiver.try_recv().unwrap().event_type,
+            EventType::ProcessExec
+        );
         assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
@@ -695,6 +715,9 @@ mod tests {
         while broadcaster.has_subscribers() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(!broadcaster.has_subscribers(), "idle connection must be dropped");
+        assert!(
+            !broadcaster.has_subscribers(),
+            "idle connection must be dropped"
+        );
     }
 }

@@ -51,7 +51,10 @@ impl NsCgroupResolver {
         resolved
     }
 
-    fn resolve_uncached(&self, pid: u32) -> Option<(NamespaceRef, CgroupRef, Option<ContainerRef>)> {
+    fn resolve_uncached(
+        &self,
+        pid: u32,
+    ) -> Option<(NamespaceRef, CgroupRef, Option<ContainerRef>)> {
         let pid_dir = self.proc_root.join(pid.to_string());
         let cgroup_contents = std::fs::read_to_string(pid_dir.join("cgroup")).ok()?;
         let (cgroup_path, file_version) = parse_cgroup_file(&cgroup_contents)?;
@@ -67,12 +70,13 @@ impl NsCgroupResolver {
 
         let namespace = read_namespaces(&pid_dir.join("ns"));
 
-        let container = container_id_from_cgroup_path(&cgroup_path).map(|container_id| ContainerRef {
-            container_id,
-            image: String::new(),
-            runtime: "cgroup".to_string(),
-            pod_ref: None,
-        });
+        let container =
+            container_id_from_cgroup_path(&cgroup_path).map(|container_id| ContainerRef {
+                container_id,
+                image: String::new(),
+                runtime: "cgroup".to_string(),
+                pod_ref: None,
+            });
 
         Some((namespace, cgroup, container))
     }
@@ -192,7 +196,11 @@ mod tests {
         write_cgroup(tmp.path(), 42, &format!("0::/docker/{id_b}\n"));
         let (_, second_cgroup, second_container) = resolver.resolve(42).unwrap();
         assert_eq!(second_cgroup.cgroup_path, first_cgroup.cgroup_path);
-        assert_eq!(second_container.unwrap().container_id, id_a, "must still be the cached value, not the mutated file's");
+        assert_eq!(
+            second_container.unwrap().container_id,
+            id_a,
+            "must still be the cached value, not the mutated file's"
+        );
     }
 
     /// Real Linux: `/proc/<pid>/ns/net` is a symlink whose target text is

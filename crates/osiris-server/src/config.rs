@@ -122,10 +122,16 @@ mod tests {
         )
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
-        assert_eq!(config.incidents_db_path.as_deref(), Some("/tmp/incidents.db"));
+        assert_eq!(
+            config.incidents_db_path.as_deref(),
+            Some("/tmp/incidents.db")
+        );
         assert_eq!(config.evidence_db_path.as_deref(), Some("/tmp/evidence.db"));
         assert_eq!(config.links_db_path.as_deref(), Some("/tmp/links.db"));
-        assert_eq!(config.investigate_audit_log_path.as_deref(), Some("/tmp/investigate-audit.jsonl"));
+        assert_eq!(
+            config.investigate_audit_log_path.as_deref(),
+            Some("/tmp/investigate-audit.jsonl")
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@ pub struct Story {
 /// whose evidence cites one of them — the composition step every
 /// `*_story` operation shares (ARCHITECTURE.md §12.1: "assembled and
 /// returned as a time-ordered structure").
-pub fn assemble(storage: &dyn Storage, mut events: Vec<CanonicalEvent>) -> Result<Story, StorageError> {
+pub fn assemble(
+    storage: &dyn Storage,
+    mut events: Vec<CanonicalEvent>,
+) -> Result<Story, StorageError> {
     events.sort_by_key(|e| (e.timestamp, e.event_id));
 
     let evidence_ids: Vec<uuid::Uuid> = events.iter().map(|e| e.event_id).collect();
@@ -37,8 +40,8 @@ pub fn assemble(storage: &dyn Storage, mut events: Vec<CanonicalEvent>) -> Resul
 mod tests {
     use super::assemble;
     use osiris_schema::{
-        Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
-        CanonicalEvent,
+        CanonicalEvent, Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source,
+        SCHEMA_VERSION,
     };
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;

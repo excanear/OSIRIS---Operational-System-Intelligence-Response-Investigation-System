@@ -17,7 +17,10 @@ impl AzureImds {
     }
 
     pub fn with_base_url(base: impl Into<String>) -> Self {
-        Self { base: base.into().trim_end_matches('/').to_string(), client: http_client() }
+        Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            client: http_client(),
+        }
     }
 
     async fn try_probe(&self) -> Result<Option<CloudContext>, reqwest::Error> {
@@ -25,7 +28,10 @@ impl AzureImds {
             return Ok(None);
         };
         let resp = client
-            .get(format!("{}/metadata/instance?api-version=2021-02-01", self.base))
+            .get(format!(
+                "{}/metadata/instance?api-version=2021-02-01",
+                self.base
+            ))
             .header("Metadata", "true")
             .send()
             .await?
@@ -47,7 +53,11 @@ impl AzureImds {
             tracing::debug!("azure imds response has no usable fields");
             return Ok(None);
         }
-        Ok(Some(CloudContext { provider: "azure".to_string(), instance_id, region }))
+        Ok(Some(CloudContext {
+            provider: "azure".to_string(),
+            instance_id,
+            region,
+        }))
     }
 }
 
@@ -81,7 +91,11 @@ mod tests {
 
     async fn instance(headers: HeaderMap) -> impl IntoResponse {
         if headers.get("metadata").and_then(|v| v.to_str().ok()) == Some("true") {
-            (StatusCode::OK, r#"{"compute":{"vmId":"vm-42","location":"westeurope"}}"#).into_response()
+            (
+                StatusCode::OK,
+                r#"{"compute":{"vmId":"vm-42","location":"westeurope"}}"#,
+            )
+                .into_response()
         } else {
             StatusCode::BAD_REQUEST.into_response()
         }
@@ -104,19 +118,25 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_json_yields_none() {
-        let base = serve(Router::new().route("/metadata/instance", get(|| async { "<html>" }))).await;
+        let base =
+            serve(Router::new().route("/metadata/instance", get(|| async { "<html>" }))).await;
         assert!(AzureImds::with_base_url(base).probe().await.is_none());
     }
 
     #[tokio::test]
     async fn missing_compute_object_yields_none() {
-        let base = serve(Router::new().route("/metadata/instance", get(|| async { r#"{"network":{}}"# }))).await;
+        let base =
+            serve(Router::new().route("/metadata/instance", get(|| async { r#"{"network":{}}"# })))
+                .await;
         assert!(AzureImds::with_base_url(base).probe().await.is_none());
     }
 
     #[tokio::test]
     async fn oversized_body_yields_none() {
-        let big = format!(r#"{{"compute":{{"vmId":"v","pad":"{}"}}}}"#, "x".repeat(crate::MAX_BODY_LEN));
+        let big = format!(
+            r#"{{"compute":{{"vmId":"v","pad":"{}"}}}}"#,
+            "x".repeat(crate::MAX_BODY_LEN)
+        );
         let router = Router::new().route(
             "/metadata/instance",
             get(move || {
@@ -130,12 +150,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_client_yields_none() {
-        let p = AzureImds { base: "http://127.0.0.1:1".into(), client: None };
+        let p = AzureImds {
+            base: "http://127.0.0.1:1".into(),
+            client: None,
+        };
         assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]
     async fn unreachable_endpoint_yields_none() {
-        assert!(AzureImds::with_base_url("http://127.0.0.1:1").probe().await.is_none());
+        assert!(AzureImds::with_base_url("http://127.0.0.1:1")
+            .probe()
+            .await
+            .is_none());
     }
 }

@@ -122,10 +122,12 @@ async fn login_handler(
 
     let password = body.password.clone();
     let password_hash = user.password_hash.clone();
-    let verified = tokio::task::spawn_blocking(move || osiris_auth::verify_password(&password, &password_hash))
-        .await
-        .unwrap()
-        .unwrap_or(false);
+    let verified = tokio::task::spawn_blocking(move || {
+        osiris_auth::verify_password(&password, &password_hash)
+    })
+    .await
+    .unwrap()
+    .unwrap_or(false);
     if !verified {
         audit_login_denied(&state, &username);
         return Err(denied());
@@ -397,7 +399,8 @@ mod tests {
             audit_log: Arc::new(audit_log),
             session_ttl_seconds: 3600,
             tenants: Arc::new(
-                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db")).unwrap(),
+                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db"))
+                    .unwrap(),
             ),
         };
         (users_dir, audit_dir, state)
@@ -508,7 +511,9 @@ mod tests {
         .unwrap();
 
         let Json(users) = list_users_handler(State(state)).await.unwrap();
-        assert!(users.iter().any(|u| u.username == "dave" && u.role == Role::ResponseOperator));
+        assert!(users
+            .iter()
+            .any(|u| u.username == "dave" && u.role == Role::ResponseOperator));
     }
 
     #[tokio::test]
@@ -533,12 +538,18 @@ mod tests {
         )
         .await;
 
-        let (status, message) = result.err().expect("a 5-character password must be rejected");
+        let (status, message) = result
+            .err()
+            .expect("a 5-character password must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("at least 8 characters"), "got: {message}");
 
         // ...and nothing was created.
-        assert!(state.users.get_user_by_username("shorty").unwrap().is_none());
+        assert!(state
+            .users
+            .get_user_by_username("shorty")
+            .unwrap()
+            .is_none());
         let Json(users) = list_users_handler(State(state)).await.unwrap();
         assert!(!users.iter().any(|u| u.username == "shorty"));
     }
@@ -551,7 +562,9 @@ mod tests {
             .append(NewAuditEntry {
                 who: ActorRef::System,
                 what: "first".to_string(),
-                target: EntityRef::Domain { name: "x".to_string() },
+                target: EntityRef::Domain {
+                    name: "x".to_string(),
+                },
                 why: None,
                 result: AuditResult::Success,
             })
@@ -561,7 +574,9 @@ mod tests {
             .append(NewAuditEntry {
                 who: ActorRef::System,
                 what: "second".to_string(),
-                target: EntityRef::Domain { name: "x".to_string() },
+                target: EntityRef::Domain {
+                    name: "x".to_string(),
+                },
                 why: None,
                 result: AuditResult::Success,
             })

@@ -32,7 +32,10 @@ pub enum PersistenceWatchKind {
 /// — anything else in that directory (`.socket`, `.mount`, `.path`, etc.)
 /// returns `None` and the caller skips it silently (plan Global Constraint
 /// #4: a documented, deliberate drop, not a guess).
-pub fn checkpoint_kind_for(target_kind: PersistenceWatchKind, path: &std::path::Path) -> Option<PersistenceCheckpointKind> {
+pub fn checkpoint_kind_for(
+    target_kind: PersistenceWatchKind,
+    path: &std::path::Path,
+) -> Option<PersistenceCheckpointKind> {
     match target_kind {
         PersistenceWatchKind::SystemdUnitDir => match path.extension().and_then(|e| e.to_str()) {
             Some("service") => Some(PersistenceCheckpointKind::SystemdUnit),

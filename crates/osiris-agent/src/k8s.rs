@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use osiris_k8s_context::{refresh_once_result, spawn_refresher, KubeletClient, KubeletConfig, PodCache};
+use osiris_k8s_context::{
+    refresh_once_result, spawn_refresher, KubeletClient, KubeletConfig, PodCache,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +37,10 @@ pub async fn start_pod_cache(
         return None;
     }
     let client = KubeletClient::new(KubeletConfig {
-        url: cfg.kubelet_url.clone().unwrap_or_else(|| DEFAULT_KUBELET_URL.to_string()),
+        url: cfg
+            .kubelet_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KUBELET_URL.to_string()),
         token_path: PathBuf::from(token_path(cfg)),
         ca_path: cfg.ca_path.as_ref().map(PathBuf::from),
         insecure_skip_verify: cfg.insecure_skip_verify,
@@ -87,13 +92,20 @@ mod tests {
 
     #[test]
     fn disabled_is_never_active() {
-        let cfg = K8sContextConfig { enabled: false, kubelet_url: Some("https://x".into()), ..Default::default() };
+        let cfg = K8sContextConfig {
+            enabled: false,
+            kubelet_url: Some("https://x".into()),
+            ..Default::default()
+        };
         assert!(!k8s_context_active(&cfg));
     }
 
     #[test]
     fn no_url_and_no_token_file_is_inactive() {
-        let cfg = K8sContextConfig { token_path: Some("/no/such/token".into()), ..Default::default() };
+        let cfg = K8sContextConfig {
+            token_path: Some("/no/such/token".into()),
+            ..Default::default()
+        };
         assert!(!k8s_context_active(&cfg));
     }
 
@@ -110,13 +122,19 @@ mod tests {
     #[test]
     fn an_existing_token_file_activates() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = K8sContextConfig { token_path: Some(token(&dir)), ..Default::default() };
+        let cfg = K8sContextConfig {
+            token_path: Some(token(&dir)),
+            ..Default::default()
+        };
         assert!(k8s_context_active(&cfg));
     }
 
     #[tokio::test]
     async fn inactive_config_starts_nothing() {
-        let cfg = K8sContextConfig { enabled: false, ..Default::default() };
+        let cfg = K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let cancel = CancellationToken::new();
         assert!(start_pod_cache(&cfg, &cancel).await.is_none());
     }
@@ -128,7 +146,8 @@ mod tests {
         let router = Router::new().route(
             "/pods",
             get(move |headers: HeaderMap| async move {
-                if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer tok") {
+                if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer tok")
+                {
                     (axum::http::StatusCode::OK, body).into_response()
                 } else {
                     axum::http::StatusCode::UNAUTHORIZED.into_response()
@@ -144,7 +163,11 @@ mod tests {
         };
         let cancel = CancellationToken::new();
         let (cache, handle) = start_pod_cache(&cfg, &cancel).await.expect("active");
-        assert_eq!(cache.lookup("abc").unwrap().pod_name, "web-0", "initial fetch must already be applied");
+        assert_eq!(
+            cache.lookup("abc").unwrap().pod_name,
+            "web-0",
+            "initial fetch must already be applied"
+        );
         cancel.cancel();
         handle.await.unwrap();
     }

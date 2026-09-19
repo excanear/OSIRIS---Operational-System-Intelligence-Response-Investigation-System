@@ -112,7 +112,9 @@ pub enum RuleError {
     BlankId { origin: String },
     #[error("rule {id} has no match conditions — it would fire on everything")]
     NoConditions { id: String },
-    #[error("rule {id} sets both 'match' and 'conditions' — a rule must use exactly one condition form")]
+    #[error(
+        "rule {id} sets both 'match' and 'conditions' — a rule must use exactly one condition form"
+    )]
     ConflictingConditions { id: String },
     #[error("rule {id} condition {index} has a blank reason (ARCHITECTURE.md §11.2 requires one explanation per matched condition)")]
     EmptyReason { id: String, index: usize },
@@ -140,11 +142,10 @@ impl Rule {
     /// messages — it deliberately does not feed the content hash, so
     /// renaming a rule file does not invalidate the alerts citing it.
     pub fn from_yaml_str(yaml: &str, origin: &str) -> Result<Self, RuleError> {
-        let parsed: RuleFile =
-            serde_yaml::from_str(yaml).map_err(|source| RuleError::Parse {
-                origin: origin.to_string(),
-                source,
-            })?;
+        let parsed: RuleFile = serde_yaml::from_str(yaml).map_err(|source| RuleError::Parse {
+            origin: origin.to_string(),
+            source,
+        })?;
         if parsed.id.trim().is_empty() {
             return Err(RuleError::BlankId {
                 origin: origin.to_string(),
@@ -254,7 +255,10 @@ match:
     fn content_hash_is_a_stable_sha256_of_the_rule_text() {
         let a = Rule::from_yaml_str(VALID_RULE, "test.yaml").unwrap();
         let b = Rule::from_yaml_str(VALID_RULE, "other-name.yaml").unwrap();
-        assert_eq!(a.content_hash, b.content_hash, "the file name is not content");
+        assert_eq!(
+            a.content_hash, b.content_hash,
+            "the file name is not content"
+        );
         assert_eq!(a.content_hash.len(), 64);
 
         let edited = VALID_RULE.replace("/var/www/", "/srv/www/");

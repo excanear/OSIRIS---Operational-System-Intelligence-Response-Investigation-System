@@ -144,7 +144,9 @@ pub fn group_to_file_events(
     }
 
     if class == SyscallClass::Rename {
-        return rename_event(id, syscall, cwd, &operands).into_iter().collect();
+        return rename_event(id, syscall, cwd, &operands)
+            .into_iter()
+            .collect();
     }
 
     operands
@@ -175,7 +177,14 @@ pub fn group_to_file_events(
                 NameType::Normal if class == SyscallClass::Write => FileOperation::Write,
                 _ => return None,
             };
-            Some(build_event(id, syscall, operation, absolutize(&path.name, cwd), None, path))
+            Some(build_event(
+                id,
+                syscall,
+                operation,
+                absolutize(&path.name, cwd),
+                None,
+                path,
+            ))
         })
         .collect()
 }
@@ -436,7 +445,8 @@ mod tests {
 
     #[test]
     fn a_failed_syscall_produces_no_events() {
-        let failed = syscall_line(463, 87, "rm", "/usr/bin/rm").replace("success=yes", "success=no");
+        let failed =
+            syscall_line(463, 87, "rm", "/usr/bin/rm").replace("success=yes", "success=no");
         let lines = vec![failed, path_line(463, 0, "/tmp/foo", 131075, "DELETE")];
         assert!(events_for(&lines).is_empty());
     }
@@ -510,7 +520,9 @@ mod tests {
         // 100ms timeout, but only 40ms have passed since the last record —
         // the group must survive this tick.
         assert!(
-            assembler.tick(start + Duration::from_millis(130)).is_empty(),
+            assembler
+                .tick(start + Duration::from_millis(130))
+                .is_empty(),
             "must track idle time since the last record, not since the group was created"
         );
 
@@ -526,7 +538,9 @@ mod tests {
         let mut assembler = AuditEventAssembler::new(Duration::from_secs(60));
         let now = Instant::now();
         assembler.offer(&syscall_line(490, 87, "rm", "/usr/bin/rm"), now);
-        assert!(assembler.offer("garbage with no audit header", now).is_empty());
+        assert!(assembler
+            .offer("garbage with no audit header", now)
+            .is_empty());
         assembler.offer(&path_line(490, 0, "/tmp/foo", 1, "DELETE"), now);
         let emitted = assembler.flush();
         assert_eq!(emitted.len(), 1);

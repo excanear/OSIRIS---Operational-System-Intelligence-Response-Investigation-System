@@ -291,8 +291,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "").unwrap();
 
-        let mut sensor =
-            IdentitySensor::new(&path).with_poll_interval(Duration::from_millis(20));
+        let mut sensor = IdentitySensor::new(&path).with_poll_interval(Duration::from_millis(20));
         let (tx, mut rx) = mpsc::channel(16);
         let cancellation = CancellationToken::new();
         sensor
@@ -365,8 +364,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut sensor =
-            IdentitySensor::new(&path).with_poll_interval(Duration::from_millis(20));
+        let mut sensor = IdentitySensor::new(&path).with_poll_interval(Duration::from_millis(20));
         let (tx, mut rx) = mpsc::channel(16);
         let cancellation = CancellationToken::new();
         sensor

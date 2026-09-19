@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query};
 use crate::tenant_scope::ScopedStorage;
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use osiris_correlate::{BehavioralChain, CorrelationEngine, EdgeSource};
-use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessKey, RiskScoreRecord};
+use osiris_schema::{
+    Alert, CanonicalEvent, EntityRef, EntityRelationship, EventType, FileIdentity, ProcessKey,
+    RiskScoreRecord,
+};
 use osiris_storage::{AlertQueryPlan, QueryPlan, RelationshipQueryPlan, RiskQueryPlan, Storage};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +28,10 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
             "/api/v1/processes/:process_key",
             get(process_detail_handler),
         )
-        .route("/api/v1/processes/:process_key/story", get(process_story_handler))
+        .route(
+            "/api/v1/processes/:process_key/story",
+            get(process_story_handler),
+        )
         .route("/api/v1/alerts", get(alerts_handler))
         .route("/api/v1/files", get(files_handler))
         .route("/api/v1/files/story", get(file_story_handler))
@@ -40,7 +46,10 @@ pub fn build_router(storage: Arc<dyn Storage>) -> Router {
         .route("/api/v1/graph", get(graph_handler))
         .route("/api/v1/graph/subgraph", get(subgraph_handler))
         .route("/api/v1/risk", get(risk_handler))
-        .route("/api/v1/incidents/:seed_entity/reconstruct", get(reconstruct_incident_handler))
+        .route(
+            "/api/v1/incidents/:seed_entity/reconstruct",
+            get(reconstruct_incident_handler),
+        )
         .with_state(storage)
 }
 
@@ -150,9 +159,13 @@ async fn subgraph_handler(
     let Some(entity_key) = q.entity else {
         return Err((StatusCode::BAD_REQUEST, "must provide entity".to_string()));
     };
-    let seed = EntityRef::parse_storage_key(&entity_key).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let seed = EntityRef::parse_storage_key(&entity_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let depth = q.depth.unwrap_or(MAX_GRAPH_DEPTH).min(MAX_GRAPH_DEPTH);
-    let max_nodes = q.max_nodes.unwrap_or(MAX_SUBGRAPH_NODES).min(MAX_SUBGRAPH_NODES);
+    let max_nodes = q
+        .max_nodes
+        .unwrap_or(MAX_SUBGRAPH_NODES)
+        .min(MAX_SUBGRAPH_NODES);
     let since = q.since.unwrap_or(0);
     let until = q.until.unwrap_or(u64::MAX);
 
@@ -186,7 +199,12 @@ async fn risk_handler(
     let mut plan = RiskQueryPlan::new();
     if let Some(pk) = &q.process_key {
         let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(pk.clone()))
-            .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid process_key: {pk}")))?;
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid process_key: {pk}"),
+                )
+            })?;
         plan.process_key = Some(process_key);
     }
     if let Some(eid) = &q.event_id {
@@ -254,7 +272,10 @@ async fn events_handler(
         // Validate the sugar param the same way the OQL path would, so a
         // typo here gets the same 400 an OQL typo would.
         serde_json::from_str::<EventType>(&format!("\"{}\"", et)).map_err(|_| {
-            (StatusCode::BAD_REQUEST, format!("invalid event_type: {}", et))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid event_type: {}", et),
+            )
         })?;
         let event_type_ast = osiris_query::ast::Ast::Compare {
             field: "event_type".to_string(),
@@ -262,7 +283,9 @@ async fn events_handler(
             value: osiris_query::ast::Value::Str(et.clone()),
         };
         plan.filter = Some(match plan.filter {
-            Some(existing) => osiris_query::ast::Ast::And(Box::new(existing), Box::new(event_type_ast)),
+            Some(existing) => {
+                osiris_query::ast::Ast::And(Box::new(existing), Box::new(event_type_ast))
+            }
             None => event_type_ast,
         });
     }
@@ -436,7 +459,9 @@ async fn files_handler(
     let mut seen: HashMap<(uuid::Uuid, FileIdentity), FileSummary> = HashMap::new();
     for event in events {
         let Some(file) = &event.file else { continue };
-        let Some(identity) = FileIdentity::from_file_ref(file) else { continue };
+        let Some(identity) = FileIdentity::from_file_ref(file) else {
+            continue;
+        };
         let key = (event.host_id, identity);
         match seen.get(&key) {
             Some(existing) if existing.timestamp >= event.timestamp => {}
@@ -465,7 +490,10 @@ async fn file_story_handler(
     Query(q): Query<FileStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.path.is_none() && q.file_id.is_none() {
-        return Err((StatusCode::BAD_REQUEST, "must provide path or file_id".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide path or file_id".to_string(),
+        ));
     }
     let file_id = match &q.file_id {
         Some(raw) => Some(
@@ -523,7 +551,9 @@ async fn network_handler(
 
     let mut seen: HashMap<(uuid::Uuid, String, u16, String), NetworkSummary> = HashMap::new();
     for event in events {
-        let Some(network) = &event.network else { continue };
+        let Some(network) = &event.network else {
+            continue;
+        };
         let key = (
             event.host_id,
             network.dst_ip.clone(),
@@ -569,7 +599,10 @@ async fn network_story_handler(
     Query(q): Query<NetworkStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.ip.is_none() && q.domain.is_none() {
-        return Err((StatusCode::BAD_REQUEST, "must provide ip or domain".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide ip or domain".to_string(),
+        ));
     }
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::network_story(storage.as_ref(), q.ip.as_deref(), q.domain.as_deref())
@@ -615,7 +648,10 @@ async fn identity_story_handler(
     Query(q): Query<IdentityStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.session_id.is_none() && q.uid.is_none() {
-        return Err((StatusCode::BAD_REQUEST, "must provide session_id or uid".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide session_id or uid".to_string(),
+        ));
     }
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::identity_story(storage.as_ref(), q.session_id.as_deref(), q.uid)
@@ -644,7 +680,10 @@ async fn systemd_story_handler(
     Query(q): Query<SystemdStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let Some(unit_name) = q.unit_name else {
-        return Err((StatusCode::BAD_REQUEST, "must provide unit_name".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide unit_name".to_string(),
+        ));
     };
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::systemd_story(storage.as_ref(), &unit_name)
@@ -733,7 +772,9 @@ async fn hosts_handler(
     Query(q): Query<HostsQuery>,
 ) -> Result<Json<Vec<HostSummary>>, (StatusCode, String)> {
     let now = now_ns();
-    let since = q.since.unwrap_or_else(|| now.saturating_sub(HOST_REGISTRY_DEFAULT_WINDOW_NS));
+    let since = q
+        .since
+        .unwrap_or_else(|| now.saturating_sub(HOST_REGISTRY_DEFAULT_WINDOW_NS));
     let until = q.until.unwrap_or(u64::MAX);
     let plan = osiris_query::EventQueryPlan {
         filter: None,
@@ -795,7 +836,11 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.host_id.cmp(&b.host_id)));
+    rows.sort_by(|a, b| {
+        b.last_seen
+            .cmp(&a.last_seen)
+            .then(a.host_id.cmp(&b.host_id))
+    });
     rows
 }
 
@@ -828,7 +873,9 @@ async fn containers_handler(
 
     let mut seen: HashMap<String, ContainerSummary> = HashMap::new();
     for event in events {
-        let Some(container) = &event.container else { continue };
+        let Some(container) = &event.container else {
+            continue;
+        };
         let key = container.container_id.clone();
         match seen.get(&key) {
             Some(existing) if existing.timestamp >= event.timestamp => {}
@@ -878,7 +925,10 @@ async fn container_story_handler(
     Query(q): Query<ContainerStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let Some(container_id) = q.container_id else {
-        return Err((StatusCode::BAD_REQUEST, "must provide container_id".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide container_id".to_string(),
+        ));
     };
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::container_story(storage.as_ref(), &container_id)
@@ -900,10 +950,12 @@ async fn system_story_handler(
     ScopedStorage(storage): ScopedStorage,
     Query(q): Query<SystemStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
-    let host_id: uuid::Uuid = q
-        .host_id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid host_id: {}", q.host_id)))?;
+    let host_id: uuid::Uuid = q.host_id.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid host_id: {}", q.host_id),
+        )
+    })?;
     let since = q.since.unwrap_or(0);
     let until = q.until.unwrap_or(u64::MAX);
     let story = tokio::task::spawn_blocking(move || {
@@ -919,8 +971,15 @@ async fn process_story_handler(
     ScopedStorage(storage): ScopedStorage,
     Path(process_key_hex): Path<String>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
-    let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(process_key_hex.clone()))
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid process_key: {}", process_key_hex)))?;
+    let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(
+        process_key_hex.clone(),
+    ))
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid process_key: {}", process_key_hex),
+        )
+    })?;
     let story = tokio::task::spawn_blocking(move || {
         osiris_investigate::process_story(storage.as_ref(), process_key)
     })
@@ -935,7 +994,8 @@ async fn reconstruct_incident_handler(
     Path(seed_key): Path<String>,
     Query(q): Query<ReconstructQuery>,
 ) -> Result<Json<osiris_investigate::IncidentReconstruction>, (StatusCode, String)> {
-    let seed = EntityRef::parse_storage_key(&seed_key).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let seed = EntityRef::parse_storage_key(&seed_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let since = q.since.unwrap_or(0);
     let until = q.until.unwrap_or(u64::MAX);
     let reconstruction = tokio::task::spawn_blocking(move || {
@@ -1080,10 +1140,26 @@ mod tests {
         let old = file_event(EventType::FileCreate, "/old", 100, 1, 1000);
         let new = file_event(EventType::FileCreate, "/new", 200, 1, 5000);
         storage.batch_write(&[old, new]).unwrap();
-        let Json(files) = files_handler(ScopedStorage(storage.clone()), Query(ListRange { since: Some(2000), until: None })).await.unwrap();
+        let Json(files) = files_handler(
+            ScopedStorage(storage.clone()),
+            Query(ListRange {
+                since: Some(2000),
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "/new");
-        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: Some(2000) })).await.unwrap();
+        let Json(files) = files_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: Some(2000),
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "/old");
     }
@@ -1100,7 +1176,15 @@ mod tests {
         let hostname = older.host.hostname.clone();
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(files) = files_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_id, "1:100");
@@ -1118,7 +1202,15 @@ mod tests {
         missing_inode.file.as_mut().unwrap().inode = None;
         storage.write(&missing_inode).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(files) = files_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(files.is_empty());
     }
@@ -1132,7 +1224,15 @@ mod tests {
         b.host.host_id = b.host_id;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(files) = files_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(files) = files_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(files.len(), 2);
     }
@@ -1230,7 +1330,9 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(ScopedStorage(storage), Query(query)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(query))
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].process.as_ref().unwrap().pid, 100);
     }
@@ -1248,7 +1350,9 @@ mod tests {
             export: None,
             q: Some("process.pid = 1".to_string()),
         };
-        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -1269,7 +1373,9 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EventType::SensorHealth);
@@ -1292,7 +1398,9 @@ mod tests {
             export: None,
             q: Some("process.pid =".to_string()),
         };
-        let err = events_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
+        let err = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -1307,7 +1415,9 @@ mod tests {
             export: None,
             q: Some("bogus_field = 1".to_string()),
         };
-        let err = events_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
+        let err = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("bogus_field"));
     }
@@ -1316,7 +1426,9 @@ mod tests {
     async fn events_endpoint_limit_alone_stays_under_the_default_cap() {
         use osiris_query::DEFAULT_EVENT_LIMIT;
         let (_dir, storage) = test_storage();
-        let batch: Vec<_> = (0..600u32).map(|i| sample_event(i, None, 1000 + i as u64)).collect();
+        let batch: Vec<_> = (0..600u32)
+            .map(|i| sample_event(i, None, 1000 + i as u64))
+            .collect();
         storage.batch_write(&batch).unwrap();
 
         // §19.2 / Global Constraint #9: `export` is opt-in. A caller that
@@ -1329,7 +1441,9 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap();
         assert_eq!(events.len(), DEFAULT_EVENT_LIMIT);
     }
 
@@ -1340,7 +1454,9 @@ mod tests {
         // ceiling, so this test can only pass under export semantics.
         const { assert!(600 > DEFAULT_EVENT_LIMIT && 600 <= MAX_EVENT_LIMIT) };
         let (_dir, storage) = test_storage();
-        let batch: Vec<_> = (0..600u32).map(|i| sample_event(i, None, 1000 + i as u64)).collect();
+        let batch: Vec<_> = (0..600u32)
+            .map(|i| sample_event(i, None, 1000 + i as u64))
+            .collect();
         storage.batch_write(&batch).unwrap();
 
         let q = EventsQuery {
@@ -1351,7 +1467,9 @@ mod tests {
             export: Some(true),
             q: None,
         };
-        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap();
         assert_eq!(events.len(), 600);
     }
 
@@ -1372,9 +1490,10 @@ mod tests {
         let child = sample_event(200, Some(parent_key), 2000);
         storage.batch_write(&[parent, child]).unwrap();
 
-        let Json(detail) = process_detail_handler(ScopedStorage(storage), Path(parent_key.as_hex()))
-            .await
-            .unwrap();
+        let Json(detail) =
+            process_detail_handler(ScopedStorage(storage), Path(parent_key.as_hex()))
+                .await
+                .unwrap();
         assert_eq!(detail.process.process.unwrap().pid, 100);
         assert_eq!(detail.children.len(), 1);
         assert_eq!(detail.children[0].process.as_ref().unwrap().pid, 200);
@@ -1385,7 +1504,8 @@ mod tests {
         let (_dir, storage) = test_storage();
         let host_id = Uuid::new_v4();
         let unknown_key = ProcessKey::new(host_id, "b", 999, 999);
-        let result = process_detail_handler(ScopedStorage(storage), Path(unknown_key.as_hex())).await;
+        let result =
+            process_detail_handler(ScopedStorage(storage), Path(unknown_key.as_hex())).await;
         assert!(result.is_err());
     }
 
@@ -1470,8 +1590,20 @@ mod tests {
     async fn file_story_by_path_returns_events_and_citing_alerts() {
         let (_dir, storage) = test_storage();
         let device_id = encode_device_id(8, 1);
-        let e1 = file_event(EventType::FileCreate, "/var/www/html/a.php", 1, device_id, 1000);
-        let e2 = file_event(EventType::FileWrite, "/var/www/html/a.php", 1, device_id, 2000);
+        let e1 = file_event(
+            EventType::FileCreate,
+            "/var/www/html/a.php",
+            1,
+            device_id,
+            1000,
+        );
+        let e2 = file_event(
+            EventType::FileWrite,
+            "/var/www/html/a.php",
+            1,
+            device_id,
+            2000,
+        );
         let unrelated = sample_event(999, None, 500); // process event, must not appear
         storage
             .batch_write(&[e1.clone(), e2.clone(), unrelated])
@@ -1617,7 +1749,15 @@ mod tests {
         let host_id = older.host_id;
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(rows) = network_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = network_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].dst_ip, "93.184.216.34");
@@ -1637,7 +1777,15 @@ mod tests {
         b.network.as_mut().unwrap().dst_port = 8443;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(rows) = network_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = network_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 2);
     }
@@ -1695,7 +1843,10 @@ mod tests {
         let (_dir, storage) = test_storage();
         let result = network_story_handler(
             ScopedStorage(storage),
-            Query(NetworkStoryQuery { ip: None, domain: None }),
+            Query(NetworkStoryQuery {
+                ip: None,
+                domain: None,
+            }),
         )
         .await;
         let err = result.unwrap_err();
@@ -1869,7 +2020,13 @@ mod tests {
     async fn identity_story_by_session_returns_the_whole_multi_category_chain() {
         let (_dir, storage) = test_storage();
         let login = session_event(EventType::SessionLogin, "3", 0, Some("198.51.100.10"), 1000);
-        let exec = session_event(EventType::ProcessExec, "3", 1000, Some("198.51.100.10"), 2000);
+        let exec = session_event(
+            EventType::ProcessExec,
+            "3",
+            1000,
+            Some("198.51.100.10"),
+            2000,
+        );
         let escalation = session_event(
             EventType::PrivilegeUidChange,
             "3",
@@ -1962,15 +2119,15 @@ mod tests {
     async fn identity_story_by_uid_does_not_expand_to_the_whole_session() {
         let (_dir, storage) = test_storage();
         // uid 0 logged in; a uid-1000 process then ran in that same session.
-        let login_as_root = session_event(
-            EventType::SessionLogin,
+        let login_as_root =
+            session_event(EventType::SessionLogin, "3", 0, Some("198.51.100.10"), 1000);
+        let alice_exec = session_event(
+            EventType::ProcessExec,
             "3",
-            0,
-            Some("198.51.100.10"),
             1000,
+            Some("198.51.100.10"),
+            2000,
         );
-        let alice_exec =
-            session_event(EventType::ProcessExec, "3", 1000, Some("198.51.100.10"), 2000);
         storage
             .batch_write(&[login_as_root.clone(), alice_exec])
             .unwrap();
@@ -1993,10 +2150,7 @@ mod tests {
         assert_eq!(story.events[0].event_id, login_as_root.event_id);
         // ...and the session id is right there on it, so the analyst can
         // take the next step themselves.
-        assert_eq!(
-            story.events[0].session.as_ref().unwrap().session_id,
-            "3"
-        );
+        assert_eq!(story.events[0].session.as_ref().unwrap().session_id, "3");
     }
 
     /// Both forms together intersect rather than union — the same
@@ -2055,8 +2209,11 @@ mod tests {
     #[tokio::test]
     async fn systemd_story_returns_400_when_unit_name_is_missing() {
         let (_dir, storage) = test_storage();
-        let result = systemd_story_handler(ScopedStorage(storage), Query(SystemdStoryQuery { unit_name: None }))
-            .await;
+        let result = systemd_story_handler(
+            ScopedStorage(storage),
+            Query(SystemdStoryQuery { unit_name: None }),
+        )
+        .await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2101,7 +2258,11 @@ mod tests {
         assert!(story.alerts.is_empty());
     }
 
-    fn container_event(container_id: &str, event_type: EventType, timestamp: u64) -> CanonicalEvent {
+    fn container_event(
+        container_id: &str,
+        event_type: EventType,
+        timestamp: u64,
+    ) -> CanonicalEvent {
         let mut event = sample_event(800, None, timestamp);
         event.category = Category::Container;
         event.event_type = event_type;
@@ -2122,7 +2283,15 @@ mod tests {
         let start = container_event(&id, EventType::ContainerStart, 2000);
         storage.batch_write(&[create, start]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = containers_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].container_id, id);
@@ -2138,7 +2307,15 @@ mod tests {
         let stop = container_event(&id, EventType::ContainerStop, 2000);
         storage.batch_write(&[start, stop]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = containers_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "STOPPED");
@@ -2156,7 +2333,15 @@ mod tests {
         on_host_a.host.host_id = on_host_a.host_id;
         storage.batch_write(&[on_host_a, on_host_b]).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = containers_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].timestamp, 2000);
@@ -2172,7 +2357,15 @@ mod tests {
         });
         storage.write(&event).unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = containers_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pod_name.as_deref(), Some("web-0"));
@@ -2182,9 +2375,19 @@ mod tests {
     #[tokio::test]
     async fn containers_endpoint_pod_fields_are_null_when_absent() {
         let (_dir, storage) = test_storage();
-        storage.write(&container_event("abc", EventType::ContainerStart, 1000)).unwrap();
+        storage
+            .write(&container_event("abc", EventType::ContainerStart, 1000))
+            .unwrap();
 
-        let Json(rows) = containers_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
+        let Json(rows) = containers_handler(
+            ScopedStorage(storage),
+            Query(ListRange {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert!(rows[0].pod_name.is_none());
         let json = serde_json::to_value(&rows[0]).unwrap();
@@ -2389,14 +2592,18 @@ mod tests {
         let process_key = event.process.as_ref().unwrap().process_key;
         storage.write(&event).unwrap();
 
-        let Json(story) = process_story_handler(ScopedStorage(storage), Path(process_key.as_hex())).await.unwrap();
+        let Json(story) = process_story_handler(ScopedStorage(storage), Path(process_key.as_hex()))
+            .await
+            .unwrap();
         assert_eq!(story.events.len(), 1);
     }
 
     #[tokio::test]
     async fn process_story_endpoint_rejects_a_malformed_process_key() {
         let (_dir, storage) = test_storage();
-        let err = process_story_handler(ScopedStorage(storage), Path("not-hex".to_string())).await.unwrap_err();
+        let err = process_story_handler(ScopedStorage(storage), Path("not-hex".to_string()))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -2408,38 +2615,63 @@ mod tests {
         storage.write(&event).unwrap();
         storage.write(&sample_event(2, None, 5000)).unwrap();
 
-        let q = SystemStoryQuery { host_id: host_id.to_string(), since: Some(0), until: Some(1000) };
-        let Json(story) = system_story_handler(ScopedStorage(storage), Query(q)).await.unwrap();
+        let q = SystemStoryQuery {
+            host_id: host_id.to_string(),
+            since: Some(0),
+            until: Some(1000),
+        };
+        let Json(story) = system_story_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap();
         assert_eq!(story.events.len(), 1);
     }
 
     #[tokio::test]
     async fn reconstruct_incident_endpoint_returns_a_reconstruction_for_a_known_entity() {
         let (_dir, storage) = test_storage();
-        let seed = EntityRef::Ip { addr: "203.0.113.10".to_string() };
-        let q = ReconstructQuery { since: Some(0), until: Some(10_000) };
-        let Json(reconstruction) =
-            reconstruct_incident_handler(ScopedStorage(storage), Path(seed.storage_key()), Query(q))
-                .await
-                .unwrap();
+        let seed = EntityRef::Ip {
+            addr: "203.0.113.10".to_string(),
+        };
+        let q = ReconstructQuery {
+            since: Some(0),
+            until: Some(10_000),
+        };
+        let Json(reconstruction) = reconstruct_incident_handler(
+            ScopedStorage(storage),
+            Path(seed.storage_key()),
+            Query(q),
+        )
+        .await
+        .unwrap();
         assert_eq!(reconstruction.seed, seed);
     }
 
     #[tokio::test]
     async fn reconstruct_incident_endpoint_rejects_a_malformed_seed_key() {
         let (_dir, storage) = test_storage();
-        let q = ReconstructQuery { since: None, until: None };
-        let err = reconstruct_incident_handler(ScopedStorage(storage), Path("not-a-key".to_string()), Query(q))
-            .await
-            .unwrap_err();
+        let q = ReconstructQuery {
+            since: None,
+            until: None,
+        };
+        let err = reconstruct_incident_handler(
+            ScopedStorage(storage),
+            Path("not-a-key".to_string()),
+            Query(q),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn subgraph_endpoint_bounds_by_node_count() {
         let (_dir, storage) = test_storage();
-        let seed = EntityRef::Ip { addr: "10.0.0.1".to_string() };
-        let other = EntityRef::Ip { addr: "10.0.0.2".to_string() };
+        let seed = EntityRef::Ip {
+            addr: "10.0.0.1".to_string(),
+        };
+        let other = EntityRef::Ip {
+            addr: "10.0.0.2".to_string(),
+        };
         storage
             .write_relationships(&[EntityRelationship {
                 from: seed.clone(),
@@ -2451,21 +2683,53 @@ mod tests {
             .unwrap();
 
         // Uncapped call should return seed + connected entity (>= 2 nodes)
-        let q_uncapped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(100), since: None, until: None };
-        let Json(uncapped_result) = subgraph_handler(ScopedStorage(storage.clone()), Query(q_uncapped)).await.unwrap();
-        assert!(uncapped_result.nodes.len() >= 2, "uncapped call should return seed + connected entity");
+        let q_uncapped = SubgraphQuery {
+            entity: Some(seed.storage_key()),
+            depth: Some(5),
+            max_nodes: Some(100),
+            since: None,
+            until: None,
+        };
+        let Json(uncapped_result) =
+            subgraph_handler(ScopedStorage(storage.clone()), Query(q_uncapped))
+                .await
+                .unwrap();
+        assert!(
+            uncapped_result.nodes.len() >= 2,
+            "uncapped call should return seed + connected entity"
+        );
 
         // Capped call should respect max_nodes=1 bound
-        let q_capped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(1), since: None, until: None };
-        let Json(capped_result) = subgraph_handler(ScopedStorage(storage), Query(q_capped)).await.unwrap();
-        assert_eq!(capped_result.nodes.len(), 1, "max_nodes=1 should return exactly 1 node");
+        let q_capped = SubgraphQuery {
+            entity: Some(seed.storage_key()),
+            depth: Some(5),
+            max_nodes: Some(1),
+            since: None,
+            until: None,
+        };
+        let Json(capped_result) = subgraph_handler(ScopedStorage(storage), Query(q_capped))
+            .await
+            .unwrap();
+        assert_eq!(
+            capped_result.nodes.len(),
+            1,
+            "max_nodes=1 should return exactly 1 node"
+        );
     }
 
     #[tokio::test]
     async fn subgraph_endpoint_requires_an_entity_parameter() {
         let (_dir, storage) = test_storage();
-        let q = SubgraphQuery { entity: None, depth: None, max_nodes: None, since: None, until: None };
-        let err = subgraph_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
+        let q = SubgraphQuery {
+            entity: None,
+            depth: None,
+            max_nodes: None,
+            since: None,
+            until: None,
+        };
+        let err = subgraph_handler(ScopedStorage(storage), Query(q))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -2525,18 +2789,39 @@ mod tests {
         let host_b = uuid::Uuid::new_v4();
         let now = now_ns_for_test();
         // host_a: two events, keep the later one (5s ago).
-        storage.write(&host_event(host_a, "host-a", now - 10_000_000_000)).unwrap();
-        storage.write(&host_event(host_a, "host-a", now - 5_000_000_000)).unwrap();
+        storage
+            .write(&host_event(host_a, "host-a", now - 10_000_000_000))
+            .unwrap();
+        storage
+            .write(&host_event(host_a, "host-a", now - 5_000_000_000))
+            .unwrap();
         // host_b: one event, 2s ago — more recent than host_a's kept event.
-        storage.write(&host_event(host_b, "host-b", now - 2_000_000_000)).unwrap();
+        storage
+            .write(&host_event(host_b, "host-b", now - 2_000_000_000))
+            .unwrap();
 
-        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: None, until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(
+            ScopedStorage(storage),
+            Query(HostsQuery {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 2, "one row per distinct host_id");
-        assert_eq!(rows[0].hostname, "host-b", "most-recently-active host first");
+        assert_eq!(
+            rows[0].hostname, "host-b",
+            "most-recently-active host first"
+        );
         assert_eq!(rows[1].hostname, "host-a");
         let kept_a = rows.iter().find(|r| r.hostname == "host-a").unwrap();
-        assert_eq!(kept_a.last_seen, now - 5_000_000_000, "kept the more recent of host_a's two events");
+        assert_eq!(
+            kept_a.last_seen,
+            now - 5_000_000_000,
+            "kept the more recent of host_a's two events"
+        );
     }
 
     #[tokio::test]
@@ -2544,15 +2829,37 @@ mod tests {
         let (_dir, storage) = test_storage();
         let host_id = uuid::Uuid::new_v4();
         let now = now_ns_for_test();
-        storage.write(&host_event(host_id, "old-host", now - 48 * 3_600_000_000_000)).unwrap();
+        storage
+            .write(&host_event(
+                host_id,
+                "old-host",
+                now - 48 * 3_600_000_000_000,
+            ))
+            .unwrap();
 
         // Default window (no since/until given) is the last 24h — this
         // event is 48h old, so it must not appear.
-        let Json(rows) = hosts_handler(ScopedStorage(storage.clone()), Query(HostsQuery { since: None, until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(
+            ScopedStorage(storage.clone()),
+            Query(HostsQuery {
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 0);
 
         // Explicitly widening the window includes it.
-        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(
+            ScopedStorage(storage),
+            Query(HostsQuery {
+                since: Some(0),
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -2562,10 +2869,30 @@ mod tests {
         let online_host = uuid::Uuid::new_v4();
         let stale_host = uuid::Uuid::new_v4();
         let now = now_ns_for_test();
-        storage.write(&host_event(online_host, "online-host", now - 60 * 1_000_000_000)).unwrap(); // 60s ago
-        storage.write(&host_event(stale_host, "stale-host", now - 10 * 60 * 1_000_000_000)).unwrap(); // 10 min ago
+        storage
+            .write(&host_event(
+                online_host,
+                "online-host",
+                now - 60 * 1_000_000_000,
+            ))
+            .unwrap(); // 60s ago
+        storage
+            .write(&host_event(
+                stale_host,
+                "stale-host",
+                now - 10 * 60 * 1_000_000_000,
+            ))
+            .unwrap(); // 10 min ago
 
-        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(
+            ScopedStorage(storage),
+            Query(HostsQuery {
+                since: Some(0),
+                until: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         let online = rows.iter().find(|r| r.hostname == "online-host").unwrap();
         let stale = rows.iter().find(|r| r.hostname == "stale-host").unwrap();
@@ -2601,7 +2928,11 @@ mod tests {
     #[test]
     fn build_host_rows_cloud_fields_are_none_and_serialize_as_null_when_absent() {
         let now = now_ns_for_test();
-        let rows = build_host_rows(vec![host_event(uuid::Uuid::new_v4(), "h", now - 1_000_000_000)], now, false);
+        let rows = build_host_rows(
+            vec![host_event(uuid::Uuid::new_v4(), "h", now - 1_000_000_000)],
+            now,
+            false,
+        );
         assert!(rows[0].cloud_provider.is_none());
         let json = serde_json::to_value(&rows[0]).unwrap();
         assert!(json["cloud_provider"].is_null());
@@ -2652,7 +2983,10 @@ mod tests {
         let rows = build_host_rows(events, now, false);
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "ONLINE", "untruncated behavior is unchanged");
+        assert_eq!(
+            rows[0].status, "ONLINE",
+            "untruncated behavior is unchanged"
+        );
     }
 
     #[tokio::test]
@@ -2662,17 +2996,34 @@ mod tests {
         // Three hosts sharing the exact same last_seen timestamp.
         let mut host_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
         for (i, host_id) in host_ids.iter().enumerate() {
-            storage.write(&host_event(*host_id, &format!("tie-host-{i}"), now - 1_000_000_000)).unwrap();
+            storage
+                .write(&host_event(
+                    *host_id,
+                    &format!("tie-host-{i}"),
+                    now - 1_000_000_000,
+                ))
+                .unwrap();
         }
         host_ids.sort();
 
         for _ in 0..3 {
-            let Json(rows) = hosts_handler(ScopedStorage(storage.clone()), Query(HostsQuery { since: Some(0), until: None }))
-                .await
-                .unwrap();
-            let ordered_ids: Vec<uuid::Uuid> =
-                rows.iter().map(|r| uuid::Uuid::parse_str(&r.host_id).unwrap()).collect();
-            assert_eq!(ordered_ids, host_ids, "ties on last_seen must break by host_id ascending, every time");
+            let Json(rows) = hosts_handler(
+                ScopedStorage(storage.clone()),
+                Query(HostsQuery {
+                    since: Some(0),
+                    until: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let ordered_ids: Vec<uuid::Uuid> = rows
+                .iter()
+                .map(|r| uuid::Uuid::parse_str(&r.host_id).unwrap())
+                .collect();
+            assert_eq!(
+                ordered_ids, host_ids,
+                "ties on last_seen must break by host_id ascending, every time"
+            );
         }
     }
 

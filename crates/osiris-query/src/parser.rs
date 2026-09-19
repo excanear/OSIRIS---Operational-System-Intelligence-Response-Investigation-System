@@ -214,11 +214,32 @@ mod tests {
         let ast = parse("a = 1 OR b = 2 AND c = 3").unwrap();
         match ast {
             Ast::Or(left, right) => {
-                assert_eq!(*left, Ast::Compare { field: "a".into(), op: Op::Eq, value: Value::Num(1.0) });
+                assert_eq!(
+                    *left,
+                    Ast::Compare {
+                        field: "a".into(),
+                        op: Op::Eq,
+                        value: Value::Num(1.0)
+                    }
+                );
                 match *right {
                     Ast::And(l, r) => {
-                        assert_eq!(*l, Ast::Compare { field: "b".into(), op: Op::Eq, value: Value::Num(2.0) });
-                        assert_eq!(*r, Ast::Compare { field: "c".into(), op: Op::Eq, value: Value::Num(3.0) });
+                        assert_eq!(
+                            *l,
+                            Ast::Compare {
+                                field: "b".into(),
+                                op: Op::Eq,
+                                value: Value::Num(2.0)
+                            }
+                        );
+                        assert_eq!(
+                            *r,
+                            Ast::Compare {
+                                field: "c".into(),
+                                op: Op::Eq,
+                                value: Value::Num(3.0)
+                            }
+                        );
                     }
                     _ => panic!("expected And on the right of Or"),
                 }
@@ -234,7 +255,14 @@ mod tests {
         match ast {
             Ast::And(left, right) => {
                 assert!(matches!(*left, Ast::Or(_, _)));
-                assert_eq!(*right, Ast::Compare { field: "c".into(), op: Op::Eq, value: Value::Num(3.0) });
+                assert_eq!(
+                    *right,
+                    Ast::Compare {
+                        field: "c".into(),
+                        op: Op::Eq,
+                        value: Value::Num(3.0)
+                    }
+                );
             }
             _ => panic!("expected And at the top"),
         }
@@ -246,7 +274,14 @@ mod tests {
         match ast {
             Ast::And(left, right) => {
                 assert!(matches!(*left, Ast::Not(_)));
-                assert_eq!(*right, Ast::Compare { field: "b".into(), op: Op::Eq, value: Value::Num(2.0) });
+                assert_eq!(
+                    *right,
+                    Ast::Compare {
+                        field: "b".into(),
+                        op: Op::Eq,
+                        value: Value::Num(2.0)
+                    }
+                );
             }
             _ => panic!("expected And at the top"),
         }

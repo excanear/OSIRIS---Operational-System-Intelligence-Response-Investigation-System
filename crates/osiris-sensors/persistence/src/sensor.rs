@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use osiris_sensor_api::{
-    RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth,
-    SensorMetrics, SensorState,
+    RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth, SensorMetrics,
+    SensorState,
 };
 use tokio_util::sync::CancellationToken;
 

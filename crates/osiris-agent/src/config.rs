@@ -36,7 +36,12 @@ fn default_cloud_enabled() -> bool {
 
 impl Default for CloudMetadataConfig {
     fn default() -> Self {
-        Self { enabled: true, aws_base_url: None, azure_base_url: None, gcp_base_url: None }
+        Self {
+            enabled: true,
+            aws_base_url: None,
+            azure_base_url: None,
+            gcp_base_url: None,
+        }
     }
 }
 
@@ -289,7 +294,10 @@ mod tests {
             Some("/var/log/audit/audit.log")
         );
         assert_eq!(config.persistence_watch_paths.len(), 2);
-        assert_eq!(config.persistence_watch_paths[0].path, "/etc/systemd/system");
+        assert_eq!(
+            config.persistence_watch_paths[0].path,
+            "/etc/systemd/system"
+        );
     }
 
     #[test]
@@ -341,7 +349,11 @@ mod tests {
     fn cloud_metadata_defaults_to_enabled_with_no_overrides_so_old_configs_still_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.yaml");
-        std::fs::write(&path, "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n").unwrap();
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.cloud_metadata.enabled);
         assert!(config.cloud_metadata.aws_base_url.is_none());
@@ -351,7 +363,11 @@ mod tests {
     fn k8s_context_defaults_so_pre_8e_configs_still_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.yaml");
-        std::fs::write(&path, "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n").unwrap();
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
         let config = AgentConfig::load(&path).unwrap();
         assert!(config.k8s_context.enabled);
         assert!(config.k8s_context.kubelet_url.is_none());
@@ -372,7 +388,10 @@ mod tests {
         .unwrap();
         let config = AgentConfig::load(&path).unwrap();
         assert!(!config.k8s_context.enabled);
-        assert_eq!(config.k8s_context.kubelet_url.as_deref(), Some("https://10.0.0.1:10250"));
+        assert_eq!(
+            config.k8s_context.kubelet_url.as_deref(),
+            Some("https://10.0.0.1:10250")
+        );
         assert_eq!(config.k8s_context.ca_path.as_deref(), Some("/ca.pem"));
         assert_eq!(config.k8s_context.refresh_secs, 5);
     }
@@ -388,6 +407,9 @@ mod tests {
         .unwrap();
         let config = AgentConfig::load(&path).unwrap();
         assert!(!config.cloud_metadata.enabled);
-        assert_eq!(config.cloud_metadata.gcp_base_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(
+            config.cloud_metadata.gcp_base_url.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
     }
 }

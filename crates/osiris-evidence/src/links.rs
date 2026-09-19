@@ -36,7 +36,9 @@ impl SqliteEvidenceIncidentLinks {
             CREATE INDEX IF NOT EXISTS idx_links_evidence ON evidence_incident_links(evidence_id);",
         )
         .map_err(|e| LinkStoreError::Backend(e.to_string()))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -63,12 +65,17 @@ impl EvidenceIncidentLinks for SqliteEvidenceIncidentLinks {
             .prepare("SELECT evidence_id FROM evidence_incident_links WHERE incident_id = ?1")
             .map_err(|e| LinkStoreError::Backend(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![incident_id.to_string()], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![incident_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| LinkStoreError::Backend(e.to_string()))?;
         let mut ids = Vec::new();
         for row in rows {
             let s = row.map_err(|e| LinkStoreError::Backend(e.to_string()))?;
-            ids.push(s.parse().map_err(|_| LinkStoreError::Backend(format!("invalid uuid '{}'", s)))?);
+            ids.push(
+                s.parse()
+                    .map_err(|_| LinkStoreError::Backend(format!("invalid uuid '{}'", s)))?,
+            );
         }
         Ok(ids)
     }
@@ -82,12 +89,17 @@ impl EvidenceIncidentLinks for SqliteEvidenceIncidentLinks {
             .prepare("SELECT incident_id FROM evidence_incident_links WHERE evidence_id = ?1")
             .map_err(|e| LinkStoreError::Backend(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![evidence_id.to_string()], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![evidence_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| LinkStoreError::Backend(e.to_string()))?;
         let mut ids = Vec::new();
         for row in rows {
             let s = row.map_err(|e| LinkStoreError::Backend(e.to_string()))?;
-            ids.push(s.parse().map_err(|_| LinkStoreError::Backend(format!("invalid uuid '{}'", s)))?);
+            ids.push(
+                s.parse()
+                    .map_err(|_| LinkStoreError::Backend(format!("invalid uuid '{}'", s)))?,
+            );
         }
         Ok(ids)
     }
@@ -137,6 +149,9 @@ mod tests {
         let evidence_id = Uuid::now_v7();
         links.link(incident_id, evidence_id).unwrap();
         links.link(incident_id, evidence_id).unwrap();
-        assert_eq!(links.evidence_ids_for_incident(incident_id).unwrap().len(), 1);
+        assert_eq!(
+            links.evidence_ids_for_incident(incident_id).unwrap().len(),
+            1
+        );
     }
 }

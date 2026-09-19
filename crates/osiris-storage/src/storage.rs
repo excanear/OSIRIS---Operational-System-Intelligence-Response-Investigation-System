@@ -39,7 +39,10 @@ pub trait Storage: Send + Sync {
     /// §12.3), additive to `query` above — `query` and its `QueryPlan`
     /// keep serving every existing caller unchanged (plan Global
     /// Constraint #3).
-    fn query_events(&self, plan: &osiris_query::EventQueryPlan) -> Result<Vec<CanonicalEvent>, StorageError>;
+    fn query_events(
+        &self,
+        plan: &osiris_query::EventQueryPlan,
+    ) -> Result<Vec<CanonicalEvent>, StorageError>;
     /// Looks up one event by its primary key. Added for `osiris-investigate`'s
     /// `reconstruct_incident` (ARCHITECTURE.md §12.1), which must resolve a
     /// `BehavioralChain`'s bare `event_id`s back into real events to bucket
@@ -63,7 +66,10 @@ pub trait Storage: Send + Sync {
     /// owning event's serialized blob). Edges are immutable facts, so this
     /// is insert-only — re-persisting the same edge twice is harmless for
     /// every read-only graph query this trait supports.
-    fn write_relationships(&self, edges: &[EntityRelationship]) -> Result<WriteReport, StorageError>;
+    fn write_relationships(
+        &self,
+        edges: &[EntityRelationship],
+    ) -> Result<WriteReport, StorageError>;
     fn query_relationships(
         &self,
         plan: &RelationshipQueryPlan,
@@ -75,5 +81,6 @@ pub trait Storage: Send + Sync {
     /// no update-in-place method for events, by design (append-only,
     /// §10.5's spirit).
     fn write_risk_scores(&self, scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError>;
-    fn query_risk_scores(&self, plan: &RiskQueryPlan) -> Result<Vec<RiskScoreRecord>, StorageError>;
+    fn query_risk_scores(&self, plan: &RiskQueryPlan)
+        -> Result<Vec<RiskScoreRecord>, StorageError>;
 }

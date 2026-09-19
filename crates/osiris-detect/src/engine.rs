@@ -143,11 +143,8 @@ impl DetectionEngine {
         event: &CanonicalEvent,
         event_json: &serde_json::Value,
     ) -> Vec<Alert> {
-        let sequence_rules: Vec<&Rule> = self
-            .rules
-            .iter()
-            .filter(|r| r.sequence.is_some())
-            .collect();
+        let sequence_rules: Vec<&Rule> =
+            self.rules.iter().filter(|r| r.sequence.is_some()).collect();
         if sequence_rules.is_empty() {
             return vec![];
         }
@@ -197,12 +194,14 @@ impl DetectionEngine {
                 }
             }
 
-            let entry = state_map.entry(state_key.clone()).or_insert_with(|| SequenceState {
-                next_step: 0,
-                started_at: event.timestamp,
-                last_ts: event.timestamp,
-                event_ids: Vec::with_capacity(steps.len()),
-            });
+            let entry = state_map
+                .entry(state_key.clone())
+                .or_insert_with(|| SequenceState {
+                    next_step: 0,
+                    started_at: event.timestamp,
+                    last_ts: event.timestamp,
+                    event_ids: Vec::with_capacity(steps.len()),
+                });
             entry.event_ids.push(event.event_id);
             entry.next_step += 1;
             entry.last_ts = event.timestamp;
@@ -369,9 +368,11 @@ match:
     }
 
     fn engine() -> DetectionEngine {
-        DetectionEngine::new(vec![
-            crate::rule::Rule::from_yaml_str(WEB_ROOT_RULE, "test.yaml").unwrap()
-        ])
+        DetectionEngine::new(vec![crate::rule::Rule::from_yaml_str(
+            WEB_ROOT_RULE,
+            "test.yaml",
+        )
+        .unwrap()])
     }
 
     #[test]
@@ -451,7 +452,11 @@ match:
     #[test]
     fn evaluate_batch_returns_one_alert_per_matching_event() {
         let events = vec![
-            event(EventType::FileCreate, "/var/www/html/a.php", "/usr/bin/curl"),
+            event(
+                EventType::FileCreate,
+                "/var/www/html/a.php",
+                "/usr/bin/curl",
+            ),
             event(EventType::FileWrite, "/home/user/notes.txt", "/bin/bash"),
             event(EventType::FileWrite, "/var/www/html/b.php", "/bin/bash"),
         ];
@@ -494,7 +499,11 @@ match:
             "/usr/bin/curl",
         ));
         assert_eq!(alerts.len(), 2);
-        assert_eq!(alerts[0].rule_id(), "a_rule", "rules load in file-name order");
+        assert_eq!(
+            alerts[0].rule_id(),
+            "a_rule",
+            "rules load in file-name order"
+        );
         assert_eq!(alerts[1].rule_id(), "shell_wrote_file_to_web_root");
     }
 
@@ -521,9 +530,11 @@ match:
             .join("../../config/rules/shell_wrote_file_to_web_root.yaml");
         let yaml = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("shipped rule must exist at {}: {e}", path.display()));
-        let engine = DetectionEngine::new(vec![
-            crate::rule::Rule::from_yaml_str(&yaml, "shell_wrote_file_to_web_root.yaml").unwrap()
-        ]);
+        let engine = DetectionEngine::new(vec![crate::rule::Rule::from_yaml_str(
+            &yaml,
+            "shell_wrote_file_to_web_root.yaml",
+        )
+        .unwrap()]);
         assert_eq!(
             engine
                 .evaluate(&event(
@@ -609,9 +620,11 @@ match:
             .join("../../config/rules/dns_query_to_suspicious_tld.yaml");
         let yaml = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("shipped rule must exist at {}: {e}", path.display()));
-        let engine = DetectionEngine::new(vec![
-            crate::rule::Rule::from_yaml_str(&yaml, "dns_query_to_suspicious_tld.yaml").unwrap()
-        ]);
+        let engine = DetectionEngine::new(vec![crate::rule::Rule::from_yaml_str(
+            &yaml,
+            "dns_query_to_suspicious_tld.yaml",
+        )
+        .unwrap()]);
         let alerts = engine.evaluate(&dns_event("cdn-assets.xyz", "/usr/bin/curl"));
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule_id(), "dns_query_to_suspicious_tld");
@@ -689,7 +702,10 @@ match:
             Some("198.51.100.10"),
         ));
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].rule_id(), "privilege_escalation_to_root_in_remote_session");
+        assert_eq!(
+            alerts[0].rule_id(),
+            "privilege_escalation_to_root_in_remote_session"
+        );
         assert_eq!(alerts[0].severity(), Severity::High);
         // §11.2's structural requirement: one specific explanation per
         // matched condition, none of them blank or generic.
@@ -710,13 +726,19 @@ match:
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../config/rules/privilege_escalation_to_root_in_remote_session.yaml");
         let yaml = std::fs::read_to_string(&path).unwrap();
-        let engine = DetectionEngine::new(vec![
-            Rule::from_yaml_str(&yaml, "privilege_escalation.yaml").unwrap()
-        ]);
+        let engine = DetectionEngine::new(vec![Rule::from_yaml_str(
+            &yaml,
+            "privilege_escalation.yaml",
+        )
+        .unwrap()]);
 
         // No remote address at all (a tty1 login).
         assert!(engine
-            .evaluate(&escalation_event(EventType::PrivilegeUidChange, Some(0), None))
+            .evaluate(&escalation_event(
+                EventType::PrivilegeUidChange,
+                Some(0),
+                None
+            ))
             .is_empty());
 
         // No session whatsoever (a daemon escalating outside any login).
@@ -730,9 +752,11 @@ match:
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../config/rules/privilege_escalation_to_root_in_remote_session.yaml");
         let yaml = std::fs::read_to_string(&path).unwrap();
-        let engine = DetectionEngine::new(vec![
-            Rule::from_yaml_str(&yaml, "privilege_escalation.yaml").unwrap()
-        ]);
+        let engine = DetectionEngine::new(vec![Rule::from_yaml_str(
+            &yaml,
+            "privilege_escalation.yaml",
+        )
+        .unwrap()]);
 
         // Escalating to a non-root account is not this rule's concern.
         assert!(engine
@@ -785,11 +809,18 @@ match:
             "an escalation event must fire exactly the escalation rule — neither the \
              web-root file rule nor the DNS rule"
         );
-        assert_eq!(alerts[0].rule_id(), "privilege_escalation_to_root_in_remote_session");
+        assert_eq!(
+            alerts[0].rule_id(),
+            "privilege_escalation_to_root_in_remote_session"
+        );
     }
 
     fn systemd_start_event(unit_name: &str, remote_addr: Option<&str>) -> CanonicalEvent {
-        let mut e = event(EventType::ServiceStart, "/unused", "/usr/lib/systemd/systemd");
+        let mut e = event(
+            EventType::ServiceStart,
+            "/unused",
+            "/usr/lib/systemd/systemd",
+        );
         e.file = None;
         e.service = Some(osiris_schema::ServiceRef {
             unit_name: unit_name.to_string(),
@@ -813,7 +844,10 @@ match:
         let event = systemd_start_event("backdoor.service", Some("198.51.100.10"));
         let alerts = engine.evaluate(&event);
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].rule_id(), "systemd_service_started_in_remote_session");
+        assert_eq!(
+            alerts[0].rule_id(),
+            "systemd_service_started_in_remote_session"
+        );
         assert_eq!(alerts[0].severity(), Severity::High);
         assert_eq!(alerts[0].reasons().len(), 2);
     }
@@ -851,7 +885,10 @@ match:
         let event = systemd_start_event("backdoor.service", Some("198.51.100.10"));
         let alerts = engine.evaluate(&event);
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].rule_id(), "systemd_service_started_in_remote_session");
+        assert_eq!(
+            alerts[0].rule_id(),
+            "systemd_service_started_in_remote_session"
+        );
     }
 
     fn container_start_event(container_id: &str, remote_addr: Option<&str>) -> CanonicalEvent {
@@ -1044,7 +1081,11 @@ sequence:
         assert!(engine.evaluate(&connect).is_empty());
         assert!(engine.evaluate(&unrelated).is_empty());
         let alerts = engine.evaluate(&write);
-        assert_eq!(alerts.len(), 1, "progress must survive an unrelated event in between");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "progress must survive an unrelated event in between"
+        );
     }
 
     #[test]
@@ -1060,14 +1101,24 @@ sequence:
         assert!(engine.evaluate(&connect_b).is_empty());
         let alerts = engine.evaluate(&write_b);
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].evidence(), &[connect_b.event_id, write_b.event_id]);
+        assert_eq!(
+            alerts[0].evidence(),
+            &[connect_b.event_id, write_b.event_id]
+        );
 
         // Process a's sequence is still only half-complete, and must not
         // have been advanced or fired by b's write.
         let write_a = file_write_event(host_id, 300, 1_000_000_000 + 2_000_000_000);
         let alerts_a = engine.evaluate(&write_a);
-        assert_eq!(alerts_a.len(), 1, "a's own sequence still completes independently");
-        assert_eq!(alerts_a[0].evidence(), &[connect_a.event_id, write_a.event_id]);
+        assert_eq!(
+            alerts_a.len(),
+            1,
+            "a's own sequence still completes independently"
+        );
+        assert_eq!(
+            alerts_a[0].evidence(),
+            &[connect_a.event_id, write_a.event_id]
+        );
     }
 
     /// The repository's own shipped sequence rule must load and behave —

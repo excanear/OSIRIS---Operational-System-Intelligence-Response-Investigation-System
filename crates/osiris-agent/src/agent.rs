@@ -186,15 +186,19 @@ impl Agent {
         ));
 
         let bus = Arc::new(bus);
-        let proc_root = config.proc_root.clone().unwrap_or_else(|| "/proc".to_string());
+        let proc_root = config
+            .proc_root
+            .clone()
+            .unwrap_or_else(|| "/proc".to_string());
         let mut pipeline = Pipeline::new(host, boot_id).with_proc_root(proc_root);
-        let k8s_refresher = match crate::k8s::start_pod_cache(&config.k8s_context, &cancellation).await {
-            Some((cache, handle)) => {
-                pipeline = pipeline.with_pod_lookup(Arc::new(cache));
-                Some(handle)
-            }
-            None => None,
-        };
+        let k8s_refresher =
+            match crate::k8s::start_pod_cache(&config.k8s_context, &cancellation).await {
+                Some((cache, handle)) => {
+                    pipeline = pipeline.with_pod_lookup(Arc::new(cache));
+                    Some(handle)
+                }
+                None => None,
+            };
         let pipeline_cancellation = cancellation.clone();
         let pipeline_bus = bus.clone();
         let pipeline_handle = tokio::spawn(async move {
@@ -300,8 +304,14 @@ mod tests {
             proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
-            cloud_metadata: crate::config::CloudMetadataConfig { enabled: false, ..Default::default() },
-            k8s_context: crate::config::K8sContextConfig { enabled: false, ..Default::default() },
+            cloud_metadata: crate::config::CloudMetadataConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            k8s_context: crate::config::K8sContextConfig {
+                enabled: false,
+                ..Default::default()
+            },
             spool_path: dir
                 .path()
                 .join("spool.ndjson")
@@ -316,10 +326,13 @@ mod tests {
         let body = format!(
             r#"{{"items":[{{"metadata":{{"name":"web-0","namespace":"prod"}},"status":{{"containerStatuses":[{{"containerID":"containerd://{container_id}"}}]}}}}]}}"#
         );
-        let router = axum::Router::new().route("/pods", get(move || {
-            let body = body.clone();
-            async move { body }
-        }));
+        let router = axum::Router::new().route(
+            "/pods",
+            get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -346,12 +359,17 @@ mod tests {
             refresh_secs: 3600,
             ..Default::default()
         };
-        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert!(contents.contains("\"pod_name\":\"web-0\""), "spool must carry the resolved pod: {contents}");
+        assert!(
+            contents.contains("\"pod_name\":\"web-0\""),
+            "spool must carry the resolved pod: {contents}"
+        );
         assert!(contents.contains("\"namespace\":\"prod\""));
     }
 
@@ -363,7 +381,9 @@ mod tests {
         config.enable_synthetic = true;
         config.synthetic_scenario = Some("container_deploy_in_remote_session".to_string());
         // base_config leaves k8s_context disabled.
-        let agent = Agent::start(config, test_host(), "boot-1".to_string()).await.unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         agent.shutdown().await;
 
@@ -543,8 +563,12 @@ mod tests {
     async fn skips_the_network_sensor_with_a_visible_reason_when_net_tcp_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = base_config(&dir);
-        config.network_proc_root =
-            Some(dir.path().join("no-such-proc").to_string_lossy().to_string());
+        config.network_proc_root = Some(
+            dir.path()
+                .join("no-such-proc")
+                .to_string_lossy()
+                .to_string(),
+        );
 
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
@@ -553,7 +577,9 @@ mod tests {
         assert_eq!(status.sensors.len(), 0);
         assert_eq!(status.skipped_sensors.len(), 1);
         assert_eq!(status.skipped_sensors[0].name, "network");
-        assert!(status.skipped_sensors[0].reason.contains("net/tcp not found"));
+        assert!(status.skipped_sensors[0]
+            .reason
+            .contains("net/tcp not found"));
         agent.shutdown().await;
     }
 
@@ -626,8 +652,7 @@ mod tests {
         std::fs::write(&identity_log, "").unwrap();
         let mut config = base_config(&dir);
         config.enable_synthetic = false;
-        config.identity_audit_log_path =
-            Some(identity_log.to_string_lossy().to_string());
+        config.identity_audit_log_path = Some(identity_log.to_string_lossy().to_string());
 
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
@@ -655,7 +680,11 @@ mod tests {
 
         let spool = std::fs::read_to_string(dir.path().join("spool.ndjson")).unwrap();
         let lines: Vec<&str> = spool.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 9, "all nine scenario events must reach the spool");
+        assert_eq!(
+            lines.len(),
+            9,
+            "all nine scenario events must reach the spool"
+        );
         let categories: std::collections::HashSet<String> = lines
             .iter()
             .map(|l| {
@@ -680,7 +709,10 @@ mod tests {
             .await
             .unwrap();
         let snapshot = agent.status_snapshot().await;
-        assert!(snapshot.sensors.iter().any(|s| s.name == "synthetic_generator"));
+        assert!(snapshot
+            .sensors
+            .iter()
+            .any(|s| s.name == "synthetic_generator"));
         agent.shutdown().await;
     }
 
@@ -694,7 +726,10 @@ mod tests {
             .await
             .unwrap();
         let snapshot = agent.status_snapshot().await;
-        assert!(snapshot.sensors.iter().any(|s| s.name == "synthetic_generator"));
+        assert!(snapshot
+            .sensors
+            .iter()
+            .any(|s| s.name == "synthetic_generator"));
         agent.shutdown().await;
     }
 

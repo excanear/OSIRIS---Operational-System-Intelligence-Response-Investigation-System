@@ -177,7 +177,8 @@ fn decode_untrusted_string(line: &str, key: &str, raw_value: &str) -> String {
 /// so the caller falls back to the raw value unchanged rather than
 /// mangling it.
 fn decode_hex(raw: &str) -> Option<String> {
-    if raw.len() < 2 || !raw.len().is_multiple_of(2) || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if raw.len() < 2 || !raw.len().is_multiple_of(2) || !raw.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
@@ -378,8 +379,8 @@ mod tests {
         assert_eq!(syscall_class(85), Some(SyscallClass::Write)); // creat
         assert_eq!(syscall_class(76), Some(SyscallClass::Write)); // truncate
         assert_eq!(syscall_class(77), Some(SyscallClass::Write)); // ftruncate
-        // execve is a Process/Exec concern, not a filesystem one, and
-        // write(2) operates on an fd so it emits no PATH records at all.
+                                                                  // execve is a Process/Exec concern, not a filesystem one, and
+                                                                  // write(2) operates on an fd so it emits no PATH records at all.
         assert_eq!(syscall_class(59), None);
         assert_eq!(syscall_class(1), None);
         assert!(is_file_syscall(87));

@@ -22,8 +22,16 @@ fn dns_domain_plan(domain: &str) -> EventQueryPlan {
 
 fn network_addr_plan(addr: &str) -> EventQueryPlan {
     let ast = Ast::Or(
-        Box::new(Ast::Compare { field: "network.src_ip".to_string(), op: Op::Eq, value: Value::Str(addr.to_string()) }),
-        Box::new(Ast::Compare { field: "network.dst_ip".to_string(), op: Op::Eq, value: Value::Str(addr.to_string()) }),
+        Box::new(Ast::Compare {
+            field: "network.src_ip".to_string(),
+            op: Op::Eq,
+            value: Value::Str(addr.to_string()),
+        }),
+        Box::new(Ast::Compare {
+            field: "network.dst_ip".to_string(),
+            op: Op::Eq,
+            value: Value::Str(addr.to_string()),
+        }),
     );
     EventQueryPlan {
         filter: Some(ast),
@@ -38,7 +46,11 @@ fn network_addr_plan(addr: &str) -> EventQueryPlan {
 /// before: the domain form resolves DNS then unions in network events
 /// touching any resolved address; the IP form matches network events
 /// directly and does not reverse-resolve to the DNS side.
-pub fn network_story(storage: &dyn Storage, ip: Option<&str>, domain: Option<&str>) -> Result<Story, StorageError> {
+pub fn network_story(
+    storage: &dyn Storage,
+    ip: Option<&str>,
+    domain: Option<&str>,
+) -> Result<Story, StorageError> {
     let mut events_by_id: HashMap<uuid::Uuid, CanonicalEvent> = HashMap::new();
 
     if let Some(domain) = domain {
@@ -90,11 +102,34 @@ mod tests {
             event_type,
             category: Category::Network,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None, file: None,
-            network: None, dns: None, device: None, service: None, container: None, namespace: None,
-            cgroup: None, kernel: None, source: Source::Synthetic, provider: "test".to_string(),
-            raw_event: None, relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -127,21 +162,37 @@ mod tests {
     fn network_story_by_domain_unions_in_events_touching_the_resolved_ip() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        storage.write(&dns_event("evil.example", "203.0.113.10", 100)).unwrap();
-        storage.write(&network_event("10.0.0.5", "203.0.113.10", 200)).unwrap();
-        storage.write(&network_event("10.0.0.5", "198.51.100.1", 300)).unwrap();
+        storage
+            .write(&dns_event("evil.example", "203.0.113.10", 100))
+            .unwrap();
+        storage
+            .write(&network_event("10.0.0.5", "203.0.113.10", 200))
+            .unwrap();
+        storage
+            .write(&network_event("10.0.0.5", "198.51.100.1", 300))
+            .unwrap();
 
         let story = network_story(&storage, None, Some("evil.example")).unwrap();
-        assert_eq!(story.events.len(), 2, "the DNS event and the one matching network event");
+        assert_eq!(
+            story.events.len(),
+            2,
+            "the DNS event and the one matching network event"
+        );
     }
 
     #[test]
     fn network_story_by_ip_matches_either_side_of_the_connection() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        storage.write(&network_event("203.0.113.10", "10.0.0.5", 100)).unwrap();
-        storage.write(&network_event("10.0.0.5", "203.0.113.10", 200)).unwrap();
-        storage.write(&network_event("10.0.0.5", "198.51.100.1", 300)).unwrap();
+        storage
+            .write(&network_event("203.0.113.10", "10.0.0.5", 100))
+            .unwrap();
+        storage
+            .write(&network_event("10.0.0.5", "203.0.113.10", 200))
+            .unwrap();
+        storage
+            .write(&network_event("10.0.0.5", "198.51.100.1", 300))
+            .unwrap();
 
         let story = network_story(&storage, Some("203.0.113.10"), None).unwrap();
         assert_eq!(story.events.len(), 2);

@@ -13,11 +13,15 @@ pub fn known_template_names() -> &'static [&'static str] {
 
 pub fn template(name: &str) -> Option<&'static str> {
     match name {
-        "network-download-then-write" => Some(include_str!("../../../hunts/network-download-then-write.oql")),
-        "shell-wrote-file-to-web-root" => Some(include_str!("../../../hunts/shell-wrote-file-to-web-root.oql")),
-        "container-started-in-remote-session" => {
-            Some(include_str!("../../../hunts/container-started-in-remote-session.oql"))
-        }
+        "network-download-then-write" => Some(include_str!(
+            "../../../hunts/network-download-then-write.oql"
+        )),
+        "shell-wrote-file-to-web-root" => Some(include_str!(
+            "../../../hunts/shell-wrote-file-to-web-root.oql"
+        )),
+        "container-started-in-remote-session" => Some(include_str!(
+            "../../../hunts/container-started-in-remote-session.oql"
+        )),
         _ => None,
     }
 }

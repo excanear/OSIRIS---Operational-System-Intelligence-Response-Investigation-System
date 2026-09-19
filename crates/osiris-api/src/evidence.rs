@@ -25,10 +25,19 @@ pub async fn create_evidence_handler(
     Json(body): Json<CreateEvidenceBody>,
 ) -> Result<Json<Evidence>, (StatusCode, String)> {
     let caller = ctx.tenant_id;
-    let integrity = Integrity { hash: body.hash, immutable_since: body.immutable_since };
-    let evidence = Evidence::new(body.source, body.immutable_since, integrity, body.relationships, body.supersedes)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-        .with_tenant(caller);
+    let integrity = Integrity {
+        hash: body.hash,
+        immutable_since: body.immutable_since,
+    };
+    let evidence = Evidence::new(
+        body.source,
+        body.immutable_since,
+        integrity,
+        body.relationships,
+        body.supersedes,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    .with_tenant(caller);
 
     // A tenant may only attach evidence to an incident it can see (a foreign
     // or platform-owned one answers 404, like a missing one).
@@ -44,7 +53,10 @@ pub async fn create_evidence_handler(
             .unwrap()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if !old.is_some_and(|o| visible_to(o.tenant_id(), caller)) {
-            return Err((StatusCode::NOT_FOUND, "superseded evidence not found".to_string()));
+            return Err((
+                StatusCode::NOT_FOUND,
+                "superseded evidence not found".to_string(),
+            ));
         }
     }
 
@@ -54,7 +66,9 @@ pub async fn create_evidence_handler(
     let created = tokio::task::spawn_blocking(move || -> Result<Evidence, String> {
         let created = evidence_store.insert(evidence).map_err(|e| e.to_string())?;
         if let Some(incident_id) = incident_id {
-            links.link(incident_id, created.evidence_id()).map_err(|e| e.to_string())?;
+            links
+                .link(incident_id, created.evidence_id())
+                .map_err(|e| e.to_string())?;
         }
         Ok(created)
     })
@@ -96,57 +110,71 @@ pub async fn list_evidence_handler(
     let caller = ctx.tenant_id;
     match q.incident_id {
         Some(incident_id_str) => {
-            let incident_id: Uuid = incident_id_str
-                .parse()
-                .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid incident_id: {}", incident_id_str)))?;
+            let incident_id: Uuid = incident_id_str.parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid incident_id: {}", incident_id_str),
+                )
+            })?;
             if caller.is_some() {
                 visible_incident(&state, incident_id, caller).await?;
             }
 
-            let evidence_list = tokio::task::spawn_blocking(move || -> Result<Vec<Evidence>, String> {
-                let evidence_ids = state.links.evidence_ids_for_incident(incident_id).map_err(|e| e.to_string())?;
-                let mut evidence = Vec::new();
-                for id in evidence_ids {
-                    if let Some(record) = state.evidence.get(id).map_err(|e| e.to_string())? {
-                        if visible_to(record.tenant_id(), caller) {
-                            evidence.push(record);
+            let evidence_list =
+                tokio::task::spawn_blocking(move || -> Result<Vec<Evidence>, String> {
+                    let evidence_ids = state
+                        .links
+                        .evidence_ids_for_incident(incident_id)
+                        .map_err(|e| e.to_string())?;
+                    let mut evidence = Vec::new();
+                    for id in evidence_ids {
+                        if let Some(record) = state.evidence.get(id).map_err(|e| e.to_string())? {
+                            if visible_to(record.tenant_id(), caller) {
+                                evidence.push(record);
+                            }
                         }
                     }
-                }
-                Ok(evidence)
-            })
-            .await
-            .unwrap()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    Ok(evidence)
+                })
+                .await
+                .unwrap()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
             Ok(Json(ListEvidenceResponse::Scoped(evidence_list)))
         }
         None => {
-            let all = tokio::task::spawn_blocking(move || -> Result<Vec<EvidenceWithIncidents>, String> {
-                let records = match caller {
-                    Some(tenant) => state.evidence.list_for_tenant(tenant),
-                    None => state.evidence.list(),
-                }
-                .map_err(|e| e.to_string())?;
-                let mut out = Vec::with_capacity(records.len());
-                for evidence in records {
-                    let mut incident_ids =
-                        state.links.incident_ids_for_evidence(evidence.evidence_id()).map_err(|e| e.to_string())?;
-                    if caller.is_some() {
-                        // Never disclose the id of an incident the caller cannot see.
-                        let mut kept = Vec::with_capacity(incident_ids.len());
-                        for id in incident_ids {
-                            let owner = state.incidents.get(id).map_err(|e| e.to_string())?;
-                            if owner.is_some_and(|i| visible_to(i.tenant_id, caller)) {
-                                kept.push(id);
-                            }
-                        }
-                        incident_ids = kept;
+            let all = tokio::task::spawn_blocking(
+                move || -> Result<Vec<EvidenceWithIncidents>, String> {
+                    let records = match caller {
+                        Some(tenant) => state.evidence.list_for_tenant(tenant),
+                        None => state.evidence.list(),
                     }
-                    out.push(EvidenceWithIncidents { evidence, incident_ids });
-                }
-                Ok(out)
-            })
+                    .map_err(|e| e.to_string())?;
+                    let mut out = Vec::with_capacity(records.len());
+                    for evidence in records {
+                        let mut incident_ids = state
+                            .links
+                            .incident_ids_for_evidence(evidence.evidence_id())
+                            .map_err(|e| e.to_string())?;
+                        if caller.is_some() {
+                            // Never disclose the id of an incident the caller cannot see.
+                            let mut kept = Vec::with_capacity(incident_ids.len());
+                            for id in incident_ids {
+                                let owner = state.incidents.get(id).map_err(|e| e.to_string())?;
+                                if owner.is_some_and(|i| visible_to(i.tenant_id, caller)) {
+                                    kept.push(id);
+                                }
+                            }
+                            incident_ids = kept;
+                        }
+                        out.push(EvidenceWithIncidents {
+                            evidence,
+                            incident_ids,
+                        });
+                    }
+                    Ok(out)
+                },
+            )
             .await
             .unwrap()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -161,7 +189,12 @@ mod tests {
     use super::*;
 
     fn platform_ctx() -> AuthContext {
-        AuthContext { user_id: Uuid::now_v7(), role: osiris_auth::Role::Admin, token: "t".to_string(), tenant_id: None }
+        AuthContext {
+            user_id: Uuid::now_v7(),
+            role: osiris_auth::Role::Admin,
+            token: "t".to_string(),
+            tenant_id: None,
+        }
     }
     use std::sync::Arc;
 
@@ -173,9 +206,13 @@ mod tests {
     fn test_state() -> (tempfile::TempDir, IncidentEvidenceState) {
         let dir = tempfile::tempdir().unwrap();
         let state = IncidentEvidenceState {
-            incidents: Arc::new(SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap()),
+            incidents: Arc::new(
+                SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap(),
+            ),
             evidence: Arc::new(SqliteEvidenceStore::open(dir.path().join("evidence.db")).unwrap()),
-            links: Arc::new(SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap()),
+            links: Arc::new(
+                SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap(),
+            ),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -189,7 +226,9 @@ mod tests {
             .create(osiris_evidence::Incident {
                 incident_id: uuid::Uuid::now_v7(),
                 status: osiris_evidence::IncidentStatus::New,
-                entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+                entities: vec![EntityRef::Ip {
+                    addr: "203.0.113.10".to_string(),
+                }],
                 alert_ids: vec![],
                 notes: vec![],
                 tenant_id: None,
@@ -204,10 +243,18 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let Json(created) = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body)).await.unwrap();
+        let Json(created) =
+            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+                .await
+                .unwrap();
 
-        let list_query = ListEvidenceQuery { incident_id: Some(incident.incident_id.to_string()) };
-        let Json(response) = list_evidence_handler(State(state), Extension(platform_ctx()), Query(list_query)).await.unwrap();
+        let list_query = ListEvidenceQuery {
+            incident_id: Some(incident.incident_id.to_string()),
+        };
+        let Json(response) =
+            list_evidence_handler(State(state), Extension(platform_ctx()), Query(list_query))
+                .await
+                .unwrap();
         let ListEvidenceResponse::Scoped(list) = response else {
             panic!("expected a scoped response");
         };
@@ -226,15 +273,21 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let err = create_evidence_handler(State(state), Extension(platform_ctx()), Json(body)).await.unwrap_err();
+        let err = create_evidence_handler(State(state), Extension(platform_ctx()), Json(body))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn list_evidence_requires_a_valid_incident_id() {
         let (_dir, state) = test_state();
-        let q = ListEvidenceQuery { incident_id: Some("not-a-uuid".to_string()) };
-        let err = list_evidence_handler(State(state), Extension(platform_ctx()), Query(q)).await.unwrap_err();
+        let q = ListEvidenceQuery {
+            incident_id: Some("not-a-uuid".to_string()),
+        };
+        let err = list_evidence_handler(State(state), Extension(platform_ctx()), Query(q))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -246,7 +299,9 @@ mod tests {
             .create(osiris_evidence::Incident {
                 incident_id: uuid::Uuid::now_v7(),
                 status: osiris_evidence::IncidentStatus::New,
-                entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+                entities: vec![EntityRef::Ip {
+                    addr: "203.0.113.10".to_string(),
+                }],
                 alert_ids: vec![],
                 notes: vec![],
                 tenant_id: None,
@@ -261,7 +316,13 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(linked_body)).await.unwrap();
+        let _ = create_evidence_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            Json(linked_body),
+        )
+        .await
+        .unwrap();
 
         let unlinked_body = CreateEvidenceBody {
             source: EvidenceSource::ManualUpload,
@@ -271,20 +332,35 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(unlinked_body)).await.unwrap();
+        let _ = create_evidence_handler(
+            State(state.clone()),
+            Extension(platform_ctx()),
+            Json(unlinked_body),
+        )
+        .await
+        .unwrap();
 
-        let Json(response) =
-            list_evidence_handler(State(state), Extension(platform_ctx()), Query(ListEvidenceQuery { incident_id: None }))
-                .await
-                .unwrap();
+        let Json(response) = list_evidence_handler(
+            State(state),
+            Extension(platform_ctx()),
+            Query(ListEvidenceQuery { incident_id: None }),
+        )
+        .await
+        .unwrap();
         let ListEvidenceResponse::All(all) = response else {
             panic!("expected an all-evidence response");
         };
 
         assert_eq!(all.len(), 2);
-        let linked = all.iter().find(|item| item.evidence.integrity().hash == "linked").unwrap();
+        let linked = all
+            .iter()
+            .find(|item| item.evidence.integrity().hash == "linked")
+            .unwrap();
         assert_eq!(linked.incident_ids, vec![incident.incident_id]);
-        let unlinked = all.iter().find(|item| item.evidence.integrity().hash == "unlinked").unwrap();
+        let unlinked = all
+            .iter()
+            .find(|item| item.evidence.integrity().hash == "unlinked")
+            .unwrap();
         assert!(unlinked.incident_ids.is_empty());
     }
 
@@ -296,7 +372,9 @@ mod tests {
             .create(osiris_evidence::Incident {
                 incident_id: uuid::Uuid::now_v7(),
                 status: osiris_evidence::IncidentStatus::New,
-                entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+                entities: vec![EntityRef::Ip {
+                    addr: "203.0.113.10".to_string(),
+                }],
                 alert_ids: vec![],
                 notes: vec![],
                 tenant_id: None,
@@ -310,12 +388,17 @@ mod tests {
             supersedes: None,
             incident_id: Some(incident.incident_id),
         };
-        let _ = create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body)).await.unwrap();
+        let _ =
+            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+                .await
+                .unwrap();
 
         let Json(response) = list_evidence_handler(
             State(state),
             Extension(platform_ctx()),
-            Query(ListEvidenceQuery { incident_id: Some(incident.incident_id.to_string()) }),
+            Query(ListEvidenceQuery {
+                incident_id: Some(incident.incident_id.to_string()),
+            }),
         )
         .await
         .unwrap();

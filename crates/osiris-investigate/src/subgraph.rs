@@ -60,7 +60,10 @@ pub fn subgraph(
 ) -> Result<Subgraph, StorageError> {
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(seed.storage_key());
-    let mut nodes = vec![GraphNode { id: seed.storage_key(), kind: kind_of(&seed).to_string() }];
+    let mut nodes = vec![GraphNode {
+        id: seed.storage_key(),
+        kind: kind_of(&seed).to_string(),
+    }];
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut seen_edges: HashSet<(String, String, Uuid)> = HashSet::new();
     let mut frontier = vec![seed];
@@ -85,7 +88,11 @@ pub fn subgraph(
                     continue;
                 }
                 let this_key = entity.storage_key();
-                let other = if rel.from.storage_key() == this_key { rel.to.clone() } else { rel.from.clone() };
+                let other = if rel.from.storage_key() == this_key {
+                    rel.to.clone()
+                } else {
+                    rel.from.clone()
+                };
                 let other_key = other.storage_key();
                 if !visited.contains(&other_key) {
                     if nodes.len() >= max_nodes {
@@ -97,7 +104,10 @@ pub fn subgraph(
                         continue;
                     }
                     visited.insert(other_key.clone());
-                    nodes.push(GraphNode { id: other_key, kind: kind_of(&other).to_string() });
+                    nodes.push(GraphNode {
+                        id: other_key,
+                        kind: kind_of(&other).to_string(),
+                    });
                     next_frontier.push(other);
                 }
                 edges.push(GraphEdge {
@@ -112,7 +122,11 @@ pub fn subgraph(
         frontier = next_frontier;
     }
 
-    Ok(Subgraph { nodes, edges, truncated })
+    Ok(Subgraph {
+        nodes,
+        edges,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -121,25 +135,43 @@ mod tests {
     use osiris_storage_sqlite::SqliteStorage;
 
     fn edge(from: EntityRef, to: EntityRef, timestamp: u64) -> EntityRelationship {
-        EntityRelationship { from, to, relation: Relation::ConnectedTo, event_id: Uuid::now_v7(), timestamp }
+        EntityRelationship {
+            from,
+            to,
+            relation: Relation::ConnectedTo,
+            event_id: Uuid::now_v7(),
+            timestamp,
+        }
     }
 
     #[test]
     fn subgraph_stops_expanding_once_max_nodes_is_reached() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        let seed = EntityRef::Ip { addr: "10.0.0.1".to_string() };
+        let seed = EntityRef::Ip {
+            addr: "10.0.0.1".to_string(),
+        };
         // seed -> a -> b -> c -> d, a chain of 5 distinct nodes
-        let a = EntityRef::Ip { addr: "10.0.0.2".to_string() };
-        let b = EntityRef::Ip { addr: "10.0.0.3".to_string() };
-        let c = EntityRef::Ip { addr: "10.0.0.4".to_string() };
-        let d = EntityRef::Ip { addr: "10.0.0.5".to_string() };
-        storage.write_relationships(&[
-            edge(seed.clone(), a.clone(), 100),
-            edge(a.clone(), b.clone(), 200),
-            edge(b.clone(), c.clone(), 300),
-            edge(c.clone(), d.clone(), 400),
-        ]).unwrap();
+        let a = EntityRef::Ip {
+            addr: "10.0.0.2".to_string(),
+        };
+        let b = EntityRef::Ip {
+            addr: "10.0.0.3".to_string(),
+        };
+        let c = EntityRef::Ip {
+            addr: "10.0.0.4".to_string(),
+        };
+        let d = EntityRef::Ip {
+            addr: "10.0.0.5".to_string(),
+        };
+        storage
+            .write_relationships(&[
+                edge(seed.clone(), a.clone(), 100),
+                edge(a.clone(), b.clone(), 200),
+                edge(b.clone(), c.clone(), 300),
+                edge(c.clone(), d.clone(), 400),
+            ])
+            .unwrap();
 
         let result = subgraph(&storage, seed.clone(), 10, 3, 0, 1000).unwrap();
         assert!(result.nodes.len() <= 3);
@@ -150,9 +182,15 @@ mod tests {
     fn subgraph_reports_not_truncated_when_everything_reachable_fits() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        let seed = EntityRef::Ip { addr: "10.0.0.1".to_string() };
-        let a = EntityRef::Ip { addr: "10.0.0.2".to_string() };
-        storage.write_relationships(&[edge(seed.clone(), a.clone(), 100)]).unwrap();
+        let seed = EntityRef::Ip {
+            addr: "10.0.0.1".to_string(),
+        };
+        let a = EntityRef::Ip {
+            addr: "10.0.0.2".to_string(),
+        };
+        storage
+            .write_relationships(&[edge(seed.clone(), a.clone(), 100)])
+            .unwrap();
 
         let result = subgraph(&storage, seed, 10, 100, 0, 1000).unwrap();
         assert_eq!(result.nodes.len(), 2);

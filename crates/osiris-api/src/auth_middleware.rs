@@ -50,18 +50,16 @@ fn percent_decode(value: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(b) => {
+                    out.push(b);
+                    i += 3;
                 }
-            }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b => {
                 out.push(b);
                 i += 1;
@@ -112,7 +110,8 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
 
     // A single non-empty path segment after `prefix` (no further `/`).
     let one_segment = |prefix: &str| {
-        path.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
     };
 
     if method == Method::POST {
@@ -266,16 +265,17 @@ mod tests {
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, AuthState) {
         let users_dir = tempfile::tempdir().unwrap();
-        let (store, _bootstrap) =
-            SqliteUserStore::open(users_dir.path().join("users.db")).unwrap();
+        let (store, _bootstrap) = SqliteUserStore::open(users_dir.path().join("users.db")).unwrap();
         let audit_dir = tempfile::tempdir().unwrap();
-        let audit_log = osiris_audit::FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap();
+        let audit_log =
+            osiris_audit::FileAuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap();
         let state = AuthState {
             users: std::sync::Arc::new(store),
             audit_log: std::sync::Arc::new(audit_log),
             session_ttl_seconds: 3600,
             tenants: std::sync::Arc::new(
-                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db")).unwrap(),
+                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db"))
+                    .unwrap(),
             ),
         };
         (users_dir, audit_dir, state)
@@ -306,7 +306,10 @@ mod tests {
                 "/api/v1/response/:action",
                 axum::routing::post(|| async { "response-ok" }),
             )
-            .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth_gate))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_gate,
+            ))
             .with_state(state)
     }
 
@@ -523,7 +526,10 @@ mod tests {
         );
 
         // Reads of the same routes stay Viewer-level.
-        assert_eq!(min_role_for(&Method::GET, "/api/v1/incidents"), Role::Viewer);
+        assert_eq!(
+            min_role_for(&Method::GET, "/api/v1/incidents"),
+            Role::Viewer
+        );
         assert_eq!(
             min_role_for(
                 &Method::GET,
@@ -597,7 +603,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "GET {uri} should be allowed for a Viewer");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "GET {uri} should be allowed for a Viewer"
+            );
         }
     }
 
@@ -691,16 +701,36 @@ mod tests {
     fn tenant_users_may_only_use_the_event_derived_get_allowlist() {
         use axum::http::Method;
         for path in [
-            "/api/v1/health", "/api/v1/auth/me", "/api/v1/events", "/api/v1/processes",
-            "/api/v1/processes/abc", "/api/v1/processes/abc/story", "/api/v1/alerts",
-            "/api/v1/files", "/api/v1/files/story", "/api/v1/network", "/api/v1/network/story",
-            "/api/v1/identity/story", "/api/v1/systemd/story", "/api/v1/hosts",
-            "/api/v1/containers", "/api/v1/containers/story", "/api/v1/system/story",
-            "/api/v1/graph", "/api/v1/graph/subgraph", "/api/v1/risk",
-            "/api/v1/incidents/PROCESS:abc/reconstruct", "/api/v1/stream/events",
-            "/api/v1/incidents", "/api/v1/incidents/123", "/api/v1/evidence",
+            "/api/v1/health",
+            "/api/v1/auth/me",
+            "/api/v1/events",
+            "/api/v1/processes",
+            "/api/v1/processes/abc",
+            "/api/v1/processes/abc/story",
+            "/api/v1/alerts",
+            "/api/v1/files",
+            "/api/v1/files/story",
+            "/api/v1/network",
+            "/api/v1/network/story",
+            "/api/v1/identity/story",
+            "/api/v1/systemd/story",
+            "/api/v1/hosts",
+            "/api/v1/containers",
+            "/api/v1/containers/story",
+            "/api/v1/system/story",
+            "/api/v1/graph",
+            "/api/v1/graph/subgraph",
+            "/api/v1/risk",
+            "/api/v1/incidents/PROCESS:abc/reconstruct",
+            "/api/v1/stream/events",
+            "/api/v1/incidents",
+            "/api/v1/incidents/123",
+            "/api/v1/evidence",
         ] {
-            assert!(tenant_route_allowed(&Method::GET, path), "GET {path} must be allowed");
+            assert!(
+                tenant_route_allowed(&Method::GET, path),
+                "GET {path} must be allowed"
+            );
         }
         assert!(tenant_route_allowed(&Method::POST, "/api/v1/auth/logout"));
         assert!(tenant_route_allowed(&Method::HEAD, "/api/v1/events"));
@@ -736,7 +766,12 @@ mod tests {
         }
     }
 
-    fn session_for_tenant_user(state: &AuthState, username: &str, role: Role, tenant: Uuid) -> String {
+    fn session_for_tenant_user(
+        state: &AuthState,
+        username: &str,
+        role: Role,
+        tenant: Uuid,
+    ) -> String {
         let user = state
             .users
             .create_user(NewUser {
@@ -746,7 +781,11 @@ mod tests {
                 tenant_id: Some(tenant),
             })
             .unwrap();
-        state.users.create_session(user.user_id, 3600).unwrap().token
+        state
+            .users
+            .create_session(user.user_id, 3600)
+            .unwrap()
+            .token
     }
 
     async fn status_of(app: &Router, uri: &str, token: &str) -> StatusCode {
@@ -768,10 +807,16 @@ mod tests {
         let (_d1, _d2, state) = test_state();
         let token = session_for_tenant_user(&state, "acme-admin", Role::Admin, Uuid::new_v4());
         let app = protected_app(state);
-        assert_eq!(status_of(&app, "/api/v1/events", &token).await, StatusCode::OK);
+        assert_eq!(
+            status_of(&app, "/api/v1/events", &token).await,
+            StatusCode::OK
+        );
         // Tenant-ness, not role, is what denies these: the caller is an Admin.
         // (the audit log spans all tenants and platform events: platform-only)
-        assert_eq!(status_of(&app, "/api/v1/audit", &token).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&app, "/api/v1/audit", &token).await,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             status_of(&app, "/api/v1/protected", &token).await,
             StatusCode::FORBIDDEN,
@@ -783,10 +828,23 @@ mod tests {
     async fn a_platform_admin_still_reaches_platform_only_and_unlisted_routes() {
         let (_d1, _d2, state) = test_state();
         let admin = state.users.get_user_by_username("admin").unwrap().unwrap();
-        let token = state.users.create_session(admin.user_id, 3600).unwrap().token;
+        let token = state
+            .users
+            .create_session(admin.user_id, 3600)
+            .unwrap()
+            .token;
         let app = protected_app(state);
-        assert_eq!(status_of(&app, "/api/v1/audit", &token).await, StatusCode::OK);
-        assert_eq!(status_of(&app, "/api/v1/protected", &token).await, StatusCode::OK);
-        assert_eq!(status_of(&app, "/api/v1/events", &token).await, StatusCode::OK);
+        assert_eq!(
+            status_of(&app, "/api/v1/audit", &token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, "/api/v1/protected", &token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, "/api/v1/events", &token).await,
+            StatusCode::OK
+        );
     }
 }

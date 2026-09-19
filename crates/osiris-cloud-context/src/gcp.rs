@@ -17,7 +17,13 @@ pub(crate) fn gcp_region_from_zone(zone: &str) -> Option<String> {
     if segment.is_empty() {
         return None;
     }
-    Some(segment.rsplit_once('-').map(|(region, _)| region).unwrap_or(segment).to_string())
+    Some(
+        segment
+            .rsplit_once('-')
+            .map(|(region, _)| region)
+            .unwrap_or(segment)
+            .to_string(),
+    )
 }
 
 impl GcpMetadata {
@@ -26,7 +32,10 @@ impl GcpMetadata {
     }
 
     pub fn with_base_url(base: impl Into<String>) -> Self {
-        Self { base: base.into().trim_end_matches('/').to_string(), client: http_client() }
+        Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            client: http_client(),
+        }
     }
 
     /// `Ok(None)`: no client, missing `Metadata-Flavor: Google` response
@@ -60,7 +69,10 @@ impl GcpMetadata {
         let instance_id = sanitize(&id);
         // A zone failure must not discard an otherwise-valid instance id.
         let region = match self.get_text("zone").await {
-            Ok(zone) => zone.and_then(|z| gcp_region_from_zone(&z)).as_deref().and_then(sanitize),
+            Ok(zone) => zone
+                .and_then(|z| gcp_region_from_zone(&z))
+                .as_deref()
+                .and_then(sanitize),
             Err(e) => {
                 tracing::debug!(error = %e, "gcp zone lookup failed");
                 None
@@ -70,7 +82,11 @@ impl GcpMetadata {
             tracing::debug!("gcp metadata response has no usable fields");
             return Ok(None);
         }
-        Ok(Some(CloudContext { provider: "gcp".to_string(), instance_id, region }))
+        Ok(Some(CloudContext {
+            provider: "gcp".to_string(),
+            instance_id,
+            region,
+        }))
     }
 }
 
@@ -107,12 +123,20 @@ mod tests {
     }
 
     async fn id(headers: HeaderMap) -> impl IntoResponse {
-        if flavored(&headers) { ([("metadata-flavor", "Google")], "1234567890\n").into_response() } else { StatusCode::FORBIDDEN.into_response() }
+        if flavored(&headers) {
+            ([("metadata-flavor", "Google")], "1234567890\n").into_response()
+        } else {
+            StatusCode::FORBIDDEN.into_response()
+        }
     }
 
     async fn zone(headers: HeaderMap) -> impl IntoResponse {
         if flavored(&headers) {
-            ([("metadata-flavor", "Google")], "projects/123/zones/us-central1-a").into_response()
+            (
+                [("metadata-flavor", "Google")],
+                "projects/123/zones/us-central1-a",
+            )
+                .into_response()
         } else {
             StatusCode::FORBIDDEN.into_response()
         }
@@ -120,8 +144,14 @@ mod tests {
 
     #[test]
     fn zone_maps_to_region() {
-        assert_eq!(gcp_region_from_zone("projects/123/zones/us-central1-a").as_deref(), Some("us-central1"));
-        assert_eq!(gcp_region_from_zone("europe-west4-b").as_deref(), Some("europe-west4"));
+        assert_eq!(
+            gcp_region_from_zone("projects/123/zones/us-central1-a").as_deref(),
+            Some("us-central1")
+        );
+        assert_eq!(
+            gcp_region_from_zone("europe-west4-b").as_deref(),
+            Some("europe-west4")
+        );
         assert_eq!(gcp_region_from_zone("weird").as_deref(), Some("weird"));
         assert_eq!(gcp_region_from_zone(""), None);
     }
@@ -134,7 +164,11 @@ mod tests {
         let base = serve(router).await;
         let got = GcpMetadata::with_base_url(base).probe().await.unwrap();
         assert_eq!(got.provider, "gcp");
-        assert_eq!(got.instance_id.as_deref(), Some("1234567890"), "trailing newline trimmed");
+        assert_eq!(
+            got.instance_id.as_deref(),
+            Some("1234567890"),
+            "trailing newline trimmed"
+        );
         assert_eq!(got.region.as_deref(), Some("us-central1"));
     }
 
@@ -156,8 +190,14 @@ mod tests {
     #[tokio::test]
     async fn response_without_metadata_flavor_header_yields_none() {
         let router = Router::new()
-            .route("/computeMetadata/v1/instance/id", get(|| async { "1234567890" }))
-            .route("/computeMetadata/v1/instance/zone", get(|| async { "projects/1/zones/us-central1-a" }));
+            .route(
+                "/computeMetadata/v1/instance/id",
+                get(|| async { "1234567890" }),
+            )
+            .route(
+                "/computeMetadata/v1/instance/zone",
+                get(|| async { "projects/1/zones/us-central1-a" }),
+            );
         let base = serve(router).await;
         assert!(GcpMetadata::with_base_url(base).probe().await.is_none());
     }
@@ -178,12 +218,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_client_yields_none() {
-        let p = GcpMetadata { base: "http://127.0.0.1:1".into(), client: None };
+        let p = GcpMetadata {
+            base: "http://127.0.0.1:1".into(),
+            client: None,
+        };
         assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]
     async fn unreachable_endpoint_yields_none() {
-        assert!(GcpMetadata::with_base_url("http://127.0.0.1:1").probe().await.is_none());
+        assert!(GcpMetadata::with_base_url("http://127.0.0.1:1")
+            .probe()
+            .await
+            .is_none());
     }
 }

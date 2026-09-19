@@ -40,7 +40,11 @@ impl PodCache {
     }
 
     pub fn lookup(&self, container_id: &str) -> Option<PodRef> {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).get(container_id).cloned()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(container_id)
+            .cloned()
     }
 }
 
@@ -60,7 +64,10 @@ mod tests {
     use super::*;
 
     fn pod(name: &str) -> PodRef {
-        PodRef { pod_name: name.to_string(), namespace: "ns".to_string() }
+        PodRef {
+            pod_name: name.to_string(),
+            namespace: "ns".to_string(),
+        }
     }
 
     #[test]
@@ -91,8 +98,9 @@ mod tests {
     #[test]
     fn replace_enforces_the_entry_cap() {
         let cache = PodCache::new();
-        let big: HashMap<String, PodRef> =
-            (0..MAX_CACHE_ENTRIES + 500).map(|i| (format!("id-{i}"), pod("p"))).collect();
+        let big: HashMap<String, PodRef> = (0..MAX_CACHE_ENTRIES + 500)
+            .map(|i| (format!("id-{i}"), pod("p")))
+            .collect();
         cache.replace(big);
         assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
     }

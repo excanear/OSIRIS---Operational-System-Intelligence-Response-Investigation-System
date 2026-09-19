@@ -109,11 +109,11 @@ pub fn reconstruct_incident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osiris_schema::CanonicalEvent;
     use osiris_schema::{
         Category, EventType, HostRef, NetworkDirection, NetworkRef, ProcessKey, ProcessRef,
         Relation, Severity, Source, SCHEMA_VERSION,
     };
-    use osiris_schema::CanonicalEvent;
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
@@ -129,12 +129,42 @@ mod tests {
             event_type: EventType::NetworkConnect,
             category,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None, file: None,
-            network: Some(NetworkRef { src_ip: "10.0.0.1".to_string(), src_port: 1, dst_ip: "10.0.0.2".to_string(), dst_port: 2, proto: "tcp".to_string(), direction: NetworkDirection::Outbound, bytes: None }),
-            dns: None, device: None, service: None, container: None, namespace: None, cgroup: None,
-            kernel: None, source: Source::Synthetic, provider: "test".to_string(), raw_event: None,
-            relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: Some(NetworkRef {
+                src_ip: "10.0.0.1".to_string(),
+                src_port: 1,
+                dst_ip: "10.0.0.2".to_string(),
+                dst_port: 2,
+                proto: "tcp".to_string(),
+                direction: NetworkDirection::Outbound,
+                bytes: None,
+            }),
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 
@@ -145,7 +175,20 @@ mod tests {
         let host_id = Uuid::new_v4();
         let process_key = ProcessKey::new(host_id, "b", 1, 1);
 
-        let exec_event = { let mut e = base_event(Category::Process, 100); e.event_type = EventType::ProcessExec; e.process = Some(ProcessRef { process_key, pid: 1, exe_path: "/bin/x".to_string(), cmdline: vec![], exe_hash: None, start_time_mono: 100 }); e.network = None; e };
+        let exec_event = {
+            let mut e = base_event(Category::Process, 100);
+            e.event_type = EventType::ProcessExec;
+            e.process = Some(ProcessRef {
+                process_key,
+                pid: 1,
+                exe_path: "/bin/x".to_string(),
+                cmdline: vec![],
+                exe_hash: None,
+                start_time_mono: 100,
+            });
+            e.network = None;
+            e
+        };
         let network_event = base_event(Category::Network, 200);
         storage.write(&exec_event).unwrap();
         storage.write(&network_event).unwrap();
@@ -154,7 +197,9 @@ mod tests {
         storage
             .write_relationships(&[EntityRelationship {
                 from: seed.clone(),
-                to: EntityRef::Ip { addr: "10.0.0.2".to_string() },
+                to: EntityRef::Ip {
+                    addr: "10.0.0.2".to_string(),
+                },
                 relation: Relation::ConnectedTo,
                 event_id: network_event.event_id,
                 timestamp: 200,

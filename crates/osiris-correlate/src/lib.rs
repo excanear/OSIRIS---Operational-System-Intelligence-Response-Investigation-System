@@ -29,11 +29,15 @@ impl BehavioralChain {
     /// True when the chain contains at least one edge of `relation`
     /// originating at (or terminating at) `entity` — the primitive the
     /// Risk Engine's chain-pattern bonus (Phase 6 plan Task 6) is built on.
-    pub fn has_relation_touching(&self, entity: &EntityRef, relation: osiris_schema::Relation) -> bool {
+    pub fn has_relation_touching(
+        &self,
+        entity: &EntityRef,
+        relation: osiris_schema::Relation,
+    ) -> bool {
         let key = entity.storage_key();
-        self.edges
-            .iter()
-            .any(|e| e.relation == relation && (e.from.storage_key() == key || e.to.storage_key() == key))
+        self.edges.iter().any(|e| {
+            e.relation == relation && (e.from.storage_key() == key || e.to.storage_key() == key)
+        })
     }
 }
 
@@ -81,7 +85,11 @@ impl CorrelationEngine {
             let mut next_frontier = Vec::new();
             for entity in &frontier {
                 for edge in source.edges_for(entity, since, until) {
-                    let edge_key = (edge.from.storage_key(), edge.to.storage_key(), edge.event_id);
+                    let edge_key = (
+                        edge.from.storage_key(),
+                        edge.to.storage_key(),
+                        edge.event_id,
+                    );
                     if !visited_edges.insert(edge_key) {
                         continue;
                     }
@@ -140,7 +148,10 @@ mod tests {
                     .entry(edge.from.storage_key())
                     .or_default()
                     .push(edge.clone());
-                by_entity.entry(edge.to.storage_key()).or_default().push(edge);
+                by_entity
+                    .entry(edge.to.storage_key())
+                    .or_default()
+                    .push(edge);
             }
             Self { by_entity }
         }
@@ -184,7 +195,12 @@ mod tests {
         }
     }
 
-    fn edge(from: EntityRef, to: EntityRef, relation: Relation, timestamp: u64) -> EntityRelationship {
+    fn edge(
+        from: EntityRef,
+        to: EntityRef,
+        relation: Relation,
+        timestamp: u64,
+    ) -> EntityRelationship {
         EntityRelationship {
             from,
             to,

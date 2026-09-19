@@ -46,7 +46,8 @@ pub const BACKDOOR_UNIT_PATH: &str = "/etc/systemd/system/backdoor.service";
 /// (a real container id's shape), reused by this scenario's own
 /// detection-rule fixture and by any test asserting on the deployed
 /// container's identity.
-pub const DEPLOYED_CONTAINER_ID: &str = "d00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d";
+pub const DEPLOYED_CONTAINER_ID: &str =
+    "d00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d";
 pub const DEPLOYED_CONTAINER_CGROUP_PATH: &str =
     "/system.slice/docker-d00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d.scope";
 
@@ -502,7 +503,13 @@ pub fn container_deploy_in_remote_session_scenario(base_ts_ns: u64) -> Vec<RawEv
             source: RawEventSource::Synthetic,
         }),
         exec(200, 100, "/bin/bash", "bash", base_ts_ns + 2_000_000),
-        exec(300, 200, "/usr/bin/docker", "docker", base_ts_ns + 3_000_000),
+        exec(
+            300,
+            200,
+            "/usr/bin/docker",
+            "docker",
+            base_ts_ns + 3_000_000,
+        ),
         RawEvent::Container(ContainerEventRaw {
             operation: ContainerOperation::Create,
             container_id: DEPLOYED_CONTAINER_ID.to_string(),
@@ -740,7 +747,10 @@ mod tests {
 
         let net = network_raw_events(&scenario);
         assert_eq!(net.len(), 2);
-        assert_eq!(net[0].operation, osiris_sensor_api::NetworkOperation::Connect);
+        assert_eq!(
+            net[0].operation,
+            osiris_sensor_api::NetworkOperation::Connect
+        );
         assert_eq!(net[0].remote_addr, BEACON_IP);
         assert_eq!(net[0].pid, Some(300));
         assert_eq!(net[1].operation, osiris_sensor_api::NetworkOperation::Close);
@@ -759,7 +769,10 @@ mod tests {
 
         let net = network_raw_events(&scenario);
         assert_eq!(net.len(), 1);
-        assert_eq!(net[0].operation, osiris_sensor_api::NetworkOperation::Connect);
+        assert_eq!(
+            net[0].operation,
+            osiris_sensor_api::NetworkOperation::Connect
+        );
         assert_eq!(net[0].remote_addr, DOWNLOAD_C2_IP);
         assert_eq!(net[0].pid, Some(300));
 
@@ -826,7 +839,10 @@ mod tests {
 
         let identity = identity_raw_events(&scenario);
         assert_eq!(identity.len(), 2, "one login, one logout");
-        assert_eq!(identity[0].operation, osiris_sensor_api::IdentityOperation::Login);
+        assert_eq!(
+            identity[0].operation,
+            osiris_sensor_api::IdentityOperation::Login
+        );
         assert_eq!(identity[0].session_id, SSH_SESSION_ID);
         assert_eq!(identity[0].remote_addr.as_deref(), Some(SSH_REMOTE_ADDR));
         assert_eq!(identity[0].auth_method.as_deref(), Some("sshd"));
@@ -840,15 +856,24 @@ mod tests {
 
         let privilege = privilege_raw_events(&scenario);
         assert_eq!(privilege.len(), 2, "one sudo invocation, one uid change");
-        assert_eq!(privilege[0].operation, osiris_sensor_api::PrivilegeOperation::Sudo);
-        assert_eq!(privilege[1].operation, osiris_sensor_api::PrivilegeOperation::UidChange);
+        assert_eq!(
+            privilege[0].operation,
+            osiris_sensor_api::PrivilegeOperation::Sudo
+        );
+        assert_eq!(
+            privilege[1].operation,
+            osiris_sensor_api::PrivilegeOperation::UidChange
+        );
         assert_eq!(privilege[1].uid, 1000);
         assert_eq!(privilege[1].target_uid, Some(0), "escalation to root");
 
         assert_eq!(file_events(&scenario).len(), 1);
         assert_eq!(file_events(&scenario)[0].path, ROOT_KEYS_PATH);
         assert_eq!(network_raw_events(&scenario).len(), 1);
-        assert_eq!(network_raw_events(&scenario)[0].remote_addr, ESCALATION_C2_IP);
+        assert_eq!(
+            network_raw_events(&scenario)[0].remote_addr,
+            ESCALATION_C2_IP
+        );
     }
 
     /// The escalating process must be a descendant of the login's pid, or
@@ -880,8 +905,10 @@ mod tests {
         sorted.sort();
         assert_eq!(timestamps, sorted);
         assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
-        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
-            == osiris_sensor_api::IdentityOperation::Logout));
+        assert!(
+            matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout)
+        );
     }
 
     fn systemd_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::SystemdEventRaw> {
@@ -894,7 +921,9 @@ mod tests {
             .collect()
     }
 
-    fn persistence_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::PersistenceEventRaw> {
+    fn persistence_raw_events(
+        scenario: &[RawEvent],
+    ) -> Vec<&osiris_sensor_api::PersistenceEventRaw> {
         scenario
             .iter()
             .filter_map(|e| match e {
@@ -968,15 +997,18 @@ mod tests {
     }
 
     #[test]
-    fn persistence_via_systemd_service_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
+    fn persistence_via_systemd_service_scenario_is_strictly_time_ordered_and_ends_with_the_logout()
+    {
         let scenario = persistence_via_systemd_service_scenario(1_000_000_000);
         let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();
         assert_eq!(timestamps, sorted);
         assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
-        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
-            == osiris_sensor_api::IdentityOperation::Logout));
+        assert!(
+            matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout)
+        );
     }
 
     fn container_raw_events(scenario: &[RawEvent]) -> Vec<&osiris_sensor_api::ContainerEventRaw> {
@@ -990,7 +1022,8 @@ mod tests {
     }
 
     #[test]
-    fn container_deploy_in_remote_session_scenario_spans_process_identity_and_container_categories() {
+    fn container_deploy_in_remote_session_scenario_spans_process_identity_and_container_categories()
+    {
         let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
         assert_eq!(scenario.len(), 7);
 
@@ -1026,20 +1059,27 @@ mod tests {
     fn the_container_events_actor_descends_from_the_logins_pid() {
         let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
         let execs = exec_events(&scenario);
-        assert_eq!((execs[2].pid, execs[2].ppid), (300, 200), "docker under bash");
+        assert_eq!(
+            (execs[2].pid, execs[2].ppid),
+            (300, 200),
+            "docker under bash"
+        );
         let containers = container_raw_events(&scenario);
         assert_eq!(containers[1].pid, Some(300));
     }
 
     #[test]
-    fn container_deploy_in_remote_session_scenario_is_strictly_time_ordered_and_ends_with_the_logout() {
+    fn container_deploy_in_remote_session_scenario_is_strictly_time_ordered_and_ends_with_the_logout(
+    ) {
         let scenario = container_deploy_in_remote_session_scenario(1_000_000_000);
         let timestamps: Vec<u64> = scenario.iter().map(RawEvent::timestamp_ns).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();
         assert_eq!(timestamps, sorted);
         assert!(timestamps.windows(2).all(|w| w[0] < w[1]));
-        assert!(matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
-            == osiris_sensor_api::IdentityOperation::Logout));
+        assert!(
+            matches!(scenario.last(), Some(RawEvent::Identity(i)) if i.operation
+            == osiris_sensor_api::IdentityOperation::Logout)
+        );
     }
 }

@@ -29,7 +29,10 @@ fn parse_ipv4_hex(hex: &str) -> Option<String> {
     for i in 0..4 {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
     }
-    Some(format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]))
+    Some(format!(
+        "{}.{}.{}.{}",
+        bytes[3], bytes[2], bytes[1], bytes[0]
+    ))
 }
 
 /// Decodes one `ADDR:PORT` field (e.g. `0100007F:0050`). The port half is

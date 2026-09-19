@@ -2,8 +2,8 @@ use osiris_schema::EntityRef;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-mod query;
 mod dispatch;
+mod query;
 pub use dispatch::dispatch;
 
 #[derive(Debug, thiserror::Error)]
@@ -80,9 +80,17 @@ pub struct ResponseRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseOutcome {
-    DryRunPreview { description: String },
-    EvidenceCollected { evidence_id: Uuid, event_count: usize, truncated: bool },
-    Rejected { reason: String },
+    DryRunPreview {
+        description: String,
+    },
+    EvidenceCollected {
+        evidence_id: Uuid,
+        event_count: usize,
+        truncated: bool,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -130,7 +138,11 @@ mod tests {
             ResponseActionKind::DisablePersistence,
             ResponseActionKind::CollectEvidence,
         ] {
-            let via_serde = serde_json::to_value(action).unwrap().as_str().unwrap().to_string();
+            let via_serde = serde_json::to_value(action)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert_eq!(action.wire_form(), via_serde);
         }
     }

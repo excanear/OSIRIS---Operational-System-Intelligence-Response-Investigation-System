@@ -69,7 +69,8 @@ fn correlate_baseline_and_score(
         process_key: process.process_key,
     };
     let edge_source = StorageEdgeSource { storage };
-    let chain: BehavioralChain = correlation_engine.build_chain(&edge_source, seed, event.timestamp);
+    let chain: BehavioralChain =
+        correlation_engine.build_chain(&edge_source, seed, event.timestamp);
 
     if let Some(record) = risk_engine.score(event, alerts_for_event, &observations, Some(&chain)) {
         storage.write_risk_scores(std::slice::from_ref(&record))?;
@@ -191,8 +192,8 @@ pub async fn run_ingestion_loop(
 mod tests {
     use super::*;
     use osiris_schema::{
-        encode_device_id, Category, EventType, FileRef, HostRef, ProcessKey, ProcessRef,
-        Severity, Source, SCHEMA_VERSION,
+        encode_device_id, Category, EventType, FileRef, HostRef, ProcessKey, ProcessRef, Severity,
+        Source, SCHEMA_VERSION,
     };
     use osiris_storage::{AlertQueryPlan, QueryPlan};
     use osiris_storage_sqlite::SqliteStorage;
@@ -655,9 +656,14 @@ sequence:
             })
             .unwrap();
         assert!(!scores.is_empty());
-        let has_chain_bonus = scores
-            .iter()
-            .any(|s| s.reasons.iter().any(|r| r.label.contains("Network connection")));
-        assert!(has_chain_bonus, "risk score must cite the chain-pattern bonus");
+        let has_chain_bonus = scores.iter().any(|s| {
+            s.reasons
+                .iter()
+                .any(|r| r.label.contains("Network connection"))
+        });
+        assert!(
+            has_chain_bonus,
+            "risk score must cite the chain-pattern bonus"
+        );
     }
 }

@@ -74,7 +74,8 @@ pub struct SqliteIncidentStore {
 
 impl SqliteIncidentStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, IncidentStoreError> {
-        let conn = Connection::open(path).map_err(|e| IncidentStoreError::Backend(e.to_string()))?;
+        let conn =
+            Connection::open(path).map_err(|e| IncidentStoreError::Backend(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS incidents (
                 incident_id TEXT PRIMARY KEY,
@@ -82,7 +83,9 @@ impl SqliteIncidentStore {
             );",
         )
         .map_err(|e| IncidentStoreError::Backend(e.to_string()))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Persists an incident via upsert (ON CONFLICT ... DO UPDATE). Unlike the append-only
@@ -97,8 +100,8 @@ impl SqliteIncidentStore {
             .conn
             .lock()
             .map_err(|_| IncidentStoreError::Backend("poisoned lock".to_string()))?;
-        let raw_json =
-            serde_json::to_string(incident).map_err(|e| IncidentStoreError::Serialize(e.to_string()))?;
+        let raw_json = serde_json::to_string(incident)
+            .map_err(|e| IncidentStoreError::Serialize(e.to_string()))?;
         conn.execute(
             "INSERT INTO incidents (incident_id, raw_json) VALUES (?1, ?2)
              ON CONFLICT(incident_id) DO UPDATE SET raw_json = excluded.raw_json",
@@ -129,9 +132,11 @@ impl IncidentStore for SqliteIncidentStore {
             .optional()
             .map_err(|e| IncidentStoreError::Backend(e.to_string()))?;
         match raw_json {
-            Some(json) => Ok(Some(
-                serde_json::from_str(&json).map_err(|e| IncidentStoreError::Serialize(e.to_string()))?,
-            )),
+            Some(json) => {
+                Ok(Some(serde_json::from_str(&json).map_err(|e| {
+                    IncidentStoreError::Serialize(e.to_string())
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -151,7 +156,8 @@ impl IncidentStore for SqliteIncidentStore {
         for row in rows {
             let raw_json = row.map_err(|e| IncidentStoreError::Backend(e.to_string()))?;
             incidents.push(
-                serde_json::from_str(&raw_json).map_err(|e| IncidentStoreError::Serialize(e.to_string()))?,
+                serde_json::from_str(&raw_json)
+                    .map_err(|e| IncidentStoreError::Serialize(e.to_string()))?,
             );
         }
         Ok(incidents)
@@ -206,7 +212,9 @@ mod tests {
         Incident {
             incident_id: Uuid::now_v7(),
             status: IncidentStatus::New,
-            entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+            entities: vec![EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            }],
             alert_ids: vec![],
             notes: vec![],
             tenant_id: None,
@@ -242,7 +250,9 @@ mod tests {
             .transition_status(
                 created.incident_id,
                 IncidentStatus::Investigating,
-                ActorRef::User { user_id: Uuid::now_v7() },
+                ActorRef::User {
+                    user_id: Uuid::now_v7(),
+                },
                 Some("starting triage".to_string()),
                 &audit_log,
             )
@@ -263,7 +273,13 @@ mod tests {
         let store = SqliteIncidentStore::open(dir.path().join("incidents.db")).unwrap();
         let audit_log = FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap();
         let err = store
-            .transition_status(Uuid::now_v7(), IncidentStatus::Resolved, ActorRef::System, None, &audit_log)
+            .transition_status(
+                Uuid::now_v7(),
+                IncidentStatus::Resolved,
+                ActorRef::System,
+                None,
+                &audit_log,
+            )
             .unwrap_err();
         assert!(matches!(err, IncidentStoreError::NotFound));
     }
@@ -283,7 +299,13 @@ mod tests {
         };
         let created = store.create(no_entities).unwrap();
         let err = store
-            .transition_status(created.incident_id, IncidentStatus::Investigating, ActorRef::System, None, &audit_log)
+            .transition_status(
+                created.incident_id,
+                IncidentStatus::Investigating,
+                ActorRef::System,
+                None,
+                &audit_log,
+            )
             .unwrap_err();
         assert!(matches!(err, IncidentStoreError::NoEntities));
     }
@@ -297,7 +319,9 @@ mod tenant_tests {
         Incident {
             incident_id: Uuid::now_v7(),
             status: IncidentStatus::New,
-            entities: vec![EntityRef::Ip { addr: "203.0.113.10".to_string() }],
+            entities: vec![EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            }],
             alert_ids: vec![],
             notes: vec![],
             tenant_id: tenant,

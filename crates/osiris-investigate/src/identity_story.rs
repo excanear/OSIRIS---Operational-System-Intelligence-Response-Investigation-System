@@ -11,7 +11,11 @@ use crate::support::{assemble, Story};
 /// that user opened (deliberately — that fan-out needs the graph, not a
 /// flat filter); both given intersects, expressed as one `AND` node so a
 /// single `query_events` call does the intersection.
-pub fn identity_story(storage: &dyn Storage, session_id: Option<&str>, uid: Option<u32>) -> Result<Story, StorageError> {
+pub fn identity_story(
+    storage: &dyn Storage,
+    session_id: Option<&str>,
+    uid: Option<u32>,
+) -> Result<Story, StorageError> {
     let session_ast = session_id.map(|s| Ast::Compare {
         field: "session.session_id".to_string(),
         op: Op::Eq,
@@ -43,7 +47,10 @@ pub fn identity_story(storage: &dyn Storage, session_id: Option<&str>, uid: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{CanonicalEvent, Category, EventType, HostRef, Severity, Source, SessionRef, UserRef, SCHEMA_VERSION};
+    use osiris_schema::{
+        CanonicalEvent, Category, EventType, HostRef, SessionRef, Severity, Source, UserRef,
+        SCHEMA_VERSION,
+    };
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
@@ -59,13 +66,46 @@ mod tests {
             event_type: EventType::SessionLogin,
             category: Category::Identity,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: Some(UserRef { uid, gid: uid, euid: uid, egid: uid, username: None, loginuid: Some(uid) }),
-            session: Some(SessionRef { session_id: session_id.to_string(), tty: None, remote_addr: None, auth_method: None }),
-            process: None, parent_process: None, thread: None, file: None, network: None, dns: None,
-            device: None, service: None, container: None, namespace: None, cgroup: None, kernel: None,
-            source: Source::Synthetic, provider: "test".to_string(), raw_event: None, relationships: vec![],
-            tags: vec![], risk: None, event_data: serde_json::json!({}),
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: Some(UserRef {
+                uid,
+                gid: uid,
+                euid: uid,
+                egid: uid,
+                username: None,
+                loginuid: Some(uid),
+            }),
+            session: Some(SessionRef {
+                session_id: session_id.to_string(),
+                tty: None,
+                remote_addr: None,
+                auth_method: None,
+            }),
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 

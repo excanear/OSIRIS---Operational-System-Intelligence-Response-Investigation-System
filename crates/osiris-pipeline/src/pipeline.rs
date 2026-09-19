@@ -7,8 +7,8 @@ use osiris_sensor_api::RawEvent;
 use crate::enrich::enrich;
 use crate::normalize::normalize;
 use crate::ns_cgroup_resolver::NsCgroupResolver;
-use crate::prioritize::{prioritize, PriorityLane, PriorityTable};
 use crate::pod_lookup::{attach_pod_ref, PodLookup};
+use crate::prioritize::{prioritize, PriorityLane, PriorityTable};
 use crate::process_resolver::ProcessResolver;
 use crate::session_resolver::SessionResolver;
 use crate::validate::validate;
@@ -91,7 +91,9 @@ impl Pipeline {
 mod tests {
     use super::*;
     use osiris_schema::PodRef;
-    use osiris_sensor_api::{ContainerEventRaw, ContainerOperation, ProcessExecRaw, RawEventSource};
+    use osiris_sensor_api::{
+        ContainerEventRaw, ContainerOperation, ProcessExecRaw, RawEventSource,
+    };
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -121,11 +123,21 @@ mod tests {
     fn pipeline_with_a_pod_lookup_attaches_pod_ref_and_without_one_leaves_it_none() {
         let id = "c".repeat(64);
         let mut pods = HashMap::new();
-        pods.insert(id.clone(), PodRef { pod_name: "web-0".to_string(), namespace: "prod".to_string() });
+        pods.insert(
+            id.clone(),
+            PodRef {
+                pod_name: "web-0".to_string(),
+                namespace: "prod".to_string(),
+            },
+        );
 
-        let mut with = Pipeline::new(test_host(), "boot-1".to_string()).with_pod_lookup(Arc::new(FakePods(pods)));
+        let mut with = Pipeline::new(test_host(), "boot-1".to_string())
+            .with_pod_lookup(Arc::new(FakePods(pods)));
         let got = with.process(container_raw(&id));
-        assert_eq!(got.event.container.unwrap().pod_ref.unwrap().pod_name, "web-0");
+        assert_eq!(
+            got.event.container.unwrap().pod_ref.unwrap().pod_name,
+            "web-0"
+        );
 
         let mut without = Pipeline::new(test_host(), "boot-1".to_string());
         let got = without.process(container_raw(&id));

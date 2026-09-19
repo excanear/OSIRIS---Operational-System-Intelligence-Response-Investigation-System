@@ -50,11 +50,26 @@ mod tests {
     #[test]
     fn known_fields_includes_every_indexed_and_common_column() {
         for f in [
-            "event_type", "category", "severity", "timestamp", "host_id",
-            "process.pid", "process.exe_path", "process.process_key",
-            "user.uid", "user.username", "file.path", "file.inode", "file.device_id",
-            "network.src_ip", "network.dst_ip", "dns.query",
-            "session.session_id", "service.unit_name", "container.container_id", "tags",
+            "event_type",
+            "category",
+            "severity",
+            "timestamp",
+            "host_id",
+            "process.pid",
+            "process.exe_path",
+            "process.process_key",
+            "user.uid",
+            "user.username",
+            "file.path",
+            "file.inode",
+            "file.device_id",
+            "network.src_ip",
+            "network.dst_ip",
+            "dns.query",
+            "session.session_id",
+            "service.unit_name",
+            "container.container_id",
+            "tags",
         ] {
             assert!(is_known_field(f), "expected '{}' to be a known field", f);
         }

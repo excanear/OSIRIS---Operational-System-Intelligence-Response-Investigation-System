@@ -13,7 +13,10 @@ use crate::auth_middleware::AuthContext;
 
 pub fn build_tenant_router(state: AuthState) -> Router {
     Router::new()
-        .route("/api/v1/tenants", get(list_tenants_handler).post(create_tenant_handler))
+        .route(
+            "/api/v1/tenants",
+            get(list_tenants_handler).post(create_tenant_handler),
+        )
         .route(
             "/api/v1/tenants/:tenant_id/hosts/:host_id",
             put(assign_host_handler).delete(unassign_host_handler),
@@ -43,7 +46,9 @@ fn store_error(e: TenantStoreError) -> (StatusCode, String) {
 
 fn audit(state: &AuthState, ctx: &AuthContext, what: &str, target: String) {
     let _ = state.audit_log.append(NewAuditEntry {
-        who: ActorRef::User { user_id: ctx.user_id },
+        who: ActorRef::User {
+            user_id: ctx.user_id,
+        },
         what: what.to_string(),
         target: EntityRef::Domain { name: target },
         why: None,
@@ -67,7 +72,12 @@ async fn create_tenant_handler(
         .await
         .unwrap()
         .map_err(store_error)?;
-    audit(&state, &ctx, "tenant_create", format!("tenant:{}", tenant.name));
+    audit(
+        &state,
+        &ctx,
+        "tenant_create",
+        format!("tenant:{}", tenant.name),
+    );
     Ok(Json(tenant))
 }
 
@@ -95,7 +105,12 @@ async fn assign_host_handler(
         .await
         .unwrap()
         .map_err(store_error)?;
-    audit(&state, &ctx, "tenant_assign_host", format!("tenant:{tenant_id}/host:{host_id}"));
+    audit(
+        &state,
+        &ctx,
+        "tenant_assign_host",
+        format!("tenant:{tenant_id}/host:{host_id}"),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -115,12 +130,20 @@ async fn unassign_host_handler(
             .map_err(store_error)?
     };
     if owner != Some(tenant_id) {
-        return Err((StatusCode::NOT_FOUND, "host is not assigned to that tenant".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "host is not assigned to that tenant".to_string(),
+        ));
     }
     tokio::task::spawn_blocking(move || tenants.unassign_host(host_id))
         .await
         .unwrap()
         .map_err(store_error)?;
-    audit(&state, &ctx, "tenant_unassign_host", format!("tenant:{tenant_id}/host:{host_id}"));
+    audit(
+        &state,
+        &ctx,
+        "tenant_unassign_host",
+        format!("tenant:{tenant_id}/host:{host_id}"),
+    );
     Ok(StatusCode::NO_CONTENT)
 }

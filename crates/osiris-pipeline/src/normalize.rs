@@ -227,12 +227,18 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
     // conventional "who is talking to whom" network-log semantics rather
     // than "which side is local."
     let (src_ip, src_port, dst_ip, dst_port) = match direction {
-        NetworkDirection::Outbound => {
-            (raw.local_addr.clone(), raw.local_port, raw.remote_addr.clone(), raw.remote_port)
-        }
-        NetworkDirection::Inbound => {
-            (raw.remote_addr.clone(), raw.remote_port, raw.local_addr.clone(), raw.local_port)
-        }
+        NetworkDirection::Outbound => (
+            raw.local_addr.clone(),
+            raw.local_port,
+            raw.remote_addr.clone(),
+            raw.remote_port,
+        ),
+        NetworkDirection::Inbound => (
+            raw.remote_addr.clone(),
+            raw.remote_port,
+            raw.local_addr.clone(),
+            raw.local_port,
+        ),
     };
     let process = provisional_process(raw.pid, &raw.exe_path, host.host_id, boot_id);
     CanonicalEvent {
@@ -412,14 +418,7 @@ fn normalize_identity_event(
         IdentityOperation::SessionStart => EventType::SessionCreate,
         IdentityOperation::SessionEnd => EventType::SessionTerminate,
     };
-    let (user, partial) = build_user_ref(
-        raw.uid,
-        None,
-        None,
-        None,
-        raw.username.clone(),
-        raw.auid,
-    );
+    let (user, partial) = build_user_ref(raw.uid, None, None, None, raw.username.clone(), raw.auid);
     let mut tags = Vec::new();
     if partial {
         tags.push("USER_REF_PARTIAL".to_string());
@@ -712,7 +711,12 @@ fn normalize_persistence_event(
 /// operation precisely.
 fn classify_persistence_event(
     raw: &PersistenceEventRaw,
-) -> (EventType, Category, Option<ServiceRef>, Option<&'static str>) {
+) -> (
+    EventType,
+    Category,
+    Option<ServiceRef>,
+    Option<&'static str>,
+) {
     use PersistenceCheckpointKind::*;
     use PersistenceOperation::*;
     match raw.checkpoint_kind {
@@ -1052,7 +1056,11 @@ mod tests {
             } else {
                 String::new()
             },
-            comm: if pid.is_some() { "curl".to_string() } else { String::new() },
+            comm: if pid.is_some() {
+                "curl".to_string()
+            } else {
+                String::new()
+            },
             timestamp_ns: 1_690_000_004_000_000_000,
             source: RawEventSource::Audit,
         }
@@ -1086,7 +1094,9 @@ mod tests {
             &host,
             "boot-1",
         );
-        let net = event.network.expect("network events must carry a NetworkRef");
+        let net = event
+            .network
+            .expect("network events must carry a NetworkRef");
         // Outbound: local is the source, remote is the destination.
         assert_eq!(net.src_ip, "10.0.0.5");
         assert_eq!(net.src_port, 51000);
@@ -1109,7 +1119,10 @@ mod tests {
             event.process.is_none(),
             "a connection the sensor could not attribute must carry no process, not a fabricated one"
         );
-        assert!(event.network.is_some(), "the NetworkRef itself is still populated");
+        assert!(
+            event.network.is_some(),
+            "the NetworkRef itself is still populated"
+        );
     }
 
     #[test]
@@ -1121,7 +1134,9 @@ mod tests {
             &host,
             "boot-1",
         );
-        let process = event.process.expect("pid was known, so process must be set");
+        let process = event
+            .process
+            .expect("pid was known, so process must be set");
         assert_eq!(process.pid, 300);
         assert_eq!(process.start_time_mono, 0);
         assert_eq!(
@@ -1280,7 +1295,10 @@ mod tests {
             "boot-1",
         );
         let user = event.user.as_ref().expect("user must be populated");
-        assert_eq!((user.uid, user.gid, user.euid, user.egid), (1000, 1000, 1000, 1000));
+        assert_eq!(
+            (user.uid, user.gid, user.euid, user.egid),
+            (1000, 1000, 1000, 1000)
+        );
         assert!(!event.tags.contains(&"USER_REF_PARTIAL".to_string()));
         assert_eq!(event.event_data["target_uid"], serde_json::json!(0));
         assert_eq!(event.event_data["ppid"], serde_json::json!(200));
@@ -1367,7 +1385,11 @@ mod tests {
         assert_eq!(service.unit_type, "service");
         assert_eq!(service.action, "start");
         assert_eq!(
-            event.session.as_ref().expect("session must be observed").session_id,
+            event
+                .session
+                .as_ref()
+                .expect("session must be observed")
+                .session_id,
             "3"
         );
         assert_eq!(event.user.as_ref().unwrap().uid, 0);

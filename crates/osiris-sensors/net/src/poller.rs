@@ -205,7 +205,10 @@ mod tests {
         assert_eq!(events[0].remote_addr, "203.27.103.50");
         assert_eq!(events[0].remote_port, 443);
         assert_eq!(events[0].uid, 1000);
-        assert_eq!(events[0].pid, None, "no /proc/<pid>/fd tree exists in this fixture");
+        assert_eq!(
+            events[0].pid, None,
+            "no /proc/<pid>/fd tree exists in this fixture"
+        );
     }
 
     #[test]

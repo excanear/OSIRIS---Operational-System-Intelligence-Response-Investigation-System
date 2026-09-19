@@ -75,10 +75,10 @@ mod tests {
 
     #[test]
     fn ignores_records_of_other_types() {
-        assert!(parse_record(
-            r#"type=SERVICE_RELOAD msg=audit(1690000000.123:501): pid=1 uid=0"#
-        )
-        .is_none());
+        assert!(
+            parse_record(r#"type=SERVICE_RELOAD msg=audit(1690000000.123:501): pid=1 uid=0"#)
+                .is_none()
+        );
         assert!(parse_record("not an audit record at all").is_none());
     }
 

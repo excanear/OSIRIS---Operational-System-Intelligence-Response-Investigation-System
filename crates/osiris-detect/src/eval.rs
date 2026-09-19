@@ -137,7 +137,11 @@ mod tests {
     #[test]
     fn string_operators_compare_strings() {
         let path = json!("/var/www/html/shell.php");
-        assert!(matches(Operator::Eq, &path, &json!("/var/www/html/shell.php")));
+        assert!(matches(
+            Operator::Eq,
+            &path,
+            &json!("/var/www/html/shell.php")
+        ));
         assert!(!matches(Operator::Eq, &path, &json!("/etc/passwd")));
         assert!(matches(Operator::Ne, &path, &json!("/etc/passwd")));
         assert!(matches(Operator::StartsWith, &path, &json!("/var/www/")));
@@ -212,7 +216,12 @@ mod tests {
         let tree = ConditionNode::Any {
             any: vec![
                 leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "matches"),
-                leaf("event_type", Operator::Eq, json!("NOT_THIS"), "never reached"),
+                leaf(
+                    "event_type",
+                    Operator::Eq,
+                    json!("NOT_THIS"),
+                    "never reached",
+                ),
             ],
         };
         let reasons = eval_node(&tree, &event_json()).unwrap();
@@ -240,7 +249,12 @@ mod tests {
         assert_eq!(eval_node(&tree, &event_json()), Some(vec![]));
 
         let inverted_match = ConditionNode::Not {
-            not: Box::new(leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "unused")),
+            not: Box::new(leaf(
+                "event_type",
+                Operator::Eq,
+                json!("FILE_CREATE"),
+                "unused",
+            )),
         };
         assert!(eval_node(&inverted_match, &event_json()).is_none());
     }
@@ -252,7 +266,12 @@ mod tests {
             any: vec![
                 ConditionNode::All {
                     all: vec![
-                        leaf("event_type", Operator::Eq, json!("FILE_CREATE"), "is a file create"),
+                        leaf(
+                            "event_type",
+                            Operator::Eq,
+                            json!("FILE_CREATE"),
+                            "is a file create",
+                        ),
                         ConditionNode::Not {
                             not: Box::new(leaf(
                                 "file.path",
@@ -263,7 +282,12 @@ mod tests {
                         },
                     ],
                 },
-                leaf("event_type", Operator::Eq, json!("PRIVILEGE_SUDO"), "is sudo"),
+                leaf(
+                    "event_type",
+                    Operator::Eq,
+                    json!("PRIVILEGE_SUDO"),
+                    "is sudo",
+                ),
             ],
         };
         let reasons = eval_node(&tree, &event_json()).unwrap();

@@ -41,7 +41,9 @@ fn harness() -> Harness {
         Arc::new(FileAuditLog::open(p("audit.jsonl")).unwrap());
 
     let incident_evidence_state = IncidentEvidenceState {
-        incidents: Arc::new(SqliteIncidentStore::open(p("incidents.db").to_str().unwrap()).unwrap()),
+        incidents: Arc::new(
+            SqliteIncidentStore::open(p("incidents.db").to_str().unwrap()).unwrap(),
+        ),
         evidence: Arc::new(SqliteEvidenceStore::open(p("evidence.db").to_str().unwrap()).unwrap()),
         links: Arc::new(
             SqliteEvidenceIncidentLinks::open(p("links.db").to_str().unwrap()).unwrap(),
@@ -51,7 +53,10 @@ fn harness() -> Harness {
 
     let (user_store, _bootstrap) = SqliteUserStore::open(p("users.db")).unwrap();
     let admin = user_store.get_user_by_username("admin").unwrap().unwrap();
-    let admin_token = user_store.create_session(admin.user_id, 3600).unwrap().token;
+    let admin_token = user_store
+        .create_session(admin.user_id, 3600)
+        .unwrap()
+        .token;
 
     let auth_state = AuthState {
         users: Arc::new(user_store),
@@ -80,7 +85,10 @@ fn harness() -> Harness {
         .merge(build_response_router(response_state))
         .merge(build_stream_router(Arc::new(LiveEventBroadcaster::new())))
         .merge(build_auth_router(auth_state.clone()))
-        .layer(axum::middleware::from_fn_with_state(auth_state.clone(), auth_gate));
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_gate,
+        ));
 
     Harness {
         _dir: dir,
@@ -182,7 +190,11 @@ fn session_for_role(state: &AuthState, username: &str, role: Role) -> String {
             tenant_id: None,
         })
         .unwrap();
-    state.users.create_session(user.user_id, 3600).unwrap().token
+    state
+        .users
+        .create_session(user.user_id, 3600)
+        .unwrap()
+        .token
 }
 
 fn collect_evidence_body() -> String {

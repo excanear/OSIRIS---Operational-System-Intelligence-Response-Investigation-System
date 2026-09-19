@@ -44,8 +44,10 @@ impl PersistencePoller {
     /// state and returns an empty `Vec` unconditionally (Global Constraint
     /// #8).
     pub fn poll(&mut self, now_ns: u64) -> Vec<PersistenceEventRaw> {
-        let mut current: HashMap<PathBuf, (SeenFile, osiris_sensor_api::PersistenceCheckpointKind)> =
-            HashMap::new();
+        let mut current: HashMap<
+            PathBuf,
+            (SeenFile, osiris_sensor_api::PersistenceCheckpointKind),
+        > = HashMap::new();
         for target in &self.targets {
             for path in candidate_paths(target) {
                 let Some(kind) = checkpoint_kind_for(target.kind, &path) else {

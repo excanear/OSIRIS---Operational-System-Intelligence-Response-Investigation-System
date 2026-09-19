@@ -121,9 +121,7 @@ mod tests {
     #[test]
     fn parses_a_cgroup_v1_multi_line_file() {
         let id = "b".repeat(64);
-        let contents = format!(
-            "11:memory:/docker/{id}\n5:cpu,cpuacct:/docker/{id}\n"
-        );
+        let contents = format!("11:memory:/docker/{id}\n5:cpu,cpuacct:/docker/{id}\n");
         let (path, version) = parse_cgroup_file(&contents).unwrap();
         assert_eq!(version, CgroupFileVersion::V1);
         assert!(path.starts_with("/docker/"));
@@ -170,7 +168,10 @@ mod tests {
 
     #[test]
     fn non_matching_path_returns_none() {
-        assert_eq!(container_id_from_cgroup_path("/user.slice/user-1000.slice"), None);
+        assert_eq!(
+            container_id_from_cgroup_path("/user.slice/user-1000.slice"),
+            None
+        );
         assert_eq!(container_id_from_cgroup_path("/"), None);
         assert_eq!(container_id_from_cgroup_path(""), None);
     }

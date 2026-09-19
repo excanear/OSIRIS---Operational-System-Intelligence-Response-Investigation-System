@@ -2,8 +2,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use osiris_schema::{
-    Alert, CanonicalEvent, EntityRef, EntityRelationship, FileIdentity, Relation,
-    RiskScoreRecord, Severity, WeightedReason,
+    Alert, CanonicalEvent, EntityRef, EntityRelationship, FileIdentity, Relation, RiskScoreRecord,
+    Severity, WeightedReason,
 };
 use osiris_storage::{
     AlertQueryPlan, DeleteCriteria, QueryPlan, RelationshipQueryPlan, RetentionPolicy,
@@ -156,7 +156,10 @@ impl SqliteStorage {
         // column here uses.
         for (column, ddl) in [
             ("file_path", "ALTER TABLE events ADD COLUMN file_path TEXT"),
-            ("file_inode", "ALTER TABLE events ADD COLUMN file_inode INTEGER"),
+            (
+                "file_inode",
+                "ALTER TABLE events ADD COLUMN file_inode INTEGER",
+            ),
             (
                 "file_device_id",
                 "ALTER TABLE events ADD COLUMN file_device_id INTEGER",
@@ -169,8 +172,14 @@ impl SqliteStorage {
                 "network_dst_ip",
                 "ALTER TABLE events ADD COLUMN network_dst_ip TEXT",
             ),
-            ("dns_domain", "ALTER TABLE events ADD COLUMN dns_domain TEXT"),
-            ("session_id", "ALTER TABLE events ADD COLUMN session_id TEXT"),
+            (
+                "dns_domain",
+                "ALTER TABLE events ADD COLUMN dns_domain TEXT",
+            ),
+            (
+                "session_id",
+                "ALTER TABLE events ADD COLUMN session_id TEXT",
+            ),
             ("user_uid", "ALTER TABLE events ADD COLUMN user_uid INTEGER"),
             ("unit_name", "ALTER TABLE events ADD COLUMN unit_name TEXT"),
             (
@@ -281,7 +290,10 @@ fn push_host_filter(
         sql.push_str(" AND 1=0");
         return Ok(());
     }
-    sql.push_str(&format!(" AND {column} IN ({})", vec!["?"; ids.len()].join(",")));
+    sql.push_str(&format!(
+        " AND {column} IN ({})",
+        vec!["?"; ids.len()].join(",")
+    ));
     for id in ids {
         params.push(Box::new(id.clone()));
     }
@@ -660,7 +672,8 @@ impl Storage for SqliteStorage {
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         match raw_json {
             Some(json) => {
-                let event = serde_json::from_str(&json).map_err(|e| StorageError::Serialize(e.to_string()))?;
+                let event = serde_json::from_str(&json)
+                    .map_err(|e| StorageError::Serialize(e.to_string()))?;
                 Ok(Some(event))
             }
             None => Ok(None),
@@ -955,7 +968,10 @@ impl Storage for SqliteStorage {
         Ok(report)
     }
 
-    fn query_risk_scores(&self, plan: &RiskQueryPlan) -> Result<Vec<RiskScoreRecord>, StorageError> {
+    fn query_risk_scores(
+        &self,
+        plan: &RiskQueryPlan,
+    ) -> Result<Vec<RiskScoreRecord>, StorageError> {
         let conn = self
             .conn
             .lock()
@@ -1021,7 +1037,9 @@ impl Storage for SqliteStorage {
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
 
             let mut reason_stmt = conn
-                .prepare("SELECT label, weight, evidence FROM risk_score_reasons WHERE event_id = ?1")
+                .prepare(
+                    "SELECT label, weight, evidence FROM risk_score_reasons WHERE event_id = ?1",
+                )
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
             let reason_rows = reason_stmt
                 .query_map(params![event_id.to_string()], |row| {
@@ -1204,7 +1222,9 @@ mod tests {
     fn query_events_with_no_filter_returns_everything_within_the_default_cap() {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
         for i in 0..3 {
-            storage.write(&sample_event(100 + i, 1000 + i as u64)).unwrap();
+            storage
+                .write(&sample_event(100 + i, 1000 + i as u64))
+                .unwrap();
         }
         let plan = osiris_query::EventQueryPlan::new();
         let events = storage.query_events(&plan).unwrap();
@@ -1265,7 +1285,8 @@ mod tests {
         let events = storage.query_events(&plan).unwrap();
         assert_eq!(events.len(), 1);
 
-        let plan_miss = osiris_query::EventQueryPlan::with_filter("category = \"NETWORK\"").unwrap();
+        let plan_miss =
+            osiris_query::EventQueryPlan::with_filter("category = \"NETWORK\"").unwrap();
         assert_eq!(storage.query_events(&plan_miss).unwrap().len(), 0);
     }
 
@@ -1287,8 +1308,8 @@ mod tests {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
         storage.write(&sample_event(1, 100)).unwrap();
         storage.write(&sample_event(2, 200)).unwrap();
-        let plan =
-            osiris_query::EventQueryPlan::with_filter("process.pid = 1 OR process.pid = 2").unwrap();
+        let plan = osiris_query::EventQueryPlan::with_filter("process.pid = 1 OR process.pid = 2")
+            .unwrap();
         assert_eq!(storage.query_events(&plan).unwrap().len(), 2);
 
         let plan_not = osiris_query::EventQueryPlan::with_filter("NOT process.pid = 1").unwrap();
@@ -1677,7 +1698,10 @@ mod tests {
         let report = storage.write_alerts(std::slice::from_ref(&alert)).unwrap();
         assert_eq!(report.written_count, 0);
         assert_eq!(report.failed_count, 1);
-        assert_eq!(storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(), 1);
+        assert_eq!(
+            storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1697,7 +1721,9 @@ mod tests {
             timestamp: 5000,
         };
 
-        let report = storage.write_relationships(std::slice::from_ref(&edge)).unwrap();
+        let report = storage
+            .write_relationships(std::slice::from_ref(&edge))
+            .unwrap();
         assert_eq!(report.written_count, 1);
 
         // Found by the `from` side.
@@ -1790,7 +1816,9 @@ mod tests {
         let process_key = ProcessKey::new(Uuid::new_v4(), "b", 300, 1);
         let record = sample_risk_record(Some(process_key), 5000);
 
-        let report = storage.write_risk_scores(std::slice::from_ref(&record)).unwrap();
+        let report = storage
+            .write_risk_scores(std::slice::from_ref(&record))
+            .unwrap();
         assert_eq!(report.written_count, 1);
 
         let by_process = storage
@@ -1873,7 +1901,10 @@ mod tests {
         storage
             .write_alerts(&[sample_alert(vec![Uuid::now_v7()], "rule_a", 3000)])
             .unwrap();
-        assert_eq!(storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(), 1);
+        assert_eq!(
+            storage.query_alerts(&AlertQueryPlan::new()).unwrap().len(),
+            1
+        );
     }
 
     fn network_event(src_ip: &str, dst_ip: &str, timestamp: u64) -> CanonicalEvent {
@@ -2003,7 +2034,9 @@ mod tests {
             "the pre-existing row must survive migration"
         );
 
-        reopened.write(&systemd_event("backdoor.service", 2000)).unwrap();
+        reopened
+            .write(&systemd_event("backdoor.service", 2000))
+            .unwrap();
         let mut plan = QueryPlan::new();
         plan.unit_name = Some("backdoor.service".to_string());
         assert_eq!(
@@ -2017,7 +2050,11 @@ mod tests {
         assert_eq!(reopened_again.query(&plan).unwrap().len(), 1);
     }
 
-    fn container_event(container_id: &str, event_type: osiris_schema::EventType, timestamp: u64) -> CanonicalEvent {
+    fn container_event(
+        container_id: &str,
+        event_type: osiris_schema::EventType,
+        timestamp: u64,
+    ) -> CanonicalEvent {
         let mut event = sample_event(600, timestamp);
         event.event_type = event_type;
         event.category = osiris_schema::Category::Container;
@@ -2110,7 +2147,11 @@ mod tests {
 
         let id = "c".repeat(64);
         reopened
-            .write(&container_event(&id, osiris_schema::EventType::ContainerStart, 2000))
+            .write(&container_event(
+                &id,
+                osiris_schema::EventType::ContainerStart,
+                2000,
+            ))
             .unwrap();
         let mut plan = QueryPlan::new();
         plan.container_id = Some(id.clone());
@@ -2212,7 +2253,11 @@ mod tests {
 
         // Pre-existing row must survive (proves no data loss during migration).
         let all_events = reopened.query(&QueryPlan::new()).unwrap();
-        assert_eq!(all_events.len(), 1, "the pre-existing row must survive migration");
+        assert_eq!(
+            all_events.len(),
+            1,
+            "the pre-existing row must survive migration"
+        );
 
         // The new columns must now exist and work: the guarded
         // ALTER TABLE ADD COLUMN path must have run. Prove this by writing a
@@ -2302,13 +2347,8 @@ mod tests {
             3000,
         );
         exec.category = osiris_schema::Category::Process;
-        let other_session = identity_event(
-            osiris_schema::EventType::SessionLogin,
-            "4",
-            0,
-            None,
-            4000,
-        );
+        let other_session =
+            identity_event(osiris_schema::EventType::SessionLogin, "4", 0, None, 4000);
         // An event that predates any session attribution at all.
         let unattributed = sample_event(900, 5000);
         storage
@@ -2546,7 +2586,10 @@ mod tests {
             );
         }
         assert_eq!(reopened_again.query_events(&process_plan).unwrap().len(), 1);
-        assert_eq!(reopened_again.query_events(&container_plan).unwrap().len(), 1);
+        assert_eq!(
+            reopened_again.query_events(&container_plan).unwrap().len(),
+            1
+        );
     }
 
     /// A row whose `event_type` COLUMN string no longer deserializes to a
@@ -2858,19 +2901,32 @@ mod tests {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         storage
-            .batch_write(&[event_on(a, 1, 100), event_on(b, 2, 200), event_on(a, 3, 300)])
+            .batch_write(&[
+                event_on(a, 1, 100),
+                event_on(b, 2, 200),
+                event_on(a, 3, 300),
+            ])
             .unwrap();
 
         let only_a = storage
-            .query(&QueryPlan { host_ids: Some(vec![a.to_string()]), ..QueryPlan::new() })
+            .query(&QueryPlan {
+                host_ids: Some(vec![a.to_string()]),
+                ..QueryPlan::new()
+            })
             .unwrap();
         assert_eq!(only_a.len(), 2);
         assert!(only_a.iter().all(|e| e.host_id == a));
 
         let none = storage
-            .query(&QueryPlan { host_ids: Some(vec![]), ..QueryPlan::new() })
+            .query(&QueryPlan {
+                host_ids: Some(vec![]),
+                ..QueryPlan::new()
+            })
             .unwrap();
-        assert!(none.is_empty(), "an empty host set must match nothing, not everything");
+        assert!(
+            none.is_empty(),
+            "an empty host set must match nothing, not everything"
+        );
 
         let both = storage
             .query(&QueryPlan {
@@ -2901,7 +2957,9 @@ mod tests {
     fn host_ids_combines_with_an_or_filter_that_defeats_other_pushdown() {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        storage.batch_write(&[event_on(a, 1, 100), event_on(b, 2, 200)]).unwrap();
+        storage
+            .batch_write(&[event_on(a, 1, 100), event_on(b, 2, 200)])
+            .unwrap();
         let plan = osiris_query::EventQueryPlan {
             host_ids: Some(vec![a.to_string()]),
             ..osiris_query::EventQueryPlan::with_filter(
@@ -2920,19 +2978,31 @@ mod tests {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let alert = |host: Uuid| {
             osiris_schema::Alert::new(
-                "r1", 1, "deadbeef", osiris_schema::Severity::High, 10, host,
-                vec!["x".to_string()], vec![Uuid::now_v7()],
+                "r1",
+                1,
+                "deadbeef",
+                osiris_schema::Severity::High,
+                10,
+                host,
+                vec!["x".to_string()],
+                vec![Uuid::now_v7()],
             )
             .unwrap()
         };
         storage.write_alerts(&[alert(a), alert(b)]).unwrap();
         let got = storage
-            .query_alerts(&AlertQueryPlan { host_ids: Some(vec![a.to_string()]), ..AlertQueryPlan::new() })
+            .query_alerts(&AlertQueryPlan {
+                host_ids: Some(vec![a.to_string()]),
+                ..AlertQueryPlan::new()
+            })
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].host_id(), a);
         assert!(storage
-            .query_alerts(&AlertQueryPlan { host_ids: Some(vec![]), ..AlertQueryPlan::new() })
+            .query_alerts(&AlertQueryPlan {
+                host_ids: Some(vec![]),
+                ..AlertQueryPlan::new()
+            })
             .unwrap()
             .is_empty());
 
@@ -2942,7 +3012,10 @@ mod tests {
         rb.host_id = b;
         storage.write_risk_scores(&[ra, rb]).unwrap();
         let got = storage
-            .query_risk_scores(&RiskQueryPlan { host_ids: Some(vec![b.to_string()]), ..RiskQueryPlan::new() })
+            .query_risk_scores(&RiskQueryPlan {
+                host_ids: Some(vec![b.to_string()]),
+                ..RiskQueryPlan::new()
+            })
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].host_id, b);
@@ -2956,13 +3029,19 @@ mod tests {
         let ev_b = event_on(b, 2, 200);
         storage.batch_write(&[ev_a.clone(), ev_b.clone()]).unwrap();
         let edge = |event: &CanonicalEvent| EntityRelationship {
-            from: EntityRef::Ip { addr: "10.0.0.1".to_string() },
-            to: EntityRef::Ip { addr: "203.0.113.10".to_string() },
+            from: EntityRef::Ip {
+                addr: "10.0.0.1".to_string(),
+            },
+            to: EntityRef::Ip {
+                addr: "203.0.113.10".to_string(),
+            },
             relation: Relation::ConnectedTo,
             event_id: event.event_id,
             timestamp: event.timestamp,
         };
-        storage.write_relationships(&[edge(&ev_a), edge(&ev_b)]).unwrap();
+        storage
+            .write_relationships(&[edge(&ev_a), edge(&ev_b)])
+            .unwrap();
         let got = storage
             .query_relationships(&RelationshipQueryPlan {
                 host_ids: Some(vec![a.to_string()]),
@@ -2972,7 +3051,10 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].event_id, ev_a.event_id);
         assert!(storage
-            .query_relationships(&RelationshipQueryPlan { host_ids: Some(vec![]), ..RelationshipQueryPlan::new() })
+            .query_relationships(&RelationshipQueryPlan {
+                host_ids: Some(vec![]),
+                ..RelationshipQueryPlan::new()
+            })
             .unwrap()
             .is_empty());
     }
@@ -2983,7 +3065,9 @@ mod tests {
 
     fn assert_too_large<T: std::fmt::Debug>(result: Result<T, StorageError>) {
         match result {
-            Err(StorageError::Backend(msg)) => assert!(msg.contains("tenant host set too large"), "{msg}"),
+            Err(StorageError::Backend(msg)) => {
+                assert!(msg.contains("tenant host set too large"), "{msg}")
+            }
             other => panic!("expected the host-set-too-large error, got {other:?}"),
         }
     }
@@ -2991,7 +3075,10 @@ mod tests {
     #[test]
     fn an_oversized_host_set_is_a_clear_error_on_the_events_path() {
         let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
-        assert_too_large(storage.query(&QueryPlan { host_ids: Some(too_many_hosts()), ..QueryPlan::new() }));
+        assert_too_large(storage.query(&QueryPlan {
+            host_ids: Some(too_many_hosts()),
+            ..QueryPlan::new()
+        }));
     }
 
     #[test]

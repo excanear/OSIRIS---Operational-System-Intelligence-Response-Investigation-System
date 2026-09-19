@@ -87,7 +87,11 @@ impl EventQueryPlan {
     /// The row cap actually enforced by a `Storage::query_events`
     /// implementation — never the caller's raw `limit` unclamped (§19.2).
     pub fn effective_limit(&self) -> usize {
-        let ceiling = if self.export { MAX_EVENT_LIMIT } else { DEFAULT_EVENT_LIMIT };
+        let ceiling = if self.export {
+            MAX_EVENT_LIMIT
+        } else {
+            DEFAULT_EVENT_LIMIT
+        };
         self.limit.min(ceiling)
     }
 }

@@ -121,8 +121,18 @@ pub fn percent_encode(s: &str) -> String {
 }
 
 /// Builds the `/api/v1/events?q=...` request URL for `osiris hunt`.
-pub fn hunt_url(server: &str, q: &str, since: &Option<u64>, until: &Option<u64>, limit: &Option<usize>) -> String {
-    let mut url = format!("{}/api/v1/events?q={}", server.trim_end_matches('/'), percent_encode(q));
+pub fn hunt_url(
+    server: &str,
+    q: &str,
+    since: &Option<u64>,
+    until: &Option<u64>,
+    limit: &Option<usize>,
+) -> String {
+    let mut url = format!(
+        "{}/api/v1/events?q={}",
+        server.trim_end_matches('/'),
+        percent_encode(q)
+    );
     if let Some(s) = since {
         url.push_str(&format!("&since={}", s));
     }
@@ -255,7 +265,10 @@ mod tests {
         let url = container_story_url("http://localhost:8080", &"a".repeat(64));
         assert_eq!(
             url,
-            format!("http://localhost:8080/api/v1/containers/story?container_id={}", "a".repeat(64))
+            format!(
+                "http://localhost:8080/api/v1/containers/story?container_id={}",
+                "a".repeat(64)
+            )
         );
     }
 
@@ -271,7 +284,10 @@ mod tests {
     #[test]
     fn chain_url_includes_the_entity_and_omits_depth_when_not_given() {
         let url = chain_url("http://localhost:8080", "PROCESS:abcd", &None);
-        assert_eq!(url, "http://localhost:8080/api/v1/graph?entity=PROCESS:abcd");
+        assert_eq!(
+            url,
+            "http://localhost:8080/api/v1/graph?entity=PROCESS:abcd"
+        );
     }
 
     #[test]
@@ -340,7 +356,13 @@ mod tests {
 
     #[test]
     fn hunt_url_includes_the_encoded_query_and_optional_filters() {
-        let url = hunt_url("http://localhost:8080", "a = \"b\"", &Some(100), &None, &Some(10));
+        let url = hunt_url(
+            "http://localhost:8080",
+            "a = \"b\"",
+            &Some(100),
+            &None,
+            &Some(10),
+        );
         assert_eq!(
             url,
             "http://localhost:8080/api/v1/events?q=a%20%3D%20%22b%22&since=100&limit=10"

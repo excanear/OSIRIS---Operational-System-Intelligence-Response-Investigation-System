@@ -79,8 +79,14 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -248,8 +254,14 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -303,17 +315,22 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
 
     // 1. Storage directly: all 7 events landed (3 exec + 4 file).
     let events = storage.query(&QueryPlan::new()).unwrap();
-    assert_eq!(events.len(), 7, "expected sshd, bash, curl, and 4 file events");
+    assert_eq!(
+        events.len(),
+        7,
+        "expected sshd, bash, curl, and 4 file events"
+    );
 
     // 2. PROCESS_KEY_PROVISIONAL must be absent from every file event: curl
     //    (pid 300) and bash (pid 200) both already executed earlier in this
     //    same scenario, so ProcessResolver must have resolved their real
     //    process_key rather than falling back to a provisional tag.
-    let file_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.file.is_some())
-        .collect();
-    assert_eq!(file_events.len(), 4, "expected create, write, rename, benign-write");
+    let file_events: Vec<_> = events.iter().filter(|e| e.file.is_some()).collect();
+    assert_eq!(
+        file_events.len(),
+        4,
+        "expected create, write, rename, benign-write"
+    );
     for event in &file_events {
         assert!(
             !event.tags.iter().any(|t| t == "PROCESS_KEY_PROVISIONAL"),
@@ -366,7 +383,10 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
         .collect();
     let mut sorted = timestamps.clone();
     sorted.sort();
-    assert_eq!(timestamps, sorted, "events must come back in timestamp order");
+    assert_eq!(
+        timestamps, sorted,
+        "events must come back in timestamp order"
+    );
     // File and process categories must both be present in this one ordered
     // response — proving interleaving, not two separately-sorted lists.
     let categories: std::collections::HashSet<_> = timeline_events
@@ -401,7 +421,9 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     for alert in alerts_array {
         let reasons = alert["reasons"].as_array().unwrap();
         assert!(!reasons.is_empty());
-        assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+        assert!(reasons
+            .iter()
+            .all(|r| !r.as_str().unwrap().trim().is_empty()));
     }
 
     // 5. File Story over real HTTP: querying by the FINAL path
@@ -451,7 +473,13 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     //    broken by adding file events and alerts to the mix).
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
-        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .args([
+            "--server",
+            &format!("http://{}", addr),
+            "--format",
+            "json",
+            "events",
+        ])
         .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
@@ -486,8 +514,14 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -536,10 +570,18 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
 
     // 1. All 5 events landed.
     let events = storage.query(&QueryPlan::new()).unwrap();
-    assert_eq!(events.len(), 5, "expected sshd, bash, curl, connect, and file create");
+    assert_eq!(
+        events.len(),
+        5,
+        "expected sshd, bash, curl, connect, and file create"
+    );
     let curl_process_key = events
         .iter()
-        .find(|e| e.process.as_ref().is_some_and(|p| p.exe_path == "/usr/bin/curl"))
+        .find(|e| {
+            e.process
+                .as_ref()
+                .is_some_and(|p| p.exe_path == "/usr/bin/curl")
+        })
         .unwrap()
         .process
         .as_ref()
@@ -580,7 +622,11 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         "network_download_then_write"
     );
     let evidence = alerts_array[0]["evidence"].as_array().unwrap();
-    assert_eq!(evidence.len(), 2, "evidence must cite both the connect and the write");
+    assert_eq!(
+        evidence.len(),
+        2,
+        "evidence must cite both the connect and the write"
+    );
 
     // 3. GET /api/v1/graph, seeded at curl's process, returns the bounded
     //    multi-category subgraph: the ConnectedTo and Wrote edges §9.4
@@ -599,7 +645,11 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         .await
         .unwrap();
     let graph_edges = graph["edges"].as_array().unwrap();
-    assert_eq!(graph_edges.len(), 2, "the process's ConnectedTo and Wrote edges");
+    assert_eq!(
+        graph_edges.len(),
+        2,
+        "the process's ConnectedTo and Wrote edges"
+    );
     let relations: std::collections::HashSet<_> = graph_edges
         .iter()
         .map(|e| e["relation"].as_str().unwrap().to_string())
@@ -623,23 +673,34 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         .await
         .unwrap();
     let risk_records = risk.as_array().unwrap();
-    assert!(!risk_records.is_empty(), "at least one risk score must be queryable");
+    assert!(
+        !risk_records.is_empty(),
+        "at least one risk score must be queryable"
+    );
     let has_alert_reason = risk_records.iter().any(|r| {
-        r["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason["label"].as_str().unwrap().contains("network connection"))
+        r["reasons"].as_array().unwrap().iter().any(|reason| {
+            reason["label"]
+                .as_str()
+                .unwrap()
+                .contains("network connection")
+        })
     });
     let has_chain_bonus = risk_records.iter().any(|r| {
-        r["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason["label"].as_str().unwrap().contains("Network connection followed by file write"))
+        r["reasons"].as_array().unwrap().iter().any(|reason| {
+            reason["label"]
+                .as_str()
+                .unwrap()
+                .contains("Network connection followed by file write")
+        })
     });
-    assert!(has_alert_reason, "a risk record must cite the fired sequence alert");
-    assert!(has_chain_bonus, "a risk record must cite the chain-pattern bonus");
+    assert!(
+        has_alert_reason,
+        "a risk record must cite the fired sequence alert"
+    );
+    assert!(
+        has_chain_bonus,
+        "a risk record must cite the chain-pattern bonus"
+    );
 }
 
 /// Phase 3's full vertical slice: the network-beacon scenario (sshd -> bash
@@ -665,8 +726,14 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -716,7 +783,11 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
 
     // 1. Storage directly: all 6 events landed (3 exec + 1 DNS + 2 network).
     let events = storage.query(&QueryPlan::new()).unwrap();
-    assert_eq!(events.len(), 6, "expected sshd, bash, curl, 1 DNS query, connect, close");
+    assert_eq!(
+        events.len(),
+        6,
+        "expected sshd, bash, curl, 1 DNS query, connect, close"
+    );
 
     // 2. PROCESS_KEY_PROVISIONAL must be absent from the DNS and network
     //    events: curl (pid 300) already executed earlier in this same
@@ -756,7 +827,10 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     );
     match &connect_to_edges[0].to {
         EntityRef::Ip { addr } => assert_eq!(addr, "203.0.113.50"),
-        other => panic!("CONNECTED_TO edge must target an Ip entity, got {:?}", other),
+        other => panic!(
+            "CONNECTED_TO edge must target an Ip entity, got {:?}",
+            other
+        ),
     }
 
     let close_event = events
@@ -835,12 +909,19 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
         .collect();
     let mut sorted = timestamps.clone();
     sorted.sort();
-    assert_eq!(timestamps, sorted, "events must come back in timestamp order");
+    assert_eq!(
+        timestamps, sorted,
+        "events must come back in timestamp order"
+    );
     let categories: std::collections::HashSet<_> = timeline_events
         .iter()
         .map(|e| e["category"].as_str().unwrap().to_string())
         .collect();
-    assert!(categories.contains("PROCESS") && categories.contains("DNS") && categories.contains("NETWORK"));
+    assert!(
+        categories.contains("PROCESS")
+            && categories.contains("DNS")
+            && categories.contains("NETWORK")
+    );
 
     // 4. The shipped DNS rule fired: GET /api/v1/alerts must show
     //    dns_query_to_suspicious_tld, citing the DNS_QUERY event.
@@ -865,7 +946,9 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     for alert in alerts_array {
         let reasons = alert["reasons"].as_array().unwrap();
         assert!(!reasons.is_empty());
-        assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+        assert!(reasons
+            .iter()
+            .all(|r| !r.as_str().unwrap().trim().is_empty()));
     }
 
     // 5. Network Story by domain: the DNS event plus both network events
@@ -931,7 +1014,13 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     //    (regression check).
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
-        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .args([
+            "--server",
+            &format!("http://{}", addr),
+            "--format",
+            "json",
+            "events",
+        ])
         .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
@@ -973,8 +1062,14 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -1037,8 +1132,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     let sshd_exec = events
         .iter()
         .find(|e| {
-            e.event_type == EventType::ProcessExec
-                && e.process.as_ref().map(|p| p.pid) == Some(100)
+            e.event_type == EventType::ProcessExec && e.process.as_ref().map(|p| p.pid) == Some(100)
         })
         .expect("the sshd exec must be present");
     assert!(
@@ -1071,8 +1165,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     let bash_exec = events
         .iter()
         .find(|e| {
-            e.event_type == EventType::ProcessExec
-                && e.process.as_ref().map(|p| p.pid) == Some(200)
+            e.event_type == EventType::ProcessExec && e.process.as_ref().map(|p| p.pid) == Some(200)
         })
         .expect("the bash exec must be present");
     let triggered: Vec<_> = bash_exec
@@ -1087,10 +1180,16 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     );
     match (&triggered[0].from, &triggered[0].to) {
         (EntityRef::Process { process_key }, EntityRef::Session { session_id }) => {
-            assert_eq!(*process_key, bash_exec.process.as_ref().unwrap().process_key);
+            assert_eq!(
+                *process_key,
+                bash_exec.process.as_ref().unwrap().process_key
+            );
             assert_eq!(session_id, "3");
         }
-        other => panic!("TRIGGERED_BY_SESSION must be Process -> Session, got {:?}", other),
+        other => panic!(
+            "TRIGGERED_BY_SESSION must be Process -> Session, got {:?}",
+            other
+        ),
     }
 
     let escalation = events
@@ -1216,7 +1315,10 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
         .collect();
     let mut sorted = timestamps.clone();
     sorted.sort();
-    assert_eq!(timestamps, sorted, "events must come back in timestamp order");
+    assert_eq!(
+        timestamps, sorted,
+        "events must come back in timestamp order"
+    );
     let categories: std::collections::HashSet<_> = timeline_events
         .iter()
         .map(|e| e["category"].as_str().unwrap().to_string())
@@ -1253,7 +1355,9 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     );
     let reasons = alerts_array[0]["reasons"].as_array().unwrap();
     assert_eq!(reasons.len(), 3);
-    assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+    assert!(reasons
+        .iter()
+        .all(|r| !r.as_str().unwrap().trim().is_empty()));
     // §11.1: the alert cites the exact rule revision that fired.
     assert_eq!(
         alerts_array[0]["rule_content_hash"].as_str().unwrap().len(),
@@ -1272,7 +1376,10 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     //    identity->process->privilege->file->network chain plus the citing
     //    alert, in one response (Global Constraint #10's session form).
     let story: serde_json::Value = client
-        .get(format!("http://{}/api/v1/identity/story?session_id=3", addr))
+        .get(format!(
+            "http://{}/api/v1/identity/story?session_id=3",
+            addr
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -1291,7 +1398,10 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
         .map(|e| e["category"].as_str().unwrap().to_string())
         .collect();
     for expected in ["IDENTITY", "PROCESS", "PRIVILEGE", "FILE", "NETWORK"] {
-        assert!(story_categories.contains(expected), "story missing {expected}");
+        assert!(
+            story_categories.contains(expected),
+            "story missing {expected}"
+        );
     }
     assert_eq!(story["alerts"].as_array().unwrap().len(), 1);
 
@@ -1329,7 +1439,13 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     //     (regression check, unchanged from Phase 2/3).
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
-        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .args([
+            "--server",
+            &format!("http://{}", addr),
+            "--format",
+            "json",
+            "events",
+        ])
         .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
@@ -1374,8 +1490,14 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -1433,12 +1555,10 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     // Constraint #6 — not something this phase may add just for a test), so
     // this checks membership directly rather than building a `HashSet`.
     assert!(
-        events
-            .iter()
-            .all(|e| matches!(
-                e.category,
-                Category::Process | Category::Identity | Category::Privilege | Category::Systemd
-            )),
+        events.iter().all(|e| matches!(
+            e.category,
+            Category::Process | Category::Identity | Category::Privilege | Category::Systemd
+        )),
         "no FILE/NETWORK/PERSISTENCE event exists in this scenario"
     );
     for expected in [
@@ -1464,8 +1584,14 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
         .iter()
         .find(|e| e.event_type == EventType::ServiceStart)
         .expect("the SERVICE_START event must be present");
-    assert_eq!(unit_create.service.as_ref().unwrap().unit_name, "backdoor.service");
-    assert_eq!(service_start.service.as_ref().unwrap().unit_name, "backdoor.service");
+    assert_eq!(
+        unit_create.service.as_ref().unwrap().unit_name,
+        "backdoor.service"
+    );
+    assert_eq!(
+        service_start.service.as_ref().unwrap().unit_name,
+        "backdoor.service"
+    );
 
     // 3. Session propagation (Global Constraint #3's disclosed asymmetry):
     //    SERVICE_CREATE carries none at all (the scanner has no process to
@@ -1491,8 +1617,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     let sshd_exec = events
         .iter()
         .find(|e| {
-            e.event_type == EventType::ProcessExec
-                && e.process.as_ref().map(|p| p.pid) == Some(100)
+            e.event_type == EventType::ProcessExec && e.process.as_ref().map(|p| p.pid) == Some(100)
         })
         .expect("the sshd exec must be present");
     assert!(
@@ -1596,7 +1721,9 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     for alert in alerts_array {
         let reasons = alert["reasons"].as_array().unwrap();
         assert!(!reasons.is_empty());
-        assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
+        assert!(reasons
+            .iter()
+            .all(|r| !r.as_str().unwrap().trim().is_empty()));
         assert_eq!(alert["rule_content_hash"].as_str().unwrap().len(), 64);
     }
 
@@ -1606,7 +1733,10 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     //    PRIVILEGE_UID_CHANGE event, which this unit-scoped story does not
     //    include).
     let story: serde_json::Value = client
-        .get(format!("http://{}/api/v1/systemd/story?unit_name=backdoor.service", addr))
+        .get(format!(
+            "http://{}/api/v1/systemd/story?unit_name=backdoor.service",
+            addr
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -1642,7 +1772,13 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     //    (regression check, unchanged from Phase 2/3/4a).
     let cli_binary = cli_binary_path();
     let output = std::process::Command::new(&cli_binary)
-        .args(["--server", &format!("http://{}", addr), "--format", "json", "events"])
+        .args([
+            "--server",
+            &format!("http://{}", addr),
+            "--format",
+            "json",
+            "events",
+        ])
         .env("OSIRIS_TOKEN", &admin_token)
         .output()
         .unwrap();
@@ -1668,10 +1804,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     std::fs::create_dir_all(&pid_dir).unwrap();
     std::fs::write(
         pid_dir.join("cgroup"),
-        format!(
-            "0::{}\n",
-            osiris_generator::DEPLOYED_CONTAINER_CGROUP_PATH
-        ),
+        format!("0::{}\n", osiris_generator::DEPLOYED_CONTAINER_CGROUP_PATH),
     )
     .unwrap();
 
@@ -1684,8 +1817,14 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -1739,9 +1878,10 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
         "expected sshd/bash/docker execs, login, container create, container start, logout"
     );
     assert!(
-        events
-            .iter()
-            .all(|e| matches!(e.category, Category::Process | Category::Identity | Category::Container)),
+        events.iter().all(|e| matches!(
+            e.category,
+            Category::Process | Category::Identity | Category::Container
+        )),
         "no FILE/NETWORK/PERSISTENCE/SYSTEMD event exists in this scenario"
     );
     for expected in [Category::Process, Category::Identity, Category::Container] {
@@ -1797,15 +1937,17 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     let docker_exec = events
         .iter()
         .find(|e| {
-            e.event_type == EventType::ProcessExec
-                && e.process.as_ref().map(|p| p.pid) == Some(300)
+            e.event_type == EventType::ProcessExec && e.process.as_ref().map(|p| p.pid) == Some(300)
         })
         .expect("the docker exec must be present");
     let docker_container = docker_exec
         .container
         .as_ref()
         .expect("the docker CLI's own cgroup must resolve to the deployed container");
-    assert_eq!(docker_container.container_id, osiris_generator::DEPLOYED_CONTAINER_ID);
+    assert_eq!(
+        docker_container.container_id,
+        osiris_generator::DEPLOYED_CONTAINER_ID
+    );
     assert!(
         docker_exec
             .relationships
@@ -1863,8 +2005,13 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     );
     let reasons = alerts_array[0]["reasons"].as_array().unwrap();
     assert!(!reasons.is_empty());
-    assert!(reasons.iter().all(|r| !r.as_str().unwrap().trim().is_empty()));
-    assert_eq!(alerts_array[0]["rule_content_hash"].as_str().unwrap().len(), 64);
+    assert!(reasons
+        .iter()
+        .all(|r| !r.as_str().unwrap().trim().is_empty()));
+    assert_eq!(
+        alerts_array[0]["rule_content_hash"].as_str().unwrap().len(),
+        64
+    );
 
     // 7. The new Container Story endpoint (Task 10) over real HTTP: the
     //    create/start/docker-exec events, plus the one alert that cites
@@ -1938,8 +2085,14 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     };
 
     let agent_config = AgentConfig {
-        cloud_metadata: osiris_agent::CloudMetadataConfig { enabled: false, ..Default::default() },
-        k8s_context: osiris_agent::K8sContextConfig { enabled: false, ..Default::default() },
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,
@@ -1953,7 +2106,9 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         spool_path: spool_path.to_string_lossy().to_string(),
         status_addr: "127.0.0.1:0".to_string(),
     };
-    let agent = Agent::start(agent_config, host, "e2e-boot".to_string()).await.unwrap();
+    let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
+        .await
+        .unwrap();
 
     let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
     let ingestion_cancellation = CancellationToken::new();
@@ -1977,13 +2132,19 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     let events = storage.query(&QueryPlan::new()).unwrap();
     let curl_process_key = events
         .iter()
-        .find(|e| e.process.as_ref().is_some_and(|p| p.exe_path == "/usr/bin/curl"))
+        .find(|e| {
+            e.process
+                .as_ref()
+                .is_some_and(|p| p.exe_path == "/usr/bin/curl")
+        })
         .expect("scenario must produce a curl exec event")
         .process
         .as_ref()
         .unwrap()
         .process_key;
-    let seed_entity = EntityRef::Process { process_key: curl_process_key };
+    let seed_entity = EntityRef::Process {
+        process_key: curl_process_key,
+    };
 
     let incidents_db = dir.path().join("incidents.db");
     let evidence_db = dir.path().join("evidence.db");
@@ -2000,7 +2161,9 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     // osiris-server/src/main.rs's merge+layer order.
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
-        .merge(osiris_api::build_incident_evidence_router(incident_evidence_state))
+        .merge(osiris_api::build_incident_evidence_router(
+            incident_evidence_state,
+        ))
         .merge(build_auth_router(auth_state.clone()))
         .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
@@ -2039,14 +2202,20 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         "OQL query must find every event attributed to curl's process (exec, connect, file create)"
     );
     assert!(
-        hunted.iter().all(|e| e["process"]["exe_path"] == "/usr/bin/curl"),
+        hunted
+            .iter()
+            .all(|e| e["process"]["exe_path"] == "/usr/bin/curl"),
         "every hunted event must actually be attributed to curl's process"
     );
 
     // 2. Process Story: the curl process's own activity (exec + whatever
     //    else it did — connect and/or file write, per the scenario).
     let story: serde_json::Value = client
-        .get(format!("http://{}/api/v1/processes/{}/story", addr, curl_process_key.as_hex()))
+        .get(format!(
+            "http://{}/api/v1/processes/{}/story",
+            addr,
+            curl_process_key.as_hex()
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -2102,7 +2271,10 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         .json()
         .await
         .unwrap();
-    let incident_id = created_incident["incident_id"].as_str().unwrap().to_string();
+    let incident_id = created_incident["incident_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(created_incident["status"], "NEW");
 
     let created_evidence: serde_json::Value = client
@@ -2125,7 +2297,10 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     assert!(created_evidence["evidence_id"].is_string());
 
     let evidence_list: Vec<serde_json::Value> = client
-        .get(format!("http://{}/api/v1/evidence?incident_id={}", addr, incident_id))
+        .get(format!(
+            "http://{}/api/v1/evidence?incident_id={}",
+            addr, incident_id
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await

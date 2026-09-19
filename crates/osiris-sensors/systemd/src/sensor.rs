@@ -234,8 +234,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "").unwrap();
 
-        let mut sensor =
-            SystemdSensor::new(&path).with_poll_interval(Duration::from_millis(20));
+        let mut sensor = SystemdSensor::new(&path).with_poll_interval(Duration::from_millis(20));
         let (tx, mut rx) = mpsc::channel(16);
         let cancellation = CancellationToken::new();
         sensor
@@ -279,8 +278,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut sensor =
-            SystemdSensor::new(&path).with_poll_interval(Duration::from_millis(20));
+        let mut sensor = SystemdSensor::new(&path).with_poll_interval(Duration::from_millis(20));
         let (tx, mut rx) = mpsc::channel(16);
         let cancellation = CancellationToken::new();
         sensor
@@ -290,7 +288,10 @@ mod tests {
         sensor.start().await.unwrap();
 
         let received = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-        assert!(received.is_err(), "must emit nothing for records it does not own");
+        assert!(
+            received.is_err(),
+            "must emit nothing for records it does not own"
+        );
         sensor.stop().await.unwrap();
         assert_eq!(sensor.health().events_emitted_total, 0);
     }

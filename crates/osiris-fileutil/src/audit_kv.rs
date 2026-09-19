@@ -108,10 +108,7 @@ mod tests {
     #[test]
     fn tokenizes_a_quoted_value_containing_spaces_as_one_token() {
         let fields = tokenize(r#"type=SYSCALL comm="my command" nametype=CREATE"#);
-        assert_eq!(
-            fields.get("comm").map(String::as_str),
-            Some("my command")
-        );
+        assert_eq!(fields.get("comm").map(String::as_str), Some("my command"));
         assert_eq!(fields.get("nametype").map(String::as_str), Some("CREATE"));
     }
 
@@ -147,7 +144,8 @@ mod tests {
     /// exactly what the Filesystem sensor's assembler groups on.
     #[test]
     fn records_of_the_same_event_share_one_id() {
-        let path_line = r#"type=PATH msg=audit(1690000000.123:456): item=1 name="/tmp/foo" nametype=DELETE"#;
+        let path_line =
+            r#"type=PATH msg=audit(1690000000.123:456): item=1 name="/tmp/foo" nametype=DELETE"#;
         let syscall_id = parse_audit_msg_id(tokenize(SYSCALL_LINE).get("msg").unwrap()).unwrap();
         let path_id = parse_audit_msg_id(tokenize(path_line).get("msg").unwrap()).unwrap();
         assert_eq!(syscall_id, path_id);

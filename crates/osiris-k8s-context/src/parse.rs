@@ -14,7 +14,10 @@ fn valid_name(s: &str) -> bool {
 
 /// `containerd://<id>`, `docker://<id>`, `cri-o://<id>` -> `<id>`.
 fn strip_runtime(container_id: &str) -> &str {
-    container_id.split_once("://").map(|(_, rest)| rest).unwrap_or(container_id)
+    container_id
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(container_id)
 }
 
 /// Parses a kubelet `GET /pods` `PodList` into `container_id -> PodRef`.
@@ -42,7 +45,10 @@ pub fn parse_pod_list(json: &str) -> Option<HashMap<String, PodRef>> {
             continue;
         }
         for key in ["containerStatuses", "initContainerStatuses"] {
-            let Some(statuses) = item.pointer(&format!("/status/{key}")).and_then(|v| v.as_array()) else {
+            let Some(statuses) = item
+                .pointer(&format!("/status/{key}"))
+                .and_then(|v| v.as_array())
+            else {
                 continue;
             };
             for status in statuses {
@@ -50,12 +56,18 @@ pub fn parse_pod_list(json: &str) -> Option<HashMap<String, PodRef>> {
                     continue;
                 };
                 let id = strip_runtime(raw_id);
-                if id.is_empty() || id.chars().count() > MAX_ID_LEN || id.chars().any(|c| c.is_control()) {
+                if id.is_empty()
+                    || id.chars().count() > MAX_ID_LEN
+                    || id.chars().any(|c| c.is_control())
+                {
                     continue;
                 }
                 out.insert(
                     id.to_string(),
-                    PodRef { pod_name: name.to_string(), namespace: namespace.to_string() },
+                    PodRef {
+                        pod_name: name.to_string(),
+                        namespace: namespace.to_string(),
+                    },
                 );
             }
         }
@@ -133,7 +145,11 @@ mod tests {
             pod_json("bad\\u0007name", "ns", statuses),
             pod_json("", "ns", statuses),
             pod_json("ok-name", "bad\\u0007ns", statuses),
-            pod_json("ok", "ns", r#""containerStatuses":[{"containerID":"containerd://k2"}]"#),
+            pod_json(
+                "ok",
+                "ns",
+                r#""containerStatuses":[{"containerID":"containerd://k2"}]"#
+            ),
         ));
         let map = parse_pod_list(&json).unwrap();
         assert!(!map.contains_key("k1"), "invalid-name pods must be skipped");
@@ -143,8 +159,15 @@ mod tests {
     #[test]
     fn duplicate_container_ids_last_one_wins() {
         let statuses = r#""containerStatuses":[{"containerID":"containerd://dup"}]"#;
-        let json = list(&format!("{},{}", pod_json("first", "ns", statuses), pod_json("second", "ns", statuses)));
-        assert_eq!(parse_pod_list(&json).unwrap().get("dup").unwrap().pod_name, "second");
+        let json = list(&format!(
+            "{},{}",
+            pod_json("first", "ns", statuses),
+            pod_json("second", "ns", statuses)
+        ));
+        assert_eq!(
+            parse_pod_list(&json).unwrap().get("dup").unwrap().pod_name,
+            "second"
+        );
     }
 
     #[test]

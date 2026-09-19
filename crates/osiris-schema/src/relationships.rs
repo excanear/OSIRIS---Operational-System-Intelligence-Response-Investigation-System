@@ -109,9 +109,21 @@ impl EntityRef {
             }
             "FILE" => {
                 let mut parts = rest.splitn(3, ':');
-                let host_id: Uuid = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
-                let inode: u64 = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
-                let device_id: u64 = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
+                let host_id: Uuid = parts
+                    .next()
+                    .ok_or_else(malformed)?
+                    .parse()
+                    .map_err(|_| malformed())?;
+                let inode: u64 = parts
+                    .next()
+                    .ok_or_else(malformed)?
+                    .parse()
+                    .map_err(|_| malformed())?;
+                let device_id: u64 = parts
+                    .next()
+                    .ok_or_else(malformed)?
+                    .parse()
+                    .map_err(|_| malformed())?;
                 Ok(EntityRef::File {
                     host_id,
                     inode,
@@ -126,8 +138,16 @@ impl EntityRef {
             }),
             "USER" => {
                 let mut parts = rest.splitn(2, ':');
-                let host_id: Uuid = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
-                let uid: u32 = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
+                let host_id: Uuid = parts
+                    .next()
+                    .ok_or_else(malformed)?
+                    .parse()
+                    .map_err(|_| malformed())?;
+                let uid: u32 = parts
+                    .next()
+                    .ok_or_else(malformed)?
+                    .parse()
+                    .map_err(|_| malformed())?;
                 Ok(EntityRef::User { host_id, uid })
             }
             "CONTAINER" => Ok(EntityRef::Container {

@@ -96,7 +96,12 @@ impl BaselineEngine {
         })
     }
 
-    fn upsert(&self, kind: FrequencyKind, key: &str, timestamp: u64) -> Result<Observation, BaselineError> {
+    fn upsert(
+        &self,
+        kind: FrequencyKind,
+        key: &str,
+        timestamp: u64,
+    ) -> Result<Observation, BaselineError> {
         let conn = self
             .conn
             .lock()
@@ -146,10 +151,17 @@ impl BaselineEngine {
 
         if let (Some(parent), Some(process)) = (&event.parent_process, &event.process) {
             let key = format!("{}\u{1}{}", parent.exe_path, process.exe_path);
-            observations.push(self.upsert(FrequencyKind::ParentChildExec, &key, event.timestamp)?);
+            observations.push(self.upsert(
+                FrequencyKind::ParentChildExec,
+                &key,
+                event.timestamp,
+            )?);
         }
         if let (Some(process), Some(network)) = (&event.process, &event.network) {
-            let key = format!("{}\u{1}{}:{}", process.exe_path, network.dst_ip, network.dst_port);
+            let key = format!(
+                "{}\u{1}{}:{}",
+                process.exe_path, network.dst_ip, network.dst_port
+            );
             observations.push(self.upsert(FrequencyKind::ProcessNetwork, &key, event.timestamp)?);
         }
         if let (Some(process), Some(dns)) = (&event.process, &event.dns) {
@@ -260,7 +272,8 @@ mod tests {
     #[test]
     fn a_pair_observed_beyond_the_threshold_becomes_common() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = BaselineEngine::open_with_threshold(dir.path().join("baseline.db"), 2).unwrap();
+        let engine =
+            BaselineEngine::open_with_threshold(dir.path().join("baseline.db"), 2).unwrap();
         let mut event = base_event();
         event.parent_process = Some(process_ref("/bin/bash", event.host_id));
         event.process = Some(process_ref("/usr/bin/curl", event.host_id));

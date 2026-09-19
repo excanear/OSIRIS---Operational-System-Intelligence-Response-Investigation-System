@@ -26,7 +26,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 fn event_on(host: Uuid, pid: u32, timestamp: u64) -> CanonicalEvent {
@@ -117,26 +120,27 @@ fn tenancy() -> Tenancy {
     let p = |name: &str| dir.path().join(name);
 
     let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(p("events.db")).unwrap());
-    let (acme_host, globex_host, unassigned_host) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (acme_host, globex_host, unassigned_host) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let t = now_ns();
     let acme_event = event_on(acme_host, 1, t);
     let acme_process_key = acme_event.process.as_ref().unwrap().process_key.as_hex();
     let globex_event = event_on(globex_host, 2, t);
     let globex_process_key = globex_event.process.as_ref().unwrap().process_key.as_hex();
     storage
-        .batch_write(&[
-            acme_event,
-            globex_event,
-            event_on(unassigned_host, 3, t),
-        ])
+        .batch_write(&[acme_event, globex_event, event_on(unassigned_host, 3, t)])
         .unwrap();
 
     let audit_log: Arc<dyn osiris_audit::AuditLog + Send + Sync> =
         Arc::new(FileAuditLog::open(p("audit.jsonl")).unwrap());
     let incident_evidence_state = IncidentEvidenceState {
-        incidents: Arc::new(SqliteIncidentStore::open(p("incidents.db").to_str().unwrap()).unwrap()),
+        incidents: Arc::new(
+            SqliteIncidentStore::open(p("incidents.db").to_str().unwrap()).unwrap(),
+        ),
         evidence: Arc::new(SqliteEvidenceStore::open(p("evidence.db").to_str().unwrap()).unwrap()),
-        links: Arc::new(SqliteEvidenceIncidentLinks::open(p("links.db").to_str().unwrap()).unwrap()),
+        links: Arc::new(
+            SqliteEvidenceIncidentLinks::open(p("links.db").to_str().unwrap()).unwrap(),
+        ),
         audit_log: audit_log.clone(),
     };
     let response_state = ResponseState {
@@ -155,7 +159,10 @@ fn tenancy() -> Tenancy {
 
     let (user_store, _bootstrap) = SqliteUserStore::open(p("users.db")).unwrap();
     let admin = user_store.get_user_by_username("admin").unwrap().unwrap();
-    let admin_token = user_store.create_session(admin.user_id, 3600).unwrap().token;
+    let admin_token = user_store
+        .create_session(admin.user_id, 3600)
+        .unwrap()
+        .token;
     let tenant_token = |name: &str, tenant: Uuid| {
         let user = user_store
             .create_user(NewUser {
@@ -224,8 +231,13 @@ async fn call(
     };
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 fn host_ids_of(events: &serde_json::Value) -> Vec<String> {
@@ -276,13 +288,14 @@ async fn the_hosts_endpoint_lists_only_the_tenants_hosts() {
 #[tokio::test]
 async fn a_tenant_user_cannot_read_platform_only_routes_even_as_a_tenant_admin() {
     let t = tenancy();
-    for (method, uri) in [
-        ("GET", "/api/v1/audit"),
-        ("GET", "/api/v1/auth/users"),
-    ] {
+    for (method, uri) in [("GET", "/api/v1/audit"), ("GET", "/api/v1/auth/users")] {
         let body = (method == "POST").then(|| serde_json::json!({}));
         let (status, _) = call(&t.app, method, uri, Some(&t.acme_token), body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} must be 403 for a tenant user");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must be 403 for a tenant user"
+        );
     }
     // The same audit route is reachable for the platform admin.
     let (status, _) = call(&t.app, "GET", "/api/v1/audit", Some(&t.admin_token), None).await;
@@ -333,10 +346,18 @@ async fn a_tenant_with_no_hosts_sees_nothing_not_everything() {
             tenant_id: Some(empty.tenant_id),
         })
         .unwrap();
-    let token = t.auth_state.users.create_session(user.user_id, 3600).unwrap().token;
+    let token = t
+        .auth_state
+        .users
+        .create_session(user.user_id, 3600)
+        .unwrap()
+        .token;
     let (status, body) = call(&t.app, "GET", "/api/v1/events", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.as_array().unwrap().is_empty(), "no hosts must mean no data");
+    assert!(
+        body.as_array().unwrap().is_empty(),
+        "no hosts must mean no data"
+    );
     let (_, hosts) = call(&t.app, "GET", "/api/v1/hosts", Some(&token), None).await;
     assert!(hosts.as_array().unwrap().is_empty());
 }
@@ -370,7 +391,9 @@ async fn a_tenants_websocket_receives_only_its_hosts_events_and_rejects_foreign_
     let event: CanonicalEvent = serde_json::from_str(message.to_text().unwrap()).unwrap();
     assert_eq!(event.host_id, t.acme_host);
     // The globex event was filtered out: nothing else arrives.
-    assert!(tokio::time::timeout(Duration::from_millis(300), ws.next()).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(300), ws.next())
+        .await
+        .is_err());
 
     // Asking for another tenant's host is rejected at the handshake with 403.
     let url = format!(
@@ -389,7 +412,10 @@ async fn a_tenants_websocket_receives_only_its_hosts_events_and_rejects_foreign_
 async fn a_platform_admin_can_create_a_tenant_assign_and_unassign_a_host() {
     let t = tenancy();
     let (status, body) = call(
-        &t.app, "POST", "/api/v1/tenants", Some(&t.admin_token),
+        &t.app,
+        "POST",
+        "/api/v1/tenants",
+        Some(&t.admin_token),
         Some(serde_json::json!({ "name": "initech" })),
     )
     .await;
@@ -404,7 +430,11 @@ async fn a_platform_admin_can_create_a_tenant_assign_and_unassign_a_host() {
 
     let (status, list) = call(&t.app, "GET", "/api/v1/tenants", Some(&t.admin_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(list.as_array().unwrap().iter().any(|x| x["name"] == "initech"));
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["name"] == "initech"));
 
     let (status, _) = call(&t.app, "DELETE", &uri, Some(&t.admin_token), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -415,7 +445,10 @@ async fn a_platform_admin_can_create_a_tenant_assign_and_unassign_a_host() {
 async fn creating_a_duplicate_tenant_name_is_a_400() {
     let t = tenancy();
     let (status, _) = call(
-        &t.app, "POST", "/api/v1/tenants", Some(&t.admin_token),
+        &t.app,
+        "POST",
+        "/api/v1/tenants",
+        Some(&t.admin_token),
         Some(serde_json::json!({ "name": "acme" })), // already created by the harness
     )
     .await;
@@ -427,7 +460,10 @@ async fn a_tenant_user_cannot_manage_tenants() {
     let t = tenancy();
     let host = Uuid::new_v4();
     let (status, _) = call(
-        &t.app, "POST", "/api/v1/tenants", Some(&t.acme_token),
+        &t.app,
+        "POST",
+        "/api/v1/tenants",
+        Some(&t.acme_token),
         Some(serde_json::json!({ "name": "sneaky" })),
     )
     .await;
@@ -440,7 +476,11 @@ async fn a_tenant_user_cannot_manage_tenants() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(t.tenants.tenant_of(host).unwrap(), None);
     assert!(
-        !t.tenants.list_tenants().unwrap().iter().any(|x| x.name == "sneaky"),
+        !t.tenants
+            .list_tenants()
+            .unwrap()
+            .iter()
+            .any(|x| x.name == "sneaky"),
         "a tenant user must not have been able to create a tenant"
     );
 }
@@ -463,7 +503,11 @@ async fn unassigning_through_the_wrong_tenants_url_is_a_404_and_changes_nothing(
 #[tokio::test]
 async fn assigning_a_host_to_an_unknown_tenant_is_404() {
     let t = tenancy();
-    let uri = format!("/api/v1/tenants/{}/hosts/{}", Uuid::new_v4(), Uuid::new_v4());
+    let uri = format!(
+        "/api/v1/tenants/{}/hosts/{}",
+        Uuid::new_v4(),
+        Uuid::new_v4()
+    );
     let (status, _) = call(&t.app, "PUT", &uri, Some(&t.admin_token), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -472,7 +516,10 @@ async fn assigning_a_host_to_an_unknown_tenant_is_404() {
 async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() {
     let t = tenancy();
     let (status, _) = call(
-        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
+        &t.app,
+        "POST",
+        "/api/v1/auth/users",
+        Some(&t.admin_token),
         Some(serde_json::json!({
             "username": "bob", "password": "password123", "role": "VIEWER",
             "tenant_id": t.acme_tenant,
@@ -482,7 +529,10 @@ async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() 
     assert_eq!(status, StatusCode::OK);
 
     let (status, login) = call(
-        &t.app, "POST", "/api/v1/auth/login", None,
+        &t.app,
+        "POST",
+        "/api/v1/auth/login",
+        None,
         Some(serde_json::json!({ "username": "bob", "password": "password123" })),
     )
     .await;
@@ -492,33 +542,56 @@ async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() 
 
     // A platform user's login carries no tenant.
     let (status, _) = call(
-        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
-        Some(serde_json::json!({ "username": "plat", "password": "password123", "role": "VIEWER" })),
+        &t.app,
+        "POST",
+        "/api/v1/auth/users",
+        Some(&t.admin_token),
+        Some(
+            serde_json::json!({ "username": "plat", "password": "password123", "role": "VIEWER" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let (status, login) = call(
-        &t.app, "POST", "/api/v1/auth/login", None,
+        &t.app,
+        "POST",
+        "/api/v1/auth/login",
+        None,
         Some(serde_json::json!({ "username": "plat", "password": "password123" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(login["tenant_id"].is_null(), "platform login must carry a null tenant_id: {login}");
+    assert!(
+        login["tenant_id"].is_null(),
+        "platform login must carry a null tenant_id: {login}"
+    );
 
     let (status, unknown) = call(
-        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
+        &t.app,
+        "POST",
+        "/api/v1/auth/users",
+        Some(&t.admin_token),
         Some(serde_json::json!({
             "username": "carol", "password": "password123", "role": "VIEWER",
             "tenant_id": Uuid::new_v4(),
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown tenant must be rejected: {unknown}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown tenant must be rejected: {unknown}"
+    );
 
     // A tenant Admin cannot mint users (platform-only).
     let (status, _) = call(
-        &t.app, "POST", "/api/v1/auth/users", Some(&t.acme_token),
-        Some(serde_json::json!({ "username": "dave", "password": "password123", "role": "VIEWER" })),
+        &t.app,
+        "POST",
+        "/api/v1/auth/users",
+        Some(&t.acme_token),
+        Some(
+            serde_json::json!({ "username": "dave", "password": "password123", "role": "VIEWER" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -531,13 +604,25 @@ fn incident_body() -> serde_json::Value {
 #[tokio::test]
 async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
     let t = tenancy();
-    let (status, created) =
-        call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(incident_body())).await;
+    let (status, created) = call(
+        &t.app,
+        "POST",
+        "/api/v1/incidents",
+        Some(&t.acme_token),
+        Some(incident_body()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{created}");
     let id = created["incident_id"].as_str().unwrap().to_string();
     assert_eq!(created["tenant_id"], t.acme_tenant.to_string());
-    let (_, platform) =
-        call(&t.app, "POST", "/api/v1/incidents", Some(&t.admin_token), Some(incident_body())).await;
+    let (_, platform) = call(
+        &t.app,
+        "POST",
+        "/api/v1/incidents",
+        Some(&t.admin_token),
+        Some(incident_body()),
+    )
+    .await;
     let platform_id = platform["incident_id"].as_str().unwrap().to_string();
 
     let uri = format!("/api/v1/incidents/{id}");
@@ -555,14 +640,42 @@ async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     // A platform-owned incident is invisible to a tenant.
-    let (s, _) = call(&t.app, "GET", &format!("/api/v1/incidents/{platform_id}"), Some(&t.acme_token), None).await;
+    let (s, _) = call(
+        &t.app,
+        "GET",
+        &format!("/api/v1/incidents/{platform_id}"),
+        Some(&t.acme_token),
+        None,
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    let (_, mine) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.acme_token), None).await;
+    let (_, mine) = call(
+        &t.app,
+        "GET",
+        "/api/v1/incidents",
+        Some(&t.acme_token),
+        None,
+    )
+    .await;
     assert_eq!(mine.as_array().unwrap().len(), 1);
-    let (_, theirs) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.globex_token), None).await;
+    let (_, theirs) = call(
+        &t.app,
+        "GET",
+        "/api/v1/incidents",
+        Some(&t.globex_token),
+        None,
+    )
+    .await;
     assert!(theirs.as_array().unwrap().is_empty());
-    let (_, all) = call(&t.app, "GET", "/api/v1/incidents", Some(&t.admin_token), None).await;
+    let (_, all) = call(
+        &t.app,
+        "GET",
+        "/api/v1/incidents",
+        Some(&t.admin_token),
+        None,
+    )
+    .await;
     assert_eq!(all.as_array().unwrap().len(), 2);
 
     // The owning tenant can still transition it.
@@ -580,8 +693,14 @@ async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
 #[tokio::test]
 async fn evidence_and_links_never_cross_tenants() {
     let t = tenancy();
-    let (_, inc) =
-        call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(incident_body())).await;
+    let (_, inc) = call(
+        &t.app,
+        "POST",
+        "/api/v1/incidents",
+        Some(&t.acme_token),
+        Some(incident_body()),
+    )
+    .await;
     let inc_id = inc["incident_id"].as_str().unwrap().to_string();
     let ev = |incident: Option<&str>| {
         serde_json::json!({
@@ -590,22 +709,50 @@ async fn evidence_and_links_never_cross_tenants() {
         })
     };
     // Globex cannot attach evidence to acme's incident.
-    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.globex_token), Some(ev(Some(&inc_id)))).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/evidence",
+        Some(&t.globex_token),
+        Some(ev(Some(&inc_id))),
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     // Acme can, and the record is tenant-tagged.
-    let (s, created) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.acme_token), Some(ev(Some(&inc_id)))).await;
+    let (s, created) = call(
+        &t.app,
+        "POST",
+        "/api/v1/evidence",
+        Some(&t.acme_token),
+        Some(ev(Some(&inc_id))),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{created}");
     let acme_ev = created["evidence_id"].as_str().unwrap().to_string();
     // A tenant cannot supersede another tenant's evidence.
     let mut supersede = ev(None);
     supersede["supersedes"] = serde_json::json!(acme_ev);
-    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.globex_token), Some(supersede)).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/evidence",
+        Some(&t.globex_token),
+        Some(supersede),
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     let (_, mine) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.acme_token), None).await;
     assert_eq!(mine.as_array().unwrap().len(), 1);
     assert_eq!(mine[0]["incident_ids"][0], inc_id);
-    let (_, theirs) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.globex_token), None).await;
+    let (_, theirs) = call(
+        &t.app,
+        "GET",
+        "/api/v1/evidence",
+        Some(&t.globex_token),
+        None,
+    )
+    .await;
     assert!(theirs.as_array().unwrap().is_empty());
     let (s, _) = call(
         &t.app,
@@ -616,7 +763,14 @@ async fn evidence_and_links_never_cross_tenants() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    let (_, all) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.admin_token), None).await;
+    let (_, all) = call(
+        &t.app,
+        "GET",
+        "/api/v1/evidence",
+        Some(&t.admin_token),
+        None,
+    )
+    .await;
     assert_eq!(all.as_array().unwrap().len(), 1);
 }
 
@@ -630,29 +784,66 @@ async fn the_response_engine_only_sees_the_tenants_own_hosts() {
         })
     };
     // Own process resolves; another tenant's process is "unknown" (400).
-    let (s, resp) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
-        Some(body(&t.acme_process_key))).await;
+    let (s, resp) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.acme_token),
+        Some(body(&t.acme_process_key)),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{resp}");
-    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
-        Some(body(&t.globex_process_key))).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.acme_token),
+        Some(body(&t.globex_process_key)),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
     // Real collection is tagged with the tenant and invisible to the other one.
     let mut real = body(&t.acme_process_key);
     real["dry_run"] = serde_json::json!(false);
-    let (s, resp) =
-        call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token), Some(real.clone())).await;
+    let (s, resp) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.acme_token),
+        Some(real.clone()),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{resp}");
     let (_, mine) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.acme_token), None).await;
     assert_eq!(mine.as_array().unwrap().len(), 1);
-    let (_, theirs) = call(&t.app, "GET", "/api/v1/evidence", Some(&t.globex_token), None).await;
+    let (_, theirs) = call(
+        &t.app,
+        "GET",
+        "/api/v1/evidence",
+        Some(&t.globex_token),
+        None,
+    )
+    .await;
     assert!(theirs.as_array().unwrap().is_empty());
 
     // A foreign incident cannot be used as a link target.
-    let (_, inc) =
-        call(&t.app, "POST", "/api/v1/incidents", Some(&t.globex_token), Some(incident_body())).await;
+    let (_, inc) = call(
+        &t.app,
+        "POST",
+        "/api/v1/incidents",
+        Some(&t.globex_token),
+        Some(incident_body()),
+    )
+    .await;
     real["incident_id"] = inc["incident_id"].clone();
-    let (s, _) =
-        call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token), Some(real)).await;
+    let (s, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/response/collect_evidence",
+        Some(&t.acme_token),
+        Some(real),
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }

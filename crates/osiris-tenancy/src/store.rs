@@ -63,12 +63,17 @@ impl SqliteTenantStore {
             CREATE INDEX IF NOT EXISTS idx_host_tenants_tenant ON host_tenants(tenant_id);",
         )
         .map_err(backend)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn row_to_tenant(row: &rusqlite::Row) -> rusqlite::Result<Tenant> {
@@ -95,7 +100,11 @@ impl TenantStore for SqliteTenantStore {
         let conn = self.conn.lock().map_err(|_| backend("poisoned lock"))?;
         conn.execute(
             "INSERT INTO tenants (tenant_id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![tenant.tenant_id.to_string(), tenant.name, tenant.created_at as i64],
+            params![
+                tenant.tenant_id.to_string(),
+                tenant.name,
+                tenant.created_at as i64
+            ],
         )
         .map_err(|e| {
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -110,7 +119,9 @@ impl TenantStore for SqliteTenantStore {
     fn list_tenants(&self) -> Result<Vec<Tenant>, TenantStoreError> {
         let conn = self.conn.lock().map_err(|_| backend("poisoned lock"))?;
         let mut stmt = conn
-            .prepare("SELECT tenant_id, name, created_at FROM tenants ORDER BY created_at ASC, name ASC")
+            .prepare(
+                "SELECT tenant_id, name, created_at FROM tenants ORDER BY created_at ASC, name ASC",
+            )
             .map_err(backend)?;
         let rows = stmt.query_map([], row_to_tenant).map_err(backend)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(backend)
@@ -143,8 +154,11 @@ impl TenantStore for SqliteTenantStore {
 
     fn unassign_host(&self, host_id: Uuid) -> Result<(), TenantStoreError> {
         let conn = self.conn.lock().map_err(|_| backend("poisoned lock"))?;
-        conn.execute("DELETE FROM host_tenants WHERE host_id = ?1", params![host_id.to_string()])
-            .map_err(backend)?;
+        conn.execute(
+            "DELETE FROM host_tenants WHERE host_id = ?1",
+            params![host_id.to_string()],
+        )
+        .map_err(backend)?;
         Ok(())
     }
 
@@ -154,7 +168,9 @@ impl TenantStore for SqliteTenantStore {
             .prepare("SELECT host_id FROM host_tenants WHERE tenant_id = ?1")
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![tenant_id.to_string()], |row| row.get::<_, String>(0))
+            .query_map(params![tenant_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(backend)?;
         let mut out = HashSet::new();
         for row in rows {
@@ -196,7 +212,10 @@ mod tests {
         let a = s.create_tenant("acme").unwrap();
         let b = s.create_tenant("globex").unwrap();
         let all = s.list_tenants().unwrap();
-        assert_eq!(all.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["acme", "globex"]);
+        assert_eq!(
+            all.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["acme", "globex"]
+        );
         assert_eq!(s.get_tenant(a.tenant_id).unwrap().unwrap().name, "acme");
         assert_ne!(a.tenant_id, b.tenant_id);
     }
@@ -205,8 +224,14 @@ mod tests {
     fn duplicate_or_blank_names_are_rejected() {
         let (_d, s) = store();
         s.create_tenant("acme").unwrap();
-        assert!(matches!(s.create_tenant("acme"), Err(TenantStoreError::DuplicateName(_))));
-        assert!(matches!(s.create_tenant("   "), Err(TenantStoreError::InvalidName(_))));
+        assert!(matches!(
+            s.create_tenant("acme"),
+            Err(TenantStoreError::DuplicateName(_))
+        ));
+        assert!(matches!(
+            s.create_tenant("   "),
+            Err(TenantStoreError::InvalidName(_))
+        ));
         assert!(matches!(
             s.create_tenant(&"x".repeat(129)),
             Err(TenantStoreError::InvalidName(_))

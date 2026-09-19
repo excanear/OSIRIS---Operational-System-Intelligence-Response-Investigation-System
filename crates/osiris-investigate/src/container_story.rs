@@ -27,7 +27,10 @@ pub fn container_story(storage: &dyn Storage, container_id: &str) -> Result<Stor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{CanonicalEvent, Category, ContainerRef, EventType, HostRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        CanonicalEvent, Category, ContainerRef, EventType, HostRef, Severity, Source,
+        SCHEMA_VERSION,
+    };
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
@@ -43,12 +46,39 @@ mod tests {
             event_type: EventType::ContainerStart,
             category: Category::Container,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None, file: None,
-            network: None, dns: None, device: None, service: None,
-            container: Some(ContainerRef { container_id: container_id.to_string(), image: "img".to_string(), runtime: "docker".to_string(), pod_ref: None }),
-            namespace: None, cgroup: None, kernel: None, source: Source::Synthetic, provider: "test".to_string(),
-            raw_event: None, relationships: vec![], tags: vec![], risk: None, event_data: serde_json::json!({}),
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: Some(ContainerRef {
+                container_id: container_id.to_string(),
+                image: "img".to_string(),
+                runtime: "docker".to_string(),
+                pod_ref: None,
+            }),
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
         }
     }
 

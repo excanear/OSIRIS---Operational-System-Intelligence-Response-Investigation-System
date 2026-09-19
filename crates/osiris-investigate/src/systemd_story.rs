@@ -26,7 +26,9 @@ pub fn systemd_story(storage: &dyn Storage, unit_name: &str) -> Result<Story, St
 
 #[cfg(test)]
 mod tests {
-    use osiris_schema::{Category, CanonicalEvent, EventType, HostRef, ServiceRef, Severity, Source, SCHEMA_VERSION};
+    use osiris_schema::{
+        CanonicalEvent, Category, EventType, HostRef, ServiceRef, Severity, Source, SCHEMA_VERSION,
+    };
     use osiris_storage::Storage;
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
@@ -43,12 +45,37 @@ mod tests {
             event_type,
             category: Category::Systemd,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
-            user: None, session: None, process: None, parent_process: None, thread: None, file: None,
-            network: None, dns: None, device: None,
-            service: Some(ServiceRef { unit_name: unit_name.to_string(), unit_type: "service".to_string(), action: "start".to_string() }),
-            container: None, namespace: None, cgroup: None, kernel: None, source: Source::Synthetic,
-            provider: "test".to_string(), raw_event: None, relationships: vec![], tags: vec![], risk: None,
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: Some(ServiceRef {
+                unit_name: unit_name.to_string(),
+                unit_type: "service".to_string(),
+                action: "start".to_string(),
+            }),
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
             event_data: serde_json::json!({}),
         }
     }
@@ -57,9 +84,23 @@ mod tests {
     fn systemd_story_covers_both_lifecycle_and_unit_file_events_for_one_unit() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        storage.write(&service_event("evil.service", EventType::ServiceCreate, 100)).unwrap();
-        storage.write(&service_event("evil.service", EventType::ServiceStart, 200)).unwrap();
-        storage.write(&service_event("other.service", EventType::ServiceStart, 300)).unwrap();
+        storage
+            .write(&service_event(
+                "evil.service",
+                EventType::ServiceCreate,
+                100,
+            ))
+            .unwrap();
+        storage
+            .write(&service_event("evil.service", EventType::ServiceStart, 200))
+            .unwrap();
+        storage
+            .write(&service_event(
+                "other.service",
+                EventType::ServiceStart,
+                300,
+            ))
+            .unwrap();
 
         let story = super::systemd_story(&storage, "evil.service").unwrap();
         assert_eq!(story.events.len(), 2);

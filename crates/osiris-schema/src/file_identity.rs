@@ -92,7 +92,10 @@ mod tests {
             FileIdentity::from_file_ref(&file_ref(Some(131075), Some(encode_device_id(8, 1)))),
             Some(FileIdentity::new(131075, encode_device_id(8, 1)))
         );
-        assert_eq!(FileIdentity::from_file_ref(&file_ref(Some(131075), None)), None);
+        assert_eq!(
+            FileIdentity::from_file_ref(&file_ref(Some(131075), None)),
+            None
+        );
         assert_eq!(FileIdentity::from_file_ref(&file_ref(None, Some(1))), None);
     }
 

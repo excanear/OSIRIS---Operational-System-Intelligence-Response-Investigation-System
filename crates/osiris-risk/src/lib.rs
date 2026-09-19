@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use osiris_baseline::{Observation, Rarity};
 use osiris_correlate::BehavioralChain;
-use osiris_schema::{Alert, CanonicalEvent, EntityRef, Relation, RiskScoreRecord, Severity, WeightedReason};
+use osiris_schema::{
+    Alert, CanonicalEvent, EntityRef, Relation, RiskScoreRecord, Severity, WeightedReason,
+};
 use serde::Deserialize;
 
 /// Per-severity weight table (ARCHITECTURE.md §11.4: "a configurable table
@@ -155,10 +157,11 @@ impl RiskEngine {
             path: path_ref.display().to_string(),
             source,
         })?;
-        let config: RiskConfig = serde_yaml::from_str(&yaml).map_err(|source| RiskError::Parse {
-            path: path_ref.display().to_string(),
-            source,
-        })?;
+        let config: RiskConfig =
+            serde_yaml::from_str(&yaml).map_err(|source| RiskError::Parse {
+                path: path_ref.display().to_string(),
+                source,
+            })?;
         Ok(Self::new(config))
     }
 
@@ -381,10 +384,18 @@ mod tests {
         edges: Vec<EntityRelationship>,
     }
     impl EdgeSource for FakeEdgeSource {
-        fn edges_for(&self, entity: &EntityRef, _since: u64, _until: u64) -> Vec<EntityRelationship> {
+        fn edges_for(
+            &self,
+            entity: &EntityRef,
+            _since: u64,
+            _until: u64,
+        ) -> Vec<EntityRelationship> {
             self.edges
                 .iter()
-                .filter(|e| e.from.storage_key() == entity.storage_key() || e.to.storage_key() == entity.storage_key())
+                .filter(|e| {
+                    e.from.storage_key() == entity.storage_key()
+                        || e.to.storage_key() == entity.storage_key()
+                })
                 .cloned()
                 .collect()
         }

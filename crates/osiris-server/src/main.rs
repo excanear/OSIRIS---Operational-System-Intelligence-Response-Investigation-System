@@ -5,8 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_api::build_router;
-use osiris_api::{build_incident_evidence_router, build_stream_router, IncidentEvidenceState, LiveEventBroadcaster};
-use osiris_api::{build_auth_router, build_tenant_router, auth_gate, AuthState};
+use osiris_api::{auth_gate, build_auth_router, build_tenant_router, AuthState};
+use osiris_api::{
+    build_incident_evidence_router, build_stream_router, IncidentEvidenceState,
+    LiveEventBroadcaster,
+};
 use osiris_api::{build_response_router, ResponseState};
 use osiris_audit::FileAuditLog;
 use osiris_auth::SqliteUserStore;
@@ -57,7 +60,10 @@ async fn main() {
     let detection_engine = match DetectionEngine::load_from_dir(Path::new(&config.rules_dir)) {
         Ok(e) => Arc::new(e),
         Err(e) => {
-            eprintln!("failed to load detection rules from {}: {}", config.rules_dir, e);
+            eprintln!(
+                "failed to load detection rules from {}: {}",
+                config.rules_dir, e
+            );
             std::process::exit(1);
         }
     };
@@ -137,9 +143,18 @@ async fn main() {
         }
     };
 
-    let incidents_db_path = config.incidents_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/incidents.db".to_string());
-    let evidence_db_path = config.evidence_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/evidence.db".to_string());
-    let links_db_path = config.links_db_path.clone().unwrap_or_else(|| "/var/lib/osiris/links.db".to_string());
+    let incidents_db_path = config
+        .incidents_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/incidents.db".to_string());
+    let evidence_db_path = config
+        .evidence_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/evidence.db".to_string());
+    let links_db_path = config
+        .links_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/links.db".to_string());
     let investigate_audit_log_path = config
         .investigate_audit_log_path
         .clone()

@@ -15,7 +15,9 @@ pub fn read_token() -> Option<String> {
         }
     }
     let path = token_path()?;
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 pub fn write_token(token: &str) -> std::io::Result<()> {

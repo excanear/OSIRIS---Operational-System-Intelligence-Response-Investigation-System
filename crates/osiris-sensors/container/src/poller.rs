@@ -60,10 +60,7 @@ impl ContainerCgroupPoller {
 
         let mut events = Vec::new();
         for container_id in current.difference(&self.previous) {
-            let cgroup_path = cgroup_paths
-                .get(container_id)
-                .cloned()
-                .unwrap_or_default();
+            let cgroup_path = cgroup_paths.get(container_id).cloned().unwrap_or_default();
             let pid = cgroup_pids.get(container_id).copied().flatten();
             events.push(make_event(
                 ContainerOperation::Create,

@@ -131,12 +131,22 @@ mod tests {
     use uuid::Uuid;
 
     fn integrity() -> Integrity {
-        Integrity { hash: "abc123".to_string(), immutable_since: 1000 }
+        Integrity {
+            hash: "abc123".to_string(),
+            immutable_since: 1000,
+        }
     }
 
     #[test]
     fn a_valid_evidence_record_carries_every_field() {
-        let evidence = Evidence::new(EvidenceSource::EventCapture, 1000, integrity(), vec![], None).unwrap();
+        let evidence = Evidence::new(
+            EvidenceSource::EventCapture,
+            1000,
+            integrity(),
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(evidence.source(), EvidenceSource::EventCapture);
         assert_eq!(evidence.timestamp(), 1000);
         assert_eq!(evidence.integrity().hash, "abc123");
@@ -145,7 +155,10 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_integrity_hash() {
-        let bad = Integrity { hash: String::new(), immutable_since: 1000 };
+        let bad = Integrity {
+            hash: String::new(),
+            immutable_since: 1000,
+        };
         let err = Evidence::new(EvidenceSource::EventCapture, 1000, bad, vec![], None).unwrap_err();
         assert_eq!(err, EvidenceError::EmptyHash);
     }
@@ -153,13 +166,27 @@ mod tests {
     #[test]
     fn supersedes_links_to_the_record_it_replaces() {
         let old_id = Uuid::now_v7();
-        let evidence = Evidence::new(EvidenceSource::ManualUpload, 2000, integrity(), vec![], Some(old_id)).unwrap();
+        let evidence = Evidence::new(
+            EvidenceSource::ManualUpload,
+            2000,
+            integrity(),
+            vec![],
+            Some(old_id),
+        )
+        .unwrap();
         assert_eq!(evidence.supersedes(), Some(old_id));
     }
 
     #[test]
     fn json_round_trip_preserves_validation() {
-        let evidence = Evidence::new(EvidenceSource::EventCapture, 1000, integrity(), vec![], None).unwrap();
+        let evidence = Evidence::new(
+            EvidenceSource::EventCapture,
+            1000,
+            integrity(),
+            vec![],
+            None,
+        )
+        .unwrap();
         let json = serde_json::to_string(&evidence).unwrap();
         let back: Evidence = serde_json::from_str(&json).unwrap();
         assert_eq!(back.evidence_id(), evidence.evidence_id());

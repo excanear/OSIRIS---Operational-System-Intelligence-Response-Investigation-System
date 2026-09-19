@@ -96,7 +96,9 @@ impl Lexer {
                     }
                     tokens.push(Token::Str(s));
                 }
-                c if c.is_ascii_digit() || (c == '-' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())) => {
+                c if c.is_ascii_digit()
+                    || (c == '-' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())) =>
+                {
                     let start = i;
                     i += 1;
                     while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
@@ -111,7 +113,9 @@ impl Lexer {
                 }
                 c if c.is_alphabetic() || c == '_' => {
                     let start = i;
-                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                    while i < chars.len()
+                        && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                    {
                         i += 1;
                     }
                     let word: String = chars[start..i].iter().collect();
@@ -207,9 +211,10 @@ mod tests {
 
     #[test]
     fn tokenizes_keyword_operators_and_in_list() {
-        let tokens =
-            Lexer::tokenize("a CONTAINS \"x\" AND b STARTS_WITH \"y\" AND c ENDS_WITH \"z\" AND d IN (1, 2, 3)")
-                .unwrap();
+        let tokens = Lexer::tokenize(
+            "a CONTAINS \"x\" AND b STARTS_WITH \"y\" AND c ENDS_WITH \"z\" AND d IN (1, 2, 3)",
+        )
+        .unwrap();
         let ops: Vec<_> = tokens
             .iter()
             .filter_map(|t| match t {

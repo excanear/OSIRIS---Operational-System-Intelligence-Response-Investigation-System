@@ -37,11 +37,17 @@ pub trait UserStore: Send + Sync {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn role_to_string(role: Role) -> String {
-    serde_json::to_string(&role).unwrap().trim_matches('"').to_string()
+    serde_json::to_string(&role)
+        .unwrap()
+        .trim_matches('"')
+        .to_string()
 }
 
 fn role_from_string(s: &str) -> Role {
@@ -116,7 +122,9 @@ impl SqliteUserStore {
                 .map_err(|e| UserStoreError::Backend(e.to_string()))?;
         }
 
-        let store = Self { conn: Mutex::new(conn) };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
 
         let user_count: i64 = {
             let conn = store.conn.lock().unwrap();
@@ -229,7 +237,12 @@ impl UserStore for SqliteUserStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (token, user_id, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            params![token, user_id.to_string(), issued_at as i64, expires_at as i64],
+            params![
+                token,
+                user_id.to_string(),
+                issued_at as i64,
+                expires_at as i64
+            ],
         )
         .map_err(|e| UserStoreError::Backend(e.to_string()))?;
         Ok(Session {
@@ -294,7 +307,9 @@ mod tests {
 
         let admin = store.get_user_by_username("admin").unwrap().unwrap();
         assert_eq!(admin.role, Role::Admin);
-        assert!(crate::password::verify_password(&bootstrap.password, &admin.password_hash).unwrap());
+        assert!(
+            crate::password::verify_password(&bootstrap.password, &admin.password_hash).unwrap()
+        );
 
         let (_store2, bootstrap2) = SqliteUserStore::open(&path).unwrap();
         assert!(
@@ -488,7 +503,10 @@ mod tests {
             .unwrap();
         }
         let (store, bootstrap) = SqliteUserStore::open(&path).unwrap();
-        assert!(bootstrap.is_none(), "an existing user means no bootstrap admin");
+        assert!(
+            bootstrap.is_none(),
+            "an existing user means no bootstrap admin"
+        );
         let legacy = store.get_user_by_username("legacy").unwrap().unwrap();
         assert_eq!(legacy.tenant_id, None);
         // And reopening again (column already present) is a no-op.

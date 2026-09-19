@@ -70,7 +70,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             container_id.to_string(),
-            PodRef { pod_name: name.to_string(), namespace: ns.to_string() },
+            PodRef {
+                pod_name: name.to_string(),
+                namespace: ns.to_string(),
+            },
         );
         FakeLookup(map)
     }

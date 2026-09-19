@@ -34,7 +34,10 @@ pub async fn detect_cloud_context(cfg: &CloudMetadataConfig) -> Option<CloudCont
     if providers.is_empty() {
         return None;
     }
-    tokio::time::timeout(DETECT_TIMEOUT, detect(providers)).await.ok().flatten()
+    tokio::time::timeout(DETECT_TIMEOUT, detect(providers))
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -63,7 +66,10 @@ mod tests {
 
     #[test]
     fn disabled_builds_no_providers() {
-        let cfg = CloudMetadataConfig { enabled: false, ..Default::default() };
+        let cfg = CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(build_providers(&cfg).is_empty());
     }
 
@@ -74,7 +80,10 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_skips_probing_entirely() {
-        let cfg = CloudMetadataConfig { enabled: false, ..none_reachable() };
+        let cfg = CloudMetadataConfig {
+            enabled: false,
+            ..none_reachable()
+        };
         assert!(detect_cloud_context(&cfg).await.is_none());
     }
 
@@ -92,7 +101,10 @@ mod tests {
                 get(|| async { r#"{"instanceId":"i-9","region":"ap-south-1"}"# }),
             );
         let base = serve(router).await;
-        let cfg = CloudMetadataConfig { aws_base_url: Some(base), ..none_reachable() };
+        let cfg = CloudMetadataConfig {
+            aws_base_url: Some(base),
+            ..none_reachable()
+        };
         let got = detect_cloud_context(&cfg).await.unwrap();
         assert_eq!(got.provider, "aws");
         assert_eq!(got.instance_id.as_deref(), Some("i-9"));

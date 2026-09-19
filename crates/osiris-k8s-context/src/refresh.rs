@@ -8,7 +8,10 @@ use crate::PodCache;
 
 /// One fetch: on success replaces the whole cache and returns `Ok`; on
 /// failure keeps the last good cache (stale-while-error) and returns the cause.
-pub async fn refresh_once_result(client: &KubeletClient, cache: &PodCache) -> Result<(), FetchError> {
+pub async fn refresh_once_result(
+    client: &KubeletClient,
+    cache: &PodCache,
+) -> Result<(), FetchError> {
     let map = client.fetch_result().await?;
     cache.replace(map);
     Ok(())
@@ -111,7 +114,11 @@ mod tests {
 
         *mock.status.lock().unwrap() = 500;
         assert!(!refresh_once(&client, &cache).await);
-        assert_eq!(cache.lookup("aaa").unwrap().pod_name, "pod-a", "stale-while-error");
+        assert_eq!(
+            cache.lookup("aaa").unwrap().pod_name,
+            "pod-a",
+            "stale-while-error"
+        );
     }
 
     #[tokio::test]
@@ -137,7 +144,10 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(200)).await; // fetch now in flight
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), handle).await.expect("cancel must not wait for the fetch").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancel must not wait for the fetch")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -149,15 +159,26 @@ mod tests {
         let base = serve(mock.clone()).await;
         let cache = PodCache::new();
         let cancel = CancellationToken::new();
-        let handle = spawn_refresher(client_for(&base, &token), cache.clone(), Duration::from_millis(30), cancel.clone());
+        let handle = spawn_refresher(
+            client_for(&base, &token),
+            cache.clone(),
+            Duration::from_millis(30),
+            cancel.clone(),
+        );
 
         wait_until(|| cache.lookup("aaa").is_some()).await;
 
         *mock.body.lock().unwrap() = one_pod("bbb", "pod-b");
         wait_until(|| cache.lookup("bbb").is_some()).await;
-        assert!(cache.lookup("aaa").is_none(), "vanished container must drop out");
+        assert!(
+            cache.lookup("aaa").is_none(),
+            "vanished container must drop out"
+        );
 
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle).await.expect("refresher must stop").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("refresher must stop")
+            .unwrap();
     }
 }

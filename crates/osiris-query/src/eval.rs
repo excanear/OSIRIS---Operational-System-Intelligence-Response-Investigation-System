@@ -17,11 +17,14 @@ pub fn get_field(event: &CanonicalEvent, field: &str) -> Option<serde_json::Valu
 }
 
 fn as_f64(v: &serde_json::Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn as_str_lossy(v: &serde_json::Value) -> String {
-    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
 }
 
 /// Evaluates one comparison from the AST against a field's actual JSON
@@ -65,7 +68,7 @@ mod tests {
     use super::*;
     use crate::ast::{Ast, Op, Value};
     use osiris_schema::{
-        Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, CanonicalEvent,
+        CanonicalEvent, Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source,
         SCHEMA_VERSION,
     };
     use uuid::Uuid;
@@ -142,18 +145,34 @@ mod tests {
 
     #[test]
     fn compare_eq_matches_string_and_number() {
-        assert!(compare(&serde_json::json!("A"), Op::Eq, &Value::Str("A".to_string())));
+        assert!(compare(
+            &serde_json::json!("A"),
+            Op::Eq,
+            &Value::Str("A".to_string())
+        ));
         assert!(compare(&serde_json::json!(42), Op::Eq, &Value::Num(42.0)));
-        assert!(!compare(&serde_json::json!("A"), Op::Eq, &Value::Str("B".to_string())));
+        assert!(!compare(
+            &serde_json::json!("A"),
+            Op::Eq,
+            &Value::Str("B".to_string())
+        ));
     }
 
     #[test]
     fn compare_contains_starts_with_ends_with() {
         let hay = serde_json::json!("/usr/bin/curl");
         assert!(compare(&hay, Op::Contains, &Value::Str("bin".to_string())));
-        assert!(compare(&hay, Op::StartsWith, &Value::Str("/usr".to_string())));
+        assert!(compare(
+            &hay,
+            Op::StartsWith,
+            &Value::Str("/usr".to_string())
+        ));
         assert!(compare(&hay, Op::EndsWith, &Value::Str("curl".to_string())));
-        assert!(!compare(&hay, Op::Contains, &Value::Str("nope".to_string())));
+        assert!(!compare(
+            &hay,
+            Op::Contains,
+            &Value::Str("nope".to_string())
+        ));
     }
 
     #[test]
@@ -223,8 +242,14 @@ mod tests {
         };
         assert!(eval_ast(&event, &is_exec));
         assert!(!eval_ast(&event, &is_fork));
-        assert!(eval_ast(&event, &Ast::Or(Box::new(is_fork.clone()), Box::new(is_exec.clone()))));
-        assert!(!eval_ast(&event, &Ast::And(Box::new(is_fork.clone()), Box::new(is_exec.clone()))));
+        assert!(eval_ast(
+            &event,
+            &Ast::Or(Box::new(is_fork.clone()), Box::new(is_exec.clone()))
+        ));
+        assert!(!eval_ast(
+            &event,
+            &Ast::And(Box::new(is_fork.clone()), Box::new(is_exec.clone()))
+        ));
         assert!(eval_ast(&event, &Ast::Not(Box::new(is_fork))));
     }
 }

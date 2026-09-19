@@ -1,6 +1,4 @@
-use osiris_fileutil::{
-    parse_id, split_record, unknown_to_none, usable_session, RecordParts,
-};
+use osiris_fileutil::{parse_id, split_record, unknown_to_none, usable_session, RecordParts};
 use osiris_sensor_api::{
     IdentityEventRaw, IdentityOperation, PrivilegeEventRaw, PrivilegeOperation, RawEventSource,
 };
@@ -72,10 +70,7 @@ fn identity(parts: &RecordParts, operation: IdentityOperation) -> Option<Identit
     }))
 }
 
-fn syscall_privilege(
-    parts: &RecordParts,
-    operation: PrivilegeOperation,
-) -> Option<IdentityRecord> {
+fn syscall_privilege(parts: &RecordParts, operation: PrivilegeOperation) -> Option<IdentityRecord> {
     // setuid/setgid's single argument, lowercase hex with no `0x` prefix.
     // `ffffffff` is `(uid_t)-1` — "leave unchanged", not a transition to
     // 4,294,967,295.
@@ -183,7 +178,8 @@ fn decode_untrusted_string(line: &str, key: &str, raw_value: &str) -> String {
 }
 
 fn decode_hex(raw: &str) -> Option<String> {
-    if raw.len() < 2 || !raw.len().is_multiple_of(2) || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if raw.len() < 2 || !raw.len().is_multiple_of(2) || !raw.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
@@ -463,10 +459,7 @@ mod tests {
     /// `osiris-sensors-fs` draws for `name=`/`cwd=`.
     #[test]
     fn a_quoted_command_is_not_hex_decoded() {
-        let line = USER_CMD.replace(
-            "cmd=2F7573722F62696E2F77686F616D69",
-            r#"cmd="deadbeef""#,
-        );
+        let line = USER_CMD.replace("cmd=2F7573722F62696E2F77686F616D69", r#"cmd="deadbeef""#);
         match parse_record(&line).expect("must parse") {
             IdentityRecord::Privilege(p) => assert_eq!(p.command.as_deref(), Some("deadbeef")),
             other => panic!("expected a Privilege record, got {other:?}"),

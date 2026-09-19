@@ -29,7 +29,12 @@ impl TenantScopedStorage {
     pub fn new(inner: Arc<dyn Storage>, hosts: HashSet<Uuid>) -> Self {
         let allowed: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
         let allowed_set: HashSet<String> = allowed.iter().cloned().collect();
-        Self { inner, hosts, allowed, allowed_set }
+        Self {
+            inner,
+            hosts,
+            allowed,
+            allowed_set,
+        }
     }
 
     /// The effective host list for a plan: the tenant's hosts, intersected
@@ -38,7 +43,12 @@ impl TenantScopedStorage {
     fn effective(&self, requested: &Option<Vec<String>>) -> Option<Vec<String>> {
         match requested {
             None => Some(self.allowed.clone()),
-            Some(want) => Some(want.iter().filter(|h| self.allowed_set.contains(*h)).cloned().collect()),
+            Some(want) => Some(
+                want.iter()
+                    .filter(|h| self.allowed_set.contains(*h))
+                    .cloned()
+                    .collect(),
+            ),
         }
     }
 }
@@ -55,7 +65,10 @@ impl Storage for TenantScopedStorage {
         plan.host_ids = self.effective(&plan.host_ids);
         self.inner.query(&plan)
     }
-    fn query_events(&self, plan: &osiris_query::EventQueryPlan) -> Result<Vec<CanonicalEvent>, StorageError> {
+    fn query_events(
+        &self,
+        plan: &osiris_query::EventQueryPlan,
+    ) -> Result<Vec<CanonicalEvent>, StorageError> {
         let mut plan = plan.clone();
         plan.host_ids = self.effective(&plan.host_ids);
         self.inner.query_events(&plan)
@@ -83,10 +96,16 @@ impl Storage for TenantScopedStorage {
         plan.host_ids = self.effective(&plan.host_ids);
         self.inner.query_alerts(&plan)
     }
-    fn write_relationships(&self, _edges: &[EntityRelationship]) -> Result<WriteReport, StorageError> {
+    fn write_relationships(
+        &self,
+        _edges: &[EntityRelationship],
+    ) -> Result<WriteReport, StorageError> {
         Err(read_only())
     }
-    fn query_relationships(&self, plan: &RelationshipQueryPlan) -> Result<Vec<EntityRelationship>, StorageError> {
+    fn query_relationships(
+        &self,
+        plan: &RelationshipQueryPlan,
+    ) -> Result<Vec<EntityRelationship>, StorageError> {
         let mut plan = plan.clone();
         plan.host_ids = self.effective(&plan.host_ids);
         self.inner.query_relationships(&plan)
@@ -94,7 +113,10 @@ impl Storage for TenantScopedStorage {
     fn write_risk_scores(&self, _scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError> {
         Err(read_only())
     }
-    fn query_risk_scores(&self, plan: &RiskQueryPlan) -> Result<Vec<RiskScoreRecord>, StorageError> {
+    fn query_risk_scores(
+        &self,
+        plan: &RiskQueryPlan,
+    ) -> Result<Vec<RiskScoreRecord>, StorageError> {
         let mut plan = plan.clone();
         plan.host_ids = self.effective(&plan.host_ids);
         self.inner.query_risk_scores(&plan)
@@ -143,7 +165,10 @@ pub(crate) async fn hosts_of_tenant(
     };
     let lookup_failed = |cause: String| {
         tracing::error!(error = %cause, "tenant host lookup failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tenant lookup failed".to_string(),
+        )
     };
     let hosts = tokio::task::spawn_blocking(move || tenants.hosts_of(tenant_id))
         .await
@@ -162,7 +187,10 @@ impl FromRequestParts<Arc<dyn Storage>> for ScopedStorage {
     ) -> Result<Self, Self::Rejection> {
         match tenant_hosts(parts).await? {
             None => Ok(ScopedStorage(state.clone())),
-            Some(hosts) => Ok(ScopedStorage(Arc::new(TenantScopedStorage::new(state.clone(), hosts)))),
+            Some(hosts) => Ok(ScopedStorage(Arc::new(TenantScopedStorage::new(
+                state.clone(),
+                hosts,
+            )))),
         }
     }
 }
@@ -171,7 +199,7 @@ impl FromRequestParts<Arc<dyn Storage>> for ScopedStorage {
 mod tests {
     use super::*;
     use osiris_schema::{
-        Category, CanonicalEvent, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source,
+        CanonicalEvent, Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source,
         SCHEMA_VERSION,
     };
     use osiris_storage::{QueryPlan, RiskQueryPlan};
@@ -243,8 +271,18 @@ mod tests {
         let ev_a = event_on(a, 1, 100);
         let ev_b = event_on(b, 2, 200);
         let ev_u = event_on(unassigned, 3, 300);
-        storage.batch_write(&[ev_a.clone(), ev_b.clone(), ev_u.clone()]).unwrap();
-        Fixture { _dir: dir, inner: Arc::new(storage), a, b, ev_a, ev_b, ev_u }
+        storage
+            .batch_write(&[ev_a.clone(), ev_b.clone(), ev_u.clone()])
+            .unwrap();
+        Fixture {
+            _dir: dir,
+            inner: Arc::new(storage),
+            a,
+            b,
+            ev_a,
+            ev_b,
+            ev_u,
+        }
     }
 
     fn scoped(f: &Fixture, hosts: &[Uuid]) -> TenantScopedStorage {
@@ -258,7 +296,9 @@ mod tests {
         let got = s.query(&QueryPlan::new()).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].host_id, f.a);
-        let got = s.query_events(&osiris_query::EventQueryPlan::new()).unwrap();
+        let got = s
+            .query_events(&osiris_query::EventQueryPlan::new())
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].host_id, f.a);
     }
@@ -268,10 +308,19 @@ mod tests {
         let f = fixture();
         let s = scoped(&f, &[]);
         assert!(s.query(&QueryPlan::new()).unwrap().is_empty());
-        assert!(s.query_events(&osiris_query::EventQueryPlan::new()).unwrap().is_empty());
+        assert!(s
+            .query_events(&osiris_query::EventQueryPlan::new())
+            .unwrap()
+            .is_empty());
         assert!(s.query_alerts(&AlertQueryPlan::new()).unwrap().is_empty());
-        assert!(s.query_risk_scores(&RiskQueryPlan::new()).unwrap().is_empty());
-        assert!(s.query_relationships(&RelationshipQueryPlan::new()).unwrap().is_empty());
+        assert!(s
+            .query_risk_scores(&RiskQueryPlan::new())
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .query_relationships(&RelationshipQueryPlan::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -289,7 +338,10 @@ mod tests {
         assert_eq!(got[0].host_id, f.a);
         // Caller asks ONLY for a foreign host: empty, not the foreign data.
         let got = s
-            .query(&QueryPlan { host_ids: Some(vec![f.b.to_string()]), ..QueryPlan::new() })
+            .query(&QueryPlan {
+                host_ids: Some(vec![f.b.to_string()]),
+                ..QueryPlan::new()
+            })
             .unwrap();
         assert!(got.is_empty());
     }
@@ -313,13 +365,22 @@ mod tests {
         assert!(s.write_alerts(&[]).is_err());
         assert!(s.write_relationships(&[]).is_err());
         assert!(s.write_risk_scores(&[]).is_err());
-        assert!(s.delete(&osiris_storage::DeleteCriteria { before_timestamp: 0 }).is_err());
-        assert!(s.retention_apply(&osiris_storage::RetentionPolicy { max_age_secs: 0 }).is_err());
+        assert!(s
+            .delete(&osiris_storage::DeleteCriteria {
+                before_timestamp: 0
+            })
+            .is_err());
+        assert!(s
+            .retention_apply(&osiris_storage::RetentionPolicy { max_age_secs: 0 })
+            .is_err());
     }
 
     #[test]
     fn health_delegates_to_the_inner_storage() {
         let f = fixture();
-        assert_eq!(scoped(&f, &[f.a]).health().healthy, f.inner.health().healthy);
+        assert_eq!(
+            scoped(&f, &[f.a]).health().healthy,
+            f.inner.health().healthy
+        );
     }
 }

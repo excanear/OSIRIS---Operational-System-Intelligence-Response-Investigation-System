@@ -45,7 +45,8 @@ pub struct SqliteEvidenceStore {
 
 impl SqliteEvidenceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EvidenceStoreError> {
-        let conn = Connection::open(path).map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
+        let conn =
+            Connection::open(path).map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS evidence (
                 evidence_id TEXT PRIMARY KEY,
@@ -53,7 +54,9 @@ impl SqliteEvidenceStore {
             );",
         )
         .map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -63,8 +66,8 @@ impl EvidenceStore for SqliteEvidenceStore {
             .conn
             .lock()
             .map_err(|_| EvidenceStoreError::Backend("poisoned lock".to_string()))?;
-        let raw_json =
-            serde_json::to_string(&evidence).map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
+        let raw_json = serde_json::to_string(&evidence)
+            .map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
         conn.execute(
             "INSERT INTO evidence (evidence_id, raw_json) VALUES (?1, ?2)",
             rusqlite::params![evidence.evidence_id().to_string(), raw_json],
@@ -87,9 +90,11 @@ impl EvidenceStore for SqliteEvidenceStore {
             .optional()
             .map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
         match raw_json {
-            Some(json) => Ok(Some(
-                serde_json::from_str(&json).map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?,
-            )),
+            Some(json) => {
+                Ok(Some(serde_json::from_str(&json).map_err(|e| {
+                    EvidenceStoreError::Serialize(e.to_string())
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -119,8 +124,8 @@ impl SqliteEvidenceStore {
         let mut all = Vec::new();
         for row in rows {
             let raw_json = row.map_err(|e| EvidenceStoreError::Backend(e.to_string()))?;
-            let evidence: Evidence =
-                serde_json::from_str(&raw_json).map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
+            let evidence: Evidence = serde_json::from_str(&raw_json)
+                .map_err(|e| EvidenceStoreError::Serialize(e.to_string()))?;
             if tenant.is_none() || evidence.tenant_id() == tenant {
                 all.push(evidence);
             }
@@ -140,7 +145,10 @@ mod tests {
         Evidence::new(
             EvidenceSource::EventCapture,
             1000,
-            Integrity { hash: "abc".to_string(), immutable_since: 1000 },
+            Integrity {
+                hash: "abc".to_string(),
+                immutable_since: 1000,
+            },
             vec![],
             None,
         )
@@ -185,7 +193,10 @@ mod tests {
         let older = Evidence::new(
             EvidenceSource::EventCapture,
             1000,
-            Integrity { hash: "a".to_string(), immutable_since: 1000 },
+            Integrity {
+                hash: "a".to_string(),
+                immutable_since: 1000,
+            },
             vec![],
             None,
         )
@@ -193,7 +204,10 @@ mod tests {
         let newer = Evidence::new(
             EvidenceSource::EventCapture,
             2000,
-            Integrity { hash: "b".to_string(), immutable_since: 2000 },
+            Integrity {
+                hash: "b".to_string(),
+                immutable_since: 2000,
+            },
             vec![],
             None,
         )
@@ -225,7 +239,10 @@ mod tenant_tests {
         Evidence::new(
             EvidenceSource::EventCapture,
             ts,
-            Integrity { hash: "h".to_string(), immutable_since: ts },
+            Integrity {
+                hash: "h".to_string(),
+                immutable_since: ts,
+            },
             vec![],
             None,
         )

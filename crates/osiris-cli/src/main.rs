@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use osiris_cli::client::{
-    chain_url, container_story_url, events_url, format_events_table, hunt_url, percent_encode, risk_url,
+    chain_url, container_story_url, events_url, format_events_table, hunt_url, percent_encode,
+    risk_url,
 };
 use osiris_cli::hunts::template;
 use osiris_schema::CanonicalEvent;
@@ -178,7 +179,9 @@ fn get(
             request = request.bearer_auth(token);
         }
     }
-    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
+    let response = request
+        .send()
+        .map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
     let body = response
         .text()
@@ -204,7 +207,9 @@ fn post_json(
             request = request.bearer_auth(token);
         }
     }
-    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
+    let response = request
+        .send()
+        .map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
     let resp_body = response
         .text()
@@ -227,7 +232,9 @@ fn send_empty(
             request = request.bearer_auth(token);
         }
     }
-    let response = request.send().map_err(|e| format!("request failed: {}", e))?;
+    let response = request
+        .send()
+        .map_err(|e| format!("request failed: {}", e))?;
     let status = response.status();
     let resp_body = response
         .text()
@@ -309,7 +316,13 @@ fn main() {
             let url = risk_url(&cli.server, process_key, event_id);
             get(&client, url, true)
         }
-        Command::Hunt { query, template: template_name, since, until, limit } => {
+        Command::Hunt {
+            query,
+            template: template_name,
+            since,
+            until,
+            limit,
+        } => {
             let resolved = match (query, template_name) {
                 (Some(q), None) => q.clone(),
                 (None, Some(name)) => match template(name) {
@@ -349,10 +362,14 @@ fn main() {
                         if status.is_success() {
                             match serde_json::from_str::<serde_json::Value>(&text) {
                                 Ok(v) => {
-                                    let token = v.get("token").and_then(|t| t.as_str()).unwrap_or_default();
+                                    let token =
+                                        v.get("token").and_then(|t| t.as_str()).unwrap_or_default();
                                     match osiris_cli::auth::write_token(token) {
                                         Ok(()) => Ok("logged in".to_string()),
-                                        Err(e) => Err(format!("login succeeded but failed to save token: {}", e)),
+                                        Err(e) => Err(format!(
+                                            "login succeeded but failed to save token: {}",
+                                            e
+                                        )),
                                     }
                                 }
                                 Err(e) => Err(format!("unexpected login response: {}", e)),
@@ -372,7 +389,11 @@ fn main() {
             }
         },
         Command::Users { action } => match action {
-            UsersAction::Create { username, role, tenant } => {
+            UsersAction::Create {
+                username,
+                role,
+                tenant,
+            } => {
                 let password = match prompt_password_or_fail("Password for new user: ") {
                     Ok(p) => p,
                     Err(e) => {

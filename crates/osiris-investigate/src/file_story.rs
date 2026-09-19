@@ -87,13 +87,17 @@ pub fn file_story(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osiris_schema::{
-        Category, EventType, FileRef, HostRef, Severity, Source, SCHEMA_VERSION,
-    };
+    use osiris_schema::{Category, EventType, FileRef, HostRef, Severity, Source, SCHEMA_VERSION};
     use osiris_storage_sqlite::SqliteStorage;
     use uuid::Uuid;
 
-    fn file_event(event_type: EventType, path: &str, inode: u64, device_id: u64, timestamp: u64) -> CanonicalEvent {
+    fn file_event(
+        event_type: EventType,
+        path: &str,
+        inode: u64,
+        device_id: u64,
+        timestamp: u64,
+    ) -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
             event_id: Uuid::now_v7(),
@@ -105,7 +109,13 @@ mod tests {
             event_type,
             category: Category::File,
             severity: Severity::Info,
-            host: HostRef { host_id, hostname: "h".to_string(), distro: "d".to_string(), kernel_version: "k".to_string(), cloud: None },
+            host: HostRef {
+                host_id,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
             user: None,
             session: None,
             process: None,
@@ -144,11 +154,31 @@ mod tests {
     fn file_story_by_path_follows_a_rename_via_inode_and_device_id() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        storage.write(&file_event(EventType::FileCreate, "/tmp/a.txt", 111, 1, 100)).unwrap();
-        storage.write(&file_event(EventType::FileRename, "/tmp/b.txt", 111, 1, 200)).unwrap();
+        storage
+            .write(&file_event(
+                EventType::FileCreate,
+                "/tmp/a.txt",
+                111,
+                1,
+                100,
+            ))
+            .unwrap();
+        storage
+            .write(&file_event(
+                EventType::FileRename,
+                "/tmp/b.txt",
+                111,
+                1,
+                200,
+            ))
+            .unwrap();
 
         let story = file_story(&storage, Some("/tmp/a.txt"), None).unwrap();
-        assert_eq!(story.events.len(), 2, "both the original and renamed-to path must appear");
+        assert_eq!(
+            story.events.len(),
+            2,
+            "both the original and renamed-to path must appear"
+        );
         assert_eq!(story.events[0].timestamp, 100);
         assert_eq!(story.events[1].timestamp, 200);
     }
@@ -157,7 +187,15 @@ mod tests {
     fn file_story_by_file_id_looks_up_identity_directly() {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(dir.path().join("e.db")).unwrap();
-        storage.write(&file_event(EventType::FileCreate, "/tmp/a.txt", 222, 1, 100)).unwrap();
+        storage
+            .write(&file_event(
+                EventType::FileCreate,
+                "/tmp/a.txt",
+                222,
+                1,
+                100,
+            ))
+            .unwrap();
         let identity = osiris_schema::FileIdentity::new(222, 1);
 
         let story = file_story(&storage, None, Some(identity)).unwrap();

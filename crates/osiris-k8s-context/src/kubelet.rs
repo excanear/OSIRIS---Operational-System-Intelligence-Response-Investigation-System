@@ -37,7 +37,11 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
         return false;
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    host == "localhost" || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// The bearer token may go over verified `https`, or to a loopback host. Plain
@@ -51,7 +55,10 @@ pub(crate) fn token_may_be_sent(url: &reqwest::Url, insecure_skip_verify: bool) 
 }
 
 async fn read_capped(mut resp: reqwest::Response) -> Result<Option<String>, reqwest::Error> {
-    if resp.content_length().is_some_and(|n| n > MAX_BODY_LEN as u64) {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY_LEN as u64)
+    {
         return Ok(None);
     }
     let mut buf = Vec::new();
@@ -73,7 +80,8 @@ impl KubeletClient {
         if url.scheme() != "http" && url.scheme() != "https" {
             return None;
         }
-        let mut builder = reqwest::Client::builder().timeout(FETCH_TIMEOUT)
+        let mut builder = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
             .no_proxy()
             // A kubelet never redirects /pods; following one could carry the token elsewhere.
             .redirect(reqwest::redirect::Policy::none());
@@ -203,12 +211,17 @@ pub(crate) mod tests {
 
     async fn pods(State(mock): State<Mock>, headers: HeaderMap) -> impl IntoResponse {
         let expected = format!("Bearer {}", mock.expected_token.lock().unwrap());
-        let ok = headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(expected.as_str());
+        let ok =
+            headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(expected.as_str());
         if !ok {
             return StatusCode::UNAUTHORIZED.into_response();
         }
         let status = *mock.status.lock().unwrap();
-        (StatusCode::from_u16(status).unwrap(), mock.body.lock().unwrap().clone()).into_response()
+        (
+            StatusCode::from_u16(status).unwrap(),
+            mock.body.lock().unwrap().clone(),
+        )
+            .into_response()
     }
 
     pub(crate) async fn serve(mock: Mock) -> String {
@@ -267,7 +280,10 @@ pub(crate) mod tests {
         *mock.expected_token.lock().unwrap() = "new".to_string();
         assert!(client.fetch().await.is_none(), "stale token must fail");
         std::fs::write(&path, "new").unwrap();
-        assert!(client.fetch().await.is_some(), "rotated token must be picked up");
+        assert!(
+            client.fetch().await.is_some(),
+            "rotated token must be picked up"
+        );
     }
 
     #[tokio::test]
@@ -293,7 +309,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A valid PodList prefix followed by padding past the cap: a truncated
         // parse would look valid, so the cap must fail the whole fetch.
-        let big = format!(r#"{{"items":[],"pad":"{}"}}"#, "x".repeat(MAX_BODY_LEN + 10));
+        let big = format!(
+            r#"{{"items":[],"pad":"{}"}}"#,
+            "x".repeat(MAX_BODY_LEN + 10)
+        );
         let base = serve(Mock::new("t", &big)).await;
         let client = client_for(&base, &token_file(&dir, "t"));
         assert!(client.fetch().await.is_none());
@@ -310,7 +329,10 @@ pub(crate) mod tests {
     async fn counting_server(
         listener: tokio::net::TcpListener,
         pods_redirects_to: Option<String>,
-    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let pods_hits = Arc::new(AtomicUsize::new(0));
         let target_hits = Arc::new(AtomicUsize::new(0));
@@ -324,7 +346,8 @@ pub(crate) mod tests {
                     async move {
                         p.fetch_add(1, Ordering::SeqCst);
                         match redirect {
-                            Some(loc) => (StatusCode::FOUND, [("location", loc)], String::new()).into_response(),
+                            Some(loc) => (StatusCode::FOUND, [("location", loc)], String::new())
+                                .into_response(),
                             None => POD_LIST.into_response(),
                         }
                     }
@@ -366,7 +389,11 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let client = client_for(&format!("http://{ip}:{port}"), &token_file(&dir, "secret"));
         assert!(client.fetch().await.is_none());
-        assert_eq!(pods_hits.load(Ordering::SeqCst), 0, "no request may reach a non-loopback http kubelet");
+        assert_eq!(
+            pods_hits.load(Ordering::SeqCst),
+            0,
+            "no request may reach a non-loopback http kubelet"
+        );
     }
 
     #[tokio::test]
@@ -381,7 +408,11 @@ pub(crate) mod tests {
         let client = client_for(&format!("http://127.0.0.1:{port}"), &token_file(&dir, "t"));
         assert!(client.fetch().await.is_none());
         assert_eq!(pods_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(target_hits.load(Ordering::SeqCst), 0, "the redirect target must never be requested");
+        assert_eq!(
+            target_hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target must never be requested"
+        );
     }
 
     #[test]
@@ -430,7 +461,12 @@ pub(crate) mod tests {
         assert!(!err.to_string().contains("secret-token"));
         assert!(err.to_string().contains("500"), "{err}");
         let missing = client_for(&base, &dir.path().join("nope"));
-        assert!(missing.fetch_result().await.unwrap_err().to_string().contains("token file"));
+        assert!(missing
+            .fetch_result()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("token file"));
     }
 
     #[test]
@@ -443,7 +479,9 @@ pub(crate) mod tests {
         };
         assert!(KubeletClient::new(base("not a url", None)).is_none());
         assert!(KubeletClient::new(base("ftp://x", None)).is_none());
-        assert!(KubeletClient::new(base("https://127.0.0.1:10250", Some("/no/such/ca.pem"))).is_none());
+        assert!(
+            KubeletClient::new(base("https://127.0.0.1:10250", Some("/no/such/ca.pem"))).is_none()
+        );
         assert!(KubeletClient::new(base("https://127.0.0.1:10250", None)).is_some());
     }
 }

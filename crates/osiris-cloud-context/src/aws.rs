@@ -17,7 +17,10 @@ impl AwsImdsV2 {
     }
 
     pub fn with_base_url(base: impl Into<String>) -> Self {
-        Self { base: base.into().trim_end_matches('/').to_string(), client: http_client() }
+        Self {
+            base: base.into().trim_end_matches('/').to_string(),
+            client: http_client(),
+        }
     }
 
     async fn try_probe(&self) -> Result<Option<CloudContext>, reqwest::Error> {
@@ -34,7 +37,10 @@ impl AwsImdsV2 {
             return Ok(None);
         };
         let resp = client
-            .get(format!("{}/latest/dynamic/instance-identity/document", self.base))
+            .get(format!(
+                "{}/latest/dynamic/instance-identity/document",
+                self.base
+            ))
             .header("X-aws-ec2-metadata-token", token.trim())
             .send()
             .await?
@@ -52,7 +58,11 @@ impl AwsImdsV2 {
             tracing::debug!("aws imds response has no usable fields");
             return Ok(None);
         }
-        Ok(Some(CloudContext { provider: "aws".to_string(), instance_id, region }))
+        Ok(Some(CloudContext {
+            provider: "aws".to_string(),
+            instance_id,
+            region,
+        }))
     }
 }
 
@@ -95,9 +105,16 @@ mod tests {
     }
 
     async fn doc(headers: HeaderMap) -> impl IntoResponse {
-        let ok = headers.get("x-aws-ec2-metadata-token").and_then(|v| v.to_str().ok()) == Some("tok-123");
+        let ok = headers
+            .get("x-aws-ec2-metadata-token")
+            .and_then(|v| v.to_str().ok())
+            == Some("tok-123");
         if ok {
-            (StatusCode::OK, r#"{"instanceId":"i-0abc","region":"us-east-1"}"#).into_response()
+            (
+                StatusCode::OK,
+                r#"{"instanceId":"i-0abc","region":"us-east-1"}"#,
+            )
+                .into_response()
         } else {
             StatusCode::UNAUTHORIZED.into_response()
         }
@@ -120,7 +137,8 @@ mod tests {
 
     #[tokio::test]
     async fn token_step_failing_yields_none() {
-        let router = Router::new().route("/latest/api/token", put(|| async { StatusCode::FORBIDDEN }));
+        let router =
+            Router::new().route("/latest/api/token", put(|| async { StatusCode::FORBIDDEN }));
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
     }
@@ -136,7 +154,10 @@ mod tests {
     async fn malformed_json_yields_none() {
         let router = Router::new()
             .route("/latest/api/token", put(|| async { "tok-123" }))
-            .route("/latest/dynamic/instance-identity/document", get(|| async { "not json" }));
+            .route(
+                "/latest/dynamic/instance-identity/document",
+                get(|| async { "not json" }),
+            );
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
     }
@@ -159,21 +180,29 @@ mod tests {
     async fn no_usable_field_yields_none() {
         let router = Router::new()
             .route("/latest/api/token", put(|| async { "tok-123" }))
-            .route("/latest/dynamic/instance-identity/document", get(|| async { "{}" }));
+            .route(
+                "/latest/dynamic/instance-identity/document",
+                get(|| async { "{}" }),
+            );
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
     }
 
     #[tokio::test]
     async fn oversized_document_yields_none() {
-        let big = format!(r#"{{"instanceId":"i-1","pad":"{}"}}"#, "x".repeat(crate::MAX_BODY_LEN));
-        let router = Router::new().route("/latest/api/token", put(|| async { "tok-123" })).route(
-            "/latest/dynamic/instance-identity/document",
-            get(move || {
-                let big = big.clone();
-                async move { big }
-            }),
+        let big = format!(
+            r#"{{"instanceId":"i-1","pad":"{}"}}"#,
+            "x".repeat(crate::MAX_BODY_LEN)
         );
+        let router = Router::new()
+            .route("/latest/api/token", put(|| async { "tok-123" }))
+            .route(
+                "/latest/dynamic/instance-identity/document",
+                get(move || {
+                    let big = big.clone();
+                    async move { big }
+                }),
+            );
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
     }
@@ -189,20 +218,29 @@ mod tests {
                     async move { big }
                 }),
             )
-            .route("/latest/dynamic/instance-identity/document", get(|| async { r#"{"instanceId":"i-1"}"# }));
+            .route(
+                "/latest/dynamic/instance-identity/document",
+                get(|| async { r#"{"instanceId":"i-1"}"# }),
+            );
         let base = serve(router).await;
         assert!(AwsImdsV2::with_base_url(base).probe().await.is_none());
     }
 
     #[tokio::test]
     async fn missing_client_yields_none() {
-        let p = AwsImdsV2 { base: "http://127.0.0.1:1".into(), client: None };
+        let p = AwsImdsV2 {
+            base: "http://127.0.0.1:1".into(),
+            client: None,
+        };
         assert!(p.probe().await.is_none());
     }
 
     #[tokio::test]
     async fn unreachable_endpoint_yields_none() {
         // Port 1 on loopback: connection refused.
-        assert!(AwsImdsV2::with_base_url("http://127.0.0.1:1").probe().await.is_none());
+        assert!(AwsImdsV2::with_base_url("http://127.0.0.1:1")
+            .probe()
+            .await
+            .is_none());
     }
 }

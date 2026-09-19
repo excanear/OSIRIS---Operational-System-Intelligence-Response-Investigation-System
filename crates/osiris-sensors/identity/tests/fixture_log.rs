@@ -26,7 +26,10 @@ fn parses_exactly_the_owned_records_out_of_a_realistic_mixed_audit_log() {
             None => {}
         }
     }
-    assert_eq!(identity, 5, "USER_LOGIN x2, USER_START, USER_END, USER_LOGOUT");
+    assert_eq!(
+        identity, 5,
+        "USER_LOGIN x2, USER_START, USER_END, USER_LOGOUT"
+    );
     assert_eq!(privilege, 3, "USER_CMD, setuid, setgid — NOT setresuid");
 }
 
@@ -52,7 +55,10 @@ fn the_remote_and_local_logins_are_distinguishable_by_remote_addr_alone() {
     assert_eq!(ssh.terminal.as_deref(), Some("/dev/pts/0"));
 
     let console = logins.iter().find(|i| i.session_id == "4").expect("ses=4");
-    assert_eq!(console.remote_addr, None, "a tty1 login has no remote address");
+    assert_eq!(
+        console.remote_addr, None,
+        "a tty1 login has no remote address"
+    );
     assert_eq!(console.auth_method.as_deref(), Some("login"));
     assert_eq!(console.terminal.as_deref(), Some("tty1"));
 }
