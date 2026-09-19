@@ -14,6 +14,7 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+osiris-tenancy = { path = "../osiris-tenancy" }
 osiris-schema = { path = "../osiris-schema" }
 osiris-agent = { path = "../osiris-agent" }
 osiris-server = { path = "../osiris-server" }

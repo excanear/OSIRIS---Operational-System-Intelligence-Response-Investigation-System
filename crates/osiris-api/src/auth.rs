@@ -17,6 +17,7 @@ pub struct AuthState {
     pub users: Arc<dyn UserStore>,
     pub audit_log: Arc<dyn AuditLog + Send + Sync>,
     pub session_ttl_seconds: u64,
+    pub tenants: Arc<dyn osiris_tenancy::TenantStore>,
 }
 
 pub fn build_auth_router(state: AuthState) -> Router {
@@ -352,6 +353,9 @@ mod tests {
             users: Arc::new(store),
             audit_log: Arc::new(audit_log),
             session_ttl_seconds: 3600,
+            tenants: Arc::new(
+                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db")).unwrap(),
+            ),
         };
         (users_dir, audit_dir, state)
     }
@@ -427,6 +431,7 @@ mod tests {
             user_id: user.user_id,
             role: user.role,
             token: "irrelevant-for-this-test".to_string(),
+            tenant_id: None,
         };
 
         let Json(me) = me_handler(State(state), Extension(ctx)).await.unwrap();
@@ -441,6 +446,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             role: Role::Admin,
             token: "irrelevant".to_string(),
+            tenant_id: None,
         };
 
         let _ = create_user_handler(
@@ -466,6 +472,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             role: Role::Admin,
             token: "irrelevant".to_string(),
+            tenant_id: None,
         };
 
         let result = create_user_handler(

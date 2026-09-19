@@ -57,6 +57,7 @@ fn harness() -> Harness {
         users: Arc::new(user_store),
         audit_log: audit_log.clone(),
         session_ttl_seconds: 3600,
+        tenants: Arc::new(osiris_tenancy::SqliteTenantStore::open(p("tenants.db")).unwrap()),
     };
 
     // Reuses the SAME `SqliteEvidenceStore`/`SqliteEvidenceIncidentLinks`

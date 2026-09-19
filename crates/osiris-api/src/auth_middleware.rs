@@ -13,6 +13,7 @@ pub struct AuthContext {
     pub user_id: Uuid,
     pub role: Role,
     pub token: String,
+    pub tenant_id: Option<Uuid>,
 }
 
 /// The one route whose token may arrive as a `?token=` query parameter
@@ -97,6 +98,55 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     Role::Viewer
 }
 
+/// Routes a TENANT user (a user bound to a tenant) may call. Everything not
+/// listed is platform-only until Phase 8g scopes incidents/evidence/audit/
+/// response: the default is DENY, so a route added later stays platform-only
+/// until someone deliberately allowlists it (and makes it tenant-aware).
+pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+
+    if method == Method::POST && path == "/api/v1/auth/logout" {
+        return true;
+    }
+    if method != Method::GET {
+        return false;
+    }
+    const EXACT: &[&str] = &[
+        "/api/v1/health",
+        "/api/v1/auth/me",
+        "/api/v1/events",
+        "/api/v1/processes",
+        "/api/v1/alerts",
+        "/api/v1/files",
+        "/api/v1/files/story",
+        "/api/v1/network",
+        "/api/v1/network/story",
+        "/api/v1/identity/story",
+        "/api/v1/systemd/story",
+        "/api/v1/hosts",
+        "/api/v1/containers",
+        "/api/v1/containers/story",
+        "/api/v1/system/story",
+        "/api/v1/graph",
+        "/api/v1/graph/subgraph",
+        "/api/v1/risk",
+        "/api/v1/stream/events",
+    ];
+    if EXACT.contains(&path) {
+        return true;
+    }
+    // /api/v1/processes/:process_key and /api/v1/processes/:process_key/story
+    if let Some(rest) = path.strip_prefix("/api/v1/processes/") {
+        return !rest.is_empty();
+    }
+    // /api/v1/incidents/:seed_entity/reconstruct is event-derived (a graph walk),
+    // unlike the incident CRUD routes, which stay platform-only.
+    if let Some(rest) = path.strip_prefix("/api/v1/incidents/") {
+        return rest.ends_with("/reconstruct") && rest.len() > "/reconstruct".len();
+    }
+    false
+}
+
 pub async fn auth_gate(State(state): State<AuthState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     if path == "/api/v1/health" || path == "/api/v1/auth/login" {
@@ -151,12 +201,17 @@ pub async fn auth_gate(State(state): State<AuthState>, mut req: Request, next: N
     if user.role < min_role_for(req.method(), &path) {
         return forbidden();
     }
+    if user.tenant_id.is_some() && !tenant_route_allowed(req.method(), &path) {
+        return forbidden();
+    }
 
     req.extensions_mut().insert(AuthContext {
         user_id: user.user_id,
         role: user.role,
         token,
+        tenant_id: user.tenant_id,
     });
+    req.extensions_mut().insert(state.tenants.clone());
 
     next.run(req).await
 }
@@ -197,6 +252,9 @@ mod tests {
             users: std::sync::Arc::new(store),
             audit_log: std::sync::Arc::new(audit_log),
             session_ttl_seconds: 3600,
+            tenants: std::sync::Arc::new(
+                osiris_tenancy::SqliteTenantStore::open(users_dir.path().join("tenants.db")).unwrap(),
+            ),
         };
         (users_dir, audit_dir, state)
     }
@@ -205,6 +263,7 @@ mod tests {
         Router::new()
             .route("/api/v1/protected", get(|| async { "ok" }))
             .route("/api/v1/audit", get(|| async { "admin-ok" }))
+            .route("/api/v1/events", get(|| async { "events-ok" }))
             .route("/api/v1/stream/events", get(|| async { "stream-ok" }))
             // Stubs that mirror the *shapes* of the real Phase 7a routes, so
             // this exercises `auth_gate` + `min_role_for` against a router
@@ -604,5 +663,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn tenant_users_may_only_use_the_event_derived_get_allowlist() {
+        use axum::http::Method;
+        for path in [
+            "/api/v1/health", "/api/v1/auth/me", "/api/v1/events", "/api/v1/processes",
+            "/api/v1/processes/abc", "/api/v1/processes/abc/story", "/api/v1/alerts",
+            "/api/v1/files", "/api/v1/files/story", "/api/v1/network", "/api/v1/network/story",
+            "/api/v1/identity/story", "/api/v1/systemd/story", "/api/v1/hosts",
+            "/api/v1/containers", "/api/v1/containers/story", "/api/v1/system/story",
+            "/api/v1/graph", "/api/v1/graph/subgraph", "/api/v1/risk",
+            "/api/v1/incidents/PROCESS:abc/reconstruct", "/api/v1/stream/events",
+        ] {
+            assert!(tenant_route_allowed(&Method::GET, path), "GET {path} must be allowed");
+        }
+        assert!(tenant_route_allowed(&Method::POST, "/api/v1/auth/logout"));
+        for (m, path) in [
+            (Method::GET, "/api/v1/incidents"),
+            (Method::GET, "/api/v1/incidents/123"),
+            (Method::POST, "/api/v1/incidents"),
+            (Method::PATCH, "/api/v1/incidents/123"),
+            (Method::GET, "/api/v1/evidence"),
+            (Method::POST, "/api/v1/evidence"),
+            (Method::GET, "/api/v1/audit"),
+            (Method::POST, "/api/v1/response/collect_evidence"),
+            (Method::GET, "/api/v1/auth/users"),
+            (Method::POST, "/api/v1/auth/users"),
+            (Method::GET, "/api/v1/tenants"),
+            (Method::PUT, "/api/v1/tenants/x/hosts/y"),
+            (Method::POST, "/api/v1/events"),
+            (Method::GET, "/api/v1/something-new"),
+        ] {
+            assert!(!tenant_route_allowed(&m, path), "{m} {path} must be denied");
+        }
+    }
+
+    fn session_for_tenant_user(state: &AuthState, username: &str, role: Role, tenant: Uuid) -> String {
+        let user = state
+            .users
+            .create_user(NewUser {
+                username: username.to_string(),
+                password_hash: osiris_auth::hash_password("password123").unwrap(),
+                role,
+                tenant_id: Some(tenant),
+            })
+            .unwrap();
+        state.users.create_session(user.user_id, 3600).unwrap().token
+    }
+
+    async fn status_of(app: &Router, uri: &str, token: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_user_reaches_allowlisted_routes_but_nothing_else_even_as_admin() {
+        let (_d1, _d2, state) = test_state();
+        let token = session_for_tenant_user(&state, "acme-admin", Role::Admin, Uuid::new_v4());
+        let app = protected_app(state);
+        assert_eq!(status_of(&app, "/api/v1/events", &token).await, StatusCode::OK);
+        // Tenant-ness, not role, is what denies these: the caller is an Admin.
+        assert_eq!(status_of(&app, "/api/v1/audit", &token).await, StatusCode::FORBIDDEN);
+        assert_eq!(status_of(&app, "/api/v1/incidents", &token).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status_of(&app, "/api/v1/protected", &token).await,
+            StatusCode::FORBIDDEN,
+            "a route that is not on the allowlist is denied by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_admin_still_reaches_platform_only_and_unlisted_routes() {
+        let (_d1, _d2, state) = test_state();
+        let admin = state.users.get_user_by_username("admin").unwrap().unwrap();
+        let token = state.users.create_session(admin.user_id, 3600).unwrap().token;
+        let app = protected_app(state);
+        assert_eq!(status_of(&app, "/api/v1/audit", &token).await, StatusCode::OK);
+        assert_eq!(status_of(&app, "/api/v1/protected", &token).await, StatusCode::OK);
+        assert_eq!(status_of(&app, "/api/v1/events", &token).await, StatusCode::OK);
     }
 }

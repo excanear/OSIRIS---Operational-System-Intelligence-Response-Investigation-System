@@ -57,6 +57,9 @@ pub struct ServerConfig {
     /// `incidents_db_path` etc. already established.
     #[serde(default)]
     pub users_db_path: Option<String>,
+    /// Phase 8f: the tenant registry's own SQLite file.
+    #[serde(default)]
+    pub tenants_db_path: Option<String>,
     /// Phase 8a: session token lifetime in seconds; `main.rs` defaults to
     /// 28800 (8 hours) when absent.
     #[serde(default)]
@@ -175,6 +178,7 @@ mod tests {
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert!(config.users_db_path.is_none());
+        assert!(config.tenants_db_path.is_none());
         assert!(config.session_ttl_seconds.is_none());
     }
 
@@ -184,11 +188,12 @@ mod tests {
         let path = dir.path().join("server.yaml");
         std::fs::write(
             &path,
-            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\nusers_db_path: /tmp/users.db\nsession_ttl_seconds: 3600\n",
+            "db_path: /tmp/events.db\nspool_path: /tmp/spool.ndjson\nlisten_addr: 127.0.0.1:8080\nrules_dir: /etc/osiris/rules\nusers_db_path: /tmp/users.db\ntenants_db_path: /tmp/tenants.db\nsession_ttl_seconds: 3600\n",
         )
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert_eq!(config.users_db_path.as_deref(), Some("/tmp/users.db"));
+        assert_eq!(config.tenants_db_path.as_deref(), Some("/tmp/tenants.db"));
         assert_eq!(config.session_ttl_seconds, Some(3600));
     }
 }

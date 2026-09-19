@@ -47,6 +47,7 @@ fn mint_admin_session(dir: &std::path::Path) -> (AuthState, String) {
         users: Arc::new(user_store),
         audit_log,
         session_ttl_seconds: 3600,
+        tenants: Arc::new(osiris_tenancy::SqliteTenantStore::open(dir.join("tenants.db")).unwrap()),
     };
     (auth_state, admin_token)
 }

@@ -32,6 +32,8 @@ osiris-auth = { path = "../osiris-auth" }
 uuid = { workspace = true }
 tower-http = { workspace = true }
 
+osiris-tenancy = { path = "../osiris-tenancy" }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 uuid = { workspace = true }

@@ -229,10 +229,20 @@ async fn main() {
         );
     }
     let session_ttl_seconds = config.session_ttl_seconds.unwrap_or(28800);
+    let tenants_db_path = config
+        .tenants_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/tenants.db".to_string());
+    let tenant_store: Arc<dyn osiris_tenancy::TenantStore> = Arc::new(open_or_exit(
+        osiris_tenancy::SqliteTenantStore::open(&tenants_db_path),
+        &tenants_db_path,
+        "tenants_db_path",
+    ));
     let auth_state = AuthState {
         users: Arc::new(user_store),
         audit_log: audit_log.clone(),
         session_ttl_seconds,
+        tenants: tenant_store.clone(),
     };
 
     let app = osiris_server::apply_dev_cors(

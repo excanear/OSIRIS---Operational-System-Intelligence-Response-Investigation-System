@@ -312,7 +312,7 @@ mod tests {
     }
 
     fn ctx() -> AuthContext {
-        AuthContext { user_id: Uuid::now_v7(), role: osiris_auth::Role::ResponseOperator, token: "t".to_string() }
+        AuthContext { user_id: Uuid::now_v7(), role: osiris_auth::Role::ResponseOperator, token: "t".to_string(), tenant_id: None }
     }
 
     fn count_audit_entries(dir: &std::path::Path) -> usize {
