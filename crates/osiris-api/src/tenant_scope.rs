@@ -237,7 +237,7 @@ mod tests {
         let f = fixture();
         let s = scoped(&f, &[f.a]);
         assert!(s.write(&f.ev_a).is_err());
-        assert!(s.batch_write(&[f.ev_a.clone()]).is_err());
+        assert!(s.batch_write(std::slice::from_ref(&f.ev_a)).is_err());
         assert!(s.write_alerts(&[]).is_err());
         assert!(s.write_relationships(&[]).is_err());
         assert!(s.write_risk_scores(&[]).is_err());
