@@ -2661,6 +2661,8 @@ mod tests {
 
 pub mod auth;
 pub use auth::{build_auth_router, AuthState};
+pub mod tenants;
+pub use tenants::build_tenant_router;
 pub mod auth_middleware;
 pub use auth_middleware::{auth_gate, AuthContext};
 pub mod evidence;

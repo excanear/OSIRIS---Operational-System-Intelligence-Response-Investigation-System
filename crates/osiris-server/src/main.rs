@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use osiris_api::build_router;
 use osiris_api::{build_incident_evidence_router, build_stream_router, IncidentEvidenceState, LiveEventBroadcaster};
-use osiris_api::{build_auth_router, auth_gate, AuthState};
+use osiris_api::{build_auth_router, build_tenant_router, auth_gate, AuthState};
 use osiris_api::{build_response_router, ResponseState};
 use osiris_audit::FileAuditLog;
 use osiris_auth::SqliteUserStore;
@@ -251,6 +251,7 @@ async fn main() {
             .merge(build_response_router(response_state))
             .merge(build_stream_router(live_event_broadcaster))
             .merge(build_auth_router(auth_state.clone()))
+            .merge(build_tenant_router(auth_state.clone()))
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,
     );

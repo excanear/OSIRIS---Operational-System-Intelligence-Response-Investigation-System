@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
-use osiris_api::{auth_gate, build_auth_router, build_router, AuthState};
+use osiris_api::{auth_gate, build_auth_router, build_router, build_tenant_router, AuthState};
 use osiris_audit::FileAuditLog;
 use osiris_auth::{SqliteUserStore, UserStore};
 use osiris_baseline::BaselineEngine;
@@ -148,6 +148,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -329,6 +330,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -549,6 +551,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -798,6 +801,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1178,6 +1182,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1550,6 +1555,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1825,6 +1831,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
     let (auth_state, admin_token) = mint_admin_session(dir.path());
     let app = build_router(storage.clone())
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1995,6 +2002,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     let app = build_router(storage.clone())
         .merge(osiris_api::build_incident_evidence_router(incident_evidence_state))
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

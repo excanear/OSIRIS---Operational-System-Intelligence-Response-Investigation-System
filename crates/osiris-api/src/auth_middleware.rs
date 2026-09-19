@@ -80,7 +80,11 @@ fn percent_decode(value: &str) -> String {
 pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     use axum::http::Method;
 
-    if path == "/api/v1/audit" || path == "/api/v1/auth/users" {
+    if path == "/api/v1/audit"
+        || path == "/api/v1/auth/users"
+        || path == "/api/v1/tenants"
+        || path.starts_with("/api/v1/tenants/")
+    {
         return Role::Admin;
     }
     if method == Method::POST && path == "/api/v1/incidents" {

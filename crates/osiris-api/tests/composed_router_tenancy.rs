@@ -107,6 +107,7 @@ fn build_app(
         .merge(build_response_router(response_state))
         .merge(build_stream_router(broadcaster))
         .merge(build_auth_router(auth_state.clone()))
+        .merge(osiris_api::build_tenant_router(auth_state.clone()))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate))
 }
 
@@ -380,4 +381,110 @@ async fn a_tenants_websocket_receives_only_its_hosts_events_and_rejects_foreign_
         }
         other => panic!("expected an HTTP 403 handshake error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_platform_admin_can_create_a_tenant_assign_and_unassign_a_host() {
+    let t = tenancy();
+    let (status, body) = call(
+        &t.app, "POST", "/api/v1/tenants", Some(&t.admin_token),
+        Some(serde_json::json!({ "name": "initech" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tenant_id = Uuid::parse_str(body["tenant_id"].as_str().unwrap()).unwrap();
+    let host = Uuid::new_v4();
+    let uri = format!("/api/v1/tenants/{tenant_id}/hosts/{host}");
+
+    let (status, _) = call(&t.app, "PUT", &uri, Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(t.tenants.hosts_of(tenant_id).unwrap().contains(&host));
+
+    let (status, list) = call(&t.app, "GET", "/api/v1/tenants", Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list.as_array().unwrap().iter().any(|x| x["name"] == "initech"));
+
+    let (status, _) = call(&t.app, "DELETE", &uri, Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(t.tenants.tenant_of(host).unwrap(), None);
+}
+
+#[tokio::test]
+async fn creating_a_duplicate_tenant_name_is_a_400() {
+    let t = tenancy();
+    let (status, _) = call(
+        &t.app, "POST", "/api/v1/tenants", Some(&t.admin_token),
+        Some(serde_json::json!({ "name": "acme" })), // already created by the harness
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_tenant_user_cannot_manage_tenants() {
+    let t = tenancy();
+    let host = Uuid::new_v4();
+    let (status, _) = call(
+        &t.app, "POST", "/api/v1/tenants", Some(&t.acme_token),
+        Some(serde_json::json!({ "name": "sneaky" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&t.app, "GET", "/api/v1/tenants", Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A tenant Admin must not be able to pull another tenant's host to itself.
+    let uri = format!("/api/v1/tenants/{}/hosts/{host}", t.acme_tenant);
+    let (status, _) = call(&t.app, "PUT", &uri, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(t.tenants.tenant_of(host).unwrap(), None);
+}
+
+#[tokio::test]
+async fn assigning_a_host_to_an_unknown_tenant_is_404() {
+    let t = tenancy();
+    let uri = format!("/api/v1/tenants/{}/hosts/{}", Uuid::new_v4(), Uuid::new_v4());
+    let (status, _) = call(&t.app, "PUT", &uri, Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn creating_a_user_bound_to_a_tenant_works_and_login_reports_the_tenant() {
+    let t = tenancy();
+    let (status, _) = call(
+        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
+        Some(serde_json::json!({
+            "username": "bob", "password": "password123", "role": "VIEWER",
+            "tenant_id": t.acme_tenant,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, login) = call(
+        &t.app, "POST", "/api/v1/auth/login", None,
+        Some(serde_json::json!({ "username": "bob", "password": "password123" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(login["tenant_id"], serde_json::json!(t.acme_tenant));
+    assert_eq!(login["tenant_name"], "acme");
+
+    // A platform user's login carries no tenant.
+    let (status, unknown) = call(
+        &t.app, "POST", "/api/v1/auth/users", Some(&t.admin_token),
+        Some(serde_json::json!({
+            "username": "carol", "password": "password123", "role": "VIEWER",
+            "tenant_id": Uuid::new_v4(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown tenant must be rejected: {unknown}");
+
+    // A tenant Admin cannot mint users (platform-only).
+    let (status, _) = call(
+        &t.app, "POST", "/api/v1/auth/users", Some(&t.acme_token),
+        Some(serde_json::json!({ "username": "dave", "password": "password123", "role": "VIEWER" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

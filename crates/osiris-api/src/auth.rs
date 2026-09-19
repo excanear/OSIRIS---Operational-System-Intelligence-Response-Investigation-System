@@ -44,6 +44,8 @@ struct LoginResponse {
     token: String,
     role: Role,
     expires_at: u64,
+    tenant_id: Option<Uuid>,
+    tenant_name: Option<String>,
 }
 
 /// A fixed, precomputed Argon2id hash used to give a nonexistent-username
@@ -156,10 +158,25 @@ async fn login_handler(
         result: AuditResult::Success,
     });
 
+    let tenant_name = match user.tenant_id {
+        Some(tid) => {
+            let tenants = state.tenants.clone();
+            tokio::task::spawn_blocking(move || tenants.get_tenant(tid))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .map(|t| t.name)
+        }
+        None => None,
+    };
+
     Ok(Json(LoginResponse {
         token: session.token,
         role: user.role,
         expires_at: session.expires_at,
+        tenant_id: user.tenant_id,
+        tenant_name,
     }))
 }
 
@@ -225,6 +242,8 @@ struct CreateUserBody {
     username: String,
     password: String,
     role: Role,
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +256,21 @@ async fn create_user_handler(
     Extension(ctx): Extension<AuthContext>,
     Json(body): Json<CreateUserBody>,
 ) -> Result<Json<CreateUserResponse>, (StatusCode, String)> {
+    // Defense in depth: minting users is platform-only.
+    if ctx.tenant_id.is_some() {
+        return Err((StatusCode::FORBIDDEN, "platform users only".to_string()));
+    }
+    if let Some(tenant_id) = body.tenant_id {
+        let tenants = state.tenants.clone();
+        let found = tokio::task::spawn_blocking(move || tenants.get_tenant(tenant_id))
+            .await
+            .unwrap()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if found.is_none() {
+            return Err((StatusCode::BAD_REQUEST, "unknown tenant".to_string()));
+        }
+    }
+
     // Server-side floor, enforced before any hashing: a client (the CLI, the
     // Console, or curl) must never be the only thing standing between a weak
     // or empty password and a real account.
@@ -257,12 +291,13 @@ async fn create_user_handler(
         let users = state.users.clone();
         let username = body.username.clone();
         let role = body.role;
+        let tenant_id = body.tenant_id;
         move || {
             users.create_user(NewUser {
                 username,
                 password_hash,
                 role,
-                tenant_id: None,
+                tenant_id,
             })
         }
     })
@@ -293,6 +328,7 @@ struct UserSummary {
     username: String,
     role: Role,
     created_at: u64,
+    tenant_id: Option<Uuid>,
 }
 
 async fn list_users_handler(
@@ -314,6 +350,7 @@ async fn list_users_handler(
                 username: u.username,
                 role: u.role,
                 created_at: u.created_at,
+                tenant_id: u.tenant_id,
             })
             .collect(),
     ))
@@ -456,6 +493,7 @@ mod tests {
                 username: "dave".to_string(),
                 password: "a-long-enough-password".to_string(),
                 role: Role::ResponseOperator,
+                tenant_id: None,
             }),
         )
         .await
@@ -482,6 +520,7 @@ mod tests {
                 username: "shorty".to_string(),
                 password: "short".to_string(),
                 role: Role::Viewer,
+                tenant_id: None,
             }),
         )
         .await;
