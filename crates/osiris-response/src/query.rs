@@ -83,7 +83,7 @@ pub(crate) fn entity_query_ast(entity: &EntityRef) -> Ast {
 /// Every event touching `entity` within `[since, until]`, bounded by
 /// `limit` (clamped further to `osiris_query::MAX_EVENT_LIMIT` when
 /// `export` is true — see `EventQueryPlan::effective_limit`).
-pub(crate) fn events_for_entity(
+pub fn events_for_entity(
     storage: &dyn Storage,
     entity: &EntityRef,
     since: u64,

@@ -141,6 +141,7 @@ fn tenancy() -> Tenancy {
         links: Arc::new(
             SqliteEvidenceIncidentLinks::open(p("links.db").to_str().unwrap()).unwrap(),
         ),
+        storage: storage.clone(),
         audit_log: audit_log.clone(),
     };
     let response_state = ResponseState {
@@ -601,6 +602,30 @@ fn incident_body() -> serde_json::Value {
     serde_json::json!({ "entities": [{ "kind": "IP", "addr": "203.0.113.10" }] })
 }
 
+fn process_incident(process_key: &str) -> serde_json::Value {
+    serde_json::json!({ "entities": [{ "kind": "PROCESS", "process_key": process_key }] })
+}
+
+#[tokio::test]
+async fn a_tenant_cannot_reference_entities_outside_its_own_data() {
+    let t = tenancy();
+    // Another tenant's process, and an entity that exists nowhere: both 400.
+    for body in [process_incident(&t.globex_process_key), incident_body()] {
+        let (s, _) = call(&t.app, "POST", "/api/v1/incidents", Some(&t.acme_token), Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+    // Evidence relationships are held to the same rule.
+    let ev = serde_json::json!({
+        "source": "MANUAL_UPLOAD", "hash": "abc", "immutable_since": 1, "supersedes": null,
+        "relationships": [{ "kind": "PROCESS", "process_key": t.globex_process_key }],
+    });
+    let (s, _) = call(&t.app, "POST", "/api/v1/evidence", Some(&t.acme_token), Some(ev)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // The platform is not restricted.
+    let (s, _) = call(&t.app, "POST", "/api/v1/incidents", Some(&t.admin_token), Some(incident_body())).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
     let t = tenancy();
@@ -609,7 +634,7 @@ async fn incidents_are_isolated_per_tenant_and_foreign_ids_look_missing() {
         "POST",
         "/api/v1/incidents",
         Some(&t.acme_token),
-        Some(incident_body()),
+        Some(process_incident(&t.acme_process_key)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created}");
@@ -698,7 +723,7 @@ async fn evidence_and_links_never_cross_tenants() {
         "POST",
         "/api/v1/incidents",
         Some(&t.acme_token),
-        Some(incident_body()),
+        Some(process_incident(&t.acme_process_key)),
     )
     .await;
     let inc_id = inc["incident_id"].as_str().unwrap().to_string();
@@ -833,7 +858,7 @@ async fn the_response_engine_only_sees_the_tenants_own_hosts() {
         "POST",
         "/api/v1/incidents",
         Some(&t.globex_token),
-        Some(incident_body()),
+        Some(process_incident(&t.globex_process_key)),
     )
     .await;
     real["incident_id"] = inc["incident_id"].clone();

@@ -177,6 +177,44 @@ pub(crate) async fn hosts_of_tenant(
     Ok(Some(hosts))
 }
 
+/// The storage a caller may read: the shared one for a platform caller, a
+/// `TenantScopedStorage` over the tenant's hosts for a tenant caller.
+pub(crate) async fn scoped_storage(
+    base: Arc<dyn Storage>,
+    tenant_id: Option<Uuid>,
+    tenants: Option<Arc<dyn TenantStore>>,
+) -> Result<Arc<dyn Storage>, (StatusCode, String)> {
+    Ok(match hosts_of_tenant(tenant_id, tenants).await? {
+        None => base,
+        Some(hosts) => Arc::new(TenantScopedStorage::new(base, hosts)),
+    })
+}
+
+/// A tenant may only reference entities that exist in its own hosts' data —
+/// otherwise an incident or evidence record could name (and so probe the
+/// existence of) another tenant's process, file, address, and so on.
+pub(crate) async fn ensure_entities_in_scope(
+    scoped: Arc<dyn Storage>,
+    entities: Vec<osiris_schema::EntityRef>,
+) -> Result<(), (StatusCode, String)> {
+    let outcome = tokio::task::spawn_blocking(move || {
+        for entity in &entities {
+            let found = osiris_response::events_for_entity(scoped.as_ref(), entity, 0, u64::MAX, 1, false)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if found.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "an entity does not resolve to any data in your tenant".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    outcome
+}
+
 #[axum::async_trait]
 impl FromRequestParts<Arc<dyn Storage>> for ScopedStorage {
     type Rejection = (StatusCode, String);

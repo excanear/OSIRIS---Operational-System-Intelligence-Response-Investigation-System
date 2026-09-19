@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -22,9 +24,19 @@ pub struct CreateEvidenceBody {
 pub async fn create_evidence_handler(
     State(state): State<IncidentEvidenceState>,
     Extension(ctx): Extension<AuthContext>,
+    tenants: Option<Extension<Arc<dyn osiris_tenancy::TenantStore>>>,
     Json(body): Json<CreateEvidenceBody>,
 ) -> Result<Json<Evidence>, (StatusCode, String)> {
     let caller = ctx.tenant_id;
+    if caller.is_some() {
+        let scoped = crate::tenant_scope::scoped_storage(
+            state.storage.clone(),
+            caller,
+            tenants.map(|Extension(t)| t),
+        )
+        .await?;
+        crate::tenant_scope::ensure_entities_in_scope(scoped, body.relationships.clone()).await?;
+    }
     let integrity = Integrity {
         hash: body.hash,
         immutable_since: body.immutable_since,
@@ -213,6 +225,7 @@ mod tests {
             links: Arc::new(
                 SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap(),
             ),
+            storage: Arc::new(osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -244,7 +257,7 @@ mod tests {
             incident_id: Some(incident.incident_id),
         };
         let Json(created) =
-            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
                 .await
                 .unwrap();
 
@@ -273,7 +286,7 @@ mod tests {
             supersedes: None,
             incident_id: None,
         };
-        let err = create_evidence_handler(State(state), Extension(platform_ctx()), Json(body))
+        let err = create_evidence_handler(State(state), Extension(platform_ctx()), None, Json(body))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -319,6 +332,7 @@ mod tests {
         let _ = create_evidence_handler(
             State(state.clone()),
             Extension(platform_ctx()),
+            None,
             Json(linked_body),
         )
         .await
@@ -335,6 +349,7 @@ mod tests {
         let _ = create_evidence_handler(
             State(state.clone()),
             Extension(platform_ctx()),
+            None,
             Json(unlinked_body),
         )
         .await
@@ -389,7 +404,7 @@ mod tests {
             incident_id: Some(incident.incident_id),
         };
         let _ =
-            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+            create_evidence_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
                 .await
                 .unwrap();
 

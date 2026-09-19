@@ -77,16 +77,12 @@ async fn response_handler(
 
     // A tenant's target resolution and evidence collection only ever see its own
     // hosts' events; a foreign/platform-owned incident answers 404.
-    let storage: Arc<dyn Storage> =
-        match crate::tenant_scope::hosts_of_tenant(ctx.tenant_id, tenants.map(|Extension(t)| t))
-            .await?
-        {
-            None => state.storage.clone(),
-            Some(hosts) => Arc::new(crate::tenant_scope::TenantScopedStorage::new(
-                state.storage.clone(),
-                hosts,
-            )),
-        };
+    let storage = crate::tenant_scope::scoped_storage(
+        state.storage.clone(),
+        ctx.tenant_id,
+        tenants.map(|Extension(t)| t),
+    )
+    .await?;
     if let (Some(tenant), Some(incident_id)) = (ctx.tenant_id, body.incident_id) {
         let incidents = state.incidents.clone();
         let owned = tokio::task::spawn_blocking(move || incidents.get(incident_id))

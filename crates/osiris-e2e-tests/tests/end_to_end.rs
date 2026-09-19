@@ -2154,6 +2154,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         incidents: Arc::new(osiris_evidence::SqliteIncidentStore::open(&incidents_db).unwrap()),
         evidence: Arc::new(osiris_evidence::SqliteEvidenceStore::open(&evidence_db).unwrap()),
         links: Arc::new(osiris_evidence::SqliteEvidenceIncidentLinks::open(&links_db).unwrap()),
+        storage: storage.clone(),
         audit_log: Arc::new(osiris_audit::FileAuditLog::open(&audit_log_path).unwrap()),
     };
 

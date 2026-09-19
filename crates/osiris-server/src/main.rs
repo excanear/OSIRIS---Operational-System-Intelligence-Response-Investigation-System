@@ -216,6 +216,7 @@ async fn main() {
             &links_db_path,
             "links_db_path",
         )),
+        storage: storage.clone(),
         audit_log: audit_log.clone(),
     };
 

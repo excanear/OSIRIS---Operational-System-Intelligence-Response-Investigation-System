@@ -5,6 +5,7 @@ use uuid::Uuid;
 mod dispatch;
 mod query;
 pub use dispatch::dispatch;
+pub use query::events_for_entity;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResponseError {

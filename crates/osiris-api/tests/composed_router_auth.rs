@@ -48,6 +48,7 @@ fn harness() -> Harness {
         links: Arc::new(
             SqliteEvidenceIncidentLinks::open(p("links.db").to_str().unwrap()).unwrap(),
         ),
+        storage: storage.clone(),
         audit_log: audit_log.clone(),
     };
 

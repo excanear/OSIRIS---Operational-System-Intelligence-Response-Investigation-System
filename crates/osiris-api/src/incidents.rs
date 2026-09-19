@@ -26,6 +26,9 @@ pub struct IncidentEvidenceState {
     pub incidents: Arc<dyn IncidentStore>,
     pub evidence: Arc<dyn EvidenceStore>,
     pub links: Arc<dyn EvidenceIncidentLinks>,
+    /// The shared event store; a tenant caller only ever sees it through a
+    /// `TenantScopedStorage` (to validate the entities it references).
+    pub storage: Arc<dyn osiris_storage::Storage>,
     pub audit_log: Arc<dyn AuditLog + Send + Sync>,
 }
 
@@ -79,8 +82,18 @@ pub(crate) async fn visible_incident(
 async fn create_incident_handler(
     State(state): State<IncidentEvidenceState>,
     Extension(ctx): Extension<AuthContext>,
+    tenants: Option<Extension<Arc<dyn osiris_tenancy::TenantStore>>>,
     Json(body): Json<CreateIncidentBody>,
 ) -> Result<Json<Incident>, (StatusCode, String)> {
+    if ctx.tenant_id.is_some() {
+        let scoped = crate::tenant_scope::scoped_storage(
+            state.storage.clone(),
+            ctx.tenant_id,
+            tenants.map(|Extension(t)| t),
+        )
+        .await?;
+        crate::tenant_scope::ensure_entities_in_scope(scoped, body.entities.clone()).await?;
+    }
     let incident = Incident {
         incident_id: Uuid::now_v7(),
         status: IncidentStatus::New,
@@ -191,6 +204,7 @@ mod tests {
             links: Arc::new(
                 SqliteEvidenceIncidentLinks::open(dir.path().join("links.db")).unwrap(),
             ),
+            storage: Arc::new(osiris_storage_sqlite::SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
         };
         (dir, state)
@@ -226,7 +240,7 @@ mod tests {
             }],
         };
         let Json(created) =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
                 .await
                 .unwrap();
         assert_eq!(created.status, IncidentStatus::New);
@@ -252,12 +266,13 @@ mod tests {
         let _ = create_incident_handler(
             State(state.clone()),
             Extension(platform_ctx()),
+            None,
             Json(body.clone()),
         )
         .await
         .unwrap();
         let _ =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
                 .await
                 .unwrap();
         let Json(list) = list_incidents_handler(State(state), Extension(platform_ctx())).await;
@@ -273,7 +288,7 @@ mod tests {
             }],
         };
         let Json(created) =
-            create_incident_handler(State(state.clone()), Extension(platform_ctx()), Json(body))
+            create_incident_handler(State(state.clone()), Extension(platform_ctx()), None, Json(body))
                 .await
                 .unwrap();
 
