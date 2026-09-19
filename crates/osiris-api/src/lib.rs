@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
+use crate::tenant_scope::ScopedStorage;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -101,7 +102,7 @@ struct GraphQuery {
 /// `since`/`until` (defaulting to "everything" when omitted, since the
 /// depth cap alone already bounds response size).
 async fn graph_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<BehavioralChain>, (StatusCode, String)> {
     let Some(entity_key) = q.entity else {
@@ -143,7 +144,7 @@ struct SubgraphQuery {
 }
 
 async fn subgraph_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<SubgraphQuery>,
 ) -> Result<Json<osiris_investigate::Subgraph>, (StatusCode, String)> {
     let Some(entity_key) = q.entity else {
@@ -179,7 +180,7 @@ struct ReconstructQuery {
 /// `GET /api/v1/risk` — queries persisted `RiskScoreRecord`s by
 /// `process_key` and/or `event_id` (ARCHITECTURE.md §11.4).
 async fn risk_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<RiskQuery>,
 ) -> Result<Json<Vec<RiskScoreRecord>>, (StatusCode, String)> {
     let mut plan = RiskQueryPlan::new();
@@ -209,7 +210,7 @@ struct ApiHealth {
     last_write_at: Option<u64>,
 }
 
-async fn health_handler(State(storage): State<Arc<dyn Storage>>) -> Json<ApiHealth> {
+async fn health_handler(ScopedStorage(storage): ScopedStorage) -> Json<ApiHealth> {
     let health = tokio::task::spawn_blocking(move || storage.health())
         .await
         .unwrap();
@@ -239,7 +240,7 @@ struct EventsQuery {
 }
 
 async fn events_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<CanonicalEvent>>, (StatusCode, String)> {
     let mut plan = if let Some(oql) = &q.q {
@@ -288,7 +289,7 @@ struct ProcessSummary {
 }
 
 async fn processes_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
 ) -> Result<Json<Vec<ProcessSummary>>, (StatusCode, String)> {
     let mut plan = QueryPlan::new();
     plan.event_type = Some(EventType::ProcessExec);
@@ -320,7 +321,7 @@ struct ProcessDetail {
 }
 
 async fn process_detail_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Path(process_key_hex): Path<String>,
 ) -> Result<Json<ProcessDetail>, (StatusCode, String)> {
     let mut plan = QueryPlan::new();
@@ -362,7 +363,7 @@ struct AlertsQuery {
 }
 
 async fn alerts_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<AlertsQuery>,
 ) -> Result<Json<Vec<Alert>>, (StatusCode, String)> {
     let mut plan = AlertQueryPlan::new();
@@ -403,7 +404,7 @@ struct FileSummary {
 /// inode or device_id) are skipped, matching that type's existing
 /// `from_file_ref` semantics.
 async fn files_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
 ) -> Result<Json<Vec<FileSummary>>, (StatusCode, String)> {
     let plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
@@ -448,7 +449,7 @@ async fn files_handler(
 }
 
 async fn file_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<FileStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.path.is_none() && q.file_id.is_none() {
@@ -488,7 +489,7 @@ struct NetworkSummary {
 /// excluding `src_ip`/`src_port` since source port is normally ephemeral
 /// (see this phase's design spec). Keeps the most-recent event per group.
 async fn network_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
 ) -> Result<Json<Vec<NetworkSummary>>, (StatusCode, String)> {
     let plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
@@ -549,7 +550,7 @@ struct NetworkStoryQuery {
 /// network events directly and does not reverse-resolve to the DNS side —
 /// a deliberate, disclosed asymmetry (see the constraint's full reasoning).
 async fn network_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<NetworkStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.ip.is_none() && q.domain.is_none() {
@@ -595,7 +596,7 @@ struct IdentityStoryQuery {
 /// `AND` clauses of one `QueryPlan`), which is what the single query below
 /// gives for free.
 async fn identity_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<IdentityStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     if q.session_id.is_none() && q.uid.is_none() {
@@ -624,7 +625,7 @@ struct SystemdStoryQuery {
 /// (`SERVICE_CREATE`/`MODIFY`/`DELETE`, `TIMER_CREATE`/`MODIFY`), so this
 /// one indexed column already spans both without a union query.
 async fn systemd_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<SystemdStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let Some(unit_name) = q.unit_name else {
@@ -713,7 +714,7 @@ struct HostSummary {
 /// Latest event only: an agent that restarts while the IMDS is unreachable will
 /// show `—` until a later event carries cloud again.
 async fn hosts_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<HostsQuery>,
 ) -> Result<Json<Vec<HostSummary>>, (StatusCode, String)> {
     let now = now_ns();
@@ -790,7 +791,7 @@ fn build_host_rows(events: Vec<CanonicalEvent>, now: u64, truncated: bool) -> Ve
 /// `status` is derived from the kept (most-recent) event's `event_type`.
 /// Pod fields (Phase 8e) come from the kept event's `container.pod_ref` only; a later event without one shows null until an event carrying it becomes the latest.
 async fn containers_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
 ) -> Result<Json<Vec<ContainerSummary>>, (StatusCode, String)> {
     let plan = osiris_query::EventQueryPlan {
         filter: Some(osiris_query::ast::Ast::Compare {
@@ -855,7 +856,7 @@ async fn containers_handler(
 /// "one indexed column already spans both" reasoning `systemd_story`
 /// established in Phase 4b).
 async fn container_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<ContainerStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let Some(container_id) = q.container_id else {
@@ -878,7 +879,7 @@ struct SystemStoryQuery {
 }
 
 async fn system_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Query(q): Query<SystemStoryQuery>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let host_id: uuid::Uuid = q
@@ -897,7 +898,7 @@ async fn system_story_handler(
 }
 
 async fn process_story_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Path(process_key_hex): Path<String>,
 ) -> Result<Json<osiris_investigate::Story>, (StatusCode, String)> {
     let process_key: ProcessKey = serde_json::from_value(serde_json::Value::String(process_key_hex.clone()))
@@ -912,7 +913,7 @@ async fn process_story_handler(
 }
 
 async fn reconstruct_incident_handler(
-    State(storage): State<Arc<dyn Storage>>,
+    ScopedStorage(storage): ScopedStorage,
     Path(seed_key): Path<String>,
     Query(q): Query<ReconstructQuery>,
 ) -> Result<Json<osiris_investigate::IncidentReconstruction>, (StatusCode, String)> {
@@ -1067,7 +1068,7 @@ mod tests {
         let hostname = older.host.hostname.clone();
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(files) = files_handler(State(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_id, "1:100");
@@ -1085,7 +1086,7 @@ mod tests {
         missing_inode.file.as_mut().unwrap().inode = None;
         storage.write(&missing_inode).unwrap();
 
-        let Json(files) = files_handler(State(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
 
         assert!(files.is_empty());
     }
@@ -1099,7 +1100,7 @@ mod tests {
         b.host.host_id = b.host_id;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(files) = files_handler(State(storage)).await.unwrap();
+        let Json(files) = files_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(files.len(), 2);
     }
@@ -1178,7 +1179,7 @@ mod tests {
     async fn health_reports_event_count() {
         let (_dir, storage) = test_storage();
         storage.write(&sample_event(100, None, 1000)).unwrap();
-        let Json(health) = health_handler(State(storage)).await;
+        let Json(health) = health_handler(ScopedStorage(storage)).await;
         assert!(health.healthy);
         assert_eq!(health.event_count, 1);
     }
@@ -1197,7 +1198,7 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(State(storage), Query(query)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(query)).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].process.as_ref().unwrap().pid, 100);
     }
@@ -1215,7 +1216,7 @@ mod tests {
             export: None,
             q: Some("process.pid = 1".to_string()),
         };
-        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -1236,7 +1237,7 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EventType::SensorHealth);
@@ -1259,7 +1260,7 @@ mod tests {
             export: None,
             q: Some("process.pid =".to_string()),
         };
-        let err = events_handler(State(storage), Query(q)).await.unwrap_err();
+        let err = events_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -1274,7 +1275,7 @@ mod tests {
             export: None,
             q: Some("bogus_field = 1".to_string()),
         };
-        let err = events_handler(State(storage), Query(q)).await.unwrap_err();
+        let err = events_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("bogus_field"));
     }
@@ -1296,7 +1297,7 @@ mod tests {
             export: None,
             q: None,
         };
-        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
         assert_eq!(events.len(), DEFAULT_EVENT_LIMIT);
     }
 
@@ -1318,7 +1319,7 @@ mod tests {
             export: Some(true),
             q: None,
         };
-        let Json(events) = events_handler(State(storage), Query(q)).await.unwrap();
+        let Json(events) = events_handler(ScopedStorage(storage), Query(q)).await.unwrap();
         assert_eq!(events.len(), 600);
     }
 
@@ -1326,7 +1327,7 @@ mod tests {
     async fn processes_endpoint_deduplicates_by_process_key() {
         let (_dir, storage) = test_storage();
         storage.write(&sample_event(100, None, 1000)).unwrap();
-        let Json(processes) = processes_handler(State(storage)).await.unwrap();
+        let Json(processes) = processes_handler(ScopedStorage(storage)).await.unwrap();
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 100);
     }
@@ -1339,7 +1340,7 @@ mod tests {
         let child = sample_event(200, Some(parent_key), 2000);
         storage.batch_write(&[parent, child]).unwrap();
 
-        let Json(detail) = process_detail_handler(State(storage), Path(parent_key.as_hex()))
+        let Json(detail) = process_detail_handler(ScopedStorage(storage), Path(parent_key.as_hex()))
             .await
             .unwrap();
         assert_eq!(detail.process.process.unwrap().pid, 100);
@@ -1352,7 +1353,7 @@ mod tests {
         let (_dir, storage) = test_storage();
         let host_id = Uuid::new_v4();
         let unknown_key = ProcessKey::new(host_id, "b", 999, 999);
-        let result = process_detail_handler(State(storage), Path(unknown_key.as_hex())).await;
+        let result = process_detail_handler(ScopedStorage(storage), Path(unknown_key.as_hex())).await;
         assert!(result.is_err());
     }
 
@@ -1363,7 +1364,7 @@ mod tests {
         storage.write_alerts(&[alert]).unwrap();
 
         let Json(alerts) = alerts_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(AlertsQuery {
                 rule_id: None,
                 since: None,
@@ -1388,7 +1389,7 @@ mod tests {
             .unwrap();
 
         let Json(alerts) = alerts_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(AlertsQuery {
                 rule_id: Some("rule_a".to_string()),
                 since: None,
@@ -1406,7 +1407,7 @@ mod tests {
     async fn file_story_returns_400_when_neither_param_given() {
         let (_dir, storage) = test_storage();
         let result = file_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(FileStoryQuery {
                 path: None,
                 file_id: None,
@@ -1421,7 +1422,7 @@ mod tests {
     async fn file_story_returns_400_when_file_id_is_malformed() {
         let (_dir, storage) = test_storage();
         let result = file_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(FileStoryQuery {
                 path: None,
                 file_id: Some("not-a-valid-key".to_string()),
@@ -1448,7 +1449,7 @@ mod tests {
         storage.write_alerts(&[alert]).unwrap();
 
         let Json(story) = file_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(FileStoryQuery {
                 path: Some("/var/www/html/a.php".to_string()),
                 file_id: None,
@@ -1475,7 +1476,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = file_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(FileStoryQuery {
                 path: Some("/tmp/a.txt".to_string()),
                 file_id: None,
@@ -1502,7 +1503,7 @@ mod tests {
 
         let identity = FileIdentity::new(42, device_id);
         let Json(story) = file_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(FileStoryQuery {
                 path: None,
                 file_id: Some(identity.as_key()),
@@ -1584,7 +1585,7 @@ mod tests {
         let host_id = older.host_id;
         storage.batch_write(&[older, newer]).unwrap();
 
-        let Json(rows) = network_handler(State(storage)).await.unwrap();
+        let Json(rows) = network_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].dst_ip, "93.184.216.34");
@@ -1604,7 +1605,7 @@ mod tests {
         b.network.as_mut().unwrap().dst_port = 8443;
         storage.batch_write(&[a, b]).unwrap();
 
-        let Json(rows) = network_handler(State(storage)).await.unwrap();
+        let Json(rows) = network_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 2);
     }
@@ -1661,7 +1662,7 @@ mod tests {
     async fn network_story_returns_400_when_neither_param_given() {
         let (_dir, storage) = test_storage();
         let result = network_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(NetworkStoryQuery { ip: None, domain: None }),
         )
         .await;
@@ -1682,7 +1683,7 @@ mod tests {
         storage.write_alerts(&[alert]).unwrap();
 
         let Json(story) = network_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(NetworkStoryQuery {
                 ip: Some("203.0.113.50".to_string()),
                 domain: None,
@@ -1708,7 +1709,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = network_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(NetworkStoryQuery {
                 ip: None,
                 domain: Some("cdn-assets.xyz".to_string()),
@@ -1733,7 +1734,7 @@ mod tests {
         storage.batch_write(&[dns, connect.clone()]).unwrap();
 
         let Json(story) = network_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(NetworkStoryQuery {
                 ip: Some("203.0.113.50".to_string()),
                 domain: None,
@@ -1818,7 +1819,7 @@ mod tests {
     async fn identity_story_returns_400_when_neither_param_given() {
         let (_dir, storage) = test_storage();
         let result = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: None,
                 uid: None,
@@ -1862,7 +1863,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: Some("3".to_string()),
                 uid: None,
@@ -1907,7 +1908,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: None,
                 uid: Some(0),
@@ -1943,7 +1944,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: None,
                 uid: Some(0),
@@ -1979,7 +1980,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: Some("3".to_string()),
                 uid: Some(1000),
@@ -1995,7 +1996,7 @@ mod tests {
     async fn identity_story_returns_an_empty_story_rather_than_404_for_an_unknown_session() {
         let (_dir, storage) = test_storage();
         let Json(story) = identity_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(IdentityStoryQuery {
                 session_id: Some("does-not-exist".to_string()),
                 uid: None,
@@ -2022,7 +2023,7 @@ mod tests {
     #[tokio::test]
     async fn systemd_story_returns_400_when_unit_name_is_missing() {
         let (_dir, storage) = test_storage();
-        let result = systemd_story_handler(State(storage), Query(SystemdStoryQuery { unit_name: None }))
+        let result = systemd_story_handler(ScopedStorage(storage), Query(SystemdStoryQuery { unit_name: None }))
             .await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
@@ -2040,7 +2041,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = systemd_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(SystemdStoryQuery {
                 unit_name: Some("backdoor.service".to_string()),
             }),
@@ -2057,7 +2058,7 @@ mod tests {
     async fn systemd_story_returns_an_empty_story_rather_than_404_for_an_unknown_unit() {
         let (_dir, storage) = test_storage();
         let Json(story) = systemd_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(SystemdStoryQuery {
                 unit_name: Some("does-not-exist.service".to_string()),
             }),
@@ -2089,7 +2090,7 @@ mod tests {
         let start = container_event(&id, EventType::ContainerStart, 2000);
         storage.batch_write(&[create, start]).unwrap();
 
-        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].container_id, id);
@@ -2105,7 +2106,7 @@ mod tests {
         let stop = container_event(&id, EventType::ContainerStop, 2000);
         storage.batch_write(&[start, stop]).unwrap();
 
-        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "STOPPED");
@@ -2123,7 +2124,7 @@ mod tests {
         on_host_a.host.host_id = on_host_a.host_id;
         storage.batch_write(&[on_host_a, on_host_b]).unwrap();
 
-        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].timestamp, 2000);
@@ -2139,7 +2140,7 @@ mod tests {
         });
         storage.write(&event).unwrap();
 
-        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pod_name.as_deref(), Some("web-0"));
@@ -2151,7 +2152,7 @@ mod tests {
         let (_dir, storage) = test_storage();
         storage.write(&container_event("abc", EventType::ContainerStart, 1000)).unwrap();
 
-        let Json(rows) = containers_handler(State(storage)).await.unwrap();
+        let Json(rows) = containers_handler(ScopedStorage(storage)).await.unwrap();
 
         assert!(rows[0].pod_name.is_none());
         let json = serde_json::to_value(&rows[0]).unwrap();
@@ -2163,7 +2164,7 @@ mod tests {
     async fn container_story_returns_400_when_container_id_is_missing() {
         let (_dir, storage) = test_storage();
         let result = container_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(ContainerStoryQuery { container_id: None }),
         )
         .await;
@@ -2185,7 +2186,7 @@ mod tests {
             .unwrap();
 
         let Json(story) = container_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(ContainerStoryQuery {
                 container_id: Some(id),
             }),
@@ -2202,7 +2203,7 @@ mod tests {
     async fn container_story_returns_an_empty_story_rather_than_404_for_an_unknown_container() {
         let (_dir, storage) = test_storage();
         let Json(story) = container_story_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(ContainerStoryQuery {
                 container_id: Some("c".repeat(64)),
             }),
@@ -2217,7 +2218,7 @@ mod tests {
     async fn graph_returns_400_when_entity_is_missing() {
         let (_dir, storage) = test_storage();
         let err = graph_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(GraphQuery {
                 entity: None,
                 depth: None,
@@ -2234,7 +2235,7 @@ mod tests {
     async fn graph_returns_400_for_an_unparseable_entity_key() {
         let (_dir, storage) = test_storage();
         let err = graph_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(GraphQuery {
                 entity: Some("NOT_A_VALID_KEY".to_string()),
                 depth: None,
@@ -2267,7 +2268,7 @@ mod tests {
             .unwrap();
 
         let Json(chain) = graph_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(GraphQuery {
                 entity: Some(process_entity.storage_key()),
                 depth: None,
@@ -2322,7 +2323,7 @@ mod tests {
             .unwrap();
 
         let Json(records) = risk_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(RiskQuery {
                 process_key: Some(process_key.as_hex()),
                 event_id: None,
@@ -2338,7 +2339,7 @@ mod tests {
     async fn risk_returns_400_for_an_invalid_event_id() {
         let (_dir, storage) = test_storage();
         let err = risk_handler(
-            State(storage),
+            ScopedStorage(storage),
             Query(RiskQuery {
                 process_key: None,
                 event_id: Some("not-a-uuid".to_string()),
@@ -2356,14 +2357,14 @@ mod tests {
         let process_key = event.process.as_ref().unwrap().process_key;
         storage.write(&event).unwrap();
 
-        let Json(story) = process_story_handler(State(storage), Path(process_key.as_hex())).await.unwrap();
+        let Json(story) = process_story_handler(ScopedStorage(storage), Path(process_key.as_hex())).await.unwrap();
         assert_eq!(story.events.len(), 1);
     }
 
     #[tokio::test]
     async fn process_story_endpoint_rejects_a_malformed_process_key() {
         let (_dir, storage) = test_storage();
-        let err = process_story_handler(State(storage), Path("not-hex".to_string())).await.unwrap_err();
+        let err = process_story_handler(ScopedStorage(storage), Path("not-hex".to_string())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -2376,7 +2377,7 @@ mod tests {
         storage.write(&sample_event(2, None, 5000)).unwrap();
 
         let q = SystemStoryQuery { host_id: host_id.to_string(), since: Some(0), until: Some(1000) };
-        let Json(story) = system_story_handler(State(storage), Query(q)).await.unwrap();
+        let Json(story) = system_story_handler(ScopedStorage(storage), Query(q)).await.unwrap();
         assert_eq!(story.events.len(), 1);
     }
 
@@ -2386,7 +2387,7 @@ mod tests {
         let seed = EntityRef::Ip { addr: "203.0.113.10".to_string() };
         let q = ReconstructQuery { since: Some(0), until: Some(10_000) };
         let Json(reconstruction) =
-            reconstruct_incident_handler(State(storage), Path(seed.storage_key()), Query(q))
+            reconstruct_incident_handler(ScopedStorage(storage), Path(seed.storage_key()), Query(q))
                 .await
                 .unwrap();
         assert_eq!(reconstruction.seed, seed);
@@ -2396,7 +2397,7 @@ mod tests {
     async fn reconstruct_incident_endpoint_rejects_a_malformed_seed_key() {
         let (_dir, storage) = test_storage();
         let q = ReconstructQuery { since: None, until: None };
-        let err = reconstruct_incident_handler(State(storage), Path("not-a-key".to_string()), Query(q))
+        let err = reconstruct_incident_handler(ScopedStorage(storage), Path("not-a-key".to_string()), Query(q))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -2419,12 +2420,12 @@ mod tests {
 
         // Uncapped call should return seed + connected entity (>= 2 nodes)
         let q_uncapped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(100), since: None, until: None };
-        let Json(uncapped_result) = subgraph_handler(State(storage.clone()), Query(q_uncapped)).await.unwrap();
+        let Json(uncapped_result) = subgraph_handler(ScopedStorage(storage.clone()), Query(q_uncapped)).await.unwrap();
         assert!(uncapped_result.nodes.len() >= 2, "uncapped call should return seed + connected entity");
 
         // Capped call should respect max_nodes=1 bound
         let q_capped = SubgraphQuery { entity: Some(seed.storage_key()), depth: Some(5), max_nodes: Some(1), since: None, until: None };
-        let Json(capped_result) = subgraph_handler(State(storage), Query(q_capped)).await.unwrap();
+        let Json(capped_result) = subgraph_handler(ScopedStorage(storage), Query(q_capped)).await.unwrap();
         assert_eq!(capped_result.nodes.len(), 1, "max_nodes=1 should return exactly 1 node");
     }
 
@@ -2432,7 +2433,7 @@ mod tests {
     async fn subgraph_endpoint_requires_an_entity_parameter() {
         let (_dir, storage) = test_storage();
         let q = SubgraphQuery { entity: None, depth: None, max_nodes: None, since: None, until: None };
-        let err = subgraph_handler(State(storage), Query(q)).await.unwrap_err();
+        let err = subgraph_handler(ScopedStorage(storage), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -2497,7 +2498,7 @@ mod tests {
         // host_b: one event, 2s ago — more recent than host_a's kept event.
         storage.write(&host_event(host_b, "host-b", now - 2_000_000_000)).unwrap();
 
-        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: None, until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: None, until: None })).await.unwrap();
 
         assert_eq!(rows.len(), 2, "one row per distinct host_id");
         assert_eq!(rows[0].hostname, "host-b", "most-recently-active host first");
@@ -2515,11 +2516,11 @@ mod tests {
 
         // Default window (no since/until given) is the last 24h — this
         // event is 48h old, so it must not appear.
-        let Json(rows) = hosts_handler(State(storage.clone()), Query(HostsQuery { since: None, until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(ScopedStorage(storage.clone()), Query(HostsQuery { since: None, until: None })).await.unwrap();
         assert_eq!(rows.len(), 0);
 
         // Explicitly widening the window includes it.
-        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -2532,7 +2533,7 @@ mod tests {
         storage.write(&host_event(online_host, "online-host", now - 60 * 1_000_000_000)).unwrap(); // 60s ago
         storage.write(&host_event(stale_host, "stale-host", now - 10 * 60 * 1_000_000_000)).unwrap(); // 10 min ago
 
-        let Json(rows) = hosts_handler(State(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
+        let Json(rows) = hosts_handler(ScopedStorage(storage), Query(HostsQuery { since: Some(0), until: None })).await.unwrap();
 
         let online = rows.iter().find(|r| r.hostname == "online-host").unwrap();
         let stale = rows.iter().find(|r| r.hostname == "stale-host").unwrap();
@@ -2634,7 +2635,7 @@ mod tests {
         host_ids.sort();
 
         for _ in 0..3 {
-            let Json(rows) = hosts_handler(State(storage.clone()), Query(HostsQuery { since: Some(0), until: None }))
+            let Json(rows) = hosts_handler(ScopedStorage(storage.clone()), Query(HostsQuery { since: Some(0), until: None }))
                 .await
                 .unwrap();
             let ordered_ids: Vec<uuid::Uuid> =

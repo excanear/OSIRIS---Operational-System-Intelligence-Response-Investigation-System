@@ -95,6 +95,59 @@ impl Storage for TenantScopedStorage {
         self.inner.query_risk_scores(&plan)
     }
 }
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use axum::http::StatusCode;
+use osiris_tenancy::TenantStore;
+
+use crate::auth_middleware::AuthContext;
+
+/// Extractor handing a handler the storage it must use for THIS request:
+/// the shared storage for platform users, a `TenantScopedStorage` for tenant
+/// users. Handlers take `ScopedStorage(storage): ScopedStorage` instead of
+/// `State<Arc<dyn Storage>>`, so a handler cannot forget to scope.
+pub struct ScopedStorage(pub Arc<dyn Storage>);
+
+/// Resolves the calling tenant user's host set: `Ok(None)` for a platform (or
+/// unauthenticated-in-tests) request, `Ok(Some(hosts))` for a tenant user,
+/// and a 500 (never an unscoped fallback) when the registry cannot answer.
+pub(crate) async fn tenant_hosts(
+    parts: &Parts,
+) -> Result<Option<HashSet<Uuid>>, (StatusCode, String)> {
+    let Some(ctx) = parts.extensions.get::<AuthContext>() else {
+        return Ok(None);
+    };
+    let Some(tenant_id) = ctx.tenant_id else {
+        return Ok(None);
+    };
+    let Some(tenants) = parts.extensions.get::<Arc<dyn TenantStore>>().cloned() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tenant registry unavailable".to_string(),
+        ));
+    };
+    let hosts = tokio::task::spawn_blocking(move || tenants.hosts_of(tenant_id))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string()))?
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tenant lookup failed".to_string()))?;
+    Ok(Some(hosts))
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<dyn Storage>> for ScopedStorage {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<dyn Storage>,
+    ) -> Result<Self, Self::Rejection> {
+        match tenant_hosts(parts).await? {
+            None => Ok(ScopedStorage(state.clone())),
+            Some(hosts) => Ok(ScopedStorage(Arc::new(TenantScopedStorage::new(state.clone(), hosts)))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
