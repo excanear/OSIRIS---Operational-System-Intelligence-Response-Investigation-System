@@ -61,7 +61,8 @@ fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         password_hash,
         role: role_from_string(&role),
         created_at: created_at as u64,
-        tenant_id: tenant_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        // Fail closed: a non-NULL but unparseable value matches no tenant.
+        tenant_id: tenant_id.map(|s| Uuid::parse_str(&s).unwrap_or_else(|_| Uuid::nil())),
     })
 }
 
@@ -429,6 +430,28 @@ mod tests {
         assert_eq!(fetched.tenant_id, Some(tenant));
         let by_name = store.get_user_by_username("alice").unwrap().unwrap();
         assert_eq!(by_name.tenant_id, Some(tenant));
+        let listed = store.list_users().unwrap();
+        let alice = listed.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(alice.tenant_id, Some(tenant));
+    }
+
+    #[test]
+    fn an_unparseable_stored_tenant_id_fails_closed_not_to_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.db");
+        let (_store, _) = SqliteUserStore::open(&path).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO users (user_id, username, password_hash, role, created_at, tenant_id)                  VALUES ('22222222-2222-2222-2222-222222222222','bad','h','VIEWER',1,'not-a-uuid')",
+                [],
+            )
+            .unwrap();
+        }
+        let (store, _) = SqliteUserStore::open(&path).unwrap();
+        let u = store.get_user_by_username("bad").unwrap().unwrap();
+        assert_ne!(u.tenant_id, None);
+        assert_eq!(u.tenant_id, Some(Uuid::nil()));
     }
 
     #[test]
