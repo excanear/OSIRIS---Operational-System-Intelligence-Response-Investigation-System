@@ -322,9 +322,12 @@ struct ProcessSummary {
 
 async fn processes_handler(
     ScopedStorage(storage): ScopedStorage,
+    Query(range): Query<ListRange>,
 ) -> Result<Json<Vec<ProcessSummary>>, (StatusCode, String)> {
     let mut plan = QueryPlan::new();
     plan.event_type = Some(EventType::ProcessExec);
+    plan.since = range.since;
+    plan.until = range.until;
     plan.limit = 1000;
     let events = tokio::task::spawn_blocking(move || storage.query(&plan))
         .await
@@ -1472,12 +1475,22 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 600);
     }
+    #[tokio::test]
+    async fn processes_endpoint_honours_the_since_window() {
+        let (_dir, storage) = test_storage();
+        storage.write(&sample_event(100, None, 1000)).unwrap();
+        storage.write(&sample_event(200, None, 9000)).unwrap();
+        let Json(rows) = processes_handler(ScopedStorage(storage), Query(ListRange { since: Some(5000), until: None })).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, 200);
+    }
+
 
     #[tokio::test]
     async fn processes_endpoint_deduplicates_by_process_key() {
         let (_dir, storage) = test_storage();
         storage.write(&sample_event(100, None, 1000)).unwrap();
-        let Json(processes) = processes_handler(ScopedStorage(storage)).await.unwrap();
+        let Json(processes) = processes_handler(ScopedStorage(storage), Query(ListRange { since: None, until: None })).await.unwrap();
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 100);
     }
