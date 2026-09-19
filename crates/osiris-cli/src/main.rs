@@ -295,7 +295,7 @@ fn main() {
                 Some(key) => format!(
                     "{}/api/v1/processes/{}",
                     cli.server.trim_end_matches('/'),
-                    percent_encode(&key)
+                    percent_encode(key)
                 ),
                 None => format!("{}/api/v1/processes", cli.server.trim_end_matches('/')),
             };
@@ -431,8 +431,8 @@ fn main() {
                     &client,
                     format!(
                         "{base}/api/v1/tenants/{}/hosts/{}",
-                        percent_encode(&tenant_id),
-                        percent_encode(&host_id)
+                        percent_encode(tenant_id),
+                        percent_encode(host_id)
                     ),
                     true,
                 ),
@@ -440,8 +440,8 @@ fn main() {
                     &client,
                     format!(
                         "{base}/api/v1/tenants/{}/hosts/{}",
-                        percent_encode(&tenant_id),
-                        percent_encode(&host_id)
+                        percent_encode(tenant_id),
+                        percent_encode(host_id)
                     ),
                     true,
                 ),

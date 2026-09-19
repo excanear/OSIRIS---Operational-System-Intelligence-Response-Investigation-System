@@ -556,9 +556,7 @@ mod tests {
         )
         .await;
 
-        let (status, message) = result
-            .err()
-            .expect("a 5-character password must be rejected");
+        let (status, message) = result.expect_err("a 5-character password must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("at least 8 characters"), "got: {message}");
 
