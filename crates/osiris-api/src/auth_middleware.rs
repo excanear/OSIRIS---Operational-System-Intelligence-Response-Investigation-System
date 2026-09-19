@@ -102,9 +102,10 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
 
 /// Routes a TENANT user (a user bound to a tenant) may call. The default is
 /// DENY: a route added later stays platform-only until someone deliberately
-/// allowlists it AND makes its handler tenant-aware. Still platform-only:
-/// `/api/v1/audit` (one hash-chained log spanning all tenants), user
-/// administration and tenant administration.
+/// allowlists it AND makes its handler tenant-aware. `/api/v1/audit` is
+/// allowed (Admin only, via `min_role_for`) and the handler narrows it to the
+/// tenant's own users' actions. Still platform-only: user administration and
+/// tenant administration.
 pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
 
@@ -149,6 +150,7 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
         "/api/v1/stream/events",
         "/api/v1/incidents",
         "/api/v1/evidence",
+        "/api/v1/audit",
     ];
     if EXACT.contains(&path) {
         return true;
@@ -286,6 +288,7 @@ mod tests {
             .route("/api/v1/protected", get(|| async { "ok" }))
             .route("/api/v1/audit", get(|| async { "admin-ok" }))
             .route("/api/v1/events", get(|| async { "events-ok" }))
+            .route("/api/v1/auth/users", get(|| async { "users-ok" }))
             .route("/api/v1/stream/events", get(|| async { "stream-ok" }))
             // Stubs that mirror the *shapes* of the real Phase 7a routes, so
             // this exercises `auth_gate` + `min_role_for` against a router
@@ -734,7 +737,7 @@ mod tests {
         }
         assert!(tenant_route_allowed(&Method::POST, "/api/v1/auth/logout"));
         assert!(tenant_route_allowed(&Method::HEAD, "/api/v1/events"));
-        assert!(!tenant_route_allowed(&Method::HEAD, "/api/v1/audit"));
+        assert!(!tenant_route_allowed(&Method::HEAD, "/api/v1/auth/users"));
         for (m, path) in [
             (Method::POST, "/api/v1/incidents"),
             (Method::PATCH, "/api/v1/incidents/123"),
@@ -744,7 +747,6 @@ mod tests {
             assert!(tenant_route_allowed(&m, path), "{m} {path} must be allowed");
         }
         for (m, path) in [
-            (Method::GET, "/api/v1/audit"),
             (Method::POST, "/api/v1/response/"),
             (Method::POST, "/api/v1/response/a/b"),
             (Method::PATCH, "/api/v1/incidents/"),
@@ -812,9 +814,9 @@ mod tests {
             StatusCode::OK
         );
         // Tenant-ness, not role, is what denies these: the caller is an Admin.
-        // (the audit log spans all tenants and platform events: platform-only)
+        // (user administration is platform-only)
         assert_eq!(
-            status_of(&app, "/api/v1/audit", &token).await,
+            status_of(&app, "/api/v1/auth/users", &token).await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(

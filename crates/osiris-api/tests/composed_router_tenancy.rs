@@ -289,7 +289,7 @@ async fn the_hosts_endpoint_lists_only_the_tenants_hosts() {
 #[tokio::test]
 async fn a_tenant_user_cannot_read_platform_only_routes_even_as_a_tenant_admin() {
     let t = tenancy();
-    for (method, uri) in [("GET", "/api/v1/audit"), ("GET", "/api/v1/auth/users")] {
+    for (method, uri) in [("GET", "/api/v1/auth/users")] {
         let body = (method == "POST").then(|| serde_json::json!({}));
         let (status, _) = call(&t.app, method, uri, Some(&t.acme_token), body).await;
         assert_eq!(
@@ -871,4 +871,36 @@ async fn the_response_engine_only_sees_the_tenants_own_hosts() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_tenant_admin_sees_only_its_own_tenants_audit_entries() {
+    let t = tenancy();
+    let dry_run = |key: &str| {
+        serde_json::json!({
+            "target": { "kind": "PROCESS", "process_key": key },
+            "reason": "investigating", "dry_run": true,
+        })
+    };
+    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.acme_token),
+        Some(dry_run(&t.acme_process_key))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&t.app, "POST", "/api/v1/response/collect_evidence", Some(&t.globex_token),
+        Some(dry_run(&t.globex_process_key))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let actors = |body: &serde_json::Value| -> std::collections::HashSet<String> {
+        body.as_array().unwrap().iter()
+            .filter_map(|e| e["who"]["user_id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (s, acme) = call(&t.app, "GET", "/api/v1/audit", Some(&t.acme_token), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, globex) = call(&t.app, "GET", "/api/v1/audit", Some(&t.globex_token), None).await;
+    let (_, all) = call(&t.app, "GET", "/api/v1/audit", Some(&t.admin_token), None).await;
+
+    assert_eq!(acme.as_array().unwrap().len(), 1);
+    assert_eq!(globex.as_array().unwrap().len(), 1);
+    assert!(actors(&acme).is_disjoint(&actors(&globex)));
+    assert!(all.as_array().unwrap().len() >= 2, "the platform sees everything");
 }

@@ -371,12 +371,30 @@ struct AuditQuery {
 
 async fn audit_handler(
     State(state): State<AuthState>,
+    Extension(ctx): Extension<AuthContext>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<osiris_audit::AuditEntry>>, (StatusCode, String)> {
     let mut entries = state
         .audit_log
         .read_all()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // A tenant Admin sees only what its own tenant's users did; the log itself
+    // spans every tenant and platform-level events (logins, tenant admin).
+    if let Some(tenant_id) = ctx.tenant_id {
+        let users = state.users.clone();
+        let members: std::collections::HashSet<Uuid> =
+            tokio::task::spawn_blocking(move || users.list_users())
+                .await
+                .unwrap()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .into_iter()
+                .filter(|u| u.tenant_id == Some(tenant_id))
+                .map(|u| u.user_id)
+                .collect();
+        entries.retain(|e| {
+            matches!(&e.who, osiris_audit::ActorRef::User { user_id } if members.contains(user_id))
+        });
+    }
     entries.reverse();
     let limit = q.limit.unwrap_or(100).min(1000);
     entries.truncate(limit);
@@ -582,7 +600,10 @@ mod tests {
             })
             .unwrap();
 
-        let Json(entries) = audit_handler(State(state), Query(AuditQuery { limit: None }))
+        let Json(entries) = audit_handler(
+            State(state),
+            Extension(AuthContext { user_id: Uuid::new_v4(), role: Role::Admin, token: "t".to_string(), tenant_id: None }),
+            Query(AuditQuery { limit: None }))
             .await
             .unwrap();
         assert_eq!(entries[0].what, "second");
