@@ -1,5 +1,6 @@
 pub mod api_tls;
 pub mod config;
+pub mod control;
 pub mod cors;
 pub mod ingest;
 

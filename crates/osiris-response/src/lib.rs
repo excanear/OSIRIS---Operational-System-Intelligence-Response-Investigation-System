@@ -160,3 +160,46 @@ mod tests {
         );
     }
 }
+
+/// Why a command could not be dispatched to an Agent.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("the command channel is not enabled")]
+    Disabled,
+    #[error("host has no control connection")]
+    Offline,
+    #[error("timed out waiting for the agent's result")]
+    TimedOut,
+    #[error("command dispatch failed: {0}")]
+    Failed(String),
+}
+
+/// Sends a signed command to a host's Agent and waits for its result.
+#[async_trait::async_trait]
+pub trait CommandDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        host_id: Uuid,
+        action: osiris_command::CommandAction,
+        dry_run: bool,
+        actor: String,
+        reason: String,
+    ) -> Result<osiris_command::CommandResult, DispatchError>;
+}
+
+/// Dispatcher used when no control channel is configured.
+pub struct DisabledDispatcher;
+
+#[async_trait::async_trait]
+impl CommandDispatcher for DisabledDispatcher {
+    async fn dispatch(
+        &self,
+        _host_id: Uuid,
+        _action: osiris_command::CommandAction,
+        _dry_run: bool,
+        _actor: String,
+        _reason: String,
+    ) -> Result<osiris_command::CommandResult, DispatchError> {
+        Err(DispatchError::Disabled)
+    }
+}

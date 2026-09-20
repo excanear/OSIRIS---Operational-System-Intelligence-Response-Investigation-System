@@ -145,6 +145,7 @@ fn tenancy() -> Tenancy {
         audit_log: audit_log.clone(),
     };
     let response_state = ResponseState {
+        commands: Arc::new(osiris_response::DisabledDispatcher),
         storage: storage.clone(),
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),

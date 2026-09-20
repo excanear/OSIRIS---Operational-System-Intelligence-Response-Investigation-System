@@ -186,6 +186,58 @@ async fn main() {
         tokio::spawn(listener.run(Arc::new(ingest_context), cancellation.clone()));
     }
 
+    // Command channel: fail closed on unusable TLS or signing key.
+    let command_dispatcher: Arc<dyn osiris_response::CommandDispatcher> = match &config.control {
+        Some(ctl) => {
+            let tls = match osiris_transport::tls::server_config(
+                Path::new(&ctl.cert),
+                Path::new(&ctl.key),
+                Path::new(&ctl.client_ca),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("control tls configuration is unusable: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let key =
+                match osiris_command::keys::load_signing_key(Path::new(&ctl.command_signing_key)) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("control command_signing_key is unusable: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            let hub = osiris_transport::control::ControlHub::new();
+            let revoked = ctl.revoked_hosts.iter().copied().collect();
+            let listener = match osiris_transport::control::ControlListener::bind(
+                &ctl.listen_addr,
+                tls,
+                revoked,
+                hub.clone(),
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("cannot bind control listener on {}: {e}", ctl.listen_addr);
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!(addr = %ctl.listen_addr, "command channel enabled");
+            tokio::spawn(listener.run(cancellation.clone()));
+            Arc::new(osiris_server::control::HubDispatcher {
+                hub,
+                key,
+                timeout: Duration::from_secs(ctl.command_timeout_secs),
+            })
+        }
+        None => {
+            tracing::info!("command channel disabled (no control section)");
+            Arc::new(osiris_server::control::DisabledDispatcher)
+        }
+    };
+
     let addr = match SocketAddr::from_str(&config.listen_addr) {
         Ok(a) => a,
         Err(e) => {
@@ -296,6 +348,7 @@ async fn main() {
     };
 
     let response_state = ResponseState {
+        commands: command_dispatcher,
         storage: storage.clone(),
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),

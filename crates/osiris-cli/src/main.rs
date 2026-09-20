@@ -121,6 +121,13 @@ enum PkiAction {
         #[arg(required = true)]
         names: Vec<String>,
     },
+    /// Create the command signing key pair `<dir>/<name>.key` + `<name>.pub`.
+    InitCommandKey {
+        #[arg(long, default_value = "pki")]
+        dir: std::path::PathBuf,
+        #[arg(long, default_value = "command")]
+        name: String,
+    },
     /// Issue `<dir>/agent-<host_id>.pem` + `.key`, bound to one host id.
     IssueAgent {
         #[arg(long, default_value = "pki")]
@@ -148,6 +155,17 @@ fn run_pki(action: &PkiAction) -> Result<String, String> {
             let ca = pki::generate_ca("OSIRIS Agent CA").map_err(e)?;
             pki::write_issued(dir, "ca", &ca).map_err(e)?;
             Ok(format!("CA written to {}", dir.display()))
+        }
+        PkiAction::InitCommandKey { dir, name } => {
+            pki::validate_name(name).map_err(e)?;
+            std::fs::create_dir_all(dir)
+                .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+            osiris_command::keys::write_signing_key(dir, name).map_err(|err| err.to_string())?;
+            Ok(format!(
+                "command key written: {}\nagent config line: command_public_key: {}",
+                dir.join(format!("{name}.key")).display(),
+                dir.join(format!("{name}.pub")).display()
+            ))
         }
         PkiAction::IssueServer { dir, name, names } => {
             pki::validate_name(name).map_err(e)?;
@@ -581,5 +599,20 @@ mod pki_tests {
                 "x"
             );
         }
+    }
+
+    #[test]
+    fn init_command_key_writes_a_key_pair_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let action = PkiAction::InitCommandKey {
+            dir: dir.path().to_path_buf(),
+            name: "command".into(),
+        };
+        let out = run_pki(&action).unwrap();
+        assert!(out.contains("command_public_key:") && out.contains("command.pub"));
+        let sk = osiris_command::keys::load_signing_key(&dir.path().join("command.key")).unwrap();
+        let vk = osiris_command::keys::load_verifying_key(&dir.path().join("command.pub")).unwrap();
+        assert_eq!(sk.verifying_key(), vk);
+        assert!(run_pki(&action).is_err());
     }
 }

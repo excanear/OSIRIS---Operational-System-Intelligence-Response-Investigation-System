@@ -18,6 +18,7 @@ use crate::auth_middleware::AuthContext;
 
 #[derive(Clone)]
 pub struct ResponseState {
+    pub commands: Arc<dyn osiris_response::CommandDispatcher>,
     pub storage: Arc<dyn Storage>,
     pub evidence: Arc<dyn EvidenceStore>,
     pub links: Arc<dyn EvidenceIncidentLinks>,
@@ -351,6 +352,7 @@ mod tests {
     fn test_state() -> (tempfile::TempDir, ResponseState) {
         let dir = tempfile::tempdir().unwrap();
         let state = ResponseState {
+            commands: Arc::new(osiris_response::DisabledDispatcher),
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: Arc::new(
                 SqliteEvidenceStore::open(dir.path().join("evidence.db").to_str().unwrap())
@@ -641,6 +643,7 @@ mod tests {
             SqliteEvidenceStore::open(dir.path().join("evidence.db").to_str().unwrap()).unwrap(),
         );
         let state = ResponseState {
+            commands: Arc::new(osiris_response::DisabledDispatcher),
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: evidence.clone(),
             links: Arc::new(
@@ -698,6 +701,7 @@ mod tests {
             SqliteEvidenceStore::open(dir.path().join("evidence.db").to_str().unwrap()).unwrap(),
         );
         let state = ResponseState {
+            commands: Arc::new(osiris_response::DisabledDispatcher),
             storage: Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap()),
             evidence: evidence.clone(),
             links: Arc::new(

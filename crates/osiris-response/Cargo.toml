@@ -10,6 +10,8 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+async-trait = { workspace = true }
+osiris-command = { path = "../osiris-command" }
 osiris-schema = { path = "../osiris-schema" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-query = { path = "../osiris-query" }

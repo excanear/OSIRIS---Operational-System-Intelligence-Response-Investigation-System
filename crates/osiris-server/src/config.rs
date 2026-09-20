@@ -73,6 +73,63 @@ pub struct ServerConfig {
     /// Phase 9b: native TLS for the API/Console listener. Absent = plain HTTP.
     #[serde(default)]
     pub api_tls: Option<ApiTlsConfig>,
+    /// Phase 9c-1: server-to-agent command channel. Absent = commands disabled.
+    #[serde(default)]
+    pub control: Option<ControlServerConfig>,
+}
+
+/// Command channel listener (mTLS) and the key commands are signed with.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlServerConfig {
+    pub listen_addr: String,
+    pub cert: String,
+    pub key: String,
+    pub client_ca: String,
+    /// Hex Ed25519 signing key (see `osiris pki init-command-key`).
+    pub command_signing_key: String,
+    #[serde(default)]
+    pub revoked_hosts: Vec<uuid::Uuid>,
+    // NOTE: the two connection caps are accepted and validated but currently
+    // reserved: the transport applies its fixed 1024 / 16 constants.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u64,
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u64,
+    /// How long to wait for an Agent's result (1..=110 s).
+    #[serde(default = "default_command_timeout_secs")]
+    pub command_timeout_secs: u64,
+}
+
+fn default_max_connections() -> u64 {
+    1024
+}
+fn default_max_connections_per_ip() -> u64 {
+    16
+}
+fn default_command_timeout_secs() -> u64 {
+    30
+}
+
+impl ControlServerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, n) in [
+            ("max_connections", self.max_connections),
+            ("max_connections_per_ip", self.max_connections_per_ip),
+        ] {
+            if n == 0 || n > tokio::sync::Semaphore::MAX_PERMITS as u64 {
+                return Err(ConfigError::Invalid(format!(
+                    "control.{name} must be between 1 and {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )));
+            }
+        }
+        if !(1..=110).contains(&self.command_timeout_secs) {
+            return Err(ConfigError::Invalid(
+                "control.command_timeout_secs must be between 1 and 110".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// PEM certificate chain and private key the API/Console presents (no client auth).
@@ -144,6 +201,9 @@ impl ServerConfig {
         let config: Self = serde_yaml::from_str(&contents)?;
         if let Some(t) = &config.api_tls {
             t.validate()?;
+        }
+        if let Some(c) = &config.control {
+            c.validate()?;
         }
         Ok(config)
     }
@@ -374,5 +434,37 @@ api_tls:
 "
         )
         .is_err());
+    }
+
+    #[test]
+    fn control_is_optional_defaults_and_validates_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let base = "db_path: /e\nspool_path: /s\nlisten_addr: 127.0.0.1:8080\nrules_dir: /r\n";
+        let load = |extra: &str| {
+            std::fs::write(&path, format!("{base}{extra}")).unwrap();
+            ServerConfig::load(&path)
+        };
+        assert!(load("").unwrap().control.is_none());
+        let ctl = |extra: &str| {
+            format!(
+                "control:\n  listen_addr: 0.0.0.0:7443\n  cert: /c\n  key: /k\n  client_ca: /ca\n  command_signing_key: /s.key\n{extra}"
+            )
+        };
+        let c = load(&ctl("")).unwrap().control.unwrap();
+        assert_eq!(
+            (
+                c.max_connections,
+                c.max_connections_per_ip,
+                c.command_timeout_secs
+            ),
+            (1024, 16, 30)
+        );
+        assert!(c.revoked_hosts.is_empty());
+        assert!(load(&ctl("  command_timeout_secs: 0\n")).is_err());
+        assert!(load(&ctl("  command_timeout_secs: 111\n")).is_err());
+        assert!(load(&ctl("  command_timeout_secs: 110\n")).is_ok());
+        assert!(load(&ctl("  max_connections: 0\n")).is_err());
+        assert!(load(&ctl("  max_connections_per_ip: 0\n")).is_err());
     }
 }

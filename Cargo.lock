@@ -1393,6 +1393,7 @@ name = "osiris-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "osiris-command",
  "osiris-schema",
  "osiris-transport",
  "reqwest",
@@ -1601,7 +1602,9 @@ dependencies = [
 name = "osiris-response"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hex",
+ "osiris-command",
  "osiris-evidence",
  "osiris-query",
  "osiris-schema",
@@ -1762,10 +1765,12 @@ dependencies = [
  "osiris-audit",
  "osiris-auth",
  "osiris-baseline",
+ "osiris-command",
  "osiris-correlate",
  "osiris-detect",
  "osiris-evidence",
  "osiris-fileutil",
+ "osiris-response",
  "osiris-risk",
  "osiris-schema",
  "osiris-selftelemetry",
@@ -1773,6 +1778,7 @@ dependencies = [
  "osiris-storage-sqlite",
  "osiris-tenancy",
  "osiris-transport",
+ "rand 0.8.8",
  "rustls",
  "serde",
  "serde_json",

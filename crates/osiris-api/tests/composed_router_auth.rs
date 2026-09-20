@@ -71,6 +71,7 @@ fn harness() -> Harness {
     // exactly how `osiris-server/src/main.rs` constructs `ResponseState`,
     // not a separate set of stores.
     let response_state = ResponseState {
+        commands: Arc::new(osiris_response::DisabledDispatcher),
         storage: incident_evidence_storage_for_response,
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),
