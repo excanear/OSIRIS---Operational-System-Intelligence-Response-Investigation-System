@@ -76,3 +76,48 @@ fn ca_cert_flag_trusts_a_private_ca_and_its_absence_fails() {
     let bad = run(port, None);
     assert!(!bad.status.success());
 }
+
+fn pki_cli(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_osiris"))
+        .env("HOME", std::env::temp_dir())
+        .args(["pki"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn issue_server_name_allows_a_second_certificate_from_the_same_ca() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    assert!(pki_cli(&["init-ca", "--dir", d]).status.success());
+    assert!(pki_cli(&["issue-server", "--dir", d, "agents.example"])
+        .status
+        .success());
+    // Default name is taken; a distinct --name succeeds.
+    assert!(!pki_cli(&["issue-server", "--dir", d, "api.example"])
+        .status
+        .success());
+    let out = pki_cli(&["issue-server", "--dir", d, "--name", "api", "api.example"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.path().join("api.pem").exists());
+    assert!(dir.path().join("api.key").exists());
+    assert!(dir.path().join("server.pem").exists());
+}
+
+#[test]
+fn ca_cert_accepts_a_pem_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = pki::generate_ca("test-ca").unwrap();
+    let other = pki::generate_ca("other-ca").unwrap();
+    let srv = pki::issue_server(&ca.cert_pem, &ca.key_pem, &["localhost".to_string()]).unwrap();
+    pki::write_issued(dir.path(), "api", &srv).unwrap();
+    let bundle = dir.path().join("bundle.pem");
+    std::fs::write(&bundle, format!("{}\n{}", other.cert_pem, ca.cert_pem)).unwrap();
+    let port = spawn_tls_server(&dir.path().join("api.pem"), &dir.path().join("api.key"));
+    assert!(run(port, Some(&bundle)).status.success());
+}

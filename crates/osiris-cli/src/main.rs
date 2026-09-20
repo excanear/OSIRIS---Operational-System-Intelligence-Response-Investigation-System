@@ -111,10 +111,13 @@ enum PkiAction {
         #[arg(long, default_value = "pki")]
         dir: std::path::PathBuf,
     },
-    /// Issue `<dir>/server.pem` + `server.key` for the given DNS names / IPs.
+    /// Issue `<dir>/<name>.pem` + `<name>.key` (default `server`) for the given DNS names / IPs.
     IssueServer {
         #[arg(long, default_value = "pki")]
         dir: std::path::PathBuf,
+        /// File stem for the issued certificate and key.
+        #[arg(long, default_value = "server")]
+        name: String,
         #[arg(required = true)]
         names: Vec<String>,
     },
@@ -146,15 +149,18 @@ fn run_pki(action: &PkiAction) -> Result<String, String> {
             pki::write_issued(dir, "ca", &ca).map_err(e)?;
             Ok(format!("CA written to {}", dir.display()))
         }
-        PkiAction::IssueServer { dir, names } => {
+        PkiAction::IssueServer { dir, name, names } => {
             let issued = pki::issue_server(
                 &read(dir.join("ca.pem"))?,
                 &read(dir.join("ca.key"))?,
                 names,
             )
             .map_err(e)?;
-            pki::write_issued(dir, "server", &issued).map_err(e)?;
-            Ok(format!("server certificate written to {}", dir.display()))
+            pki::write_issued(dir, name, &issued).map_err(e)?;
+            Ok(format!(
+                "server certificate {name}.pem/.key written to {}",
+                dir.display()
+            ))
         }
         PkiAction::IssueAgent { dir, host_id } => {
             let issued = pki::issue_agent(

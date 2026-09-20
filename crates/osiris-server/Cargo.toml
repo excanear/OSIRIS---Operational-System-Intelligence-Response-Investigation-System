@@ -36,14 +36,13 @@ osiris-tenancy = { path = "../osiris-tenancy" }
 osiris-transport = { path = "../osiris-transport" }
 async-trait = { workspace = true }
 tokio-rustls = { workspace = true }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 tower = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 uuid = { workspace = true }
-tower = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 rustls = { workspace = true }

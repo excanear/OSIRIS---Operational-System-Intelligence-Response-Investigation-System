@@ -186,16 +186,25 @@ pub fn build_stream_router_with_keepalive(
 /// carries an `Origin` header, it must match the request's own `Host`
 /// header. Non-browser clients (tokio-tungstenite, websocat, Node `ws`,
 /// ...) typically send no `Origin` header at all and are unaffected.
-fn origin_is_same_site(headers: &HeaderMap) -> bool {
+fn origin_is_same_site(headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         // No Origin header: not a browser cross-origin request (e.g. a
         // native WebSocket client). Nothing to check.
         return true;
     };
-    let Some(host) = headers.get(axum::http::header::HOST) else {
-        return false;
+    // HTTP/2 carries the authority in `:authority` (the request URI), not a
+    // `Host` header, so fall back to it.
+    let host_str = match headers.get(axum::http::header::HOST) {
+        Some(h) => match h.to_str() {
+            Ok(h) => h,
+            Err(_) => return false,
+        },
+        None => match uri.authority() {
+            Some(a) => a.as_str(),
+            None => return false,
+        },
     };
-    let (Ok(origin_str), Ok(host_str)) = (origin.to_str(), host.to_str()) else {
+    let Ok(origin_str) = origin.to_str() else {
         return false;
     };
     // Origin looks like "http://127.0.0.1:8080" or "https://example.com";
@@ -227,7 +236,7 @@ async fn stream_events_handler(
     keepalive: Option<axum::Extension<KeepAlive>>,
 ) -> Result<Response, (StatusCode, String)> {
     let headers = parts.headers.clone();
-    if !origin_is_same_site(&headers) {
+    if !origin_is_same_site(&headers, &parts.uri) {
         return Err((
             StatusCode::FORBIDDEN,
             "cross-origin WebSocket connections are not allowed".to_string(),
@@ -489,7 +498,10 @@ mod tests {
             "http://127.0.0.1:8080".parse().unwrap(),
         );
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
-        assert!(origin_is_same_site(&headers));
+        assert!(origin_is_same_site(
+            &headers,
+            &axum::http::Uri::from_static("/x")
+        ));
     }
 
     #[test]
@@ -500,14 +512,38 @@ mod tests {
             "https://evil.example".parse().unwrap(),
         );
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
-        assert!(!origin_is_same_site(&headers));
+        assert!(!origin_is_same_site(
+            &headers,
+            &axum::http::Uri::from_static("/x")
+        ));
     }
 
     #[test]
     fn origin_is_same_site_allows_a_request_with_no_origin_header() {
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
-        assert!(origin_is_same_site(&headers));
+        assert!(origin_is_same_site(
+            &headers,
+            &axum::http::Uri::from_static("/x")
+        ));
+    }
+
+    #[test]
+    fn origin_is_same_site_uses_the_uri_authority_when_host_is_missing() {
+        // HTTP/2 requests have `:authority` instead of a Host header.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://osiris.example:8443".parse().unwrap(),
+        );
+        let same: axum::http::Uri = "https://osiris.example:8443/api/v1/stream/events"
+            .parse()
+            .unwrap();
+        let other: axum::http::Uri = "https://other.example/api/v1/stream/events"
+            .parse()
+            .unwrap();
+        assert!(origin_is_same_site(&headers, &same));
+        assert!(!origin_is_same_site(&headers, &other));
     }
 
     #[test]
@@ -517,7 +553,10 @@ mod tests {
             axum::http::header::ORIGIN,
             "http://127.0.0.1:8080".parse().unwrap(),
         );
-        assert!(!origin_is_same_site(&headers));
+        assert!(!origin_is_same_site(
+            &headers,
+            &axum::http::Uri::from_static("/x")
+        ));
     }
 
     #[test]

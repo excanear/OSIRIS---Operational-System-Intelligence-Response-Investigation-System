@@ -121,6 +121,14 @@ async fn main() {
     let live_event_broadcaster = Arc::new(LiveEventBroadcaster::new());
 
     let cancellation = CancellationToken::new();
+    tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            osiris_server::shutdown_signal().await;
+            tracing::info!("shutdown signal received; draining connections");
+            cancellation.cancel();
+        }
+    });
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
     let ingest_context = osiris_server::IngestContext {
@@ -199,12 +207,16 @@ async fn main() {
             if !osiris_server::api_tls::is_loopback_addr(&config.listen_addr) {
                 tracing::warn!(
                     listen_addr = %config.listen_addr,
-                    "API/Console is listening on a non-loopback address without api_tls;                      session tokens travel unencrypted"
+                    "API/Console is listening on a non-loopback address without api_tls; session tokens travel unencrypted"
                 );
             }
+            tracing::info!("API TLS disabled (no api_tls configured); serving plain HTTP");
             None
         }
     };
+    if config.api_tls.is_some() {
+        tracing::info!("API TLS enabled");
+    }
 
     let incidents_db_path = config
         .incidents_db_path
@@ -348,7 +360,11 @@ async fn main() {
             osiris_server::api_tls::serve_tls(listener, acceptor.clone(), app, cancellation).await;
         }
         None => {
-            axum::serve(listener, app).await.unwrap();
+            let token = cancellation.clone();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .await
+                .unwrap();
         }
     }
 }
