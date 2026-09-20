@@ -158,8 +158,6 @@ fn run_pki(action: &PkiAction) -> Result<String, String> {
         }
         PkiAction::InitCommandKey { dir, name } => {
             pki::validate_name(name).map_err(e)?;
-            std::fs::create_dir_all(dir)
-                .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
             osiris_command::keys::write_signing_key(dir, name).map_err(|err| err.to_string())?;
             Ok(format!(
                 "command key written: {}\nagent config line: command_public_key: {}",

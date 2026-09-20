@@ -168,6 +168,10 @@ pub enum DispatchError {
     Disabled,
     #[error("host has no control connection")]
     Offline,
+    /// NEVER means "not executed": the signed validity window is the wait
+    /// timeout plus 5 s, so the Agent may still accept the command for ~5 s
+    /// after this is reported and then run it for up to its own execution
+    /// timeout. An Agent clock that lags by X also extends validity by X.
     #[error("timed out waiting for the agent's result")]
     TimedOut,
     #[error("command dispatch failed: {0}")]

@@ -226,11 +226,11 @@ async fn main() {
             };
             tracing::info!(addr = %ctl.listen_addr, "command channel enabled");
             tokio::spawn(listener.run(cancellation.clone()));
-            Arc::new(osiris_server::control::HubDispatcher {
+            Arc::new(osiris_server::control::HubDispatcher::new(
                 hub,
                 key,
-                timeout: Duration::from_secs(ctl.command_timeout_secs),
-            })
+                Duration::from_secs(ctl.command_timeout_secs),
+            ))
         }
         None => {
             tracing::info!("command channel disabled (no control section)");

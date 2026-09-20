@@ -89,10 +89,11 @@ pub struct ControlServerConfig {
     pub command_signing_key: String,
     #[serde(default)]
     pub revoked_hosts: Vec<uuid::Uuid>,
-    // NOTE: the two connection caps are accepted and validated but currently
-    // reserved: the transport applies its fixed 1024 / 16 constants.
+    /// RESERVED - accepted and validated but NOT yet enforced; the control listener currently applies fixed caps of 1024 connections / 16 per IP.
+    // Task 7's operator documentation must repeat this reservation.
     #[serde(default = "default_max_connections")]
     pub max_connections: u64,
+    /// RESERVED - accepted and validated but NOT yet enforced; the control listener currently applies fixed caps of 1024 connections / 16 per IP.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u64,
     /// How long to wait for an Agent's result (1..=110 s).
@@ -112,13 +113,31 @@ fn default_command_timeout_secs() -> u64 {
 
 impl ControlServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        for (name, v) in [
+            ("cert", &self.cert),
+            ("key", &self.key),
+            ("client_ca", &self.client_ca),
+            ("command_signing_key", &self.command_signing_key),
+        ] {
+            if v.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "control.{name} must not be empty"
+                )));
+            }
+        }
+        if self.listen_addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(ConfigError::Invalid(format!(
+                "control.listen_addr '{}' is not a valid socket address",
+                self.listen_addr
+            )));
+        }
         for (name, n) in [
             ("max_connections", self.max_connections),
             ("max_connections_per_ip", self.max_connections_per_ip),
         ] {
             if n == 0 || n > tokio::sync::Semaphore::MAX_PERMITS as u64 {
                 return Err(ConfigError::Invalid(format!(
-                    "control.{name} must be between 1 and {}",
+                    "control.{name} (reserved, not yet enforced) must be between 1 and {}",
                     tokio::sync::Semaphore::MAX_PERMITS
                 )));
             }
@@ -466,5 +485,51 @@ api_tls:
         assert!(load(&ctl("  command_timeout_secs: 110\n")).is_ok());
         assert!(load(&ctl("  max_connections: 0\n")).is_err());
         assert!(load(&ctl("  max_connections_per_ip: 0\n")).is_err());
+    }
+
+    #[test]
+    fn control_reserved_caps_are_accepted_and_validated_but_not_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let load = |body: &str| {
+            std::fs::write(
+                &path,
+                format!("db_path: /e\nspool_path: /s\nlisten_addr: 127.0.0.1:8080\nrules_dir: /r\ncontrol:\n{body}"),
+            )
+            .unwrap();
+            ServerConfig::load(&path)
+        };
+        let ok = "  listen_addr: 0.0.0.0:7443\n  cert: /c\n  key: /k\n  client_ca: /ca\n  command_signing_key: /s\n";
+        let c = load(&format!(
+            "{ok}  max_connections: 5\n  max_connections_per_ip: 2\n"
+        ))
+        .unwrap()
+        .control
+        .unwrap();
+        assert_eq!((c.max_connections, c.max_connections_per_ip), (5, 2));
+        let err = load(&format!("{ok}  max_connections: 0\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn control_rejects_empty_paths_and_bad_listen_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let load = |addr: &str, cert: &str, key: &str, ca: &str, sk: &str| {
+            std::fs::write(
+                &path,
+                format!("db_path: /e\nspool_path: /s\nlisten_addr: 127.0.0.1:8080\nrules_dir: /r\ncontrol:\n  listen_addr: {addr}\n  cert: \"{cert}\"\n  key: \"{key}\"\n  client_ca: \"{ca}\"\n  command_signing_key: \"{sk}\"\n"),
+            )
+            .unwrap();
+            ServerConfig::load(&path)
+        };
+        assert!(load("0.0.0.0:1", "/c", "/k", "/ca", "/s").is_ok());
+        assert!(load("0.0.0.0:1", "", "/k", "/ca", "/s").is_err());
+        assert!(load("0.0.0.0:1", "/c", "", "/ca", "/s").is_err());
+        assert!(load("0.0.0.0:1", "/c", "/k", "", "/s").is_err());
+        assert!(load("0.0.0.0:1", "/c", "/k", "/ca", "").is_err());
+        assert!(load("not-an-addr", "/c", "/k", "/ca", "/s").is_err());
     }
 }
