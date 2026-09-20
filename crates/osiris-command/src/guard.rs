@@ -2,7 +2,7 @@ use crate::envelope::{verify, CommandAction, SignedCommand};
 use crate::replay::ReplayStore;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 const MAX_TTL_MS: u64 = 120_000;
@@ -43,10 +43,42 @@ impl ProtectedTargets {
     }
 
     pub fn check_path(&self, path: &str) -> Result<(), Refusal> {
-        if Path::new(path).starts_with(&self.vault) {
-            return Err(Refusal::ProtectedTarget(format!("path {path}")));
+        let deny = |why: &str| Err(Refusal::ProtectedTarget(format!("path {path}: {why}")));
+        let p = Path::new(path);
+        if !(p.is_absolute() || p.has_root()) {
+            return deny("not absolute");
+        }
+        if p.components().any(|c| c == Component::ParentDir) {
+            return deny("contains ..");
+        }
+        if p.starts_with(&self.vault) {
+            return deny("inside vault");
+        }
+        let vault = std::fs::canonicalize(&self.vault).unwrap_or_else(|_| self.vault.clone());
+        if resolve_lenient(p).starts_with(&vault) {
+            return deny("resolves into vault");
         }
         Ok(())
+    }
+}
+
+/// Canonicalizes the longest existing ancestor and re-appends the missing remainder.
+fn resolve_lenient(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            let mut out = c;
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
     }
 }
 
@@ -239,6 +271,56 @@ mod tests {
         );
         assert!(matches!(
             f.guard.admit(&sc, NOW),
+            Err(Refusal::ProtectedTarget(_))
+        ));
+    }
+
+    #[test]
+    fn ttl_and_skew_boundaries_admitted() {
+        let f = fx();
+        let sc = signed(&f, term(42), |c| c.expires_at_ms = c.issued_at_ms + 120_000);
+        assert_eq!(f.guard.admit(&sc, NOW), Ok(()));
+        let sc = signed(&f, term(42), |c| {
+            c.issued_at_ms = NOW + 60_000;
+            c.expires_at_ms = NOW + 90_000;
+        });
+        assert_eq!(f.guard.admit(&sc, NOW), Ok(()));
+    }
+
+    #[test]
+    fn path_checks() {
+        let f = fx();
+        let p = &f.guard.protected;
+        for bad in [
+            "/tmp/../var/lib/osiris/vault/secret",
+            "relative/file",
+            "/var/lib/osiris/vault",
+            "/var/lib/osiris/vault/x",
+        ] {
+            assert!(
+                matches!(p.check_path(bad), Err(Refusal::ProtectedTarget(_))),
+                "{bad}"
+            );
+        }
+        assert_eq!(p.check_path("/var/lib/osiris/vault-other/x"), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_into_vault_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let vault = d.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&vault, &link).unwrap();
+        let t = ProtectedTargets {
+            agent_pid: 1,
+            extra_pids: vec![],
+            vault,
+        };
+        let target = format!("{}/secret", link.display());
+        assert!(matches!(
+            t.check_path(&target),
             Err(Refusal::ProtectedTarget(_))
         ));
     }

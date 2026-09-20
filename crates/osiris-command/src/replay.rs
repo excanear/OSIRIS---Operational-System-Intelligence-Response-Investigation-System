@@ -1,12 +1,23 @@
 use crate::guard::Refusal;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
 const PRUNE_GRACE_MS: u64 = 60_000;
+
+fn parse_line(buf: &[u8]) -> Option<(Uuid, u64)> {
+    let line = std::str::from_utf8(buf).ok()?;
+    if !line.ends_with('\n') {
+        return None; // torn final line
+    }
+    let mut it = line.split_whitespace();
+    let id = it.next()?.parse::<Uuid>().ok()?;
+    let exp = it.next()?.parse::<u64>().ok()?;
+    Some((id, exp))
+}
 
 struct Inner {
     seen: HashMap<Uuid, u64>,
@@ -21,15 +32,25 @@ pub struct ReplayStore {
 impl ReplayStore {
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut seen = HashMap::new();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                let mut it = line.split_whitespace();
-                if let (Some(id), Some(exp)) = (it.next(), it.next()) {
-                    if let (Ok(id), Ok(exp)) = (id.parse::<Uuid>(), exp.parse::<u64>()) {
-                        seen.insert(id, exp);
-                    }
+        let mut reader = match File::open(path) {
+            Ok(f) => Some(std::io::BufReader::new(f)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(r) = reader.as_mut() {
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                if r.read_until(b'\n', &mut buf)? == 0 {
+                    break;
+                }
+                // Malformed or torn lines are skipped; they never discard other entries.
+                if let Some((id, exp)) = parse_line(&buf) {
+                    seen.insert(id, exp);
                 }
             }
+        } else {
+            // no file yet: empty store
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
@@ -56,5 +77,48 @@ impl ReplayStore {
             .map_err(|_| Refusal::Replay)?;
         g.seen.insert(id, expires_at_ms);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn torn_non_utf8_last_line_keeps_earlier_ids() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("r");
+        let mut f = File::create(&p).unwrap();
+        writeln!(f, "{} 100", id(1)).unwrap();
+        writeln!(f, "{} 100", id(2)).unwrap();
+        f.write_all(b"0000\xff\xfe").unwrap();
+        drop(f);
+        let s = ReplayStore::open(&p).unwrap();
+        assert_eq!(s.check_and_record(id(1), 100, 0), Err(Refusal::Replay));
+        assert_eq!(s.check_and_record(id(2), 100, 0), Err(Refusal::Replay));
+    }
+
+    #[test]
+    fn unreadable_path_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(ReplayStore::open(d.path()).is_err());
+    }
+
+    #[test]
+    fn garbage_middle_line_does_not_drop_later_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("r");
+        let mut f = File::create(&p).unwrap();
+        writeln!(f, "{} 100", id(1)).unwrap();
+        f.write_all(b"garbage\xff line\n").unwrap();
+        writeln!(f, "{} 100", id(3)).unwrap();
+        drop(f);
+        let s = ReplayStore::open(&p).unwrap();
+        assert_eq!(s.check_and_record(id(1), 100, 0), Err(Refusal::Replay));
+        assert_eq!(s.check_and_record(id(3), 100, 0), Err(Refusal::Replay));
     }
 }
