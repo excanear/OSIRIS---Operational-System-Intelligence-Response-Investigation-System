@@ -24,3 +24,23 @@ pub enum ServerMsg {
         permanent: bool,
     },
 }
+
+/// Server → Agent on the control connection.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ControlServerMsg {
+    Command(osiris_command::SignedCommand),
+    Ping,
+}
+
+/// Agent → Server on the control connection.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ControlClientMsg {
+    Hello {
+        agent_version: String,
+    },
+    Result {
+        command_id: uuid::Uuid,
+        result: osiris_command::CommandResult,
+    },
+    Pong,
+}

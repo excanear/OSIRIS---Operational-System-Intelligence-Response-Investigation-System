@@ -22,7 +22,7 @@ const BATCH_MAX_EVENTS: usize = 500;
 /// Most spool bytes read for one batch (also bounds one line's length).
 const BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -60,7 +60,7 @@ impl ForwarderConfig {
 }
 
 /// Exponential reconnect delay, 1s doubling to 30s; reset only once a batch is acked.
-struct Backoff(Duration);
+pub(crate) struct Backoff(Duration);
 
 impl Default for Backoff {
     fn default() -> Self {
@@ -70,13 +70,13 @@ impl Default for Backoff {
 
 impl Backoff {
     /// The delay to wait now; the next call returns double (capped).
-    fn next_delay(&mut self) -> Duration {
+    pub(crate) fn next_delay(&mut self) -> Duration {
         let d = self.0;
         self.0 = (self.0 * 2).min(BACKOFF_MAX);
         d
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.0 = BACKOFF_MIN;
     }
 }
@@ -330,7 +330,7 @@ pub async fn run_forwarder(
 }
 
 /// Sleeps for `d`; returns `true` if cancelled first.
-async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) -> bool {
+pub(crate) async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(d) => false,
         _ = cancel.cancelled() => true,

@@ -22,12 +22,12 @@ use crate::frame::{read_frame, write_frame, FrameError};
 use crate::wire::{ClientMsg, ServerMsg};
 use crate::HOST_URI_PREFIX;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// An Agent that sends nothing for this long is disconnected (it reconnects).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_CONNECTIONS: usize = 1024;
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MAX_CONNECTIONS: usize = 1024;
 /// Most concurrent connections from one peer IP.
-const MAX_CONNECTIONS_PER_IP: usize = 16;
+pub(crate) const MAX_CONNECTIONS_PER_IP: usize = 16;
 
 /// Processes a batch that has already been authenticated and host-checked.
 /// `Ok` means the batch was durably handled (it is then acknowledged).
@@ -52,15 +52,15 @@ pub fn event_belongs_to_host(e: &CanonicalEvent, host_id: Uuid) -> bool {
 
 /// Tracks concurrent connections per peer IP; dropping the guard releases the slot.
 #[derive(Default)]
-struct IpCounter(Mutex<HashMap<IpAddr, usize>>);
+pub(crate) struct IpCounter(Mutex<HashMap<IpAddr, usize>>);
 
-struct IpGuard {
+pub(crate) struct IpGuard {
     counter: Arc<IpCounter>,
     ip: IpAddr,
 }
 
 impl IpCounter {
-    fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<IpGuard> {
+    pub(crate) fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<IpGuard> {
         let mut map = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let n = map.entry(ip).or_insert(0);
         if *n >= max {

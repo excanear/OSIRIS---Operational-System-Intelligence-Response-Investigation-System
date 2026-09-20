@@ -8,6 +8,7 @@
 //! * [`server`] — the Listener: accepts enrolled Agents and hands batches to a handler.
 
 pub mod client;
+pub mod control;
 pub mod frame;
 pub mod pki;
 pub mod server;
