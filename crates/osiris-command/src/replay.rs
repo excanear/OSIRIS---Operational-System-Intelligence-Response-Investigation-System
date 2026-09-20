@@ -1,7 +1,7 @@
 use crate::guard::Refusal;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -24,7 +24,9 @@ struct Inner {
     file: File,
 }
 
-/// Durable set of seen command ids. One line per id: `<uuid> <expires_at_ms>\n`.
+/// Durable set of seen command ids. `dry_run` commands also consume their id
+/// (one signed command = one use).
+/// One line per id: `<uuid> <expires_at_ms>\n`.
 pub struct ReplayStore {
     inner: Mutex<Inner>,
 }
@@ -52,7 +54,23 @@ impl ReplayStore {
         } else {
             // no file yet: empty store
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        // A torn final line must be terminated before any append, or the next
+        // record would be glued onto it and lost on the following restart.
+        let len = file.metadata()?.len();
+        if len > 0 {
+            file.seek(SeekFrom::Start(len - 1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+                file.sync_data()?;
+            }
+        }
         Ok(Self {
             inner: Mutex::new(Inner { seen, file }),
         })
@@ -120,5 +138,31 @@ mod tests {
         let s = ReplayStore::open(&p).unwrap();
         assert_eq!(s.check_and_record(id(1), 100, 0), Err(Refusal::Replay));
         assert_eq!(s.check_and_record(id(3), 100, 0), Err(Refusal::Replay));
+    }
+
+    fn torn_tail_then_new_id(tail: &[u8]) {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("r");
+        let mut f = File::create(&p).unwrap();
+        writeln!(f, "{} 100", id(1)).unwrap();
+        f.write_all(tail).unwrap();
+        drop(f);
+        let s = ReplayStore::open(&p).unwrap();
+        assert_eq!(s.check_and_record(id(2), 100, 0), Ok(()));
+        drop(s);
+        let s = ReplayStore::open(&p).unwrap();
+        assert_eq!(s.check_and_record(id(1), 100, 0), Err(Refusal::Replay));
+        assert_eq!(s.check_and_record(id(2), 100, 0), Err(Refusal::Replay));
+    }
+
+    #[test]
+    fn torn_tail_is_repaired_before_append() {
+        torn_tail_then_new_id(format!("{} 12", id(9)).as_bytes());
+    }
+
+    #[test]
+    fn torn_invalid_utf8_tail_is_repaired_before_append() {
+        torn_tail_then_new_id(&[b'0', b'0', 0xff, 0xfe]);
     }
 }
