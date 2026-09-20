@@ -190,6 +190,7 @@ impl Agent {
             .proc_root
             .clone()
             .unwrap_or_else(|| "/proc".to_string());
+        let host_id = host.host_id;
         let mut pipeline = Pipeline::new(host, boot_id).with_proc_root(proc_root);
         let k8s_refresher =
             match crate::k8s::start_pod_cache(&config.k8s_context, &cancellation).await {
@@ -240,6 +241,18 @@ impl Agent {
                     tracing::error!(error = %e, "forwarder not started; events stay in the local spool");
                 }
             }));
+        }
+
+        if let Some(control) = &config.control {
+            tasks.extend(
+                crate::control::start_control(
+                    control,
+                    host_id,
+                    &config.spool_path,
+                    cancellation.clone(),
+                )
+                .await,
+            );
         }
 
         Ok(Arc::new(Self {
@@ -316,6 +329,7 @@ mod tests {
     fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
         AgentConfig {
             forward: None,
+            control: None,
             audit_log_path: None,
             fs_audit_log_path: None,
             network_proc_root: None,

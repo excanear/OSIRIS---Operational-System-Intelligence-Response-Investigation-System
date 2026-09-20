@@ -80,6 +80,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -256,6 +257,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -517,6 +519,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -730,6 +733,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -1067,6 +1071,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -1496,6 +1501,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -1824,6 +1830,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()
@@ -2093,6 +2100,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
 
     let agent_config = AgentConfig {
         forward: None,
+        control: None,
         cloud_metadata: osiris_agent::CloudMetadataConfig {
             enabled: false,
             ..Default::default()

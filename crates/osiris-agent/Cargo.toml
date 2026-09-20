@@ -36,7 +36,13 @@ osiris-sensors-systemd = { path = "../osiris-sensors/systemd" }
 osiris-sensors-persistence = { path = "../osiris-sensors/persistence" }
 osiris-sensors-container = { path = "../osiris-sensors/container" }
 osiris-generator = { path = "../../generator" }
+osiris-command = { path = "../osiris-command" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }

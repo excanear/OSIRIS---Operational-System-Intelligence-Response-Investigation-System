@@ -107,6 +107,27 @@ pub struct ForwardConfig {
     pub key: String,
 }
 
+/// Phase 9c-1: a control connection over which the Server can send signed
+/// commands (terminate a process, quarantine a file). Absent = no control
+/// connection. The Agent verifies every command against `command_public_key`
+/// and fails closed if that key cannot be loaded.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlConfig {
+    /// `host:port` of the Server's control listener.
+    pub server_addr: String,
+    /// The name the Server's certificate must be valid for.
+    pub server_name: String,
+    /// CA that signed the Server's certificate (PEM).
+    pub ca: String,
+    /// This Agent's certificate and private key (PEM).
+    pub cert: String,
+    pub key: String,
+    /// Path to the Server's command-signing public key.
+    pub command_public_key: String,
+    /// Quarantine vault directory (created 0700 on Linux).
+    pub vault_dir: String,
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
@@ -115,6 +136,9 @@ pub struct AgentConfig {
     /// Remote delivery over mTLS (Phase 9a); `None` keeps spool-only behaviour.
     #[serde(default)]
     pub forward: Option<ForwardConfig>,
+    /// Signed-command control connection (Phase 9c-1); `None` = disabled.
+    #[serde(default)]
+    pub control: Option<ControlConfig>,
     /// Cloud metadata probe (Phase 8d). Defaults to enabled, no overrides,
     /// so every pre-8d agent.yaml still loads.
     #[serde(default)]
@@ -406,6 +430,38 @@ forward:
         let forward = AgentConfig::load(&path).unwrap().forward.unwrap();
         assert_eq!(forward.server_addr, "srv:9443");
         assert_eq!(forward.server_name, "srv");
+    }
+
+    #[test]
+    fn control_is_optional_and_parses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /s
+status_addr: 127.0.0.1:9200
+",
+        )
+        .unwrap();
+        assert!(AgentConfig::load(&path).unwrap().control.is_none());
+        std::fs::write(
+            &path,
+            "spool_path: /s
+status_addr: 127.0.0.1:9200
+control:
+  server_addr: srv:9444
+  server_name: srv
+  ca: /ca.pem
+  cert: /a.pem
+  key: /a.key
+  command_public_key: /cmd.pub
+  vault_dir: /var/lib/osiris/vault
+",
+        )
+        .unwrap();
+        let c = AgentConfig::load(&path).unwrap().control.unwrap();
+        assert_eq!(c.server_addr, "srv:9444");
+        assert_eq!(c.vault_dir, "/var/lib/osiris/vault");
     }
 
     #[test]
