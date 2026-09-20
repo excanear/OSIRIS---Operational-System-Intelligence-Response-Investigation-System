@@ -165,6 +165,17 @@ impl Default for KeepAlive {
     }
 }
 
+/// Request extension: cancelled when the server shuts down; live WebSockets
+/// send a Close frame and end.
+#[derive(Clone)]
+pub struct ShutdownSignal(pub tokio_util::sync::CancellationToken);
+
+/// Request extension: an opaque guard (connection permit, per-IP slot) that
+/// the WebSocket task keeps alive until it ends, so the server's connection
+/// caps and shutdown drain cover upgraded connections.
+#[derive(Clone)]
+pub struct ConnectionHold(pub Arc<dyn std::any::Any + Send + Sync>);
+
 pub fn build_stream_router(broadcaster: Arc<LiveEventBroadcaster>) -> Router {
     build_stream_router_with_keepalive(broadcaster, KeepAlive::default())
 }
@@ -186,23 +197,29 @@ pub fn build_stream_router_with_keepalive(
 /// carries an `Origin` header, it must match the request's own `Host`
 /// header. Non-browser clients (tokio-tungstenite, websocat, Node `ws`,
 /// ...) typically send no `Origin` header at all and are unaffected.
-fn origin_is_same_site(headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+fn origin_is_same_site(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    version: axum::http::Version,
+) -> bool {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         // No Origin header: not a browser cross-origin request (e.g. a
         // native WebSocket client). Nothing to check.
         return true;
     };
-    // HTTP/2 carries the authority in `:authority` (the request URI), not a
-    // `Host` header, so fall back to it.
-    let host_str = match headers.get(axum::http::header::HOST) {
-        Some(h) => match h.to_str() {
-            Ok(h) => h,
-            Err(_) => return false,
-        },
-        None => match uri.authority() {
+    // HTTP/2 carries the authority in `:authority` (the request URI) and any
+    // Host header is client-supplied noise, so the URI wins. HTTP/1 uses Host
+    // only: an absolute-form request line must not stand in for a missing Host.
+    let host_str = if version >= axum::http::Version::HTTP_2 {
+        match uri.authority() {
             Some(a) => a.as_str(),
             None => return false,
-        },
+        }
+    } else {
+        match headers.get(axum::http::header::HOST).map(|h| h.to_str()) {
+            Some(Ok(h)) => h,
+            _ => return false,
+        }
     };
     let Ok(origin_str) = origin.to_str() else {
         return false;
@@ -236,7 +253,7 @@ async fn stream_events_handler(
     keepalive: Option<axum::Extension<KeepAlive>>,
 ) -> Result<Response, (StatusCode, String)> {
     let headers = parts.headers.clone();
-    if !origin_is_same_site(&headers, &parts.uri) {
+    if !origin_is_same_site(&headers, &parts.uri, parts.version) {
         return Err((
             StatusCode::FORBIDDEN,
             "cross-origin WebSocket connections are not allowed".to_string(),
@@ -299,7 +316,10 @@ async fn stream_events_handler(
         (Some(tenant_id), Some(tenants)) => Some(TenantRefresh { tenants, tenant_id }),
         _ => None,
     };
-    Ok(ws.on_upgrade(move |socket| {
+    let shutdown = parts.extensions.get::<ShutdownSignal>().cloned();
+    let hold = parts.extensions.get::<ConnectionHold>().cloned();
+    Ok(ws.on_upgrade(move |socket| async move {
+        let _hold = hold;
         handle_socket(
             socket,
             broadcaster,
@@ -307,7 +327,9 @@ async fn stream_events_handler(
             tenant_hosts,
             keepalive,
             refresh,
+            shutdown.map(|s| s.0),
         )
+        .await
     }))
 }
 
@@ -339,13 +361,19 @@ async fn handle_socket(
     hosts: Option<HashSet<Uuid>>,
     keepalive: KeepAlive,
     refresh: Option<TenantRefresh>,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
 ) {
     let (id, mut receiver, _dropped_total) = broadcaster.subscribe_scoped(filter, hosts);
     let mut ping = tokio::time::interval(keepalive.ping_every);
     ping.tick().await; // the first tick fires immediately
     let mut last_seen = tokio::time::Instant::now();
+    let shutdown = shutdown.unwrap_or_default();
     loop {
         tokio::select! {
+            _ = shutdown.cancelled() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
             maybe_event = receiver.recv() => {
                 let Some(event) = maybe_event else { break; };
                 let Ok(payload) = serde_json::to_string(&event) else { continue; };
@@ -500,7 +528,8 @@ mod tests {
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
         assert!(origin_is_same_site(
             &headers,
-            &axum::http::Uri::from_static("/x")
+            &axum::http::Uri::from_static("/x"),
+            axum::http::Version::HTTP_11
         ));
     }
 
@@ -514,7 +543,8 @@ mod tests {
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
         assert!(!origin_is_same_site(
             &headers,
-            &axum::http::Uri::from_static("/x")
+            &axum::http::Uri::from_static("/x"),
+            axum::http::Version::HTTP_11
         ));
     }
 
@@ -524,12 +554,13 @@ mod tests {
         headers.insert(axum::http::header::HOST, "127.0.0.1:8080".parse().unwrap());
         assert!(origin_is_same_site(
             &headers,
-            &axum::http::Uri::from_static("/x")
+            &axum::http::Uri::from_static("/x"),
+            axum::http::Version::HTTP_11
         ));
     }
 
     #[test]
-    fn origin_is_same_site_uses_the_uri_authority_when_host_is_missing() {
+    fn origin_is_same_site_prefers_the_uri_authority_on_h2_only() {
         // HTTP/2 requests have `:authority` instead of a Host header.
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -542,8 +573,19 @@ mod tests {
         let other: axum::http::Uri = "https://other.example/api/v1/stream/events"
             .parse()
             .unwrap();
-        assert!(origin_is_same_site(&headers, &same));
-        assert!(!origin_is_same_site(&headers, &other));
+        let h2 = axum::http::Version::HTTP_2;
+        assert!(origin_is_same_site(&headers, &same, h2));
+        assert!(!origin_is_same_site(&headers, &other, h2));
+        // A spoofed Host header does not override the h2 authority.
+        headers.insert(axum::http::header::HOST, "other.example".parse().unwrap());
+        assert!(origin_is_same_site(&headers, &same, h2));
+        // HTTP/1: an absolute-form URI cannot stand in for a missing Host.
+        headers.remove(axum::http::header::HOST);
+        assert!(!origin_is_same_site(
+            &headers,
+            &same,
+            axum::http::Version::HTTP_11
+        ));
     }
 
     #[test]
@@ -555,7 +597,8 @@ mod tests {
         );
         assert!(!origin_is_same_site(
             &headers,
-            &axum::http::Uri::from_static("/x")
+            &axum::http::Uri::from_static("/x"),
+            axum::http::Version::HTTP_11
         ));
     }
 

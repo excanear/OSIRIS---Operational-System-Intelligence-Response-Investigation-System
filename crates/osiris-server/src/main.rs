@@ -357,14 +357,34 @@ async fn main() {
     match &api_acceptor {
         Some(acceptor) => {
             tracing::info!(%addr, "API/Console serving HTTPS (TLS 1.3)");
-            osiris_server::api_tls::serve_tls(listener, acceptor.clone(), app, cancellation).await;
+            let limits = config
+                .api_tls
+                .as_ref()
+                .map(|t| t.limits())
+                .unwrap_or_default();
+            osiris_server::api_tls::serve_tls_with(
+                listener,
+                acceptor.clone(),
+                app,
+                cancellation,
+                limits,
+            )
+            .await;
         }
         None => {
             let token = cancellation.clone();
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move { token.cancelled().await })
-                .await
-                .unwrap();
+            let served = axum::serve(listener, app).with_graceful_shutdown({
+                let token = token.clone();
+                async move { token.cancelled().await }
+            });
+            // Bound the drain: a slow client must not hang SIGTERM.
+            tokio::select! {
+                r = served => r.unwrap(),
+                _ = async {
+                    token.cancelled().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                } => tracing::warn!("plain HTTP shutdown drain timed out after 10s; exiting"),
+            }
         }
     }
 }

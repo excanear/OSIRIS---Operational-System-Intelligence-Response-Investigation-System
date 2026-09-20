@@ -150,6 +150,7 @@ fn run_pki(action: &PkiAction) -> Result<String, String> {
             Ok(format!("CA written to {}", dir.display()))
         }
         PkiAction::IssueServer { dir, name, names } => {
+            pki::validate_name(name).map_err(e)?;
             let issued = pki::issue_server(
                 &read(dir.join("ca.pem"))?,
                 &read(dir.join("ca.key"))?,

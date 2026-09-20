@@ -6,9 +6,12 @@
 //! connections gracefully (bounded).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -19,6 +22,7 @@ use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -154,6 +158,62 @@ impl Drop for IpGuard {
     }
 }
 
+/// Wraps the TLS stream so a client that completes the handshake but never
+/// sends a byte is dropped after `deadline`. Once any byte has been read the
+/// deadline is gone: established idle WebSockets and keep-alive h2 are left to
+/// their own keepalives.
+struct FirstByteDeadline<T> {
+    inner: T,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(d) = this.deadline.as_mut() {
+            if d.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+            }
+        }
+        let before = buf.filled().len();
+        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.deadline = None;
+        }
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for FirstByteDeadline<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 /// Serves `router` over TLS on `listener` until `shutdown` is cancelled.
 pub async fn serve_tls(
     listener: TcpListener,
@@ -163,6 +223,9 @@ pub async fn serve_tls(
 ) {
     serve_tls_with(listener, acceptor, router, shutdown, Limits::default()).await
 }
+
+/// Refusals are logged at debug; one aggregate warning at most every 10s.
+const REFUSAL_WARN_EVERY: Duration = Duration::from_secs(10);
 
 /// [`serve_tls`] with explicit [`Limits`].
 pub async fn serve_tls_with(
@@ -175,6 +238,8 @@ pub async fn serve_tls_with(
     let router = with_hsts(router);
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(IpCounter::default());
+    let mut refused: u64 = 0;
+    let mut last_warn: Option<tokio::time::Instant> = None;
     loop {
         let (tcp, peer) = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -187,20 +252,29 @@ pub async fn serve_tls_with(
                 }
             },
         };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            tracing::warn!(%peer, "api listener at its connection limit; refusing");
-            continue;
+        let admitted = match permits.clone().try_acquire_owned() {
+            Ok(permit) => per_ip
+                .acquire(peer.ip(), limits.max_per_ip)
+                .map(|g| (permit, g)),
+            Err(_) => None,
         };
-        let Some(ip_guard) = per_ip.acquire(peer.ip(), limits.max_per_ip) else {
-            tracing::warn!(%peer, "too many concurrent api connections from this address; refusing");
+        let Some((permit, ip_guard)) = admitted else {
+            refused += 1;
+            tracing::debug!(%peer, "api connection refused: connection cap reached");
+            if last_warn.is_none_or(|t| t.elapsed() >= REFUSAL_WARN_EVERY) {
+                tracing::warn!(refused, "api listener refused connections at its caps");
+                refused = 0;
+                last_warn = Some(tokio::time::Instant::now());
+            }
             continue;
         };
         let acceptor = acceptor.clone();
         let router = router.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let _ip_guard = ip_guard;
+            // Held for the connection and, via `ConnectionHold`, any WebSocket
+            // upgraded from it.
+            let hold: Arc<dyn std::any::Any + Send + Sync> = Arc::new((permit, ip_guard));
             let tls =
                 match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp)).await {
                     Ok(Ok(s)) => s,
@@ -213,8 +287,16 @@ pub async fn serve_tls_with(
                         return;
                     }
                 };
-            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let io = FirstByteDeadline {
+                inner: tls,
+                deadline: Some(Box::pin(tokio::time::sleep(limits.header_read_timeout))),
+            };
+            let signal = osiris_api::ShutdownSignal(shutdown.clone());
+            let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
                 let router = router.clone();
+                req.extensions_mut().insert(signal.clone());
+                req.extensions_mut()
+                    .insert(osiris_api::ConnectionHold(hold.clone()));
                 async move { router.oneshot(req.map(Body::new)).await }
             });
             let mut builder = Builder::new(TokioExecutor::new());
@@ -227,11 +309,9 @@ pub async fn serve_tls_with(
                 .timer(TokioTimer::new())
                 .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
                 .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT);
-            let conn = builder.serve_connection_with_upgrades(TokioIo::new(tls), service);
+            let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
             tokio::pin!(conn);
-            let mut draining = false;
-            let grace = tokio::time::sleep(Duration::MAX / 4);
-            tokio::pin!(grace);
+            let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
             loop {
                 tokio::select! {
                     r = conn.as_mut() => {
@@ -240,22 +320,28 @@ pub async fn serve_tls_with(
                         }
                         break;
                     }
-                    _ = shutdown.cancelled(), if !draining => {
-                        draining = true;
+                    _ = shutdown.cancelled(), if grace.is_none() => {
                         conn.as_mut().graceful_shutdown();
-                        grace.as_mut().reset(tokio::time::Instant::now() + limits.shutdown_grace);
+                        grace = Some(Box::pin(tokio::time::sleep(limits.shutdown_grace)));
                     }
-                    _ = &mut grace, if draining => break,
+                    _ = async {
+                        match grace.as_mut() {
+                            Some(g) => g.await,
+                            None => std::future::pending().await,
+                        }
+                    } => break,
                 }
             }
         });
     }
-    // Let in-flight connections finish (bounded).
-    let _ = tokio::time::timeout(
-        limits.shutdown_grace + Duration::from_secs(1),
-        permits.acquire_many(limits.max_connections as u32),
-    )
-    .await;
+    // Stop accepting now; the drain below only waits for open connections.
+    drop(listener);
+    let drained = async {
+        while permits.available_permits() < limits.max_connections {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let _ = tokio::time::timeout(limits.shutdown_grace + Duration::from_secs(1), drained).await;
 }
 
 #[cfg(test)]
@@ -322,6 +408,7 @@ mod tests {
         addr: std::net::SocketAddr,
         token: CancellationToken,
         session: String,
+        handle: tokio::task::JoinHandle<()>,
         _dir: tempfile::TempDir,
     }
 
@@ -363,7 +450,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let token = CancellationToken::new();
         let (app, session, dir) = gated_app();
-        tokio::spawn(serve_tls_with(
+        let handle = tokio::spawn(serve_tls_with(
             listener,
             acceptor(&c.cert, &c.key).unwrap(),
             app,
@@ -374,6 +461,7 @@ mod tests {
             addr,
             token,
             session,
+            handle,
             _dir: dir,
         }
     }
@@ -640,13 +728,116 @@ mod tests {
         srv.token.cancel();
     }
 
+    type WsStream =
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+    async fn ws_open(srv: &Server, ca: &str) -> WsStream {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let tcp = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let tls = connector(Some(ca), &[b"http/1.1"])
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        let req = format!(
+            "wss://localhost:{}/api/v1/stream/events?token={}",
+            srv.addr.port(),
+            srv.session
+        )
+        .into_client_request()
+        .unwrap();
+        let (ws, resp) = tokio_tungstenite::client_async(req, tls).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 101);
+        ws
+    }
+
     #[tokio::test]
-    async fn cancelling_shuts_the_listener_down() {
+    async fn silent_client_after_tls_is_dropped_and_frees_its_permit() {
+        let c = certs();
+        let srv = start_with(
+            &c,
+            Limits {
+                max_connections: 1,
+                header_read_timeout: Duration::from_millis(300),
+                ..Limits::default()
+            },
+        )
+        .await;
+        let tcp = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let mut s = connector(Some(&c.ca_pem), &[b"http/1.1"])
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        // Send nothing: the server must close within the timeout.
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out))
+            .await
+            .expect("a silent client must be dropped");
+        // The single permit is free again.
+        let resp = https_get(srv.addr, Some(&c.ca_pem)).await.unwrap();
+        assert!(resp.ends_with("pong"), "{resp}");
+        srv.token.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_open_websocket_holds_its_connection_slot() {
+        let c = certs();
+        let srv = start_with(
+            &c,
+            Limits {
+                max_connections: 1,
+                ..Limits::default()
+            },
+        )
+        .await;
+        let ws = ws_open(&srv, &c.ca_pem).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_dropped(srv.addr).await;
+        // Closing the WebSocket frees the slot.
+        drop(ws);
+        let mut ok = false;
+        for _ in 0..40 {
+            if https_get(srv.addr, Some(&c.ca_pem))
+                .await
+                .is_ok_and(|r| r.ends_with("pong"))
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ok, "slot must be released after the websocket ends");
+        srv.token.cancel();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_websockets_and_the_drain_finishes() {
         let c = certs();
         let srv = start(&c).await;
-        assert!(https_get(srv.addr, Some(&c.ca_pem)).await.is_ok());
+        let mut ws = ws_open(&srv, &c.ca_pem).await;
         srv.token.cancel();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(tokio::net::TcpStream::connect(srv.addr).await.is_err());
+        // The listener is gone promptly, while the websocket was still live.
+        let mut refused = false;
+        for _ in 0..30 {
+            if tokio::net::TcpStream::connect(srv.addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(refused, "listener must be dropped on cancel");
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("websocket must end on shutdown");
+        assert!(
+            matches!(
+                msg,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None | Some(Err(_))
+            ),
+            "{msg:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), srv.handle)
+            .await
+            .expect("serve_tls must return after draining")
+            .unwrap();
     }
 }

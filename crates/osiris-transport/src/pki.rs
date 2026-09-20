@@ -24,6 +24,24 @@ pub enum PkiError {
     },
     #[error("invalid subject alternative name: {0}")]
     San(String),
+    #[error("invalid file name '{0}': use letters, digits, '_', '-' and inner '.', not starting with '.'")]
+    InvalidName(String),
+}
+
+/// A certificate file stem: `[A-Za-z0-9_-][A-Za-z0-9._-]*` (no separators, no
+/// leading dot, not empty).
+pub fn validate_name(name: &str) -> Result<(), PkiError> {
+    let mut chars = name.chars();
+    let ok_first =
+        matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok_first
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !name.contains("..")
+    {
+        Ok(())
+    } else {
+        Err(PkiError::InvalidName(name.to_string()))
+    }
 }
 
 /// PEM material for one certificate and its private key.
@@ -123,25 +141,36 @@ pub fn write_issued(dir: &Path, name: &str, issued: &Issued) -> Result<(), PkiEr
         path: path.display().to_string(),
         source,
     };
+    validate_name(name)?;
     std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
-    // Key first, created exclusively and (on unix) 0600 from the start, so it is
-    // never world-readable and an existing key is never clobbered.
     let key_path = dir.join(format!("{name}.key"));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    {
-        use std::io::Write;
-        let mut f = opts.open(&key_path).map_err(|e| io(&key_path, e))?;
-        f.write_all(issued.key_pem.as_bytes())
-            .map_err(|e| io(&key_path, e))?;
-    }
     let cert_path = dir.join(format!("{name}.pem"));
-    std::fs::write(&cert_path, &issued.cert_pem).map_err(|e| io(&cert_path, e))?;
+    // Refuse before writing either file, so a clash never leaves a half-written pair.
+    for p in [&key_path, &cert_path] {
+        if p.exists() {
+            return Err(io(
+                p,
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "file already exists"),
+            ));
+        }
+    }
+    // Both created exclusively; the key is 0600 from the start on unix.
+    let create = |path: &Path, private: bool, data: &str| -> Result<(), PkiError> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut f = opts.open(path).map_err(|e| io(path, e))?;
+        f.write_all(data.as_bytes()).map_err(|e| io(path, e))
+    };
+    create(&key_path, true, &issued.key_pem)?;
+    create(&cert_path, false, &issued.cert_pem)?;
     Ok(())
 }
 
@@ -194,5 +223,32 @@ mod tests {
         write_issued(dir.path(), "ca", &ca).unwrap();
         assert!(dir.path().join("ca.pem").exists());
         assert!(dir.path().join("ca.key").exists());
+    }
+
+    #[test]
+    fn write_issued_rejects_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = generate_ca("test-ca").unwrap();
+        for bad in [
+            "", "../x", "a/b", r"a\b", "/abs", ".hidden", "a..b", "..", "sp ace",
+        ] {
+            assert!(write_issued(dir.path(), bad, &ca).is_err(), "{bad:?}");
+        }
+        for good in ["api", "server", "api-2026", "a.b_c", "agent-1234"] {
+            assert!(validate_name(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn write_issued_refuses_when_only_the_pem_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = generate_ca("test-ca").unwrap();
+        std::fs::write(dir.path().join("x.pem"), "old").unwrap();
+        assert!(write_issued(dir.path(), "x", &ca).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x.pem")).unwrap(),
+            "old"
+        );
+        assert!(!dir.path().join("x.key").exists());
     }
 }

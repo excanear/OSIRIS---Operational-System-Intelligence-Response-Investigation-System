@@ -1245,6 +1245,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
+ "tokio-util",
  "tower 0.4.13",
  "tracing",
  "uuid",

@@ -13,6 +13,8 @@ pub enum ConfigError {
     },
     #[error("failed to parse config: {0}")]
     Parse(#[from] serde_yaml::Error),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +80,45 @@ pub struct ServerConfig {
 pub struct ApiTlsConfig {
     pub cert: String,
     pub key: String,
+    /// Concurrent connection cap (default 1024).
+    #[serde(default)]
+    pub max_connections: Option<u64>,
+    /// Concurrent connections per peer IP (default 16).
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+}
+
+impl ApiTlsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, v) in [
+            ("max_connections", self.max_connections),
+            ("max_connections_per_ip", self.max_connections_per_ip),
+        ] {
+            if let Some(n) = v {
+                if n == 0 || n > tokio::sync::Semaphore::MAX_PERMITS as u64 {
+                    return Err(ConfigError::Invalid(format!(
+                        "api_tls.{name} must be between 1 and {}",
+                        tokio::sync::Semaphore::MAX_PERMITS
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Listener limits: configured caps over the defaults.
+    pub fn limits(&self) -> crate::api_tls::Limits {
+        let d = crate::api_tls::Limits::default();
+        crate::api_tls::Limits {
+            max_connections: self
+                .max_connections
+                .map_or(d.max_connections, |n| n as usize),
+            max_per_ip: self
+                .max_connections_per_ip
+                .map_or(d.max_per_ip, |n| n as usize),
+            ..d
+        }
+    }
 }
 
 /// Where remote Agents connect and how they are authenticated.
@@ -100,7 +141,11 @@ impl ServerConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        Ok(serde_yaml::from_str(&contents)?)
+        let config: Self = serde_yaml::from_str(&contents)?;
+        if let Some(t) = &config.api_tls {
+            t.validate()?;
+        }
+        Ok(config)
     }
 }
 
@@ -284,5 +329,50 @@ rules_dir: /r
         .unwrap();
         let t = ServerConfig::load(&path).unwrap().api_tls.unwrap();
         assert_eq!((t.cert.as_str(), t.key.as_str()), ("/a.pem", "/a.key"));
+    }
+
+    #[test]
+    fn api_tls_limits_are_validated_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let base = "db_path: /e
+spool_path: /s
+listen_addr: 127.0.0.1:8080
+rules_dir: /r
+api_tls:
+  cert: /a
+  key: /k
+";
+        let load = |extra: &str| {
+            std::fs::write(&path, format!("{base}{extra}")).unwrap();
+            ServerConfig::load(&path)
+        };
+        let l = load("").unwrap().api_tls.unwrap().limits();
+        assert_eq!((l.max_connections, l.max_per_ip), (1024, 16));
+        let l = load(
+            "  max_connections: 50
+  max_connections_per_ip: 3
+",
+        )
+        .unwrap()
+        .api_tls
+        .unwrap()
+        .limits();
+        assert_eq!((l.max_connections, l.max_per_ip), (50, 3));
+        assert!(load(
+            "  max_connections: 0
+"
+        )
+        .is_err());
+        assert!(load(
+            "  max_connections_per_ip: 0
+"
+        )
+        .is_err());
+        assert!(load(
+            "  max_connections: 18446744073709551615
+"
+        )
+        .is_err());
     }
 }
