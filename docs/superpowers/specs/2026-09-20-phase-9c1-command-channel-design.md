@@ -166,3 +166,12 @@ carve-outs.
 * Clock skew tolerance is fixed (±60 s).
 * No offline queueing by design; an operator retries.
 * `TerminateProcess` has no rollback.
+
+## 10. Amendment (2026-09-20, found while writing the plan)
+
+`ProcessKey` is a one-way hash, and real sensor events carry no `/proc`-comparable start time, so
+the Agent cannot resolve a process from the key. §3/§4 are amended: `TerminateProcess` carries
+`{pid, exe_path, observed_at_ns}` taken by the Server from the stored event that resolved the
+target. The Agent requires `/proc/<pid>/exe == exe_path` **and** the process start time
+`<= observed_at_ns + 2 s`; otherwise `Failed{TargetChanged}` (or `Unverifiable` if `/proc` cannot be
+read). `QuarantineFile` carries `{path, inode, device_id}`. See the plan header for the exact rule.
