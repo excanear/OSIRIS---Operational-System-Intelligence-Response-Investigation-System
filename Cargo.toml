@@ -43,3 +43,4 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
 zstd = "0.13"
 time = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }

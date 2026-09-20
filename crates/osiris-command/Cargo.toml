@@ -1,0 +1,15 @@
+[package]
+name = "osiris-command"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
