@@ -59,16 +59,57 @@ pub fn start_ns(btime_s: u64, starttime_ticks: u64, clk_tck: u64) -> Option<u64>
     boot.checked_add(since_boot)
 }
 
-/// OSIRIS device encoding `(major << 32) | minor`.
-pub fn encode_dev(major: u64, minor: u64) -> u64 {
-    (major << 32) | (minor & 0xffff_ffff)
-}
-
 /// Splits a Linux `st_dev` (glibc `gnu_dev_major/minor`) and re-encodes it.
 pub fn encode_st_dev(st_dev: u64) -> u64 {
     let major = ((st_dev >> 8) & 0xfff) | ((st_dev >> 32) & !0xfff);
     let minor = (st_dev & 0xff) | ((st_dev >> 12) & !0xff);
-    encode_dev(major, minor)
+    osiris_schema::encode_device_id(major as u32, minor as u32)
+}
+
+/// `/proc/<pid>/exe` reads "<path> (deleted)" once the binary is unlinked.
+/// Strips one trailing suffix; reports whether it was there.
+pub fn normalize_exe_link(link: &str) -> (String, bool) {
+    match link.strip_suffix(" (deleted)") {
+        Some(p) => (p.to_string(), true),
+        None => (link.to_string(), false),
+    }
+}
+
+fn timed_out_io() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")
+}
+
+/// Copies `r` to `w` in chunks, checking `cancelled` before each one.
+pub fn copy_until(
+    r: &mut impl Read,
+    w: &mut impl std::io::Write,
+    cancelled: &dyn Fn() -> bool,
+) -> std::io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        if cancelled() {
+            return Err(timed_out_io());
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        w.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
+/// `nlink` includes the named path; extra links stay reachable after a move.
+pub fn hardlink_warning(nlink: u64) -> String {
+    if nlink > 1 {
+        format!(
+            " WARNING: {} other hard link(s) to this file remain",
+            nlink - 1
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Walks the parent chain of `pid` (excluding `pid`), stopping at 0, on a
@@ -97,10 +138,21 @@ pub fn ancestors_of(pid: u32) -> Vec<u32> {
 }
 
 /// Lowercase hex SHA-256 of a stream.
-pub fn sha256_reader(mut r: impl Read) -> std::io::Result<String> {
+pub fn sha256_reader(r: impl Read) -> std::io::Result<String> {
+    sha256_reader_until(r, &|| false)
+}
+
+/// As `sha256_reader`, but stops with a `TimedOut` error once `cancelled()`.
+pub fn sha256_reader_until(
+    mut r: impl Read,
+    cancelled: &dyn Fn() -> bool,
+) -> std::io::Result<String> {
     let mut h = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        if cancelled() {
+            return Err(timed_out_io());
+        }
         let n = r.read(&mut buf)?;
         if n == 0 {
             break;
@@ -120,6 +172,13 @@ pub struct Sidecar {
     pub sha256: String,
     /// Milliseconds since the Unix epoch.
     pub quarantined_at: u64,
+    /// Link count of the file when quarantined (older sidecars: 1).
+    #[serde(default = "one")]
+    pub nlink: u64,
+}
+
+fn one() -> u64 {
+    1
 }
 
 /// `(vaulted file, sidecar)` for a quarantine id.
@@ -153,7 +212,7 @@ impl ActionExecutor for UnsupportedExecutor {
 
 #[cfg(target_os = "linux")]
 pub fn default_executor(vault: PathBuf) -> Arc<dyn ActionExecutor> {
-    Arc::new(LinuxExecutor { vault })
+    Arc::new(LinuxExecutor::new(vault))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -169,7 +228,7 @@ pub use linux::LinuxExecutor;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use osiris_command::process_started_by;
+    use osiris_command::{process_started_by, ProtectedTargets};
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
@@ -177,12 +236,28 @@ mod linux {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    /// Default per-command work budget; below the handler's 30 s timeout so
+    /// the loops give the slot back on their own.
+    const DEFAULT_BUDGET: Duration = Duration::from_secs(25);
+
     pub struct LinuxExecutor {
         pub vault: PathBuf,
+        /// Loops (hashing, copying, waiting for exit) stop after this long.
+        pub budget: Duration,
+    }
+
+    impl LinuxExecutor {
+        pub fn new(vault: PathBuf) -> Self {
+            Self {
+                vault,
+                budget: DEFAULT_BUDGET,
+            }
+        }
     }
 
     struct Ident {
-        exe: PathBuf,
+        exe: String,
+        deleted: bool,
         start_ns: u64,
         starttime_ticks: u64,
     }
@@ -209,14 +284,12 @@ mod linux {
         }
         let unverifiable = |what: &str| fail(FailCode::Unverifiable, format!("pid {pid}: {what}"));
         let stat = read_stat(pid).map_err(|_| unverifiable("stat unreadable"))?;
-        let exe = std::fs::read_link(format!("{proc_dir}/exe"))
-            .map_err(|_| unverifiable("exe unreadable (kernel thread or no access)"))?;
-        if exe.as_os_str().is_empty() {
-            return Err(unverifiable("empty exe"));
+        let link = std::fs::read_link(format!("{proc_dir}/exe"))
+            .map_err(|_| unverifiable("no exe link (kernel thread or unreadable)"))?;
+        if link.as_os_str().is_empty() {
+            return Err(unverifiable("no exe link (kernel thread or unreadable)"));
         }
-        if pid == 2 || stat.ppid == 2 {
-            return Err(unverifiable("kernel thread"));
-        }
+        let (exe, deleted) = normalize_exe_link(&link.to_string_lossy());
         let btime = std::fs::read_to_string("/proc/stat")
             .ok()
             .and_then(|s| parse_btime(&s))
@@ -225,6 +298,7 @@ mod linux {
             .ok_or_else(|| unverifiable("start time not computable"))?;
         Ok(Ident {
             exe,
+            deleted,
             start_ns: start,
             starttime_ticks: stat.starttime_ticks,
         })
@@ -232,10 +306,10 @@ mod linux {
 
     fn verify_identity(pid: u32, exe_path: &str, observed: u64) -> Result<Ident, ExecFailure> {
         let id = read_identity(pid)?;
-        if id.exe != Path::new(exe_path) {
+        if id.exe != exe_path {
             return Err(fail(
                 FailCode::TargetChanged,
-                format!("pid {pid} runs {} not {exe_path}", id.exe.display()),
+                format!("pid {pid} runs {} not {exe_path}", id.exe),
             ));
         }
         if !process_started_by(id.start_ns, observed) {
@@ -255,14 +329,26 @@ mod linux {
         }
     }
 
-    fn wait_exit(pid: u32, ticks: u64, max: Duration) -> bool {
+    fn timed_out() -> ExecFailure {
+        fail(FailCode::Io, "timed out")
+    }
+
+    fn wait_exit(
+        pid: u32,
+        ticks: u64,
+        max: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool, ExecFailure> {
         let deadline = Instant::now() + max;
         loop {
             if exited(pid, ticks) {
-                return true;
+                return Ok(true);
+            }
+            if cancelled() {
+                return Err(timed_out());
             }
             if Instant::now() >= deadline {
-                return false;
+                return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -290,6 +376,9 @@ mod linux {
     }
 
     fn io_fail(what: &str, e: std::io::Error) -> ExecFailure {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            return timed_out();
+        }
         fail(FailCode::Io, format!("{what}: {e}"))
     }
 
@@ -297,15 +386,34 @@ mod linux {
         a.ino() == b.ino() && a.dev() == b.dev()
     }
 
-    impl LinuxExecutor {
-        fn ensure_vault(&self) -> Result<(), ExecFailure> {
-            crate::control::ensure_vault(&self.vault).map_err(|e| io_fail("vault", e))
-        }
+    fn perm(mode: u32) -> std::fs::Permissions {
+        std::fs::Permissions::from_mode(mode)
+    }
 
-        fn hash_file(path: &Path) -> Result<String, ExecFailure> {
-            let f = File::open(path).map_err(|e| io_fail("open for hashing", e))?;
-            sha256_reader(f).map_err(|e| io_fail("hash", e))
+    fn detail(
+        summary: String,
+        id: Option<Uuid>,
+        sha: Option<String>,
+        sig: Option<&str>,
+    ) -> ExecDetail {
+        ExecDetail {
+            summary,
+            quarantine_id: id,
+            sha256: sha,
+            signal: sig.map(str::to_string),
         }
+    }
+
+    /// Opens the mode-0000 vaulted file for reading without leaving its mode
+    /// changed: chmod 0400, open, chmod back to 0000; the fd stays readable.
+    fn open_vaulted(vaulted: &Path) -> Result<File, ExecFailure> {
+        std::fs::set_permissions(vaulted, perm(0o400)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => fail(FailCode::NotFound, "vaulted file missing"),
+            _ => io_fail("chmod vaulted file", e),
+        })?;
+        let f = File::open(vaulted);
+        let _ = std::fs::set_permissions(vaulted, perm(0));
+        f.map_err(|e| io_fail("open vaulted file", e))
     }
 
     impl ActionExecutor for LinuxExecutor {
@@ -316,37 +424,67 @@ mod linux {
             observed_at_ns: u64,
             dry_run: bool,
         ) -> Result<ExecDetail, ExecFailure> {
+            let deadline = Instant::now() + self.budget;
+            let cancelled = move || Instant::now() >= deadline;
             if pid == 0 {
                 return Err(fail(FailCode::Unverifiable, "pid 0"));
             }
             let id = verify_identity(pid, exe_path, observed_at_ns)?;
+            let note = if id.deleted {
+                " (binary was deleted from disk)"
+            } else {
+                ""
+            };
             if dry_run {
-                return Ok(ExecDetail {
-                    summary: format!("terminate pid {pid} ({exe_path})"),
-                    quarantine_id: None,
-                    sha256: None,
-                    signal: None,
-                });
+                return Ok(detail(
+                    format!("terminate pid {pid} ({exe_path}){note}"),
+                    None,
+                    None,
+                    None,
+                ));
             }
             signal(pid, libc::SIGTERM)?;
-            if wait_exit(pid, id.starttime_ticks, Duration::from_secs(5)) {
-                return Ok(ExecDetail {
-                    summary: format!("terminated pid {pid}"),
-                    quarantine_id: None,
-                    sha256: None,
-                    signal: Some("SIGTERM".into()),
-                });
+            if wait_exit(pid, id.starttime_ticks, Duration::from_secs(5), &cancelled)? {
+                return Ok(detail(
+                    format!("terminated pid {pid}{note}"),
+                    None,
+                    None,
+                    Some("SIGTERM"),
+                ));
             }
             // Still alive: prove it is the same process before the hard kill.
-            verify_identity(pid, exe_path, observed_at_ns)?;
-            signal(pid, libc::SIGKILL)?;
-            if wait_exit(pid, id.starttime_ticks, Duration::from_secs(5)) {
-                Ok(ExecDetail {
-                    summary: format!("killed pid {pid}"),
-                    quarantine_id: None,
-                    sha256: None,
-                    signal: Some("SIGKILL".into()),
-                })
+            match verify_identity(pid, exe_path, observed_at_ns) {
+                Ok(_) => {}
+                // It went away between the last poll and now: that is success.
+                Err(e) if e.code == FailCode::NotFound => {
+                    return Ok(detail(
+                        format!("terminated pid {pid}{note}"),
+                        None,
+                        None,
+                        Some("SIGTERM"),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+            match signal(pid, libc::SIGKILL) {
+                Ok(()) => {}
+                Err(e) if e.code == FailCode::NotFound => {
+                    return Ok(detail(
+                        format!("terminated pid {pid}{note}"),
+                        None,
+                        None,
+                        Some("SIGTERM"),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+            if wait_exit(pid, id.starttime_ticks, Duration::from_secs(5), &cancelled)? {
+                Ok(detail(
+                    format!("killed pid {pid}{note}"),
+                    None,
+                    None,
+                    Some("SIGKILL"),
+                ))
             } else {
                 Err(fail(FailCode::Io, format!("pid {pid} survived SIGKILL")))
             }
@@ -359,6 +497,8 @@ mod linux {
             device_id: u64,
             dry_run: bool,
         ) -> Result<ExecDetail, ExecFailure> {
+            let deadline = Instant::now() + self.budget;
+            let cancelled = move || Instant::now() >= deadline;
             // Open the final component without following symlinks, then judge
             // the OPEN file, so a swap after the guard's lexical check cannot
             // redirect us (e.g. a dangling symlink into the vault).
@@ -380,7 +520,7 @@ mod linux {
             if meta.ino() != inode || encode_st_dev(meta.dev()) != device_id {
                 return Err(fail(FailCode::TargetChanged, "inode/device changed"));
             }
-            self.ensure_vault()?;
+            crate::control::ensure_vault(&self.vault).map_err(|e| io_fail("vault", e))?;
             let vault_meta = std::fs::metadata(&self.vault).map_err(|e| io_fail("vault", e))?;
             if same_file(&vault_meta, &meta) {
                 return Err(fail(FailCode::TargetChanged, "protected: the vault itself"));
@@ -392,17 +532,20 @@ mod linux {
             if real.starts_with(&vault_real) {
                 return Err(fail(FailCode::TargetChanged, "protected: inside the vault"));
             }
+            let nlink = meta.nlink();
+            let warning = hardlink_warning(nlink);
             if dry_run {
-                return Ok(ExecDetail {
-                    summary: format!("quarantine {path}"),
-                    quarantine_id: None,
-                    sha256: None,
-                    signal: None,
-                });
+                return Ok(detail(
+                    format!("quarantine {path}{warning}"),
+                    None,
+                    None,
+                    None,
+                ));
             }
 
             let id = Uuid::new_v4();
             let (vaulted, sidecar_path) = vault_paths(&self.vault, id);
+            let mut copied = false;
             match std::fs::rename(path, &vaulted) {
                 Ok(()) => {
                     // The path could have been swapped after the open: whatever
@@ -415,13 +558,36 @@ mod linux {
                     }
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                    copy_across(&file, &meta, path, &vaulted)?;
+                    // Copy only; the original is unlinked once the sidecar is durable.
+                    copy_into_vault(&file, &vaulted, &cancelled)?;
+                    copied = true;
                 }
                 Err(e) => return Err(io_fail("move into vault", e)),
             }
-            let sha = Self::hash_file(&vaulted)?;
-            std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(0))
-                .map_err(|e| io_fail("chmod 0000", e))?;
+            let undo = |restore_mode: bool| {
+                if copied {
+                    let _ = std::fs::remove_file(&vaulted);
+                } else {
+                    if restore_mode {
+                        let _ = std::fs::set_permissions(&vaulted, perm(meta.mode() & 0o7777));
+                    }
+                    let _ = std::fs::rename(&vaulted, path);
+                }
+            };
+            let sha = match File::open(&vaulted)
+                .and_then(|f| sha256_reader_until(f, &cancelled))
+                .map_err(|e| io_fail("hash", e))
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    undo(false);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = std::fs::set_permissions(&vaulted, perm(0)) {
+                undo(false);
+                return Err(io_fail("chmod 0000", e));
+            }
             let car = Sidecar {
                 path: path.to_string(),
                 mode: meta.mode() & 0o7777,
@@ -429,6 +595,7 @@ mod linux {
                 gid: meta.gid(),
                 sha256: sha.clone(),
                 quarantined_at: now_ms(),
+                nlink,
             };
             let json = serde_json::to_vec_pretty(&car)
                 .map_err(|e| fail(FailCode::Io, format!("sidecar encode: {e}")))?;
@@ -440,20 +607,34 @@ mod linux {
                 .and_then(|mut f| f.write_all(&json).and_then(|_| f.sync_all()));
             if let Err(e) = written {
                 let _ = std::fs::remove_file(&sidecar_path);
-                let _ =
-                    std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(car.mode));
-                let _ = std::fs::rename(&vaulted, path);
+                undo(true);
                 return Err(io_fail("write sidecar", e));
             }
-            Ok(ExecDetail {
-                summary: format!("quarantined {path}"),
-                quarantine_id: Some(id),
-                sha256: Some(sha),
-                signal: None,
-            })
+            if copied {
+                // Only now remove the original, and only if it is still the checked file.
+                let unlinked = match std::fs::symlink_metadata(path) {
+                    Ok(now) if same_file(&now, &meta) => {
+                        std::fs::remove_file(path).map_err(|e| io_fail("unlink original", e))
+                    }
+                    _ => Err(fail(FailCode::TargetChanged, "file swapped during move")),
+                };
+                if let Err(e) = unlinked {
+                    let _ = std::fs::remove_file(&vaulted);
+                    let _ = std::fs::remove_file(&sidecar_path);
+                    return Err(e);
+                }
+            }
+            Ok(detail(
+                format!("quarantined {path}{warning}"),
+                Some(id),
+                Some(sha),
+                None,
+            ))
         }
 
         fn restore(&self, id: Uuid, dry_run: bool) -> Result<ExecDetail, ExecFailure> {
+            let deadline = Instant::now() + self.budget;
+            let cancelled = move || Instant::now() >= deadline;
             let (vaulted, sidecar_path) = vault_paths(&self.vault, id);
             let raw = std::fs::read(&sidecar_path).map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => {
@@ -464,79 +645,77 @@ mod linux {
             let car: Sidecar = serde_json::from_slice(&raw)
                 .map_err(|e| fail(FailCode::Unverifiable, format!("bad sidecar: {e}")))?;
             let dest = PathBuf::from(&car.path);
-            if !dest.is_absolute() || dest.starts_with(&self.vault) {
-                return Err(fail(FailCode::Unverifiable, "sidecar path not restorable"));
-            }
-            // The vaulted file is mode 0000; make it readable to its owner.
-            std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(0o400)).map_err(
-                |e| match e.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        fail(FailCode::NotFound, "vaulted file missing")
-                    }
-                    _ => io_fail("chmod vaulted file", e),
-                },
-            )?;
-            let relock = |r: Result<ExecDetail, ExecFailure>| {
-                if r.is_err() {
-                    let _ = std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(0));
-                }
-                r
+            // Absolute, no `..`, and not resolving (through symlinks) into the vault.
+            let guard = ProtectedTargets {
+                agent_pid: 0,
+                extra_pids: Vec::new(),
+                vault: self.vault.clone(),
             };
-            relock((|| {
-                if Self::hash_file(&vaulted)? != car.sha256 {
-                    return Err(fail(FailCode::TargetChanged, "vaulted file hash mismatch"));
-                }
-                if std::fs::symlink_metadata(&dest).is_ok() {
-                    return Err(fail(
-                        FailCode::DestinationExists,
-                        format!("{} exists", dest.display()),
-                    ));
-                }
-                if dry_run {
-                    return Ok(ExecDetail {
-                        summary: format!("restore {}", dest.display()),
-                        quarantine_id: Some(id),
-                        sha256: Some(car.sha256.clone()),
-                        signal: None,
-                    });
-                }
-                // hard_link fails atomically if the destination appeared meanwhile.
-                match std::fs::hard_link(&vaulted, &dest) {
-                    Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                        let src = File::open(&vaulted).map_err(|e| io_fail("open vaulted", e))?;
-                        let mut out = OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
-                            .open(&dest)
-                            .map_err(dest_err)?;
-                        std::io::copy(&mut &src, &mut out)
-                            .and_then(|_| out.sync_all())
-                            .map_err(|e| {
-                                let _ = std::fs::remove_file(&dest);
-                                io_fail("copy back", e)
-                            })?;
+            if let Err(r) = guard.check_path(&car.path) {
+                return Err(fail(
+                    FailCode::Unverifiable,
+                    format!("sidecar path not restorable: {r}"),
+                ));
+            }
+            // Read through an fd opened while briefly readable; the mode is
+            // back to 0000 before anything else happens (dry run included).
+            let src = open_vaulted(&vaulted)?;
+            if sha256_reader_until(&src, &cancelled).map_err(|e| io_fail("hash", e))? != car.sha256
+            {
+                return Err(fail(FailCode::TargetChanged, "vaulted file hash mismatch"));
+            }
+            if std::fs::symlink_metadata(&dest).is_ok() {
+                return Err(fail(
+                    FailCode::DestinationExists,
+                    format!("{} exists", dest.display()),
+                ));
+            }
+            if dry_run {
+                return Ok(detail(
+                    format!("restore {}", dest.display()),
+                    Some(id),
+                    Some(car.sha256.clone()),
+                    None,
+                ));
+            }
+            // hard_link fails atomically if the destination appeared meanwhile.
+            match std::fs::hard_link(&vaulted, &dest) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                    let mut out = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&dest)
+                        .map_err(dest_err)?;
+                    let mut r = &src;
+                    let copied = r
+                        .seek(SeekFrom::Start(0))
+                        .and_then(|_| copy_until(&mut r, &mut out, &cancelled))
+                        .and_then(|_| out.sync_all());
+                    if let Err(e) = copied {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(io_fail("copy back", e));
                     }
-                    Err(e) => return Err(dest_err(e)),
                 }
-                let restored =
-                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(car.mode))
-                        .map_err(|e| io_fail("chmod", e))
-                        .and_then(|_| chown(&dest, car.uid, car.gid));
-                if let Err(e) = restored {
-                    let _ = std::fs::remove_file(&dest);
-                    return Err(e);
-                }
-                let _ = std::fs::remove_file(&vaulted);
-                let _ = std::fs::remove_file(&sidecar_path);
-                Ok(ExecDetail {
-                    summary: format!("restored {}", dest.display()),
-                    quarantine_id: Some(id),
-                    sha256: Some(car.sha256.clone()),
-                    signal: None,
-                })
-            })())
+                Err(e) => return Err(dest_err(e)),
+            }
+            // chown FIRST (it clears setuid/setgid), then the original mode.
+            let restored = chown(&dest, car.uid, car.gid).and_then(|_| {
+                std::fs::set_permissions(&dest, perm(car.mode)).map_err(|e| io_fail("chmod", e))
+            });
+            if let Err(e) = restored {
+                let _ = std::fs::remove_file(&dest);
+                return Err(e);
+            }
+            let _ = std::fs::remove_file(&vaulted);
+            let _ = std::fs::remove_file(&sidecar_path);
+            Ok(detail(
+                format!("restored {}", dest.display()),
+                Some(id),
+                Some(car.sha256.clone()),
+                None,
+            ))
         }
     }
 
@@ -564,13 +743,12 @@ mod linux {
         f.as_raw_fd()
     }
 
-    /// Cross-device move: copy from the checked open fd, sync, then unlink the
-    /// original only if the path still names the same file.
-    fn copy_across(
+    /// Cross-device move, step one: copy from the checked open fd into a new
+    /// vault file and sync it. The original is left in place.
+    fn copy_into_vault(
         file: &File,
-        meta: &std::fs::Metadata,
-        path: &str,
         vaulted: &Path,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(), ExecFailure> {
         let mut src = file;
         src.seek(SeekFrom::Start(0))
@@ -581,21 +759,12 @@ mod linux {
             .mode(0o600)
             .open(vaulted)
             .map_err(|e| io_fail("create vault file", e))?;
-        let copied = std::io::copy(&mut src, &mut out).and_then(|_| out.sync_all());
+        let copied = copy_until(&mut src, &mut out, cancelled).and_then(|_| out.sync_all());
         if let Err(e) = copied {
             let _ = std::fs::remove_file(vaulted);
             return Err(io_fail("copy into vault", e));
         }
-        match std::fs::symlink_metadata(path) {
-            Ok(now) if same_file(&now, meta) => std::fs::remove_file(path).map_err(|e| {
-                let _ = std::fs::remove_file(vaulted);
-                io_fail("unlink original", e)
-            }),
-            _ => {
-                let _ = std::fs::remove_file(vaulted);
-                Err(fail(FailCode::TargetChanged, "file swapped during move"))
-            }
-        }
+        Ok(())
     }
 }
 
@@ -632,9 +801,11 @@ mod pure_tests {
 
     #[test]
     fn device_encoding() {
-        assert_eq!(encode_dev(8, 1), (8u64 << 32) | 1);
+        assert_eq!(osiris_schema::encode_device_id(8, 1), (8u64 << 32) | 1);
         // st_dev of major 8, minor 1 is 0x801.
-        assert_eq!(encode_st_dev(0x801), encode_dev(8, 1));
+        assert_eq!(encode_st_dev(0x801), osiris_schema::encode_device_id(8, 1));
+        // A huge value must not overflow a shift.
+        let _ = encode_st_dev(u64::MAX);
     }
 
     #[test]
@@ -671,9 +842,57 @@ mod pure_tests {
             gid: 2,
             sha256: "x".into(),
             quarantined_at: 3,
+            nlink: 2,
         };
         let back: Sidecar = serde_json::from_slice(&serde_json::to_vec(&car).unwrap()).unwrap();
         assert_eq!(back, car);
+    }
+
+    #[test]
+    fn sidecar_nlink_defaults_when_absent() {
+        let old = br#"{"path":"/a","mode":420,"uid":1,"gid":2,"sha256":"x","quarantined_at":3}"#;
+        let car: Sidecar = serde_json::from_slice(old).unwrap();
+        assert_eq!(car.nlink, 1);
+        let new = br#"{"path":"/a","mode":420,"uid":1,"gid":2,"sha256":"x","quarantined_at":3,"nlink":3}"#;
+        assert_eq!(serde_json::from_slice::<Sidecar>(new).unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn hardlink_warning_text() {
+        assert_eq!(hardlink_warning(1), "");
+        assert!(hardlink_warning(3).contains("WARNING: 2 other hard link(s)"));
+    }
+
+    #[test]
+    fn deleted_suffix_is_normalized() {
+        assert_eq!(
+            normalize_exe_link("/tmp/x (deleted)"),
+            ("/tmp/x".to_string(), true)
+        );
+        assert_eq!(normalize_exe_link("/tmp/x"), ("/tmp/x".to_string(), false));
+        assert_eq!(
+            normalize_exe_link("/tmp/a (deleted)/b"),
+            ("/tmp/a (deleted)/b".to_string(), false)
+        );
+        assert_eq!(
+            normalize_exe_link("/tmp/x (deleted) (deleted)"),
+            ("/tmp/x (deleted)".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn cancellable_loops_stop() {
+        let e = sha256_reader_until(&b"abc"[..], &|| true).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        let mut out = Vec::new();
+        let e = copy_until(&mut &b"abc"[..], &mut out, &|| true).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        let mut out = Vec::new();
+        assert_eq!(
+            copy_until(&mut &b"abc"[..], &mut out, &|| false).unwrap(),
+            3
+        );
+        assert_eq!(out, b"abc");
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -708,9 +927,7 @@ mod linux_tests {
     }
 
     fn exec(dir: &tempfile::TempDir) -> LinuxExecutor {
-        LinuxExecutor {
-            vault: dir.path().join("vault"),
-        }
+        LinuxExecutor::new(dir.path().join("vault"))
     }
 
     #[test]
@@ -765,9 +982,15 @@ mod linux_tests {
     #[test]
     fn kernel_threads_and_missing_pids_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        // pid 2 is kthreadd; its exe link is unreadable.
-        let e = exec(&dir).terminate(2, "/x", now_ns(), false).unwrap_err();
-        assert_eq!(e.code, FailCode::Unverifiable);
+        // Only assert on pid 2 where it really is a kernel thread (containers
+        // may differ): a readable stat with ppid 0/2 and an unreadable exe link.
+        if let Ok(s) = std::fs::read_to_string("/proc/2/stat") {
+            let ppid = parse_stat(&s).map(|i| i.ppid);
+            if matches!(ppid, Some(0) | Some(2)) && std::fs::read_link("/proc/2/exe").is_err() {
+                let e = exec(&dir).terminate(2, "/x", now_ns(), false).unwrap_err();
+                assert_eq!(e.code, FailCode::Unverifiable);
+            }
+        }
         let e = exec(&dir)
             .terminate(u32::MAX - 1, "/x", now_ns(), false)
             .unwrap_err();
@@ -775,6 +998,22 @@ mod linux_tests {
             e.code,
             FailCode::NotFound | FailCode::Unverifiable
         ));
+    }
+
+    #[test]
+    fn a_deleted_binary_can_still_be_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("selfdel");
+        std::fs::copy("/bin/sleep", &bin).unwrap();
+        let mut child = Command::new(&bin).arg("60").spawn().unwrap();
+        std::fs::remove_file(&bin).unwrap();
+        let link = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        assert!(link.to_string_lossy().ends_with(" (deleted)"));
+        let r = exec(&dir)
+            .terminate(child.id(), bin.to_str().unwrap(), now_ns(), false)
+            .unwrap();
+        assert!(r.summary.contains("binary was deleted from disk"));
+        assert!(child.wait().is_ok());
     }
 
     fn ids(path: &Path) -> (u64, u64) {
@@ -905,5 +1144,81 @@ mod linux_tests {
         assert!(p
             .check_path(dir.path().join("vault").join("x").to_str().unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn dry_run_restore_leaves_the_vaulted_file_locked_and_destination_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("dr.bin");
+        std::fs::write(&f, b"data").unwrap();
+        let (ino, dev) = ids(&f);
+        let id = ex
+            .quarantine(f.to_str().unwrap(), ino, dev, false)
+            .unwrap()
+            .quarantine_id
+            .unwrap();
+        ex.restore(id, true).unwrap();
+        let (vaulted, sidecar) = vault_paths(&ex.vault, id);
+        assert_eq!(std::fs::metadata(&vaulted).unwrap().mode() & 0o7777, 0);
+        assert!(sidecar.exists());
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn extra_hard_links_are_reported_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("h1.bin");
+        let other = dir.path().join("h2.bin");
+        std::fs::write(&f, b"data").unwrap();
+        std::fs::hard_link(&f, &other).unwrap();
+        let (ino, dev) = ids(&f);
+        let d = ex.quarantine(f.to_str().unwrap(), ino, dev, false).unwrap();
+        assert!(d.summary.contains("WARNING: 1 other hard link(s)"));
+        let (_, sidecar) = vault_paths(&ex.vault, d.quarantine_id.unwrap());
+        let car: Sidecar = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(car.nlink, 2);
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn restore_preserves_setuid_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("suid.bin");
+        std::fs::write(&f, b"data").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let (ino, dev) = ids(&f);
+        let id = ex
+            .quarantine(f.to_str().unwrap(), ino, dev, false)
+            .unwrap()
+            .quarantine_id
+            .unwrap();
+        ex.restore(id, false).unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().mode() & 0o7777, 0o4755);
+    }
+
+    #[test]
+    fn restore_through_a_symlinked_parent_into_the_vault_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("s.bin");
+        std::fs::write(&f, b"data").unwrap();
+        let (ino, dev) = ids(&f);
+        let id = ex
+            .quarantine(f.to_str().unwrap(), ino, dev, false)
+            .unwrap()
+            .quarantine_id
+            .unwrap();
+        let (_, sidecar) = vault_paths(&ex.vault, id);
+        let mut car: Sidecar = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&ex.vault, &alias).unwrap();
+        car.path = alias.join("planted").display().to_string();
+        std::fs::write(&sidecar, serde_json::to_vec(&car).unwrap()).unwrap();
+        let e = ex.restore(id, false).unwrap_err();
+        assert_eq!(e.code, FailCode::Unverifiable);
+        assert!(!ex.vault.join("planted").exists());
     }
 }

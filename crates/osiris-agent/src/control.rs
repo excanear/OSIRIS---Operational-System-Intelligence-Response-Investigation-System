@@ -95,11 +95,23 @@ fn now_ms() -> u64 {
 #[async_trait]
 impl CommandHandler for AgentCommandHandler {
     async fn handle(&self, cmd: SignedCommand) -> CommandResult {
+        // Never log the signature: only the id and the action.
         let command_id = cmd.command.command_id;
+        let action = format!("{:?}", cmd.command.action);
         let result = self.execute(cmd).await;
-        if let CommandResult::Refused { reason } = &result {
-            // Never log the signature.
-            tracing::warn!(%command_id, refusal = ?reason, "command refused");
+        match &result {
+            CommandResult::Refused { reason } => {
+                tracing::warn!(%command_id, refusal = ?reason, "command refused");
+            }
+            CommandResult::Failed { code, message } => {
+                tracing::warn!(%command_id, %action, code = ?code, %message, "command failed");
+            }
+            CommandResult::Executed { detail } => {
+                tracing::info!(%command_id, %action, summary = %detail.summary, "command executed");
+            }
+            CommandResult::DryRunOk { would_do } => {
+                tracing::info!(%command_id, %action, %would_do, "command dry run ok");
+            }
         }
         result
     }
@@ -107,7 +119,30 @@ impl CommandHandler for AgentCommandHandler {
 
 /// Creates the quarantine vault (0700 on Unix).
 pub fn ensure_vault(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    let not_a_dir = || {
+        std::io::Error::other(format!(
+            "vault {} exists but is not a real directory",
+            dir.display()
+        ))
+    };
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Err(not_a_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut b = std::fs::DirBuilder::new();
+            b.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            b.create(dir)?;
+            if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
+                return Err(not_a_dir());
+            }
+        }
+        Err(e) => return Err(e),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -277,8 +312,10 @@ mod tests {
             let (h, c) = (h.clone(), cmd(&key));
             joins.push(tokio::spawn(async move { h.handle(c).await }));
         }
-        // Let the nine occupy every slot while the executor blocks.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait (deterministically) until the nine occupy every slot.
+        while h.admission.available_permits() != 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         assert_eq!(
             h.handle(cmd(&key)).await,
             CommandResult::Refused {
@@ -356,5 +393,24 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vault_creates_0700_and_refuses_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let v = dir.path().join("v");
+        ensure_vault(&v).unwrap();
+        assert_eq!(
+            std::fs::metadata(&v).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&v, &link).unwrap();
+        assert!(ensure_vault(&link).is_err());
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(ensure_vault(&file).is_err());
     }
 }
