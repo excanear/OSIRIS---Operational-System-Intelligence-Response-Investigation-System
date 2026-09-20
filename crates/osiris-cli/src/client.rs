@@ -145,6 +145,26 @@ pub fn hunt_url(
     url
 }
 
+/// Builds the shared blocking HTTP client. With `ca_cert` (a PEM file) the
+/// certificate is added as a trusted root and rustls is used; without it the
+/// default client is returned unchanged.
+pub fn build_client(
+    ca_cert: Option<&std::path::Path>,
+) -> Result<reqwest::blocking::Client, String> {
+    let Some(path) = ca_cert else {
+        return Ok(reqwest::blocking::Client::new());
+    };
+    let pem = std::fs::read(path)
+        .map_err(|e| format!("cannot read --ca-cert {}: {e}", path.display()))?;
+    let cert = reqwest::Certificate::from_pem(&pem)
+        .map_err(|e| format!("invalid --ca-cert {}: {e}", path.display()))?;
+    reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(cert)
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

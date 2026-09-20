@@ -82,6 +82,22 @@ pub fn server_config(
     Ok(Arc::new(config))
 }
 
+/// Server side for a public-facing listener (the API/Console): presents
+/// `cert`/`key`, TLS 1.3 only, NO client authentication, ALPN `h2`/`http/1.1`.
+pub fn server_config_no_client_auth(
+    cert: &Path,
+    key: &Path,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| TlsError::Rustls(e.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(load_certs(cert)?, load_key(key)?)
+        .map_err(|e| TlsError::Rustls(e.to_string()))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// Client side: trusts only `ca` and presents `cert`/`key`.
 pub fn client_config(ca: &Path, cert: &Path, key: &Path) -> Result<Arc<ClientConfig>, TlsError> {
     let config = ClientConfig::builder_with_provider(provider())

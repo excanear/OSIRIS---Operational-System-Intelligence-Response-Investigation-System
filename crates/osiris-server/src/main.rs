@@ -186,6 +186,26 @@ async fn main() {
         }
     };
 
+    // Fail closed: a configured-but-unusable api_tls must never fall back to HTTP.
+    let api_acceptor = match &config.api_tls {
+        Some(t) => match osiris_server::api_tls::acceptor(Path::new(&t.cert), Path::new(&t.key)) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("config key 'api_tls': {e}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            if !osiris_server::api_tls::is_loopback_addr(&config.listen_addr) {
+                tracing::warn!(
+                    listen_addr = %config.listen_addr,
+                    "API/Console is listening on a non-loopback address without api_tls;                      session tokens travel unencrypted"
+                );
+            }
+            None
+        }
+    };
+
     let incidents_db_path = config
         .incidents_db_path
         .clone()
@@ -315,6 +335,20 @@ async fn main() {
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,
     );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot bind listen_addr {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match &api_acceptor {
+        Some(acceptor) => {
+            tracing::info!(%addr, "API/Console serving HTTPS (TLS 1.3)");
+            osiris_server::api_tls::serve_tls(listener, acceptor.clone(), app, cancellation).await;
+        }
+        None => {
+            axum::serve(listener, app).await.unwrap();
+        }
+    }
 }

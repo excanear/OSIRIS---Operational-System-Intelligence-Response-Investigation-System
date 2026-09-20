@@ -68,6 +68,16 @@ pub struct ServerConfig {
     /// tails `spool_path` (same-host Agent), exactly as before.
     #[serde(default)]
     pub agent_listener: Option<AgentListenerConfig>,
+    /// Phase 9b: native TLS for the API/Console listener. Absent = plain HTTP.
+    #[serde(default)]
+    pub api_tls: Option<ApiTlsConfig>,
+}
+
+/// PEM certificate chain and private key the API/Console presents (no client auth).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiTlsConfig {
+    pub cert: String,
+    pub key: String,
 }
 
 /// Where remote Agents connect and how they are authenticated.
@@ -249,5 +259,30 @@ rules_dir: /r
         assert_eq!(config.users_db_path.as_deref(), Some("/tmp/users.db"));
         assert_eq!(config.tenants_db_path.as_deref(), Some("/tmp/tenants.db"));
         assert_eq!(config.session_ttl_seconds, Some(3600));
+    }
+
+    #[test]
+    fn api_tls_is_optional_and_parses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        let base = "db_path: /tmp/e.db
+spool_path: /tmp/s
+listen_addr: 127.0.0.1:8080
+rules_dir: /r
+";
+        std::fs::write(&path, base).unwrap();
+        assert!(ServerConfig::load(&path).unwrap().api_tls.is_none());
+        std::fs::write(
+            &path,
+            format!(
+                "{base}api_tls:
+  cert: /a.pem
+  key: /a.key
+"
+            ),
+        )
+        .unwrap();
+        let t = ServerConfig::load(&path).unwrap().api_tls.unwrap();
+        assert_eq!((t.cert.as_str(), t.key.as_str()), ("/a.pem", "/a.key"));
     }
 }

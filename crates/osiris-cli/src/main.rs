@@ -16,6 +16,11 @@ struct Cli {
     server: String,
     #[arg(long, default_value = "http://127.0.0.1:9200")]
     agent: String,
+    /// PEM CA certificate to trust for `https://` --server URLs (in addition
+    /// to the system roots). Also read from OSIRIS_CA_CERT. The same shared
+    /// client is used for --agent requests.
+    #[arg(long, global = true, env = "OSIRIS_CA_CERT")]
+    ca_cert: Option<std::path::PathBuf>,
     #[arg(long, default_value = "table")]
     format: String,
     #[command(subcommand)]
@@ -340,7 +345,13 @@ fn delete_empty(
 
 fn main() {
     let cli = Cli::parse();
-    let client = reqwest::blocking::Client::new();
+    let client = match osiris_cli::client::build_client(cli.ca_cert.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     let result = match &cli.command {
         // `--agent` is a separate service (default port 9200), potentially on
