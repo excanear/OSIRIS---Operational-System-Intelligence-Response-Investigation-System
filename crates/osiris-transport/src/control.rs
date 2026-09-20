@@ -41,9 +41,12 @@ pub enum SendError {
     TimedOut,
     #[error("the control connection was lost or replaced")]
     Disconnected,
+    #[error("a command with this id is already pending")]
+    Duplicate,
 }
 
-type Outbound = (SignedCommand, oneshot::Sender<CommandResult>);
+type Reply = Result<CommandResult, SendError>;
+type Outbound = (SignedCommand, oneshot::Sender<Reply>);
 
 struct HostConn {
     tx: mpsc::Sender<Outbound>,
@@ -101,7 +104,7 @@ impl ControlHub {
                 .await
                 .map_err(|_| SendError::Disconnected)?;
             // The connection task drops the sender when it ends or is replaced.
-            result_rx.await.map_err(|_| SendError::Disconnected)
+            result_rx.await.map_err(|_| SendError::Disconnected)?
         };
         tokio::time::timeout(timeout, exchange)
             .await
@@ -191,6 +194,14 @@ impl ControlListener {
             });
         }
     }
+}
+
+/// Truncates to 64 characters and replaces control characters with `?`.
+fn sanitize_agent_version(v: &str) -> String {
+    v.chars()
+        .take(64)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Removes the connection from the hub when the serving task ends (only if it
@@ -299,19 +310,32 @@ async fn serve(
         host: host_id,
         id,
     };
+    let agent_version = sanitize_agent_version(&agent_version);
     tracing::info!(%host_id, %agent_version, "agent control connection established");
+    // Acts as the acceptance ack: the Agent resets its reconnect backoff on it.
+    write_bounded(&mut wr, &ControlServerMsg::Ping).await?;
 
     // Dropping `pending` (on any exit) resolves waiting senders with `Disconnected`.
-    let mut pending: HashMap<Uuid, oneshot::Sender<CommandResult>> = HashMap::new();
+    let mut pending: HashMap<Uuid, oneshot::Sender<Reply>> = HashMap::new();
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Ok(()),
             _ = replaced.cancelled() => return Ok(()),
             out = cmd_rx.recv() => {
-                                let Some((cmd, result_tx)) = out else { return Ok(()) };
+                let Some((cmd, result_tx)) = out else { return Ok(()) };
+                // Never deliver on a connection that is being replaced or shut
+                // down: the caller is told `Disconnected` and may retry.
+                if replaced.is_cancelled() || cancel.is_cancelled() {
+                    return Ok(());
+                }
                 let command_id = cmd.command.command_id;
+                if pending.get(&command_id).is_some_and(|tx| !tx.is_closed()) {
+                    let _ = result_tx.send(Err(SendError::Duplicate));
+                    continue;
+                }
                 pending.insert(command_id, result_tx);
                 write_bounded(&mut wr, &ControlServerMsg::Command(cmd)).await?;
             }
@@ -320,7 +344,7 @@ async fn serve(
                 Some(Err(e)) => return Err(e),
                 Some(Ok(ControlClientMsg::Result { command_id, result })) => {
                     match pending.remove(&command_id) {
-                        Some(tx) => { let _ = tx.send(result); }
+                        Some(tx) => { let _ = tx.send(Ok(result)); }
                         None => tracing::debug!(%host_id, %command_id, "result for an unknown or expired command; ignoring"),
                     }
                 }
@@ -418,12 +442,15 @@ pub async fn run_control_client(
 }
 
 /// One connected session. `Ok` means cancelled; `Err` means reconnect.
-async fn control_session(
-    conn: tokio_rustls::client::TlsStream<TcpStream>,
+async fn control_session<S>(
+    conn: S,
     handler: &Arc<dyn CommandHandler>,
     cancel: &CancellationToken,
     backoff: &mut Backoff,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let (rd, mut wr) = tokio::io::split(conn);
     let (mut inbound, _reader) = spawn_reader::<_, ControlServerMsg>(rd);
     write_bounded(
@@ -433,8 +460,9 @@ async fn control_session(
         },
     )
     .await?;
-    backoff.reset();
-    tracing::info!("control connection established");
+    // Backoff resets only once the Server answers (its first frame), so a
+    // rejected agent keeps backing off.
+    let mut acknowledged = false;
 
     let (result_tx, mut results) = mpsc::channel::<ControlClientMsg>(COMMAND_QUEUE);
     loop {
@@ -443,18 +471,13 @@ async fn control_session(
             msg = inbound.recv() => match msg {
                 None => return Err("reader stopped".to_string()),
                 Some(Err(e)) => return Err(e),
-                Some(Ok(ControlServerMsg::Ping)) => {
-                    write_bounded(&mut wr, &ControlClientMsg::Pong).await?;
+                Some(Ok(m)) if !acknowledged => {
+                    acknowledged = true;
+                    backoff.reset();
+                    tracing::info!("control connection established");
+                    inbound_msg(m, &mut wr, handler, &result_tx).await?;
                 }
-                Some(Ok(ControlServerMsg::Command(cmd))) => {
-                    let command_id = cmd.command.command_id;
-                    let handler = handler.clone();
-                    let result_tx = result_tx.clone();
-                    tokio::spawn(async move {
-                        let result = handler.handle(cmd).await;
-                        let _ = result_tx.send(ControlClientMsg::Result { command_id, result }).await;
-                    });
-                }
+                Some(Ok(m)) => inbound_msg(m, &mut wr, handler, &result_tx).await?,
             },
             Some(reply) = results.recv() => {
                 write_bounded(&mut wr, &reply).await?;
@@ -463,6 +486,28 @@ async fn control_session(
     }
 }
 
+async fn inbound_msg<W: tokio::io::AsyncWrite>(
+    m: ControlServerMsg,
+    wr: &mut WriteHalf<W>,
+    handler: &Arc<dyn CommandHandler>,
+    result_tx: &mpsc::Sender<ControlClientMsg>,
+) -> Result<(), String> {
+    match m {
+        ControlServerMsg::Ping => write_bounded(wr, &ControlClientMsg::Pong).await,
+        ControlServerMsg::Command(cmd) => {
+            let command_id = cmd.command.command_id;
+            let handler = handler.clone();
+            let result_tx = result_tx.clone();
+            tokio::spawn(async move {
+                let result = handler.handle(cmd).await;
+                let _ = result_tx
+                    .send(ControlClientMsg::Result { command_id, result })
+                    .await;
+            });
+            Ok(())
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +789,135 @@ mod tests {
         }
         assert!(!hub.connected(host));
         ccancel.cancel();
+    }
+
+    #[test]
+    fn agent_version_is_bounded_and_sanitized() {
+        assert_eq!(
+            sanitize_agent_version(
+                "1.2
+[31m"
+            ),
+            "1.2??[31m"
+        );
+        assert_eq!(sanitize_agent_version(&"a".repeat(500)).chars().count(), 64);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_pending_command_id_is_rejected() {
+        let pki = Pki::new();
+        let host = Uuid::new_v4();
+        pki.agent("a", host);
+        let (addr, hub, cancel, _t) = start(&pki, HashSet::new()).await;
+        let (ccancel, _ct) = client(&pki, &addr, "a", Arc::new(Fake::default()));
+        wait_connected(&hub, host).await;
+        let first = cmd(host, 800);
+        let h2 = hub.clone();
+        let f2 = first.clone();
+        let p = tokio::spawn(async move { h2.send(host, f2, Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let dup = hub.send(host, first, Duration::from_secs(5)).await;
+        assert_eq!(dup, Err(SendError::Duplicate));
+        assert!(matches!(
+            p.await.unwrap(),
+            Ok(CommandResult::DryRunOk { .. })
+        ));
+        ccancel.cancel();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn no_command_reaches_a_replaced_connection() {
+        use crate::frame::{read_frame, write_frame};
+        // Fake old agent: a bare mTLS-less duplex is not possible with the
+        // server, so use a real TLS client that records frames.
+        let pki = Pki::new();
+        let host = Uuid::new_v4();
+        pki.agent("a", host);
+        pki.agent("b", host);
+        let (addr, hub, cancel, _t) = start(&pki, HashSet::new()).await;
+        let tlsc = tls::client_config(&pki.p("ca.pem"), &pki.p("a.pem"), &pki.p("a.key")).unwrap();
+        let tcp = TcpStream::connect(&addr).await.unwrap();
+        let mut old = TlsConnector::from(tlsc)
+            .connect(ServerName::try_from("localhost".to_string()).unwrap(), tcp)
+            .await
+            .unwrap();
+        write_frame(
+            &mut old,
+            &ControlClientMsg::Hello {
+                agent_version: "t".into(),
+            },
+        )
+        .await
+        .unwrap();
+        wait_connected(&hub, host).await;
+        let (bcancel, _bt) = client(&pki, &addr, "b", Arc::new(Fake::default()));
+        // The server closes the old connection once b replaces it.
+        let mut delivered = 0;
+        loop {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                read_frame::<_, ControlServerMsg>(&mut old),
+            )
+            .await
+            .expect("old connection must be closed on replacement")
+            {
+                Ok(ControlServerMsg::Command(_)) => delivered += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        // Sends racing the close must be served by b only, never by old.
+        let mut sends = Vec::new();
+        for _ in 0..20 {
+            let h = hub.clone();
+            sends.push(tokio::spawn(async move {
+                h.send(host, cmd(host, 0), Duration::from_secs(5)).await
+            }));
+        }
+        for s in sends {
+            assert!(s.await.unwrap().is_ok());
+        }
+        assert_eq!(delivered, 0, "old connection received commands");
+        bcancel.cancel();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn backoff_resets_only_after_the_server_answers() {
+        use crate::frame::write_frame;
+        let handler: Arc<dyn CommandHandler> = Arc::new(Fake::default());
+        let cancel = CancellationToken::new();
+
+        // Rejected: peer closes without a frame.
+        let (client_io, peer) = tokio::io::duplex(4096);
+        drop(peer);
+        let mut b = Backoff::default();
+        b.next_delay();
+        b.next_delay();
+        assert!(control_session(client_io, &handler, &cancel, &mut b)
+            .await
+            .is_err());
+        assert_eq!(b.next_delay(), Duration::from_secs(4));
+
+        // Accepted: peer sends a Ping first.
+        let (client_io, mut peer) = tokio::io::duplex(4096);
+        write_frame(&mut peer, &ControlServerMsg::Ping)
+            .await
+            .unwrap();
+        let mut b = Backoff::default();
+        b.next_delay();
+        b.next_delay();
+        let c2 = cancel.clone();
+        let h2 = handler.clone();
+        let task = tokio::spawn(async move {
+            let r = control_session(client_io, &h2, &c2, &mut b).await;
+            (r, b)
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(peer);
+        let (r, mut b) = task.await.unwrap();
+        assert!(r.is_err());
+        assert_eq!(b.next_delay(), Duration::from_secs(1));
     }
 }
