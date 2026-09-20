@@ -494,6 +494,23 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    fn event_owner(&self, event_id: Uuid) -> Result<Option<Uuid>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT host_id FROM events WHERE event_id = ?1",
+                [event_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        owner
+            .map(|h| Uuid::parse_str(&h).map_err(|e| StorageError::Backend(e.to_string())))
+            .transpose()
+    }
     fn batch_write(&self, events: &[CanonicalEvent]) -> Result<WriteReport, StorageError> {
         let mut conn = self
             .conn

@@ -119,6 +119,25 @@ impl IngestContext {
         };
         let outcome = tokio::task::spawn_blocking(move || {
             Ok::<_, osiris_storage::StorageError>({
+                // An event id already owned by a different host must not be
+                // ingested: the insert would be ignored but its edges, alerts
+                // and risk would otherwise be attributed to the victim host.
+                let total = events.len();
+                let mut kept = Vec::with_capacity(total);
+                for event in events {
+                    match storage.event_owner(event.event_id)? {
+                        Some(owner) if owner != event.host_id => {}
+                        _ => kept.push(event),
+                    }
+                }
+                let events = kept;
+                if events.len() < total {
+                    tracing::error!(
+                        dropped = total - events.len(),
+                        total,
+                        "dropped events whose event_id is already owned by another host"
+                    );
+                }
                 let report = storage.batch_write(&events)?;
                 let alerts = detection_engine.evaluate_batch(&events);
                 if !alerts.is_empty() {
@@ -435,6 +454,49 @@ mod tests {
         let edges = source.edges_for(&process, 0, 100);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].event_id, a.event_id);
+    }
+
+    #[tokio::test]
+    async fn foreign_event_id_reuse_is_dropped_and_own_redelivery_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        };
+        let a = sample_event();
+        context.ingest(vec![a.clone()]).await.unwrap();
+        context.ingest(vec![a.clone()]).await.unwrap();
+        context.ingest(vec![a.clone()]).await.unwrap();
+
+        let mut forged = sample_event();
+        forged.event_id = a.event_id;
+        forged.relationships.push(EntityRelationship {
+            from: EntityRef::Process {
+                process_key: ProcessKey::new(forged.host_id, "b", 1, 1),
+            },
+            to: EntityRef::Ip {
+                addr: "6.6.6.6".to_string(),
+            },
+            relation: osiris_schema::Relation::ConnectedTo,
+            event_id: a.event_id,
+            timestamp: 10,
+        });
+        context.ingest(vec![forged.clone()]).await.unwrap();
+
+        let all = storage.query(&QueryPlan::new()).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].host_id, a.host_id);
+        assert_eq!(storage.event_owner(a.event_id).unwrap(), Some(a.host_id));
+        let mut plan = osiris_storage::RelationshipQueryPlan::new();
+        plan.limit = 100;
+        assert_eq!(storage.query_relationships(&plan).unwrap().len(), 0);
     }
 
     #[tokio::test]

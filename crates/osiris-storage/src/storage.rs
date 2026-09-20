@@ -34,6 +34,9 @@ pub struct StorageHealth {
 pub trait Storage: Send + Sync {
     fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError>;
     fn batch_write(&self, events: &[CanonicalEvent]) -> Result<WriteReport, StorageError>;
+    /// The host that owns an already-stored event id, if any. Ingest uses this
+    /// to refuse events reusing another host's `event_id`.
+    fn event_owner(&self, event_id: Uuid) -> Result<Option<Uuid>, StorageError>;
     fn query(&self, plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError>;
     /// The OQL-backed, backend-agnostic query surface (ARCHITECTURE.md
     /// §12.3), additive to `query` above — `query` and its `QueryPlan`

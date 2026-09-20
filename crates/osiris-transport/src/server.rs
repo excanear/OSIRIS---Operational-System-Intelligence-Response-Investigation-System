@@ -47,7 +47,7 @@ pub fn event_belongs_to_host(e: &CanonicalEvent, host_id: Uuid) -> bool {
         && e.host.host_id == host_id
         && e.relationships
             .iter()
-            .all(|r| ref_ok(&r.from) && ref_ok(&r.to))
+            .all(|r| r.event_id == e.event_id && ref_ok(&r.from) && ref_ok(&r.to))
 }
 
 /// Tracks concurrent connections per peer IP; dropping the guard releases the slot.
@@ -300,6 +300,24 @@ mod tests {
         });
         assert!(!event_belongs_to_host(&e, h));
         e.relationships[0].from = EntityRef::User { host_id: h, uid: 0 };
+        assert!(event_belongs_to_host(&e, h));
+    }
+
+    #[test]
+    fn relationship_event_id_must_match_the_event() {
+        let h = Uuid::new_v4();
+        let mut e = event(h);
+        e.relationships.push(EntityRelationship {
+            from: EntityRef::User { host_id: h, uid: 0 },
+            to: EntityRef::Ip {
+                addr: "1.2.3.4".into(),
+            },
+            relation: Relation::ConnectedTo,
+            event_id: Uuid::new_v4(),
+            timestamp: 1,
+        });
+        assert!(!event_belongs_to_host(&e, h));
+        e.relationships[0].event_id = e.event_id;
         assert!(event_belongs_to_host(&e, h));
     }
 

@@ -60,6 +60,10 @@ impl Storage for TenantScopedStorage {
     fn batch_write(&self, _events: &[CanonicalEvent]) -> Result<WriteReport, StorageError> {
         Err(read_only())
     }
+    fn event_owner(&self, event_id: Uuid) -> Result<Option<Uuid>, StorageError> {
+        let owner = self.inner.event_owner(event_id)?;
+        Ok(owner.filter(|h| self.hosts.contains(h)))
+    }
     fn query(&self, plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError> {
         let mut plan = plan.clone();
         plan.host_ids = self.effective(&plan.host_ids);
