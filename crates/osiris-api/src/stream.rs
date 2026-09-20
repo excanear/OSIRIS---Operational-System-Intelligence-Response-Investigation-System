@@ -371,7 +371,11 @@ async fn handle_socket(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                let _ = socket.send(Message::Close(None)).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    socket.send(Message::Close(None)),
+                )
+                .await;
                 break;
             }
             maybe_event = receiver.recv() => {

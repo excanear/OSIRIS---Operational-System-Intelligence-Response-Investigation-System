@@ -34,7 +34,14 @@ pub fn validate_name(name: &str) -> Result<(), PkiError> {
     let mut chars = name.chars();
     let ok_first =
         matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let stem = name.split('.').next().unwrap_or("").to_ascii_lowercase();
+    let reserved = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+        || ((stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
     if ok_first
+        && !reserved
+        && !name.ends_with('.')
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && !name.contains("..")
     {
@@ -170,7 +177,10 @@ pub fn write_issued(dir: &Path, name: &str, issued: &Issued) -> Result<(), PkiEr
         f.write_all(data.as_bytes()).map_err(|e| io(path, e))
     };
     create(&key_path, true, &issued.key_pem)?;
-    create(&cert_path, false, &issued.cert_pem)?;
+    if let Err(e) = create(&cert_path, false, &issued.cert_pem) {
+        let _ = std::fs::remove_file(&key_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -230,7 +240,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = generate_ca("test-ca").unwrap();
         for bad in [
-            "", "../x", "a/b", r"a\b", "/abs", ".hidden", "a..b", "..", "sp ace",
+            "", "../x", "a/b", r"a\b", "/abs", ".hidden", "a..b", "..", "sp ace", "con", "CON",
+            "nul.txt", "Com1", "lpt9", "aux.pem", "trail.",
         ] {
             assert!(write_issued(dir.path(), bad, &ca).is_err(), "{bad:?}");
         }

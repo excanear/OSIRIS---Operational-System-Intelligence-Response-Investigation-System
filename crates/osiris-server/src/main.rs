@@ -379,7 +379,11 @@ async fn main() {
             });
             // Bound the drain: a slow client must not hang SIGTERM.
             tokio::select! {
-                r = served => r.unwrap(),
+                r = served => {
+                    if let Err(e) = r {
+                        tracing::error!(error = %e, "plain HTTP server ended with error");
+                    }
+                }
                 _ = async {
                     token.cancelled().await;
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;

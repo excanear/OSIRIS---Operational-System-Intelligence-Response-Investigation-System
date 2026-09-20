@@ -10,6 +10,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -159,11 +160,13 @@ impl Drop for IpGuard {
 }
 
 /// Wraps the TLS stream so a client that completes the handshake but never
-/// sends a byte is dropped after `deadline`. Once any byte has been read the
-/// deadline is gone: established idle WebSockets and keep-alive h2 are left to
+/// produces a request (silent, or a stalled partial preface) is dropped after
+/// `deadline`. Once a request has been dispatched the deadline is gone: established idle WebSockets and keep-alive h2 are left to
 /// their own keepalives.
 struct FirstByteDeadline<T> {
     inner: T,
+    /// Set once the connection has produced a request.
+    requested: Arc<AtomicBool>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -174,17 +177,15 @@ impl<T: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if this.requested.load(Ordering::Acquire) {
+            this.deadline = None;
+        }
         if let Some(d) = this.deadline.as_mut() {
             if d.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
             }
         }
-        let before = buf.filled().len();
-        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            this.deadline = None;
-        }
-        r
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
@@ -238,7 +239,8 @@ pub async fn serve_tls_with(
     let router = with_hsts(router);
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(IpCounter::default());
-    let mut refused: u64 = 0;
+    let mut refused_global: u64 = 0;
+    let mut refused_per_ip: u64 = 0;
     let mut last_warn: Option<tokio::time::Instant> = None;
     loop {
         let (tcp, peer) = tokio::select! {
@@ -253,17 +255,29 @@ pub async fn serve_tls_with(
             },
         };
         let admitted = match permits.clone().try_acquire_owned() {
-            Ok(permit) => per_ip
-                .acquire(peer.ip(), limits.max_per_ip)
-                .map(|g| (permit, g)),
-            Err(_) => None,
+            Ok(permit) => match per_ip.acquire(peer.ip(), limits.max_per_ip) {
+                Some(g) => Some((permit, g)),
+                None => {
+                    refused_per_ip += 1;
+                    tracing::debug!(%peer, "api connection refused: per-IP cap reached");
+                    None
+                }
+            },
+            Err(_) => {
+                refused_global += 1;
+                tracing::debug!(%peer, "api connection refused: global cap reached");
+                None
+            }
         };
         let Some((permit, ip_guard)) = admitted else {
-            refused += 1;
-            tracing::debug!(%peer, "api connection refused: connection cap reached");
             if last_warn.is_none_or(|t| t.elapsed() >= REFUSAL_WARN_EVERY) {
-                tracing::warn!(refused, "api listener refused connections at its caps");
-                refused = 0;
+                tracing::warn!(
+                    refused_global,
+                    refused_per_ip,
+                    "api listener refused connections at its caps"
+                );
+                refused_global = 0;
+                refused_per_ip = 0;
                 last_warn = Some(tokio::time::Instant::now());
             }
             continue;
@@ -287,13 +301,16 @@ pub async fn serve_tls_with(
                         return;
                     }
                 };
+            let requested = Arc::new(AtomicBool::new(false));
             let io = FirstByteDeadline {
                 inner: tls,
+                requested: requested.clone(),
                 deadline: Some(Box::pin(tokio::time::sleep(limits.header_read_timeout))),
             };
             let signal = osiris_api::ShutdownSignal(shutdown.clone());
             let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
                 let router = router.clone();
+                requested.store(true, Ordering::Release);
                 req.extensions_mut().insert(signal.clone());
                 req.extensions_mut()
                     .insert(osiris_api::ConnectionHold(hold.clone()));
@@ -773,6 +790,34 @@ mod tests {
             .await
             .expect("a silent client must be dropped");
         // The single permit is free again.
+        let resp = https_get(srv.addr, Some(&c.ca_pem)).await.unwrap();
+        assert!(resp.ends_with("pong"), "{resp}");
+        srv.token.cancel();
+    }
+
+    #[tokio::test]
+    async fn partial_h2_preface_then_stall_is_dropped_and_frees_its_permit() {
+        let c = certs();
+        let srv = start_with(
+            &c,
+            Limits {
+                max_connections: 1,
+                header_read_timeout: Duration::from_millis(300),
+                ..Limits::default()
+            },
+        )
+        .await;
+        let tcp = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let mut s = connector(Some(&c.ca_pem), &[b"h2", b"http/1.1"])
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        s.write_all(b"P").await.unwrap();
+        s.flush().await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out))
+            .await
+            .expect("a stalled partial preface must be dropped");
         let resp = https_get(srv.addr, Some(&c.ca_pem)).await.unwrap();
         assert!(resp.ends_with("pong"), "{resp}");
         srv.token.cancel();

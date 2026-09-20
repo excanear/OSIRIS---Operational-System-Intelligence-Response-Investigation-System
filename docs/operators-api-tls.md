@@ -107,4 +107,6 @@ redirect listener.
 On SIGTERM/SIGINT the HTTPS listener stops accepting immediately, in-flight
 requests get up to 10 seconds to finish, and WebSocket streams are closed with
 a Close frame. Without `api_tls` (plain HTTP) the graceful drain is also capped
-at 10 seconds, after which the server exits.
+at 10 seconds, after which the server exits. On plain HTTP, open WebSockets
+are not closed cleanly: they are cut abruptly (no Close frame) when the
+10-second cap expires.
