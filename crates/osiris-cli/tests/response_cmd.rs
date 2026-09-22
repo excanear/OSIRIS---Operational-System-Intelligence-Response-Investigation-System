@@ -141,3 +141,23 @@ fn reason_is_required() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--reason"));
 }
+
+#[test]
+fn omitted_dry_run_sends_false_and_token_is_attached() {
+    let key = "ab".repeat(16);
+    let (port, rx) = mock("200 OK", "{}");
+    let out = Command::new(env!("CARGO_BIN_EXE_osiris"))
+        .args(["--server", &format!("http://127.0.0.1:{port}"), "response"])
+        .args(["terminate-process", "--pid-target", &key, "--reason", "r"])
+        .env("OSIRIS_TOKEN", "tok123")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let req = rx.recv().unwrap();
+    assert!(req.contains("\"dry_run\":false"), "{req}");
+    assert!(
+        req.to_ascii_lowercase()
+            .contains("authorization: bearer tok123"),
+        "{req}"
+    );
+}
