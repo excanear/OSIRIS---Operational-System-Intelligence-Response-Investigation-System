@@ -117,7 +117,14 @@ impl CommandHandler for AgentCommandHandler {
     }
 }
 
-/// Creates the quarantine vault (0700 on Unix).
+/// Makes sure the quarantine vault is usable, creating it 0700 if it is
+/// missing.
+///
+/// The Agent runs as root, so it deliberately does **not** chmod or chown a
+/// directory it did not create: silently widening or narrowing an
+/// operator-supplied path is worse than refusing it. A pre-existing vault is
+/// only accepted when it is a real directory (not a symlink), has no group or
+/// other permission bits, and is owned by the uid the Agent runs as.
 pub fn ensure_vault(dir: &Path) -> std::io::Result<()> {
     let not_a_dir = || {
         std::io::Error::other(format!(
@@ -126,8 +133,8 @@ pub fn ensure_vault(dir: &Path) -> std::io::Result<()> {
         ))
     };
     match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Err(not_a_dir()),
+        Ok(m) if m.file_type().is_dir() => check_vault_dir(dir, &m),
+        Ok(_) => Err(not_a_dir()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut b = std::fs::DirBuilder::new();
             b.recursive(true);
@@ -137,17 +144,48 @@ pub fn ensure_vault(dir: &Path) -> std::io::Result<()> {
                 b.mode(0o700);
             }
             b.create(dir)?;
-            if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
+            // Re-stat rather than trust the create: another process may have
+            // won the race and put something else here.
+            let m = std::fs::symlink_metadata(dir)?;
+            if !m.file_type().is_dir() {
                 return Err(not_a_dir());
             }
+            check_vault_dir(dir, &m)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
-    #[cfg(unix)]
+}
+
+/// Ownership/permission verification for an existing vault directory.
+#[cfg(unix)]
+fn check_vault_dir(dir: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::other(format!(
+            "vault {} has mode {mode:o}: it must not be readable or writable by group or others; \
+             fix it with `chmod 0700` (the agent never changes an existing vault's mode)",
+            dir.display()
+        )));
+    }
+    #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // SAFETY: geteuid() takes no arguments and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return Err(std::io::Error::other(format!(
+                "vault {} is owned by uid {} but the agent runs as uid {me}; \
+                 fix it with `chown {me}` (the agent never changes an existing vault's owner)",
+                dir.display(),
+                meta.uid()
+            )));
+        }
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_vault_dir(_dir: &Path, _meta: &std::fs::Metadata) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -181,18 +219,21 @@ pub async fn start_control(
         }
     };
     let agent_pid = std::process::id();
+    let protected = ProtectedTargets {
+        agent_pid,
+        extra_pids: ancestors_of(agent_pid),
+        vault: vault.clone(),
+    };
     let guard = Guard {
         host_id,
         key,
         replay,
-        protected: ProtectedTargets {
-            agent_pid,
-            extra_pids: ancestors_of(agent_pid),
-            vault: vault.clone(),
-        },
+        protected: protected.clone(),
     };
-    let handler: Arc<dyn CommandHandler> =
-        Arc::new(AgentCommandHandler::new(guard, default_executor(vault)));
+    let handler: Arc<dyn CommandHandler> = Arc::new(AgentCommandHandler::new(
+        guard,
+        default_executor(vault, protected),
+    ));
     let cfg = ControlClientConfig {
         server_addr: control.server_addr.clone(),
         server_name: control.server_name.clone(),
@@ -406,11 +447,33 @@ mod tests {
             std::fs::metadata(&v).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        // An existing, correctly-owned 0700 directory is accepted as is.
+        ensure_vault(&v).unwrap();
         let link = dir.path().join("l");
         std::os::unix::fs::symlink(&v, &link).unwrap();
         assert!(ensure_vault(&link).is_err());
         let file = dir.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         assert!(ensure_vault(&file).is_err());
+    }
+
+    /// An operator-supplied vault that is group/world accessible is refused,
+    /// never chmodded: the agent runs as root and must not silently narrow a
+    /// directory it did not create.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_vault_refuses_a_group_accessible_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let v = dir.path().join("wide");
+        std::fs::create_dir(&v).unwrap();
+        std::fs::set_permissions(&v, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let e = ensure_vault(&v).unwrap_err();
+        assert!(e.to_string().contains("chmod 0700"), "{e}");
+        // Refused, not repaired.
+        assert_eq!(
+            std::fs::metadata(&v).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 }

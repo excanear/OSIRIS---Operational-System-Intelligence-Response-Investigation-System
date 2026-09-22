@@ -28,6 +28,9 @@ pub struct ResponseState {
     pub audit_log: Arc<dyn AuditLog + Send + Sync>,
 }
 
+/// Upper bound for the operator-supplied `reason` (UTF-8 bytes).
+const MAX_REASON_BYTES: usize = 1024;
+
 pub fn build_response_router(state: ResponseState) -> Router {
     Router::new()
         .route("/api/v1/response/:action", post(response_handler))
@@ -83,6 +86,14 @@ async fn response_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "reason must not be empty".to_string(),
+        ));
+    }
+    // The reason is copied into audit entries and into the signed command
+    // envelope, so it must be bounded: cap it at 1 KiB of UTF-8 bytes.
+    if body.reason.len() > MAX_REASON_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("reason must be at most {MAX_REASON_BYTES} bytes"),
         ));
     }
     let is_remote = matches!(
@@ -1218,6 +1229,64 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(count_audit_entries(dir.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn an_over_long_reason_is_rejected_before_any_audit_write() {
+        let (dir, state) = test_state();
+        let too_long = "r".repeat(MAX_REASON_BYTES + 1);
+        let body = ResponseRequestBody {
+            target: Some(EntityRef::Domain {
+                name: "x.example".to_string(),
+            }),
+            reason: too_long,
+            dry_run: true,
+            since: None,
+            until: None,
+            incident_id: None,
+            quarantine_id: None,
+            host_id: None,
+        };
+        let err = response_handler(
+            State(state.clone()),
+            Extension(ctx()),
+            None,
+            Path("collect_evidence".to_string()),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("1024 bytes"));
+        assert_eq!(count_audit_entries(dir.path()), 0);
+
+        // Exactly at the limit is still accepted.
+        let body = ResponseRequestBody {
+            target: Some(EntityRef::Domain {
+                name: "x.example".to_string(),
+            }),
+            reason: "r".repeat(MAX_REASON_BYTES),
+            dry_run: true,
+            since: None,
+            until: None,
+            incident_id: None,
+            quarantine_id: None,
+            host_id: None,
+        };
+        let at_limit = response_handler(
+            State(state),
+            Extension(ctx()),
+            None,
+            Path("collect_evidence".to_string()),
+            Json(body),
+        )
+        .await;
+        if let Err((_, message)) = at_limit {
+            assert!(
+                !message.contains("at most"),
+                "a reason of exactly the limit must not be rejected for length: {message}"
+            );
+        }
     }
 
     #[tokio::test]

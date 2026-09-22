@@ -83,7 +83,10 @@ impl ReplayStore {
         expires_at_ms: u64,
         now_ms: u64,
     ) -> Result<(), Refusal> {
-        let mut g = self.inner.lock().expect("replay lock");
+        // A poisoned lock must not take the agent's command path down: the
+        // guarded state is a map plus an append-only file, both consistent
+        // after a panic. Same policy as `ControlHub`.
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.seen
             .retain(|_, exp| exp.saturating_add(PRUNE_GRACE_MS) >= now_ms);
         if g.seen.contains_key(&id) {

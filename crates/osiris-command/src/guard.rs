@@ -28,6 +28,7 @@ pub enum Refusal {
     ProtectedTarget(String),
 }
 
+#[derive(Clone, Debug)]
 pub struct ProtectedTargets {
     pub agent_pid: u32,
     pub extra_pids: Vec<u32>,

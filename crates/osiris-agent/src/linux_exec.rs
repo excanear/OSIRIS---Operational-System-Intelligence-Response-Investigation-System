@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use osiris_command::{ActionExecutor, ExecDetail, ExecFailure, FailCode};
+use osiris_command::{ActionExecutor, ExecDetail, ExecFailure, FailCode, ProtectedTargets};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -175,6 +175,11 @@ pub struct Sidecar {
     /// Link count of the file when quarantined (older sidecars: 1).
     #[serde(default = "one")]
     pub nlink: u64,
+    /// True between the record becoming durable and the quarantine finishing.
+    /// A sidecar found pending after a restart describes a quarantine that was
+    /// interrupted: `sha256` is then empty. (Older sidecars: false.)
+    #[serde(default)]
+    pub pending: bool,
 }
 
 fn one() -> u64 {
@@ -191,6 +196,17 @@ fn fail(code: FailCode, message: impl Into<String>) -> ExecFailure {
         code,
         message: message.into(),
     }
+}
+
+/// Defence in depth (spec §4): the guard already refuses protected pids, but
+/// the executor re-checks them itself so that no path into the executor — a
+/// future caller, a test double, a refactor — can signal pid 1, the Agent or
+/// one of its ancestors. Pure, so it is testable off Linux.
+pub fn protected_pid_failure(protected: &ProtectedTargets, pid: u32) -> Option<ExecFailure> {
+    protected
+        .check_pid(pid)
+        .err()
+        .map(|r| fail(FailCode::TargetChanged, format!("protected: {r}")))
 }
 
 // ------------------------------------------------------------- non-Linux stub
@@ -211,12 +227,12 @@ impl ActionExecutor for UnsupportedExecutor {
 }
 
 #[cfg(target_os = "linux")]
-pub fn default_executor(vault: PathBuf) -> Arc<dyn ActionExecutor> {
-    Arc::new(LinuxExecutor::new(vault))
+pub fn default_executor(vault: PathBuf, protected: ProtectedTargets) -> Arc<dyn ActionExecutor> {
+    Arc::new(LinuxExecutor::new(vault, protected))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn default_executor(_vault: PathBuf) -> Arc<dyn ActionExecutor> {
+pub fn default_executor(_vault: PathBuf, _protected: ProtectedTargets) -> Arc<dyn ActionExecutor> {
     Arc::new(UnsupportedExecutor)
 }
 
@@ -228,7 +244,7 @@ pub use linux::LinuxExecutor;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use osiris_command::{process_started_by, ProtectedTargets};
+    use osiris_command::process_started_by;
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
@@ -242,14 +258,17 @@ mod linux {
 
     pub struct LinuxExecutor {
         pub vault: PathBuf,
+        /// Re-checked by the executor itself, not only by the guard.
+        pub protected: ProtectedTargets,
         /// Loops (hashing, copying, waiting for exit) stop after this long.
         pub budget: Duration,
     }
 
     impl LinuxExecutor {
-        pub fn new(vault: PathBuf) -> Self {
+        pub fn new(vault: PathBuf, protected: ProtectedTargets) -> Self {
             Self {
                 vault,
+                protected,
                 budget: DEFAULT_BUDGET,
             }
         }
@@ -429,6 +448,11 @@ mod linux {
             if pid == 0 {
                 return Err(fail(FailCode::Unverifiable, "pid 0"));
             }
+            // Re-checked here as well as in the guard (spec §4): pid 1, the
+            // Agent and its ancestors are never signalled, dry run included.
+            if let Some(e) = protected_pid_failure(&self.protected, pid) {
+                return Err(e);
+            }
             let id = verify_identity(pid, exe_path, observed_at_ns)?;
             let note = if id.deleted {
                 " (binary was deleted from disk)"
@@ -545,24 +569,57 @@ mod linux {
 
             let id = Uuid::new_v4();
             let (vaulted, sidecar_path) = vault_paths(&self.vault, id);
+            // Crash safety: the file's identity (original path, mode, owner)
+            // becomes durable BEFORE it moves. A crash between the two used to
+            // leave an unnamed blob in the vault; now it leaves a PENDING
+            // record that `restore` understands. The record is finalised (with
+            // the hash) once the move and hashing have succeeded.
+            let mut car = Sidecar {
+                path: path.to_string(),
+                mode: meta.mode() & 0o7777,
+                uid: meta.uid(),
+                gid: meta.gid(),
+                sha256: String::new(),
+                quarantined_at: now_ms(),
+                nlink,
+                pending: true,
+            };
+            write_sidecar(&sidecar_path, &car, true)?;
+            if let Err(e) = fsync_dir(&self.vault) {
+                let _ = std::fs::remove_file(&sidecar_path);
+                return Err(io_fail("sync vault directory", e));
+            }
             let mut copied = false;
             match std::fs::rename(path, &vaulted) {
                 Ok(()) => {
                     // The path could have been swapped after the open: whatever
                     // we moved must be the file we checked, or we put it back.
-                    let moved = std::fs::symlink_metadata(&vaulted)
-                        .map_err(|e| io_fail("stat vault", e))?;
-                    if !same_file(&moved, &meta) {
-                        let _ = std::fs::rename(&vaulted, path);
-                        return Err(fail(FailCode::TargetChanged, "file swapped during move"));
+                    let moved = std::fs::symlink_metadata(&vaulted);
+                    match moved {
+                        Ok(m) if same_file(&m, &meta) => {}
+                        Ok(_) => {
+                            let _ = std::fs::rename(&vaulted, path);
+                            let _ = std::fs::remove_file(&sidecar_path);
+                            return Err(fail(FailCode::TargetChanged, "file swapped during move"));
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&sidecar_path);
+                            return Err(io_fail("stat vault", e));
+                        }
                     }
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                     // Copy only; the original is unlinked once the sidecar is durable.
-                    copy_into_vault(&file, &vaulted, &cancelled)?;
+                    if let Err(e) = copy_into_vault(&file, &vaulted, &cancelled) {
+                        let _ = std::fs::remove_file(&sidecar_path);
+                        return Err(e);
+                    }
                     copied = true;
                 }
-                Err(e) => return Err(io_fail("move into vault", e)),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&sidecar_path);
+                    return Err(io_fail("move into vault", e));
+                }
             }
             let undo = |restore_mode: bool| {
                 if copied {
@@ -573,6 +630,7 @@ mod linux {
                     }
                     let _ = std::fs::rename(&vaulted, path);
                 }
+                let _ = std::fs::remove_file(&sidecar_path);
             };
             let sha = match File::open(&vaulted)
                 .and_then(|f| sha256_reader_until(f, &cancelled))
@@ -588,27 +646,16 @@ mod linux {
                 undo(false);
                 return Err(io_fail("chmod 0000", e));
             }
-            let car = Sidecar {
-                path: path.to_string(),
-                mode: meta.mode() & 0o7777,
-                uid: meta.uid(),
-                gid: meta.gid(),
-                sha256: sha.clone(),
-                quarantined_at: now_ms(),
-                nlink,
-            };
-            let json = serde_json::to_vec_pretty(&car)
-                .map_err(|e| fail(FailCode::Io, format!("sidecar encode: {e}")))?;
-            let written = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&sidecar_path)
-                .and_then(|mut f| f.write_all(&json).and_then(|_| f.sync_all()));
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&sidecar_path);
+            // Finalise: same path, now carrying the hash and no longer pending.
+            car.sha256 = sha.clone();
+            car.pending = false;
+            if let Err(e) = write_sidecar(&sidecar_path, &car, false) {
                 undo(true);
-                return Err(io_fail("write sidecar", e));
+                return Err(e);
+            }
+            if let Err(e) = fsync_dir(&self.vault) {
+                undo(true);
+                return Err(io_fail("sync vault directory", e));
             }
             if copied {
                 // Only now remove the original, and only if it is still the checked file.
@@ -646,12 +693,7 @@ mod linux {
                 .map_err(|e| fail(FailCode::Unverifiable, format!("bad sidecar: {e}")))?;
             let dest = PathBuf::from(&car.path);
             // Absolute, no `..`, and not resolving (through symlinks) into the vault.
-            let guard = ProtectedTargets {
-                agent_pid: 0,
-                extra_pids: Vec::new(),
-                vault: self.vault.clone(),
-            };
-            if let Err(r) = guard.check_path(&car.path) {
+            if let Err(r) = self.protected.check_path(&car.path) {
                 return Err(fail(
                     FailCode::Unverifiable,
                     format!("sidecar path not restorable: {r}"),
@@ -736,6 +778,31 @@ mod linux {
         } else {
             Err(io_fail("chown", std::io::Error::last_os_error()))
         }
+    }
+
+    /// Writes the sidecar durably. `create_new` distinguishes the initial
+    /// PENDING record (which must not clobber anything) from the finalising
+    /// rewrite of that same path.
+    fn write_sidecar(p: &Path, car: &Sidecar, create_new: bool) -> Result<(), ExecFailure> {
+        let json = serde_json::to_vec_pretty(car)
+            .map_err(|e| fail(FailCode::Io, format!("sidecar encode: {e}")))?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).mode(0o600);
+        if create_new {
+            opts.create_new(true);
+        } else {
+            opts.create(true).truncate(true);
+        }
+        let mut f = opts.open(p).map_err(|e| io_fail("write sidecar", e))?;
+        f.write_all(&json)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| io_fail("write sidecar", e))
+    }
+
+    /// fsync the vault directory so a just-created (or just-removed) entry
+    /// survives a crash; without it the sidecar could be lost after the move.
+    fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+        File::open(dir)?.sync_all()
     }
 
     fn file_fd(f: &File) -> i32 {
@@ -843,6 +910,7 @@ mod pure_tests {
             sha256: "x".into(),
             quarantined_at: 3,
             nlink: 2,
+            pending: false,
         };
         let back: Sidecar = serde_json::from_slice(&serde_json::to_vec(&car).unwrap()).unwrap();
         assert_eq!(back, car);
@@ -898,7 +966,14 @@ mod pure_tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn unsupported_executor_fails_unsupported() {
-        let e = default_executor(PathBuf::from("v"));
+        let e = default_executor(
+            PathBuf::from("v"),
+            ProtectedTargets {
+                agent_pid: 1,
+                extra_pids: Vec::new(),
+                vault: PathBuf::from("v"),
+            },
+        );
         assert_eq!(
             e.terminate(2, "/x", 0, false).unwrap_err().code,
             FailCode::Unsupported
