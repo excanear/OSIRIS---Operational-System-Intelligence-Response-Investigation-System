@@ -33,3 +33,5 @@ osiris-correlate = { path = "../osiris-correlate" }
 osiris-baseline = { path = "../osiris-baseline" }
 osiris-risk = { path = "../osiris-risk" }
 osiris-generator = { path = "../../generator" }
+osiris-transport = { path = "../osiris-transport" }
+osiris-command = { path = "../osiris-command" }
