@@ -1661,7 +1661,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(fake.call_count(), 0);
-        call(&state, "restore_file", mk(None)).await.unwrap();
+        let _ = call(&state, "restore_file", mk(None)).await.unwrap();
         let e = last_audit_entry(dir.path());
         let why = e.why.unwrap();
         assert!(why.contains(&qid.to_string()) && why.contains(&host.to_string()));
