@@ -176,6 +176,65 @@ pub fn build_client(
         .map_err(|e| format!("cannot build HTTP client: {e}"))
 }
 
+/// URL for `POST /api/v1/response/<action>` (`action` is lower_snake_case).
+pub fn response_url(server: &str, action: &str) -> String {
+    format!(
+        "{}/api/v1/response/{}",
+        server.trim_end_matches('/'),
+        percent_encode(action)
+    )
+}
+
+/// Body for `terminate_process`. `process_key` must be the process key hex
+/// (validated through the schema type so a typo fails before any request).
+pub fn terminate_body(
+    process_key: &str,
+    reason: &str,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
+    let key: osiris_schema::ProcessKey =
+        serde_json::from_value(serde_json::Value::String(process_key.to_string()))
+            .map_err(|e| format!("invalid --pid-target process key: {e}"))?;
+    let target = osiris_schema::EntityRef::Process { process_key: key };
+    Ok(serde_json::json!({
+        "target": target, "reason": reason, "dry_run": dry_run,
+    }))
+}
+
+/// Body for `quarantine_file`. `file` is `<inode>:<device_id>:<host_uuid>`.
+pub fn quarantine_body(
+    file: &str,
+    reason: &str,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
+    let bad = || format!("invalid --file '{file}': expected <inode>:<device_id>:<host_uuid>");
+    let mut parts = file.splitn(3, ':');
+    let inode: u64 = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
+    let device_id: u64 = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
+    let host_id: uuid::Uuid = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
+    let target = osiris_schema::EntityRef::File {
+        host_id,
+        inode,
+        device_id,
+    };
+    Ok(serde_json::json!({
+        "target": target, "reason": reason, "dry_run": dry_run,
+    }))
+}
+
+/// Body for `restore_file` (no `target`: the server rejects one).
+pub fn restore_body(
+    host_id: uuid::Uuid,
+    quarantine_id: uuid::Uuid,
+    reason: &str,
+    dry_run: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "host_id": host_id, "quarantine_id": quarantine_id,
+        "reason": reason, "dry_run": dry_run,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +242,30 @@ mod tests {
         Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn response_bodies_have_the_api_shape() {
+        let h = Uuid::nil();
+        let key = ProcessKey::new(h, "b", 7, 9);
+        let t = terminate_body(&key.as_hex(), "r", true).unwrap();
+        assert_eq!(t["target"]["kind"], "PROCESS");
+        assert_eq!(t["target"]["process_key"], key.as_hex());
+        assert_eq!(t["dry_run"], true);
+        assert!(terminate_body("zz", "r", false).is_err());
+        let q = quarantine_body(&format!("5:6:{h}"), "r", false).unwrap();
+        assert_eq!(q["target"]["kind"], "FILE");
+        assert_eq!(q["target"]["inode"], 5);
+        assert_eq!(q["target"]["device_id"], 6);
+        assert_eq!(q["target"]["host_id"], h.to_string());
+        assert!(quarantine_body("5:6", "r", false).is_err());
+        let r = restore_body(h, h, "r", false);
+        assert!(r.get("target").is_none());
+        assert_eq!(r["quarantine_id"], h.to_string());
+        assert_eq!(
+            response_url("http://x:1/", "restore_file"),
+            "http://x:1/api/v1/response/restore_file"
+        );
+    }
 
     #[test]
     fn events_url_includes_only_provided_filters() {

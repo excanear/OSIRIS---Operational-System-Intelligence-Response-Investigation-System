@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use osiris_cli::client::{
     chain_url, container_story_url, events_url, format_events_table, hunt_url, percent_encode,
-    risk_url,
+    quarantine_body, response_url, restore_body, risk_url, terminate_body,
 };
 use osiris_cli::hunts::template;
 use osiris_schema::CanonicalEvent;
@@ -96,11 +96,51 @@ enum Command {
         #[command(subcommand)]
         action: TenantsAction,
     },
+    /// Server-executed response actions on an enrolled Agent (Phase 9c-1).
+    Response {
+        #[command(subcommand)]
+        action: ResponseAction,
+    },
     /// Local private PKI for Agent->Server mTLS (Phase 9a). Offline: no
     /// Server round trip, only files under `--dir`.
     Pki {
         #[command(subcommand)]
         action: PkiAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResponseAction {
+    /// SIGKILL a process (irreversible).
+    TerminateProcess {
+        /// Process key (hex) of the target.
+        #[arg(long)]
+        pid_target: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move a file into the Agent's quarantine vault.
+    QuarantineFile {
+        /// `<inode>:<device_id>:<host_uuid>`.
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore a quarantined file.
+    RestoreFile {
+        #[arg(long)]
+        host: uuid::Uuid,
+        #[arg(long)]
+        quarantine_id: uuid::Uuid,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -526,6 +566,33 @@ fn main() {
             }
         },
         Command::Pki { action } => run_pki(action),
+        Command::Response { action } => {
+            let (name, body) = match action {
+                ResponseAction::TerminateProcess {
+                    pid_target,
+                    reason,
+                    dry_run,
+                } => (
+                    "terminate_process",
+                    terminate_body(pid_target, reason, *dry_run),
+                ),
+                ResponseAction::QuarantineFile {
+                    file,
+                    reason,
+                    dry_run,
+                } => ("quarantine_file", quarantine_body(file, reason, *dry_run)),
+                ResponseAction::RestoreFile {
+                    host,
+                    quarantine_id,
+                    reason,
+                    dry_run,
+                } => (
+                    "restore_file",
+                    Ok(restore_body(*host, *quarantine_id, reason, *dry_run)),
+                ),
+            };
+            body.and_then(|b| post_json(&client, response_url(&cli.server, name), b, true))
+        }
         Command::Tenants { action } => {
             let base = cli.server.trim_end_matches('/').to_string();
             match action {
