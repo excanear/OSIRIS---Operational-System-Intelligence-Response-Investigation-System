@@ -75,8 +75,12 @@ osiris response restore-file      --host <host_uuid> --quarantine-id <uuid> --re
 
 ### Protected targets (built in, not configurable)
 
-pid 1, the Agent's own pid and its ancestors, the quarantine vault, and
-kernel threads are refused. Refusals return 422.
+pid 1, the Agent's own pid and its ancestors, and the quarantine vault
+(including paths that resolve into it) are refused by the Agent; the path
+check also rejects non-absolute paths and paths containing `..`. Such
+refusals return 422. Kernel threads are not in this list: they fail the
+Agent's process identity check (Unverifiable), which returns HTTP 200 with
+`ok: false`.
 
 ### Dry-run
 
@@ -99,10 +103,13 @@ Agent is back.
 |------|---------|
 | 200  | Executed (`ok: true`), or the Agent tried and failed (`ok: false` with a `code`), or a dry-run result |
 | 409  | Agent offline or control channel disabled (nothing sent) |
-| 422  | Invalid request, protected target, unresolved target, or Agent refused verification |
+| 400  | Empty `reason`, missing `target`, or (platform users) a target that resolves to no stored data |
+| 404  | Tenant users: unresolved target or a host of another tenant (indistinguishable by design) |
+| 422  | `restore_file` id/target misuse (missing ids, or a `target` supplied), or the Agent refused the command (e.g. protected target) |
+| 501  | `stop_service`, `block_indicator`, `isolate_network`, `disable_persistence`: `not_implemented` |
 | 502  | Dispatch error (could not hand the command to the control hub) |
 | 504  | Timed out waiting for the Agent (see below) |
-| 401/403/404 | Not authenticated / role too low / tenant scoping (unknown or foreign target) |
+| 401/403 | Not authenticated / role too low |
 
 ### 504 never means "not executed"
 
@@ -121,8 +128,8 @@ the outcome as unknown.
 * A symlinked `vault_dir` is refused; the control channel is not started for
   that deployment. Use a real directory.
 * `revoked_hosts` is a bind-time snapshot: revoking a host does not kill its
-  live control connections. Restart the Server (or wait for the Agent to
-  reconnect) for it to take effect.
+  live control connections. The set is read from config at bind time, so a
+  config edit needs a Server restart to take effect.
 * The Linux executor code has not yet been compiled or tested on real Linux
   (development was on Windows, where a stub runs). Validate on a Linux test
   host before relying on it.
