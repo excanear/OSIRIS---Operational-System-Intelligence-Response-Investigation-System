@@ -1305,10 +1305,12 @@ dependencies = [
 name = "osiris-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures-util",
  "osiris-audit",
  "osiris-auth",
+ "osiris-command",
  "osiris-correlate",
  "osiris-evidence",
  "osiris-investigate",

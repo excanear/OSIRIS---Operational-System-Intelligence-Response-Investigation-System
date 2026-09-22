@@ -27,6 +27,7 @@ fn describe_target(
     let verb = match action {
         ResponseActionKind::TerminateProcess => "terminate process",
         ResponseActionKind::StopService => "stop service",
+        ResponseActionKind::RestoreFile => "restore quarantined file for",
         ResponseActionKind::QuarantineFile => "quarantine file",
         ResponseActionKind::BlockIndicator => "block indicator",
         ResponseActionKind::IsolateNetwork => "isolate network for",

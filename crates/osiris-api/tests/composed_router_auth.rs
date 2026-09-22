@@ -283,3 +283,52 @@ async fn the_response_route_is_not_401_or_403_for_the_admin_token_on_the_compose
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(response.status(), StatusCode::FORBIDDEN);
 }
+
+fn restore_file_body() -> String {
+    serde_json::json!({
+        "reason": "false positive",
+        "dry_run": true,
+        "quarantine_id": "0192f0a0-0000-7000-8000-000000000001",
+        "host_id": "0192f0a0-0000-7000-8000-000000000002",
+    })
+    .to_string()
+}
+
+async fn post_restore(h: Harness, token: Option<String>) -> StatusCode {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/api/v1/response/restore_file")
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        b = b.header("Authorization", format!("Bearer {t}"));
+    }
+    h.app
+        .oneshot(b.body(Body::from(restore_file_body())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn the_restore_file_route_is_401_without_a_token_on_the_composed_router() {
+    assert_eq!(
+        post_restore(harness(), None).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_restore_file_route_is_403_below_response_operator_on_the_composed_router() {
+    let h = harness();
+    let token = session_for_role(&h.auth_state, "restore-analyst", Role::Analyst);
+    assert_eq!(post_restore(h, Some(token)).await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_restore_file_route_is_allowed_for_the_admin_token_on_the_composed_router() {
+    let h = harness();
+    let token = h.admin_token.clone();
+    // Control channel disabled in the harness: the dry-run falls back to the
+    // server-side preview, proving the route is wired and authorised.
+    assert_eq!(post_restore(h, Some(token)).await, StatusCode::OK);
+}

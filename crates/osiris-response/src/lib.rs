@@ -4,8 +4,10 @@ use uuid::Uuid;
 
 mod dispatch;
 mod query;
+mod remote;
 pub use dispatch::dispatch;
 pub use query::events_for_entity;
+pub use remote::{outcome_from_dispatch, remote_action, resolve_remote_action};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResponseError {
@@ -27,6 +29,7 @@ pub enum ResponseActionKind {
     TerminateProcess,
     StopService,
     QuarantineFile,
+    RestoreFile,
     BlockIndicator,
     IsolateNetwork,
     DisablePersistence,
@@ -58,6 +61,7 @@ impl ResponseActionKind {
             ResponseActionKind::TerminateProcess => "TERMINATE_PROCESS",
             ResponseActionKind::StopService => "STOP_SERVICE",
             ResponseActionKind::QuarantineFile => "QUARANTINE_FILE",
+            ResponseActionKind::RestoreFile => "RESTORE_FILE",
             ResponseActionKind::BlockIndicator => "BLOCK_INDICATOR",
             ResponseActionKind::IsolateNetwork => "ISOLATE_NETWORK",
             ResponseActionKind::DisablePersistence => "DISABLE_PERSISTENCE",
@@ -92,6 +96,25 @@ pub enum ResponseOutcome {
     Rejected {
         reason: String,
     },
+    /// The Agent executed the command.
+    Executed {
+        detail: String,
+        quarantine_id: Option<Uuid>,
+    },
+    /// The Agent accepted the command but the action failed.
+    ExecutionFailed {
+        code: String,
+        message: String,
+    },
+    /// The Agent refused the command before acting.
+    Refused {
+        reason: String,
+    },
+    /// No result arrived in time. The outcome is unknown: the Agent may
+    /// still execute the command shortly after this is reported.
+    TimedOut,
+    AgentOffline,
+    ControlDisabled,
 }
 
 #[cfg(test)]
