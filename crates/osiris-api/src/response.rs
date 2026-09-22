@@ -108,10 +108,18 @@ async fn response_handler(
         }
     };
     let target = match (restore_target, body.target.clone()) {
-        (_, Some(t)) => t,
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "restore_file must not carry a target".to_string(),
+            ));
+        }
+        // EntityRef has no host/quarantine variant, so the restore audit
+        // target is a synthetic Domain encoding `quarantine:<id>@<host>`.
         (Some((q, h)), None) => EntityRef::Domain {
             name: format!("quarantine:{q}@{h}"),
         },
+        (None, Some(t)) => t,
         (None, None) => {
             return Err((StatusCode::BAD_REQUEST, "target is required".to_string()));
         }
@@ -538,6 +546,15 @@ impl RemoteCall<'_> {
             .map(|_| ())
     }
 
+    /// The reason, plus the ids for restore (which has no event-derived
+    /// target to show in the audit entry).
+    fn base_why(&self) -> String {
+        match self.restore_target {
+            Some((q, h)) => format!("{} (quarantine_id={q}, host_id={h})", self.request.reason),
+            None => self.request.reason.clone(),
+        }
+    }
+
     fn audit_or_warn(&self, why: String, result: AuditResult) {
         if let Err(e) = self.audit(why, result) {
             tracing::warn!(error = %e, "post-execution audit log write failed after an agent command");
@@ -575,6 +592,8 @@ impl RemoteCall<'_> {
                     "target does not resolve to any known data".to_string(),
                     AuditResult::Failure,
                 );
+                // Tenant users get 404 (not 400) so a foreign host is
+                // indistinguishable from an unknown one (anti-enumeration).
                 if self.tenant_id.is_some() {
                     Err((StatusCode::NOT_FOUND, "target not found".to_string()))
                 } else {
@@ -644,11 +663,10 @@ impl RemoteCall<'_> {
             ResponseOutcome::AgentOffline | ResponseOutcome::ControlDisabled
         ) {
             // No Agent to validate with: today's server-side preview.
-            if self.restore_target.is_some() {
+            // Disabled also yields a 200 preview by design (spec 5.6).
+            if let Some((q, h)) = self.restore_target {
                 let preview = format!(
-                    "would restore quarantined file {} on host {} (agent not consulted) - no action taken, dry run",
-                    self.restore_target.map(|(q, _)| q).unwrap_or_default(),
-                    self.restore_target.map(|(_, h)| h).unwrap_or_default(),
+                    "would restore quarantined file {q} on host {h} (agent not consulted) - no action taken, dry run",
                 );
                 self.audit_or_warn(preview.clone(), AuditResult::Success);
                 return Ok((
@@ -684,7 +702,7 @@ impl RemoteCall<'_> {
     async fn run_real(self, host: Uuid, action: CommandAction) -> HandlerResult {
         // Fail closed: no destructive command is sent without a recorded
         // pre-execution audit entry (ARCHITECTURE.md 17.3).
-        if let Err(e) = self.audit(self.request.reason.clone(), AuditResult::Success) {
+        if let Err(e) = self.audit(self.base_why(), AuditResult::Success) {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("audit log write failed: {e}"),
@@ -696,7 +714,7 @@ impl RemoteCall<'_> {
                 self.audit_or_warn(
                     format!(
                         "{} (dispatch failed: {msg}; outcome unknown)",
-                        self.request.reason
+                        self.base_why()
                     ),
                     AuditResult::Failure,
                 );
@@ -707,7 +725,7 @@ impl RemoteCall<'_> {
             }
         };
         let m = map_outcome(outcome, false);
-        self.audit_or_warn(format!("{} ({})", self.request.reason, m.why), m.result);
+        self.audit_or_warn(format!("{} ({})", self.base_why(), m.why), m.result);
         Ok((m.status, Json(m.body)))
     }
 }
@@ -1615,6 +1633,70 @@ mod tests {
             CommandAction::RestoreFile { quarantine_id: qid }
         );
         assert_eq!(count_audit_entries(dir.path()), 2);
+    }
+
+    #[tokio::test]
+    async fn restore_with_a_client_target_is_422_and_ids_appear_in_the_audit_why() {
+        let fake = FakeDispatcher::new(Box::new(|_| executed(None)));
+        let (dir, state) = test_state_with(fake.clone());
+        let (host, qid) = (Uuid::new_v4(), Uuid::new_v4());
+        let mk = |target| ResponseRequestBody {
+            target,
+            reason: "fp".to_string(),
+            dry_run: false,
+            since: None,
+            until: None,
+            incident_id: None,
+            quarantine_id: Some(qid),
+            host_id: Some(host),
+        };
+        let err = call(
+            &state,
+            "restore_file",
+            mk(Some(EntityRef::Domain {
+                name: "spoof.example".to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(fake.call_count(), 0);
+        call(&state, "restore_file", mk(None)).await.unwrap();
+        let e = last_audit_entry(dir.path());
+        let why = e.why.unwrap();
+        assert!(why.contains(&qid.to_string()) && why.contains(&host.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_tenant_user_restoring_on_a_foreign_host_is_404() {
+        let fake = FakeDispatcher::new(Box::new(|_| executed(None)));
+        let (dir, state) = test_state_with(fake.clone());
+        let tenants = osiris_tenancy::SqliteTenantStore::open(dir.path().join("t.db")).unwrap();
+        let mine = tenants.create_tenant("mine").unwrap();
+        let store: Arc<dyn osiris_tenancy::TenantStore> = Arc::new(tenants);
+        let mut c = ctx();
+        c.tenant_id = Some(mine.tenant_id);
+        let b = ResponseRequestBody {
+            target: None,
+            reason: "fp".to_string(),
+            dry_run: false,
+            since: None,
+            until: None,
+            incident_id: None,
+            quarantine_id: Some(Uuid::new_v4()),
+            host_id: Some(Uuid::new_v4()),
+        };
+        let err = response_handler(
+            State(state),
+            Extension(c),
+            Some(Extension(store)),
+            Path("restore_file".to_string()),
+            Json(b),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(fake.call_count(), 0);
     }
 
     #[test]

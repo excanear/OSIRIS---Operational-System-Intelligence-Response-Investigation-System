@@ -128,6 +128,7 @@ mod tests {
             ResponseActionKind::TerminateProcess,
             ResponseActionKind::StopService,
             ResponseActionKind::QuarantineFile,
+            ResponseActionKind::RestoreFile,
             ResponseActionKind::BlockIndicator,
             ResponseActionKind::IsolateNetwork,
             ResponseActionKind::DisablePersistence,

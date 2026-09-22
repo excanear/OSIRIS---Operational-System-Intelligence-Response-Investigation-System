@@ -53,15 +53,35 @@ pub fn resolve_remote_action(
     request: &ResponseRequest,
     storage: &dyn Storage,
 ) -> Result<(Uuid, CommandAction), ResponseError> {
-    let events = events_for_entity(storage, &request.target, 0, u64::MAX, 1000, false)?;
-    let mut usable: Vec<CanonicalEvent> = events
-        .into_iter()
-        .filter(|e| remote_action(request, e).is_ok())
-        .collect();
-    usable.sort_by_key(|e| e.timestamp);
-    let sample = usable
-        .pop()
-        .ok_or_else(|| ResponseError::UnknownTarget(request.target.clone()))?;
+    // Storage returns oldest-first and has no descending order, so page
+    // forward through the whole history and keep the newest usable event.
+    const PAGE: usize = osiris_query::DEFAULT_EVENT_LIMIT;
+    const MAX_PAGES: usize = 1000;
+    let mut cursor = 0u64;
+    let mut newest: Option<CanonicalEvent> = None;
+    for _ in 0..MAX_PAGES {
+        let page = events_for_entity(storage, &request.target, cursor, u64::MAX, PAGE, false)?;
+        let full = page.len() >= PAGE;
+        let last_ts = page.iter().map(|e| e.timestamp).max().unwrap_or(cursor);
+        for e in page {
+            if remote_action(request, &e).is_ok()
+                && newest.as_ref().is_none_or(|n| e.timestamp >= n.timestamp)
+            {
+                newest = Some(e);
+            }
+        }
+        if !full {
+            break;
+        }
+        // Inclusive re-read of the boundary timestamp; step past it if a
+        // whole page shares one timestamp so the loop always advances.
+        cursor = if last_ts > cursor {
+            last_ts
+        } else {
+            cursor + 1
+        };
+    }
+    let sample = newest.ok_or_else(|| ResponseError::UnknownTarget(request.target.clone()))?;
     remote_action(request, &sample)
 }
 
@@ -303,6 +323,36 @@ mod tests {
                 pid: 42,
                 exe_path: "/bin/newer".to_string(),
                 observed_at_ns: 200
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_finds_the_newest_event_beyond_the_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = osiris_storage_sqlite::SqliteStorage::open(dir.path().join("e.db")).unwrap();
+        let host = Uuid::new_v4();
+        let key = ProcessKey::new(host, "b", 42, 5);
+        let events: Vec<CanonicalEvent> = (1..=1005u64)
+            .map(|ts| {
+                let (mut e, _) = with_process(host, ts, 42);
+                e.process.as_mut().unwrap().process_key = key;
+                e.process.as_mut().unwrap().exe_path = format!("/bin/v{ts}");
+                e
+            })
+            .collect();
+        storage.batch_write(&events).unwrap();
+        let r = req(
+            ResponseActionKind::TerminateProcess,
+            EntityRef::Process { process_key: key },
+        );
+        let (_, a) = resolve_remote_action(&r, &storage).unwrap();
+        assert_eq!(
+            a,
+            CommandAction::TerminateProcess {
+                pid: 42,
+                exe_path: "/bin/v1005".to_string(),
+                observed_at_ns: 1005
             }
         );
     }
