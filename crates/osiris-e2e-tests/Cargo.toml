@@ -35,3 +35,4 @@ osiris-risk = { path = "../osiris-risk" }
 osiris-generator = { path = "../../generator" }
 osiris-transport = { path = "../osiris-transport" }
 osiris-command = { path = "../osiris-command" }
+osiris-fleet = { path = "../osiris-fleet" }

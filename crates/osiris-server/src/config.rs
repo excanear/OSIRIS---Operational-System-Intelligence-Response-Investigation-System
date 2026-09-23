@@ -62,6 +62,9 @@ pub struct ServerConfig {
     /// Phase 8f: the tenant registry's own SQLite file.
     #[serde(default)]
     pub tenants_db_path: Option<String>,
+    /// Phase 9d-1: the Fleet Manager host registry's own SQLite file.
+    #[serde(default)]
+    pub hosts_db_path: Option<String>,
     /// Phase 8a: session token lifetime in seconds; `main.rs` defaults to
     /// 28800 (8 hours) when absent.
     #[serde(default)]

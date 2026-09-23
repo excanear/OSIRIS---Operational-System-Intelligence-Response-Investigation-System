@@ -118,6 +118,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -307,6 +308,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -566,6 +568,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -782,6 +785,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -1120,6 +1124,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -1550,6 +1555,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -1880,6 +1886,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));
@@ -2145,6 +2152,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         risk_engine,
         correlation_engine,
         Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
         Duration::from_millis(50),
         ingestion_cancellation.clone(),
     ));

@@ -98,6 +98,7 @@ pub struct IngestContext {
     pub risk_engine: Arc<RiskEngine>,
     pub correlation_engine: Arc<CorrelationEngine>,
     pub broadcaster: Arc<osiris_api::LiveEventBroadcaster>,
+    pub fleet_registry: Arc<dyn osiris_fleet::HostRegistry>,
 }
 
 impl IngestContext {
@@ -117,6 +118,11 @@ impl IngestContext {
         } else {
             None
         };
+        let health_events: Vec<CanonicalEvent> = events
+            .iter()
+            .filter(|e| e.event_type == osiris_schema::EventType::AgentHealth)
+            .cloned()
+            .collect();
         let outcome = tokio::task::spawn_blocking(move || {
             Ok::<_, osiris_storage::StorageError>({
                 // An event id already owned by a different host must not be
@@ -177,6 +183,37 @@ impl IngestContext {
                 if let Some(events) = events_for_broadcast {
                     self.broadcaster.publish(&events);
                 }
+                if !health_events.is_empty() {
+                    let fleet_registry = self.fleet_registry.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for event in health_events {
+                            let agent_version =
+                                event.event_data.get("agent_version").and_then(|v| v.as_str());
+                            let health: Option<osiris_health::AgentHealth> = event
+                                .event_data
+                                .get("health")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok());
+                            let (Some(agent_version), Some(health)) = (agent_version, health) else {
+                                tracing::warn!(host_id = %event.host_id, "AGENT_HEALTH event has malformed event_data; skipping fleet registry upsert");
+                                continue;
+                            };
+                            let row = osiris_fleet::HostRow {
+                                host_id: event.host_id,
+                                hostname: event.host.hostname.clone(),
+                                distro: event.host.distro.clone(),
+                                kernel_version: event.host.kernel_version.clone(),
+                                agent_version: agent_version.to_string(),
+                                enrolled_at: event.timestamp, // ignored by upsert_heartbeat after the first insert
+                                last_seen: event.timestamp,
+                                health_state: health.state,
+                            };
+                            if let Err(e) = fleet_registry.upsert_heartbeat(row) {
+                                tracing::warn!(host_id = %event.host_id, error = %e, "fleet registry upsert failed");
+                            }
+                        }
+                    })
+                    .await;
+                }
                 Ok(())
             }
             Ok(Err(storage_err)) => Err(storage_err.to_string()),
@@ -207,6 +244,7 @@ pub async fn run_ingestion_loop(
     risk_engine: Arc<RiskEngine>,
     correlation_engine: Arc<CorrelationEngine>,
     broadcaster: Arc<osiris_api::LiveEventBroadcaster>,
+    fleet_registry: Arc<dyn osiris_fleet::HostRegistry>,
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
@@ -217,6 +255,7 @@ pub async fn run_ingestion_loop(
         risk_engine,
         correlation_engine,
         broadcaster,
+        fleet_registry,
     };
     let mut tailer = LineTailer::new(spool_path);
     loop {
@@ -319,6 +358,161 @@ mod tests {
         }
     }
 
+    fn agent_health_event(host_id: uuid::Uuid, timestamp: u64) -> CanonicalEvent {
+        let host = osiris_schema::HostRef {
+            host_id,
+            hostname: "h1".into(),
+            distro: "ubuntu-24.04".into(),
+            kernel_version: "6.8.0".into(),
+            cloud: None,
+        };
+        CanonicalEvent {
+            event_id: uuid::Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id,
+            boot_id: "boot-1".into(),
+            timestamp,
+            monotonic_timestamp: timestamp,
+            event_type: EventType::AgentHealth,
+            category: EventType::AgentHealth.category(),
+            severity: Severity::Info,
+            host,
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::AgentInternal,
+            provider: "agent/health".into(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({
+                "agent_version": "0.1.0",
+                "health": {"state": {"state": "HEALTHY"}, "sensors": []}
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingesting_an_agent_health_event_upserts_the_fleet_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: fleet_registry.clone(),
+        };
+        let host_id = uuid::Uuid::new_v4();
+
+        context
+            .ingest(vec![agent_health_event(host_id, 1_000)])
+            .await
+            .unwrap();
+
+        let row = fleet_registry.get(host_id).unwrap().unwrap();
+        assert_eq!(row.agent_version, "0.1.0");
+        assert_eq!(row.last_seen, 1_000);
+        // The underlying event is still written to Storage unchanged — the
+        // registry is an additive side effect, not a replacement path.
+        let stored = storage
+            .query(&osiris_storage::QueryPlan::default())
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_agent_health_event_data_does_not_fail_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: fleet_registry.clone(),
+        };
+        let host_id = uuid::Uuid::new_v4();
+        let mut bad = agent_health_event(host_id, 1_000);
+        bad.event_data = serde_json::json!({"nonsense": true}); // no "agent_version"/"health"
+
+        let result = context.ingest(vec![bad]).await;
+
+        assert!(
+            result.is_ok(),
+            "a bad AGENT_HEALTH payload must not fail the batch"
+        );
+        assert_eq!(
+            fleet_registry.get(host_id).unwrap(),
+            None,
+            "no row is created for the unparseable event"
+        );
+        let stored = storage
+            .query(&osiris_storage::QueryPlan::default())
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the underlying event is still stored even though its registry upsert was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_event_batch_does_not_touch_the_fleet_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage,
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: fleet_registry.clone(),
+        };
+        // `sample_event()` (this file's existing test-only helper, defined
+        // above at the top of this test module) builds a plain ProcessExec
+        // CanonicalEvent with its own freshly-generated host_id — reuse it
+        // rather than inventing a new builder.
+        let plain = sample_event();
+        let host_id = plain.host_id;
+
+        context.ingest(vec![plain]).await.unwrap();
+
+        assert_eq!(fleet_registry.get(host_id).unwrap(), None);
+    }
+
     #[tokio::test]
     async fn ingests_spooled_events_into_storage() {
         let dir = tempfile::tempdir().unwrap();
@@ -338,6 +532,7 @@ mod tests {
             risk_engine,
             correlation_engine,
             Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -383,6 +578,9 @@ mod tests {
             risk_engine,
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
+            ),
         };
         let tls = osiris_transport::tls::server_config(
             &dir.path().join("server.pem"),
@@ -469,6 +667,9 @@ mod tests {
             risk_engine,
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
+            ),
         };
         let a = sample_event();
         context.ingest(vec![a.clone()]).await.unwrap();
@@ -520,6 +721,7 @@ mod tests {
             risk_engine,
             correlation_engine,
             broadcaster.clone(),
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -560,6 +762,7 @@ mod tests {
             risk_engine,
             correlation_engine,
             Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -686,6 +889,7 @@ match:
             risk_engine,
             correlation_engine,
             Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));
@@ -817,6 +1021,7 @@ sequence:
             risk_engine,
             correlation_engine,
             Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap()),
             Duration::from_millis(20),
             cancellation.clone(),
         ));

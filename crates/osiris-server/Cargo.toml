@@ -36,6 +36,8 @@ osiris-tenancy = { path = "../osiris-tenancy" }
 osiris-transport = { path = "../osiris-transport" }
 osiris-command = { path = "../osiris-command" }
 osiris-response = { path = "../osiris-response" }
+osiris-fleet = { path = "../osiris-fleet" }
+osiris-health = { path = "../osiris-health" }
 rand = { workspace = true }
 async-trait = { workspace = true }
 tokio-rustls = { workspace = true }

@@ -129,6 +129,23 @@ async fn main() {
             cancellation.cancel();
         }
     });
+    // Phase 9d-1: the Fleet Manager host registry. Best-effort, like
+    // Baseline/Risk above, would be too weak a posture here — a missing
+    // registry silently drops fleet visibility for every host, not just one
+    // enrichment signal — but this crate has no other required-store
+    // ordering constraint, so it is opened here, ahead of `ingest_context`'s
+    // construction, using the same fail-fast `open_or_exit` helper the
+    // Incident/Evidence/tenant stores use below.
+    let hosts_db_path = config
+        .hosts_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/hosts.db".to_string());
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = Arc::new(open_or_exit(
+        osiris_fleet::SqliteHostRegistry::open(&hosts_db_path),
+        &hosts_db_path,
+        "hosts_db_path",
+    ));
+
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
     let ingest_context = osiris_server::IngestContext {
@@ -138,6 +155,7 @@ async fn main() {
         risk_engine: risk_engine.clone(),
         correlation_engine: correlation_engine.clone(),
         broadcaster: live_event_broadcaster.clone(),
+        fleet_registry: fleet_registry.clone(),
     };
     tokio::spawn(run_ingestion_loop(
         spool_path,
@@ -147,6 +165,7 @@ async fn main() {
         risk_engine,
         correlation_engine,
         live_event_broadcaster.clone(),
+        fleet_registry.clone(),
         Duration::from_millis(200),
         cancellation.clone(),
     ));
