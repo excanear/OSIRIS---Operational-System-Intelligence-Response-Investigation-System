@@ -1525,6 +1525,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-fleet"
+version = "0.1.0"
+dependencies = [
+ "osiris-health",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-generator"
 version = "0.1.0"
 dependencies = [
