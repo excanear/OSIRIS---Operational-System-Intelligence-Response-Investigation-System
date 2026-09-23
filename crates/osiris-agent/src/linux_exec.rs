@@ -572,8 +572,12 @@ mod linux {
             // Crash safety: the file's identity (original path, mode, owner)
             // becomes durable BEFORE it moves. A crash between the two used to
             // leave an unnamed blob in the vault; now it leaves a PENDING
-            // record that `restore` understands. The record is finalised (with
-            // the hash) once the move and hashing have succeeded.
+            // record. The record is finalised (with the hash) once the move and
+            // hashing have succeeded. `restore` handles a record left pending:
+            // with the vaulted file present it restores from the recorded
+            // identity, skipping the hash check (no finalised hash ever
+            // existed); with it absent it reports that the quarantine never
+            // completed, rather than the generic "vaulted file missing".
             let mut car = Sidecar {
                 path: path.to_string(),
                 mode: meta.mode() & 0o7777,
@@ -647,15 +651,13 @@ mod linux {
                 return Err(io_fail("chmod 0000", e));
             }
             // Finalise: same path, now carrying the hash and no longer pending.
+            // The rewrite is atomic (temp file + rename) and fsyncs the vault
+            // directory itself, so a crash cannot tear the record.
             car.sha256 = sha.clone();
             car.pending = false;
             if let Err(e) = write_sidecar(&sidecar_path, &car, false) {
                 undo(true);
                 return Err(e);
-            }
-            if let Err(e) = fsync_dir(&self.vault) {
-                undo(true);
-                return Err(io_fail("sync vault directory", e));
             }
             if copied {
                 // Only now remove the original, and only if it is still the checked file.
@@ -699,11 +701,30 @@ mod linux {
                     format!("sidecar path not restorable: {r}"),
                 ));
             }
+            // A record still pending describes a quarantine interrupted by a
+            // crash. Nothing reached the vault if the vaulted file is absent:
+            // say so explicitly, so it is not confused with vault contents
+            // deleted out from under a completed quarantine.
+            if car.pending && std::fs::symlink_metadata(&vaulted).is_err() {
+                return Err(fail(
+                    FailCode::NotFound,
+                    format!(
+                        "quarantine {id} never completed: nothing was moved into the vault \
+                         (record still pending); {} was left in place",
+                        car.path
+                    ),
+                ));
+            }
             // Read through an fd opened while briefly readable; the mode is
             // back to 0000 before anything else happens (dry run included).
             let src = open_vaulted(&vaulted)?;
-            if sha256_reader_until(&src, &cancelled).map_err(|e| io_fail("hash", e))? != car.sha256
-            {
+            let sha = sha256_reader_until(&src, &cancelled).map_err(|e| io_fail("hash", e))?;
+            // The hash check proves the vaulted blob was not swapped since the
+            // quarantine finished. A pending record has no finalised hash to
+            // compare against (the crash happened before one existed), so the
+            // identity recorded before the move is all there is; the check
+            // stays in force for every ordinary record.
+            if !car.pending && sha != car.sha256 {
                 return Err(fail(FailCode::TargetChanged, "vaulted file hash mismatch"));
             }
             if std::fs::symlink_metadata(&dest).is_ok() {
@@ -716,7 +737,7 @@ mod linux {
                 return Ok(detail(
                     format!("restore {}", dest.display()),
                     Some(id),
-                    Some(car.sha256.clone()),
+                    Some(sha),
                     None,
                 ));
             }
@@ -755,7 +776,7 @@ mod linux {
             Ok(detail(
                 format!("restored {}", dest.display()),
                 Some(id),
-                Some(car.sha256.clone()),
+                Some(sha),
                 None,
             ))
         }
@@ -781,22 +802,65 @@ mod linux {
     }
 
     /// Writes the sidecar durably. `create_new` distinguishes the initial
-    /// PENDING record (which must not clobber anything) from the finalising
-    /// rewrite of that same path.
+    /// PENDING record — created with `O_EXCL` so it can never clobber an
+    /// existing record — from the finalising rewrite of that same path, which
+    /// goes through a temp file in the same directory and an atomic `rename`.
+    /// Truncating in place would let a crash mid-write leave a zero-length or
+    /// half-written sidecar, which cannot be parsed at all: strictly worse than
+    /// a record left pending, which `restore` knows how to handle.
     fn write_sidecar(p: &Path, car: &Sidecar, create_new: bool) -> Result<(), ExecFailure> {
         let json = serde_json::to_vec_pretty(car)
             .map_err(|e| fail(FailCode::Io, format!("sidecar encode: {e}")))?;
-        let mut opts = OpenOptions::new();
-        opts.write(true).mode(0o600);
         if create_new {
-            opts.create_new(true);
-        } else {
-            opts.create(true).truncate(true);
+            let mut f = OpenOptions::new()
+                .write(true)
+                .mode(0o600)
+                .create_new(true)
+                .open(p)
+                .map_err(|e| io_fail("write sidecar", e))?;
+            return f
+                .write_all(&json)
+                .and_then(|_| f.sync_all())
+                .map_err(|e| io_fail("write sidecar", e));
         }
-        let mut f = opts.open(p).map_err(|e| io_fail("write sidecar", e))?;
-        f.write_all(&json)
-            .and_then(|_| f.sync_all())
-            .map_err(|e| io_fail("write sidecar", e))
+        replace_sidecar(p, &json)
+    }
+
+    /// `<sidecar>.tmp`: same directory, so the rename stays on one filesystem.
+    fn sidecar_tmp_path(p: &Path) -> PathBuf {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".tmp");
+        PathBuf::from(name)
+    }
+
+    /// Replaces `p`'s contents atomically: write a synced temp file next to it,
+    /// rename it over `p`, then fsync the directory. A crash at any point
+    /// leaves either the old sidecar or the new one, never a torn one.
+    fn replace_sidecar(p: &Path, json: &[u8]) -> Result<(), ExecFailure> {
+        let dir = p
+            .parent()
+            .ok_or_else(|| fail(FailCode::Io, "sidecar has no directory"))?;
+        let tmp = sidecar_tmp_path(p);
+        // A leftover temp file from an interrupted run must not block us.
+        let _ = std::fs::remove_file(&tmp);
+        let written = (|| -> std::io::Result<()> {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .mode(0o600)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(json)?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_fail("write sidecar", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, p) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_fail("replace sidecar", e));
+        }
+        fsync_dir(dir).map_err(|e| io_fail("sync vault directory", e))
     }
 
     /// fsync the vault directory so a just-created (or just-removed) entry
@@ -832,6 +896,59 @@ mod linux {
             return Err(io_fail("copy into vault", e));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod sidecar_tests {
+        use super::*;
+
+        fn car(sha: &str, pending: bool) -> Sidecar {
+            Sidecar {
+                path: "/tmp/x".into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                sha256: sha.into(),
+                quarantined_at: 7,
+                nlink: 1,
+                pending,
+            }
+        }
+
+        #[test]
+        fn the_initial_write_refuses_to_clobber_an_existing_sidecar() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("a.json");
+            write_sidecar(&p, &car("", true), true).unwrap();
+            let e = write_sidecar(&p, &car("", true), true).unwrap_err();
+            assert_eq!(e.code, FailCode::Io);
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn the_finalising_write_replaces_atomically_and_removes_its_temp_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("b.json");
+            write_sidecar(&p, &car("", true), true).unwrap();
+            // A leftover temp file from an interrupted run must not block it.
+            std::fs::write(sidecar_tmp_path(&p), b"junk").unwrap();
+            write_sidecar(&p, &car("abc", false), false).unwrap();
+            let back: Sidecar = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(back, car("abc", false));
+            assert!(!sidecar_tmp_path(&p).exists());
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "only the sidecar itself should remain"
+            );
+        }
     }
 }
 
@@ -926,6 +1043,29 @@ mod pure_tests {
     }
 
     #[test]
+    fn protected_pids_are_refused_by_the_executors_own_recheck() {
+        // How `control.rs` builds it: the Agent's pid plus its ancestors.
+        let ancestors = ancestors_from(4242, |p| match p {
+            4242 => Some(4100),
+            4100 => Some(1),
+            _ => None,
+        });
+        assert_eq!(ancestors, vec![4100, 1]);
+        let protected = ProtectedTargets {
+            agent_pid: 4242,
+            extra_pids: ancestors,
+            vault: PathBuf::from("/var/lib/osiris/vault"),
+        };
+        for pid in [1, 4242, 4100] {
+            let e = protected_pid_failure(&protected, pid)
+                .unwrap_or_else(|| panic!("pid {pid} must be refused"));
+            assert_eq!(e.code, FailCode::TargetChanged, "{pid}");
+            assert!(e.message.contains("protected"), "{}", e.message);
+        }
+        assert!(protected_pid_failure(&protected, 31337).is_none());
+    }
+
+    #[test]
     fn hardlink_warning_text() {
         assert_eq!(hardlink_warning(1), "");
         assert!(hardlink_warning(3).contains("WARNING: 2 other hard link(s)"));
@@ -1002,7 +1142,15 @@ mod linux_tests {
     }
 
     fn exec(dir: &tempfile::TempDir) -> LinuxExecutor {
-        LinuxExecutor::new(dir.path().join("vault"))
+        let vault = dir.path().join("vault");
+        LinuxExecutor::new(
+            vault.clone(),
+            ProtectedTargets {
+                agent_pid: std::process::id(),
+                extra_pids: Vec::new(),
+                vault,
+            },
+        )
     }
 
     #[test]
@@ -1295,5 +1443,107 @@ mod linux_tests {
         let e = ex.restore(id, false).unwrap_err();
         assert_eq!(e.code, FailCode::Unverifiable);
         assert!(!ex.vault.join("planted").exists());
+    }
+
+    /// Rewrites a finalised sidecar as it looked after a crash between the move
+    /// and the finalising write: no hash yet, still pending.
+    fn make_pending(sidecar: &Path) {
+        let mut car: Sidecar = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        car.sha256 = String::new();
+        car.pending = true;
+        std::fs::write(sidecar, serde_json::to_vec(&car).unwrap()).unwrap();
+    }
+
+    fn quarantine_one(ex: &LinuxExecutor, path: &Path, body: &[u8], mode: u32) -> Uuid {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (ino, dev) = ids(path);
+        ex.quarantine(path.to_str().unwrap(), ino, dev, false)
+            .unwrap()
+            .quarantine_id
+            .unwrap()
+    }
+
+    #[test]
+    fn restore_completes_an_interrupted_pending_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("pending.bin");
+        let id = quarantine_one(&ex, &f, b"payload", 0o640);
+        let (vaulted, sidecar) = vault_paths(&ex.vault, id);
+        make_pending(&sidecar);
+        // The crash may also have preceded the chmod 0000 of the vaulted file.
+        std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let d = ex.restore(id, false).unwrap();
+        assert_eq!(
+            d.sha256.as_deref(),
+            Some(sha256_reader(&b"payload"[..]).unwrap().as_str())
+        );
+        assert_eq!(std::fs::read(&f).unwrap(), b"payload");
+        assert_eq!(std::fs::metadata(&f).unwrap().mode() & 0o7777, 0o640);
+        assert!(!vaulted.exists() && !sidecar.exists());
+    }
+
+    #[test]
+    fn a_pending_quarantine_with_an_empty_vault_reports_that_it_never_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("never.bin");
+        let id = quarantine_one(&ex, &f, b"payload", 0o644);
+        let (vaulted, sidecar) = vault_paths(&ex.vault, id);
+        make_pending(&sidecar);
+        std::fs::remove_file(&vaulted).unwrap();
+        let e = ex.restore(id, false).unwrap_err();
+        assert_eq!(e.code, FailCode::NotFound);
+        assert!(e.message.contains("never completed"), "{}", e.message);
+        assert!(e.message.contains("pending"), "{}", e.message);
+
+        // A finalised record whose blob vanished keeps its own, distinct wording.
+        let g = dir.path().join("gone.bin");
+        let id2 = quarantine_one(&ex, &g, b"payload", 0o644);
+        std::fs::remove_file(vault_paths(&ex.vault, id2).0).unwrap();
+        let e2 = ex.restore(id2, false).unwrap_err();
+        assert_eq!(e2.code, FailCode::NotFound);
+        assert!(
+            e2.message.contains("vaulted file missing"),
+            "{}",
+            e2.message
+        );
+        assert!(!e2.message.contains("never completed"), "{}", e2.message);
+    }
+
+    #[test]
+    fn a_swapped_blob_is_still_refused_for_a_finalised_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("swap.bin");
+        let id = quarantine_one(&ex, &f, b"original", 0o644);
+        let (vaulted, _) = vault_paths(&ex.vault, id);
+        std::fs::set_permissions(&vaulted, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&vaulted, b"tampered").unwrap();
+        let e = ex.restore(id, false).unwrap_err();
+        assert_eq!(e.code, FailCode::TargetChanged);
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn the_finalised_sidecar_is_complete_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = exec(&dir);
+        let f = dir.path().join("final.bin");
+        let id = quarantine_one(&ex, &f, b"payload", 0o600);
+        let (_, sidecar) = vault_paths(&ex.vault, id);
+        let car: Sidecar = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert!(!car.pending);
+        assert_eq!(car.sha256, sha256_reader(&b"payload"[..]).unwrap());
+        assert_eq!(car.path, f.to_str().unwrap());
+        // The tmp+rename finalise must not leave anything else behind.
+        let mut names: Vec<String> = std::fs::read_dir(&ex.vault)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![id.to_string(), format!("{id}.json")]);
     }
 }
