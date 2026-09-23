@@ -105,7 +105,8 @@ impl HostRegistry for SqliteHostRegistry {
                 kernel_version = excluded.kernel_version,
                 agent_version = excluded.agent_version,
                 last_seen = MAX(hosts.last_seen, excluded.last_seen),
-                health_state = excluded.health_state",
+                health_state = excluded.health_state
+             WHERE excluded.last_seen >= hosts.last_seen",
             params![
                 row.host_id.to_string(),
                 row.hostname,
@@ -214,6 +215,33 @@ mod tests {
         assert_eq!(
             got.last_seen, 5_000,
             "last_seen is the max timestamp ever seen, not the most recently upserted"
+        );
+    }
+
+    #[test]
+    fn an_out_of_order_older_heartbeat_never_overwrites_other_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
+        let host_id = Uuid::new_v4();
+        let mut failed = row(host_id, 5_000);
+        failed.health_state = HealthState::Failed {
+            last_error: "x".into(),
+        };
+        reg.upsert_heartbeat(failed).unwrap();
+
+        let mut stale_healthy = row(host_id, 1_000); // arrives later, but is an OLDER event
+        stale_healthy.health_state = HealthState::Healthy;
+        reg.upsert_heartbeat(stale_healthy).unwrap();
+
+        let got = reg.get(host_id).unwrap().unwrap();
+        assert_eq!(
+            got.last_seen, 5_000,
+            "last_seen must not regress on an out-of-order older heartbeat"
+        );
+        assert!(
+            matches!(got.health_state, HealthState::Failed { .. }),
+            "health_state must not be overwritten by a stale, out-of-order heartbeat: got {:?}",
+            got.health_state
         );
     }
 
