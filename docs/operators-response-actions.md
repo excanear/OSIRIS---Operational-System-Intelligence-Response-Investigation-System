@@ -65,8 +65,9 @@ osiris response restore-file      --host <host_uuid> --quarantine-id <uuid> --re
 * **terminate-process**: the Server resolves the process from stored events
   and sends pid, exe path and observation time. The Agent confirms
   `/proc/<pid>/exe` matches and the process did not start after the
-  observation (pid-reuse defence), then sends SIGKILL. **Termination is
-  irreversible.**
+  observation (pid-reuse defence), then sends SIGTERM and waits up to 5 s.
+  If the process is still alive, it re-verifies identity and sends SIGKILL,
+  waiting up to another 5 s. **Termination is irreversible.**
 * **quarantine-file**: moves the file into the Agent's vault and reports a
   `quarantine_id`. Keep it; it is required to restore.
 * **restore-file**: takes `--host` and `--quarantine-id` only (a target is
@@ -133,3 +134,10 @@ the outcome as unknown.
 * The Linux executor code has not yet been compiled or tested on real Linux
   (development was on Windows, where a stub runs). Validate on a Linux test
   host before relying on it.
+* Quarantine normally moves the file into the vault with an atomic rename. If
+  the vault is on a different filesystem/mount than the target file (common
+  with btrfs subvolumes or overlayfs layers presented as separate devices),
+  the Agent falls back to copy-then-unlink, which is not atomic: a crash
+  mid-copy can leave the original file in place with no quarantine recorded.
+  Keep `vault_dir` on the same filesystem as the paths you expect to
+  quarantine to get the atomic-rename path.
