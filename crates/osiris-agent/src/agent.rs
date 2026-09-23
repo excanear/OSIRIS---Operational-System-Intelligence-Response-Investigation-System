@@ -325,6 +325,12 @@ impl Agent {
         for sensor in sensors.iter_mut() {
             let _ = sensor.stop().await;
         }
+        // Release the sensors lock before awaiting background tasks: the
+        // periodic health task calls status_snapshot(), which itself locks
+        // self.sensors. Holding the guard across the awaits below would
+        // deadlock against that task whenever it is mid-snapshot at
+        // shutdown time.
+        drop(sensors);
 
         // Await the pipeline and drain-loop tasks so shutdown genuinely
         // waits for the final drain (finding 3) to complete before
@@ -401,8 +407,10 @@ mod tests {
     async fn agent_health_event_is_emitted_within_two_intervals() {
         let dir = tempfile::tempdir().unwrap();
         let spool_path = dir.path().join("spool.ndjson");
-        let mut config = base_config(&dir); // this test module's existing config builder (agent.rs's other tests, e.g. line ~388, all use it)
-        config.fleet.health_interval_secs = 1; // the task's own `.max(1)` floors below this anyway; keep the test's wait proportionate
+        let mut config = base_config(&dir);
+        // 1s is the minimum health interval the agent accepts; keeping it
+        // small bounds the sleep below while still exercising a real tick.
+        config.fleet.health_interval_secs = 1;
         let agent = Agent::start(config, test_host(), "boot-1".to_string())
             .await
             .unwrap();
