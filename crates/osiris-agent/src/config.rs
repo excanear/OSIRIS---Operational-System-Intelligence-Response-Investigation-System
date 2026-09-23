@@ -45,6 +45,27 @@ impl Default for CloudMetadataConfig {
     }
 }
 
+/// Phase 9d-1: how often the Agent emits an AGENT_HEALTH event. Always
+/// on (unlike `control`/`forward`, which are opt-in features) — the
+/// Fleet Manager registry depends on every agent heartbeating.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default = "default_health_interval_secs")]
+    pub health_interval_secs: u64,
+}
+
+fn default_health_interval_secs() -> u64 {
+    60
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            health_interval_secs: default_health_interval_secs(),
+        }
+    }
+}
+
 /// Optional Kubernetes context (Phase 8e, ARCHITECTURE.md §21.3): resolves
 /// container -> pod from the node's kubelet. On by default but active only
 /// when a kubelet URL is configured or a service-account token exists, so a
@@ -147,6 +168,10 @@ pub struct AgentConfig {
     /// every pre-8e agent.yaml still loads.
     #[serde(default)]
     pub k8s_context: K8sContextConfig,
+    /// AGENT_HEALTH heartbeat cadence (Phase 9d-1). Defaults to enabled at
+    /// 60s, so every pre-9d-1 agent.yaml still loads.
+    #[serde(default)]
+    pub fleet: FleetConfig,
     /// Path to a Linux auditd-style log file for the Process/Exec sensor's
     /// audit backend. If absent or the file doesn't exist, that sensor is
     /// skipped (capabilities()-driven, never silently).

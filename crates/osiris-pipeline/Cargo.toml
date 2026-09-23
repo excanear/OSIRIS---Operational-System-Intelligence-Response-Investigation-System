@@ -9,6 +9,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-sensor-api = { path = "../osiris-sensor-api" }
+osiris-health = { path = "../osiris-health" }
 osiris-config = { path = "../osiris-config" }
 osiris-fileutil = { path = "../osiris-fileutil" }
 

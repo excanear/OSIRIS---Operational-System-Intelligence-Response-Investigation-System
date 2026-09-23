@@ -1596,6 +1596,7 @@ version = "0.1.0"
 dependencies = [
  "osiris-config",
  "osiris-fileutil",
+ "osiris-health",
  "osiris-schema",
  "osiris-sensor-api",
  "serde",

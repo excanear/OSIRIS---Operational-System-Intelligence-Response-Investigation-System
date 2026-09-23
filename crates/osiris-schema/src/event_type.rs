@@ -37,6 +37,9 @@ pub enum Source {
     Dbus,
     ContainerApi,
     Synthetic,
+    /// The Agent's own internal state (health, lifecycle) — not sensed
+    /// from any external backend, so none of the above apply.
+    AgentInternal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

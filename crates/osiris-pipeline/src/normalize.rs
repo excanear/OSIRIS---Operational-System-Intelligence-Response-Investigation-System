@@ -1,16 +1,17 @@
 use uuid::Uuid;
 
+use osiris_health::HealthState;
 use osiris_schema::{
     CanonicalEvent, Category, CgroupRef, CgroupVersion, ContainerRef, DnsRef, EventType, FileRef,
     HostRef, NetworkDirection, NetworkRef, PodRef, ProcessKey, ProcessRef, ServiceRef, SessionRef,
     Severity, Source, UserRef, SCHEMA_VERSION,
 };
 use osiris_sensor_api::{
-    ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw, FileOperation,
-    IdentityEventRaw, IdentityOperation, NetworkDirection as RawNetworkDirection, NetworkEventRaw,
-    NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation,
-    PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
-    SystemdEventRaw, SystemdOperation,
+    AgentHealthRaw, ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw,
+    FileOperation, IdentityEventRaw, IdentityOperation, NetworkDirection as RawNetworkDirection,
+    NetworkEventRaw, NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw,
+    PersistenceOperation, PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent,
+    RawEventSource, SystemdEventRaw, SystemdOperation,
 };
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
@@ -31,6 +32,7 @@ pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent
         RawEvent::Systemd(s) => normalize_systemd_event(s, host, boot_id),
         RawEvent::Persistence(p) => normalize_persistence_event(p, host, boot_id),
         RawEvent::Container(c) => normalize_container_event(c, host, boot_id),
+        RawEvent::AgentHealth(a) => normalize_agent_health(a, host, boot_id),
     }
 }
 
@@ -89,6 +91,50 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
         tags: vec![],
         risk: None,
         event_data: serde_json::json!({ "comm": raw.comm, "ppid": raw.ppid, "uid": raw.uid }),
+    }
+}
+
+fn normalize_agent_health(raw: AgentHealthRaw, host: &HostRef, boot_id: &str) -> CanonicalEvent {
+    let severity = match &raw.health.state {
+        HealthState::Healthy => Severity::Info,
+        HealthState::Degraded { .. } => Severity::Medium,
+        HealthState::Failed { .. } => Severity::High,
+    };
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.timestamp_ns,
+        event_type: EventType::AgentHealth,
+        category: EventType::AgentHealth.category(),
+        severity,
+        host: host.clone(),
+        user: None,
+        session: None,
+        process: None,
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: Source::AgentInternal,
+        provider: "agent/health".to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags: vec![],
+        risk: None,
+        event_data: serde_json::json!({
+            "agent_version": raw.agent_version,
+            "health": raw.health,
+        }),
     }
 }
 
@@ -1643,5 +1689,75 @@ mod tests {
             "boot-1",
         );
         assert_eq!(start.event_data["observed_transition"], false);
+    }
+
+    #[test]
+    fn agent_health_normalizes_with_event_data_and_severity_from_worst_state() {
+        use osiris_health::{AgentHealth, HealthState};
+        use osiris_sensor_api::AgentHealthRaw;
+
+        let host = sample_host();
+        let raw = RawEvent::AgentHealth(AgentHealthRaw {
+            agent_version: "0.1.0".into(),
+            health: AgentHealth {
+                state: HealthState::Degraded {
+                    last_error: "sensor stopped".into(),
+                },
+                sensors: vec![],
+            },
+            timestamp_ns: 1_700_000_000_000_000_000,
+        });
+
+        let event = normalize(raw, &host, "boot-1");
+
+        assert_eq!(event.event_type, EventType::AgentHealth);
+        assert_eq!(event.category, Category::System);
+        assert_eq!(event.severity, Severity::Medium);
+        assert_eq!(event.source, Source::AgentInternal);
+        assert_eq!(event.timestamp, 1_700_000_000_000_000_000);
+        assert_eq!(event.event_data["agent_version"].as_str().unwrap(), "0.1.0");
+        assert_eq!(
+            event.event_data["health"]["state"]["state"]
+                .as_str()
+                .unwrap(),
+            "DEGRADED"
+        );
+    }
+
+    #[test]
+    fn agent_health_severity_is_info_for_healthy_and_high_for_failed() {
+        use osiris_health::{AgentHealth, HealthState};
+        use osiris_sensor_api::AgentHealthRaw;
+
+        let host = sample_host();
+        let healthy = normalize(
+            RawEvent::AgentHealth(AgentHealthRaw {
+                agent_version: "0.1.0".into(),
+                health: AgentHealth {
+                    state: HealthState::Healthy,
+                    sensors: vec![],
+                },
+                timestamp_ns: 1,
+            }),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(healthy.severity, Severity::Info);
+
+        let failed = normalize(
+            RawEvent::AgentHealth(AgentHealthRaw {
+                agent_version: "0.1.0".into(),
+                health: AgentHealth {
+                    state: HealthState::Failed {
+                        last_error: "x".into(),
+                    },
+                    sensors: vec![],
+                },
+                timestamp_ns: 1,
+            }),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(failed.severity, Severity::High);
     }
 }

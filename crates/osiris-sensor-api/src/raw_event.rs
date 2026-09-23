@@ -462,6 +462,15 @@ pub struct ContainerEventRaw {
     pub source: RawEventSource,
 }
 
+/// The Agent's periodic aggregated health report (Phase 9d-1). Built by
+/// the Agent's own supervisor loop, not sensed from any raw source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHealthRaw {
+    pub agent_version: String,
+    pub health: osiris_health::AgentHealth,
+    pub timestamp_ns: u64,
+}
+
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1
 /// step 1, "Collect"). Phase 1 scoped this to Process/Exec; Phase 2 added
 /// File; Phase 3 added Network and Dns; Phase 4a adds Identity and
@@ -478,6 +487,7 @@ pub enum RawEvent {
     Systemd(SystemdEventRaw),
     Persistence(PersistenceEventRaw),
     Container(ContainerEventRaw),
+    AgentHealth(AgentHealthRaw),
 }
 
 impl RawEvent {
@@ -495,6 +505,7 @@ impl RawEvent {
             RawEvent::Systemd(s) => s.timestamp_ns,
             RawEvent::Persistence(p) => p.timestamp_ns,
             RawEvent::Container(c) => c.timestamp_ns,
+            RawEvent::AgentHealth(a) => a.timestamp_ns,
         }
     }
 }

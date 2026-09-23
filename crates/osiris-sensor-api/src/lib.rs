@@ -10,10 +10,10 @@ pub use context::SensorContext;
 pub use error::SensorError;
 pub use health::{SensorHealth, SensorState};
 pub use raw_event::{
-    ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw, FileOperation,
-    IdentityEventRaw, IdentityOperation, NetworkDirection, NetworkEventRaw, NetworkOperation,
-    PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation, PrivilegeEventRaw,
-    PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource, SystemdEventRaw,
-    SystemdOperation,
+    AgentHealthRaw, ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw,
+    FileOperation, IdentityEventRaw, IdentityOperation, NetworkDirection, NetworkEventRaw,
+    NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation,
+    PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
+    SystemdEventRaw, SystemdOperation,
 };
 pub use sensor::{Sensor, SensorMetrics};

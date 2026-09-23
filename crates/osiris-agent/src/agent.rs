@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use osiris_bus::{run_drain_loop, EventBus, Sink, SpoolFileSink};
 use osiris_generator::{
@@ -173,6 +173,7 @@ impl Agent {
                 }
             }
         }
+        let health_raw_tx = raw_tx.clone();
         drop(raw_tx);
 
         let metrics = Arc::new(MetricsRegistry::new());
@@ -255,13 +256,51 @@ impl Agent {
             );
         }
 
-        Ok(Arc::new(Self {
+        let health_cancellation = cancellation.clone();
+        let agent = Arc::new(Self {
             lifecycle: Mutex::new(AgentLifecycle::Running),
             sensors: tokio::sync::Mutex::new(running_sensors),
             skipped_sensors: Mutex::new(skipped),
             cancellation,
             background_tasks: tokio::sync::Mutex::new(tasks),
-        }))
+        });
+
+        // Phase 9d-1: periodic AGENT_HEALTH heartbeat. Spawned after `agent`
+        // exists so it can reuse status_snapshot()'s existing sensor-health
+        // readout instead of re-polling sensors directly.
+        {
+            let health_interval = Duration::from_secs(config.fleet.health_interval_secs.max(1));
+            let health_agent = agent.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(health_interval) => {}
+                        _ = health_cancellation.cancelled() => break,
+                    }
+                    let status = health_agent.status_snapshot().await;
+                    let mut aggregator = osiris_health::HealthAggregator::new();
+                    for s in &status.sensors {
+                        aggregator.record_sensor(s.to_agent_health());
+                    }
+                    let raw = osiris_sensor_api::RawEvent::AgentHealth(
+                        osiris_sensor_api::AgentHealthRaw {
+                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                            health: aggregator.aggregate(),
+                            timestamp_ns: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64,
+                        },
+                    );
+                    if health_raw_tx.send(raw).await.is_err() {
+                        break; // pipeline task gone; agent is shutting down
+                    }
+                }
+            });
+            agent.background_tasks.lock().await.push(handle);
+        }
+
+        Ok(agent)
     }
 
     pub async fn status_snapshot(&self) -> AgentStatus {
@@ -348,6 +387,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            fleet: crate::config::FleetConfig::default(),
             spool_path: dir
                 .path()
                 .join("spool.ndjson")
@@ -355,6 +395,27 @@ mod tests {
                 .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_health_event_is_emitted_within_two_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir); // this test module's existing config builder (agent.rs's other tests, e.g. line ~388, all use it)
+        config.fleet.health_interval_secs = 1; // the task's own `.max(1)` floors below this anyway; keep the test's wait proportionate
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+
+        // health_interval_secs=1: one full interval plus slack for the tokio scheduler.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let spooled = std::fs::read_to_string(&spool_path).unwrap();
+        assert!(
+            spooled.contains("\"event_type\":\"AGENT_HEALTH\""),
+            "expected an AGENT_HEALTH line in the spool, got: {spooled}"
+        );
+        agent.shutdown().await;
     }
 
     async fn kubelet_mock_serving(container_id: &str) -> String {

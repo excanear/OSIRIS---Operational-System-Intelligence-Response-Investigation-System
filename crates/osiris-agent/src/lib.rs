@@ -9,7 +9,7 @@ pub mod status;
 
 pub use agent::{Agent, AgentError};
 pub use config::{
-    AgentConfig, CloudMetadataConfig, ControlConfig, ForwardConfig, K8sContextConfig,
+    AgentConfig, CloudMetadataConfig, ControlConfig, FleetConfig, ForwardConfig, K8sContextConfig,
 };
 pub use lifecycle::AgentLifecycle;
 pub use status::{serve_status, AgentStatus, SkippedSensor};
