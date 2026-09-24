@@ -86,11 +86,10 @@ export interface HostSummary {
   hostname: string;
   distro: string;
   kernel_version: string;
+  agent_version: string;
+  enrolled_at: number;
   last_seen: number;
-  status: "ONLINE" | "STALE" | "UNKNOWN";
-  cloud_provider?: string | null;
-  cloud_instance_id?: string | null;
-  cloud_region?: string | null;
+  status: "ONLINE" | "STALE";
 }
 
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

@@ -1,21 +1,12 @@
 import { Link } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
-import type { HostSummary } from "../../api/types";
-
-// Phase 8d: provider (+ region when known) from the host's cloud metadata
-// probe, or a dash for on-prem/bare-metal hosts (cloud is null there).
-function formatCloud(row: HostSummary): string {
-  if (!row.cloud_provider) return "—";
-  return row.cloud_region ? `${row.cloud_provider} / ${row.cloud_region}` : row.cloud_provider;
-}
 
 // GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/fleet.rs, Phase
-// 9d-1) now reads the real fleet registry (osiris-fleet's HostRegistry)
-// instead of scanning recent events: one row per host that has sent at
-// least one AGENT_HEALTH heartbeat, with `status` derived from how recent
-// that host's `last_seen` heartbeat is. See that module's doc comment for
-// the exact ONLINE/STALE threshold. Task 5 updates this screen for the new
-// shape (e.g. cloud fields are no longer part of the response).
+// 9d-1) reads the real fleet registry (osiris-fleet's HostRegistry) instead
+// of scanning recent events: one row per host that has sent at least one
+// AGENT_HEALTH heartbeat, with `status` derived from how recent that host's
+// `last_seen` heartbeat is relative to the `EXPECTED_HEARTBEAT_INTERVAL_NS`
+// constant defined in that module.
 export function HostList() {
   const hosts = useHosts();
   const rows = hosts.data ?? [];
@@ -35,9 +26,10 @@ export function HostList() {
               <th>Hostname</th>
               <th>Distro</th>
               <th>Kernel</th>
+              <th>Agent version</th>
+              <th>Enrolled</th>
               <th>Last Seen</th>
               <th>Status</th>
-              <th>Cloud</th>
             </tr>
           </thead>
           <tbody>
@@ -48,9 +40,10 @@ export function HostList() {
                 </td>
                 <td>{row.distro}</td>
                 <td>{row.kernel_version}</td>
+                <td>{row.agent_version}</td>
+                <td>{new Date(row.enrolled_at / 1_000_000).toLocaleString()}</td>
                 <td>{new Date(row.last_seen / 1_000_000).toLocaleString()}</td>
                 <td>{row.status}</td>
-                <td>{formatCloud(row)}</td>
               </tr>
             ))}
           </tbody>
