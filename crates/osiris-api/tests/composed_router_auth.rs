@@ -12,9 +12,9 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use osiris_api::{
-    auth_gate, build_auth_router, build_incident_evidence_router, build_response_router,
-    build_router, build_stream_router, AuthState, IncidentEvidenceState, LiveEventBroadcaster,
-    ResponseState,
+    auth_gate, build_auth_router, build_fleet_router, build_incident_evidence_router,
+    build_response_router, build_router, build_stream_router, AuthState, FleetState,
+    IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
 };
 use osiris_audit::FileAuditLog;
 use osiris_auth::{NewUser, Role, SqliteUserStore, UserStore};
@@ -79,14 +79,21 @@ fn harness() -> Harness {
         audit_log: audit_log.clone(),
     };
 
+    let fleet_state = FleetState {
+        registry: Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap()),
+        tenants: auth_state.tenants.clone(),
+    };
+
     // The exact composition from `osiris-server/src/main.rs`: build_router,
     // build_incident_evidence_router, build_response_router,
-    // build_stream_router, build_auth_router, then the auth_gate layer.
+    // build_stream_router, build_auth_router, build_fleet_router, then the
+    // auth_gate layer.
     let app = build_router(storage_for_router)
         .merge(build_incident_evidence_router(incident_evidence_state))
         .merge(build_response_router(response_state))
         .merge(build_stream_router(Arc::new(LiveEventBroadcaster::new())))
         .merge(build_auth_router(auth_state.clone()))
+        .merge(build_fleet_router(fleet_state))
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_gate,

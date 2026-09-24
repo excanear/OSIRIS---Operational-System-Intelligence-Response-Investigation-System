@@ -21,6 +21,8 @@ osiris-response = { path = "../osiris-response" }
 osiris-command = { path = "../osiris-command" }
 async-trait = { workspace = true }
 osiris-tenancy = { path = "../osiris-tenancy" }
+osiris-fleet = { path = "../osiris-fleet" }
+osiris-health = { path = "../osiris-health" }
 uuid = { workspace = true }
 tracing = { workspace = true }
 

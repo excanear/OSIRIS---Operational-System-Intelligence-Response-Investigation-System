@@ -9,15 +9,13 @@ function formatCloud(row: HostSummary): string {
   return row.cloud_region ? `${row.cloud_provider} / ${row.cloud_region}` : row.cloud_provider;
 }
 
-// GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/lib.rs) queries
-// a bounded, time-windowed event scan capped at MAX_EVENT_LIMIT (5,000)
-// events, ordered oldest-first, breaking once the cap is hit. If that cap is
-// hit, the handler cannot tell whether any given host's true most-recent
-// event fell inside or outside the truncated portion of the window, so it
-// reports `status: "UNKNOWN"` for EVERY row in the response rather than a
-// possibly-wrong ONLINE/STALE verdict. "UNKNOWN" therefore means "liveness
-// cannot currently be determined for any host in this response" (a
-// query-wide condition), not "these specific hosts are unknown."
+// GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/fleet.rs, Phase
+// 9d-1) now reads the real fleet registry (osiris-fleet's HostRegistry)
+// instead of scanning recent events: one row per host that has sent at
+// least one AGENT_HEALTH heartbeat, with `status` derived from how recent
+// that host's `last_seen` heartbeat is. See that module's doc comment for
+// the exact ONLINE/STALE threshold. Task 5 updates this screen for the new
+// shape (e.g. cloud fields are no longer part of the response).
 export function HostList() {
   const hosts = useHosts();
   const rows = hosts.data ?? [];

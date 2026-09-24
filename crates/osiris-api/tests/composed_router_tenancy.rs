@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use osiris_api::{
-    auth_gate, build_auth_router, build_incident_evidence_router, build_response_router,
-    build_router, build_stream_router, AuthState, IncidentEvidenceState, LiveEventBroadcaster,
-    ResponseState,
+    auth_gate, build_auth_router, build_fleet_router, build_incident_evidence_router,
+    build_response_router, build_router, build_stream_router, AuthState, FleetState,
+    IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
 };
 use osiris_audit::FileAuditLog;
 use osiris_auth::{NewUser, Role, SqliteUserStore, UserStore};
@@ -105,6 +105,7 @@ fn build_app(
     response_state: ResponseState,
     broadcaster: Arc<LiveEventBroadcaster>,
     auth_state: AuthState,
+    fleet_state: FleetState,
 ) -> axum::Router {
     build_router(storage)
         .merge(build_incident_evidence_router(incident_evidence_state))
@@ -112,6 +113,7 @@ fn build_app(
         .merge(build_stream_router(broadcaster))
         .merge(build_auth_router(auth_state.clone()))
         .merge(osiris_api::build_tenant_router(auth_state.clone()))
+        .merge(build_fleet_router(fleet_state))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate))
 }
 
@@ -159,6 +161,28 @@ fn tenancy() -> Tenancy {
     tenants.assign_host(acme_host, acme.tenant_id).unwrap();
     tenants.assign_host(globex_host, globex.tenant_id).unwrap();
 
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap());
+    let heartbeat = |host_id: Uuid| osiris_fleet::HostRow {
+        host_id,
+        hostname: format!("host-{host_id}"),
+        distro: "ubuntu-24.04".to_string(),
+        kernel_version: "6.8.0".to_string(),
+        agent_version: "0.1.0".to_string(),
+        enrolled_at: t,
+        last_seen: t,
+        health_state: osiris_health::HealthState::Healthy,
+    };
+    fleet_registry
+        .upsert_heartbeat(heartbeat(acme_host))
+        .unwrap();
+    fleet_registry
+        .upsert_heartbeat(heartbeat(globex_host))
+        .unwrap();
+    fleet_registry
+        .upsert_heartbeat(heartbeat(unassigned_host))
+        .unwrap();
+
     let (user_store, _bootstrap) = SqliteUserStore::open(p("users.db")).unwrap();
     let admin = user_store.get_user_by_username("admin").unwrap().unwrap();
     let admin_token = user_store
@@ -186,12 +210,17 @@ fn tenancy() -> Tenancy {
         tenants: tenants.clone(),
     };
     let broadcaster = Arc::new(LiveEventBroadcaster::new());
+    let fleet_state = FleetState {
+        registry: fleet_registry,
+        tenants: tenants.clone(),
+    };
     let app = build_app(
         storage,
         incident_evidence_state,
         response_state,
         broadcaster.clone(),
         auth_state.clone(),
+        fleet_state,
     );
 
     Tenancy {

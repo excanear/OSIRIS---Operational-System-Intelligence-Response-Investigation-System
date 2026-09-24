@@ -416,6 +416,10 @@ async fn main() {
             .merge(build_stream_router(live_event_broadcaster))
             .merge(build_auth_router(auth_state.clone()))
             .merge(build_tenant_router(auth_state.clone()))
+            .merge(osiris_api::build_fleet_router(osiris_api::FleetState {
+                registry: fleet_registry.clone(),
+                tenants: tenant_store.clone(),
+            }))
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,
     );

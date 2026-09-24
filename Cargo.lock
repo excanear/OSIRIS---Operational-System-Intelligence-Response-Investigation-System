@@ -1313,6 +1313,8 @@ dependencies = [
  "osiris-command",
  "osiris-correlate",
  "osiris-evidence",
+ "osiris-fleet",
+ "osiris-health",
  "osiris-investigate",
  "osiris-query",
  "osiris-response",
