@@ -11,6 +11,18 @@ use tokio_util::sync::CancellationToken;
 
 use osiris_fileutil::LineTailer;
 
+/// The server's own wall clock, nanoseconds since the Unix epoch — used to
+/// clamp agent-supplied `event.timestamp` values before they reach the fleet
+/// registry (see `IngestContext::ingest`'s AGENT_HEALTH handling below).
+/// Panics if the system clock is set before the epoch, matching the existing
+/// `now_ns` pattern used elsewhere in the workspace (e.g. `osiris-api`).
+fn server_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
 /// Adapts `osiris_storage::Storage::query_relationships` to
 /// `osiris_correlate::EdgeSource` — the one place `osiris-correlate` and
 /// `osiris-storage` meet, keeping the Correlation Engine itself decoupled
@@ -185,7 +197,19 @@ impl IngestContext {
                 }
                 if !health_events.is_empty() {
                     let fleet_registry = self.fleet_registry.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    // Computed once for the whole batch: an agent's clock is
+                    // unbounded, so every timestamp that reaches the registry
+                    // is capped at the server's own clock. Without this, a
+                    // future-stamped heartbeat (bad RTC, manual clock set,
+                    // compromised host) would freeze the row's last_seen
+                    // ahead of real time — the freshness gate in
+                    // `osiris-fleet` then rejects every correctly-stamped
+                    // heartbeat that follows until real time catches up, so
+                    // a dead host would keep showing ONLINE/healthy. A
+                    // backward-skewed agent still reports its true (older)
+                    // timestamp and shows STALE, which is honest.
+                    let server_now = server_now_ns();
+                    let join_result = tokio::task::spawn_blocking(move || {
                         for event in health_events {
                             let agent_version =
                                 event.event_data.get("agent_version").and_then(|v| v.as_str());
@@ -197,15 +221,20 @@ impl IngestContext {
                                 tracing::warn!(host_id = %event.host_id, "AGENT_HEALTH event has malformed event_data; skipping fleet registry upsert");
                                 continue;
                             };
+                            let clamped_ts = event.timestamp.min(server_now);
+                            let cloud = event.host.cloud.as_ref();
                             let row = osiris_fleet::HostRow {
                                 host_id: event.host_id,
                                 hostname: event.host.hostname.clone(),
                                 distro: event.host.distro.clone(),
                                 kernel_version: event.host.kernel_version.clone(),
                                 agent_version: agent_version.to_string(),
-                                enrolled_at: event.timestamp, // ignored by upsert_heartbeat after the first insert
-                                last_seen: event.timestamp,
+                                enrolled_at: clamped_ts, // ignored by upsert_heartbeat after the first insert
+                                last_seen: clamped_ts,
                                 health_state: health.state,
+                                cloud_provider: cloud.map(|c| c.provider.clone()),
+                                cloud_instance_id: cloud.and_then(|c| c.instance_id.clone()),
+                                cloud_region: cloud.and_then(|c| c.region.clone()),
                             };
                             if let Err(e) = fleet_registry.upsert_heartbeat(row) {
                                 tracing::warn!(host_id = %event.host_id, error = %e, "fleet registry upsert failed");
@@ -213,6 +242,9 @@ impl IngestContext {
                         }
                     })
                     .await;
+                    if let Err(e) = join_result {
+                        tracing::error!(error = %e, "fleet registry upsert task panicked or was cancelled");
+                    }
                 }
                 Ok(())
             }
@@ -402,6 +434,82 @@ mod tests {
                 "health": {"state": {"state": "HEALTHY"}, "sensors": []}
             }),
         }
+    }
+
+    fn agent_health_event_with_health(
+        host_id: uuid::Uuid,
+        timestamp: u64,
+        health_json: serde_json::Value,
+    ) -> CanonicalEvent {
+        let mut event = agent_health_event(host_id, timestamp);
+        event.event_data = serde_json::json!({
+            "agent_version": "0.1.0",
+            "health": {"state": health_json, "sensors": []}
+        });
+        event
+    }
+
+    #[tokio::test]
+    async fn a_future_stamped_heartbeat_does_not_freeze_the_row_as_online_and_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let detection_engine = Arc::new(DetectionEngine::new(vec![]));
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine,
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: fleet_registry.clone(),
+        };
+        let host_id = uuid::Uuid::new_v4();
+        let server_now = server_now_ns();
+        let one_hour_ns = 60 * 60 * 1_000_000_000u64;
+
+        // A heartbeat stamped an hour in the future (bad RTC, manual clock
+        // set, compromised host) must be clamped to server time on ingest,
+        // not stored verbatim.
+        context
+            .ingest(vec![agent_health_event_with_health(
+                host_id,
+                server_now + one_hour_ns,
+                serde_json::json!({"state": "HEALTHY"}),
+            )])
+            .await
+            .unwrap();
+        let after_future = fleet_registry.get(host_id).unwrap().unwrap();
+        assert!(
+            after_future.last_seen <= server_now_ns(),
+            "a future-stamped heartbeat's last_seen must be clamped to server time"
+        );
+
+        // A correctly-stamped Failed heartbeat that follows must not be
+        // rejected by the freshness gate (which it would be if the first
+        // heartbeat's last_seen had been stored unclamped, ahead of real
+        // time).
+        context
+            .ingest(vec![agent_health_event_with_health(
+                host_id,
+                server_now_ns(),
+                serde_json::json!({"state": "FAILED", "last_error": "sensor crashed"}),
+            )])
+            .await
+            .unwrap();
+        let after_failed = fleet_registry.get(host_id).unwrap().unwrap();
+        assert!(
+            matches!(after_failed.health_state, osiris_health::HealthState::Failed { .. }),
+            "a subsequent correctly-stamped Failed heartbeat must not be frozen out by a future last_seen: got {:?}",
+            after_failed.health_state
+        );
+        assert!(
+            after_failed.last_seen <= server_now_ns(),
+            "last_seen must never exceed server time"
+        );
     }
 
     #[tokio::test]

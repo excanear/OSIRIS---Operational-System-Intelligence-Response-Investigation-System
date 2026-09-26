@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
+import type { HostSummary } from "../../api/types";
 
 // GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/fleet.rs, Phase
 // 9d-1) reads the real fleet registry (osiris-fleet's HostRegistry) instead
@@ -7,6 +8,14 @@ import { useHosts } from "../../api/hooks";
 // AGENT_HEALTH heartbeat, with `status` derived from how recent that host's
 // `last_seen` heartbeat is relative to the `EXPECTED_HEARTBEAT_INTERVAL_NS`
 // constant defined in that module.
+
+// Phase 8d: provider (+ region when known) from the host's cloud metadata
+// probe, or a dash for on-prem/bare-metal hosts (cloud is null there).
+function formatCloud(row: HostSummary): string {
+  if (!row.cloud_provider) return "—";
+  return row.cloud_region ? `${row.cloud_provider} / ${row.cloud_region}` : row.cloud_provider;
+}
+
 export function HostList() {
   const hosts = useHosts();
   const rows = hosts.data ?? [];
@@ -30,6 +39,7 @@ export function HostList() {
               <th>Enrolled</th>
               <th>Last Seen</th>
               <th>Status</th>
+              <th>Cloud</th>
             </tr>
           </thead>
           <tbody>
@@ -44,6 +54,7 @@ export function HostList() {
                 <td>{new Date(row.enrolled_at / 1_000_000).toLocaleString()}</td>
                 <td>{new Date(row.last_seen / 1_000_000).toLocaleString()}</td>
                 <td>{row.status}</td>
+                <td>{formatCloud(row)}</td>
               </tr>
             ))}
           </tbody>

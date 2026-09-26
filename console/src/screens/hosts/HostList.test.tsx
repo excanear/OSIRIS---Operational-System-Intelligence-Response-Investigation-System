@@ -78,4 +78,33 @@ describe("HostList", () => {
     expect(screen.getByText("0.1.0")).toBeInTheDocument();
     expect(screen.getByText(new Date(enrolledAtNs / 1_000_000).toLocaleString())).toBeInTheDocument();
   });
+
+  it("renders a Cloud column with provider and region, and a dash when absent", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "cloud-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 500, last_seen: 1000, status: "ONLINE", cloud_provider: "aws", cloud_instance_id: "i-0abc", cloud_region: "us-east-1" },
+          { host_id: "22222222-2222-2222-2222-222222222222", hostname: "onprem-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 400, last_seen: 900, status: "STALE", cloud_provider: null, cloud_instance_id: null, cloud_region: null },
+        ],
+      })
+    );
+    renderWithRouter();
+
+    expect(screen.getByRole("columnheader", { name: "Cloud" })).toBeInTheDocument();
+    expect(screen.getByText("aws / us-east-1")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
+
+  it("renders just the provider when the cloud region is absent", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "33333333-3333-3333-3333-333333333333", hostname: "azure-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 300, last_seen: 800, status: "ONLINE", cloud_provider: "azure", cloud_instance_id: null, cloud_region: null },
+        ],
+      })
+    );
+    renderWithRouter();
+
+    expect(screen.getByText("azure")).toBeInTheDocument();
+  });
 });

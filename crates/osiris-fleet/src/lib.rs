@@ -27,9 +27,24 @@ pub struct HostRow {
     pub distro: String,
     pub kernel_version: String,
     pub agent_version: String,
+    /// Nanoseconds since the Unix epoch (server-clamped: the ingest hook
+    /// caps the agent-supplied timestamp at the server's own clock before it
+    /// ever reaches the registry, so this can never be ahead of `now`).
     pub enrolled_at: u64,
+    /// Nanoseconds since the Unix epoch (server-clamped, same as `enrolled_at`).
     pub last_seen: u64,
     pub health_state: HealthState,
+    pub cloud_provider: Option<String>,
+    pub cloud_instance_id: Option<String>,
+    pub cloud_region: Option<String>,
+}
+
+/// Converts an agent-supplied timestamp into the signed representation SQLite
+/// stores it as. `u64` values above `i64::MAX` are clamped rather than cast
+/// (a raw `as i64` wraps negative, which would silently corrupt
+/// `last_seen`/`enrolled_at` ordering and the freshness gate below).
+fn to_stored_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 pub trait HostRegistry: Send + Sync {
@@ -54,7 +69,10 @@ impl SqliteHostRegistry {
                 agent_version TEXT NOT NULL,
                 enrolled_at INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
-                health_state TEXT NOT NULL
+                health_state TEXT NOT NULL,
+                cloud_provider TEXT,
+                cloud_instance_id TEXT,
+                cloud_region TEXT
             )",
             [],
         )?;
@@ -87,6 +105,9 @@ impl SqliteHostRegistry {
                     Box::new(e),
                 )
             })?,
+            cloud_provider: r.get(8)?,
+            cloud_instance_id: r.get(9)?,
+            cloud_region: r.get(10)?,
         })
     }
 }
@@ -97,15 +118,18 @@ impl HostRegistry for SqliteHostRegistry {
         let health_json = serde_json::to_string(&row.health_state)
             .map_err(|e| FleetError::Serde(e.to_string()))?;
         conn.execute(
-            "INSERT INTO hosts (host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
+            "INSERT INTO hosts (host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(host_id) DO UPDATE SET
                 hostname = excluded.hostname,
                 distro = excluded.distro,
                 kernel_version = excluded.kernel_version,
                 agent_version = excluded.agent_version,
                 last_seen = MAX(hosts.last_seen, excluded.last_seen),
-                health_state = excluded.health_state
+                health_state = excluded.health_state,
+                cloud_provider = excluded.cloud_provider,
+                cloud_instance_id = excluded.cloud_instance_id,
+                cloud_region = excluded.cloud_region
              WHERE excluded.last_seen >= hosts.last_seen",
             params![
                 row.host_id.to_string(),
@@ -113,8 +137,11 @@ impl HostRegistry for SqliteHostRegistry {
                 row.distro,
                 row.kernel_version,
                 row.agent_version,
-                row.last_seen as i64,
+                to_stored_i64(row.last_seen),
                 health_json,
+                row.cloud_provider,
+                row.cloud_instance_id,
+                row.cloud_region,
             ],
         )?;
         Ok(())
@@ -124,7 +151,7 @@ impl HostRegistry for SqliteHostRegistry {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         Ok(conn
             .query_row(
-                "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state
+                "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region
                  FROM hosts WHERE host_id = ?1",
                 params![host_id.to_string()],
                 Self::row_from,
@@ -135,7 +162,7 @@ impl HostRegistry for SqliteHostRegistry {
     fn list(&self) -> Result<Vec<HostRow>, FleetError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state FROM hosts",
+            "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region FROM hosts",
         )?;
         let rows = stmt
             .query_map([], Self::row_from)?
@@ -160,6 +187,9 @@ mod tests {
             enrolled_at: last_seen,
             last_seen,
             health_state: HealthState::Healthy,
+            cloud_provider: None,
+            cloud_instance_id: None,
+            cloud_region: None,
         }
     }
 
@@ -265,5 +295,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
         assert_eq!(reg.get(Uuid::new_v4()).unwrap(), None);
+    }
+
+    #[test]
+    fn cloud_fields_round_trip_and_update_like_other_mutable_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
+        let host_id = Uuid::new_v4();
+        let mut first = row(host_id, 1_000);
+        first.cloud_provider = Some("aws".into());
+        first.cloud_instance_id = Some("i-0abc".into());
+        first.cloud_region = Some("us-east-1".into());
+        reg.upsert_heartbeat(first).unwrap();
+
+        let got = reg.get(host_id).unwrap().unwrap();
+        assert_eq!(got.cloud_provider.as_deref(), Some("aws"));
+        assert_eq!(got.cloud_instance_id.as_deref(), Some("i-0abc"));
+        assert_eq!(got.cloud_region.as_deref(), Some("us-east-1"));
+
+        // A later, fresher heartbeat updates cloud fields exactly like the
+        // other mutable columns (hostname etc.), under the same freshness gate.
+        let mut second = row(host_id, 2_000);
+        second.cloud_provider = Some("azure".into());
+        second.cloud_instance_id = None;
+        second.cloud_region = None;
+        reg.upsert_heartbeat(second).unwrap();
+        let got = reg.get(host_id).unwrap().unwrap();
+        assert_eq!(got.cloud_provider.as_deref(), Some("azure"));
+        assert_eq!(got.cloud_instance_id, None);
+        assert_eq!(got.cloud_region, None);
+    }
+
+    #[test]
+    fn a_timestamp_above_i64_max_does_not_produce_a_negative_stored_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
+        let host_id = Uuid::new_v4();
+        // Above i64::MAX: a raw `as i64` cast would wrap negative.
+        let huge = u64::MAX;
+        reg.upsert_heartbeat(row(host_id, huge)).unwrap();
+        let got = reg.get(host_id).unwrap().unwrap();
+        assert!(
+            got.last_seen > 0,
+            "last_seen must not wrap negative for a u64 above i64::MAX, got {}",
+            got.last_seen
+        );
+        assert!(
+            got.enrolled_at > 0,
+            "enrolled_at must not wrap negative for a u64 above i64::MAX, got {}",
+            got.enrolled_at
+        );
     }
 }

@@ -46,6 +46,9 @@ struct HostSummary {
     enrolled_at: u64,
     last_seen: u64,
     status: String,
+    cloud_provider: Option<String>,
+    cloud_instance_id: Option<String>,
+    cloud_region: Option<String>,
 }
 
 fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
@@ -63,6 +66,9 @@ fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
         enrolled_at: row.enrolled_at,
         last_seen: row.last_seen,
         status: status.to_string(),
+        cloud_provider: row.cloud_provider,
+        cloud_instance_id: row.cloud_instance_id,
+        cloud_region: row.cloud_region,
     }
 }
 
@@ -84,9 +90,10 @@ async fn hosts_handler(
 ) -> Result<Json<Vec<HostSummary>>, (StatusCode, String)> {
     let scope =
         crate::tenant_scope::hosts_of_tenant(ctx.tenant_id, Some(state.tenants.clone())).await?;
-    let mut rows = state
-        .registry
-        .list()
+    let registry = state.registry.clone();
+    let mut rows = tokio::task::spawn_blocking(move || registry.list())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let Some(allowed) = scope {
         rows.retain(|r| allowed.contains(&r.host_id));
@@ -117,6 +124,9 @@ mod tests {
             enrolled_at: last_seen,
             last_seen,
             health_state: osiris_health::HealthState::Healthy,
+            cloud_provider: None,
+            cloud_instance_id: None,
+            cloud_region: None,
         }
     }
 
@@ -163,6 +173,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_host_summary_carries_its_cloud_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let host_id = Uuid::new_v4();
+        let mut with_cloud = row(host_id, 1_000);
+        with_cloud.cloud_provider = Some("aws".into());
+        with_cloud.cloud_instance_id = Some("i-0abc".into());
+        with_cloud.cloud_region = Some("us-east-1".into());
+        s.registry.upsert_heartbeat(with_cloud).unwrap();
+
+        let Json(rows) = hosts_handler(Extension(platform_ctx()), State(s))
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cloud_provider.as_deref(), Some("aws"));
+        assert_eq!(rows[0].cloud_instance_id.as_deref(), Some("i-0abc"));
+        assert_eq!(rows[0].cloud_region.as_deref(), Some("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn a_host_summary_has_null_cloud_fields_when_on_prem() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let host_id = Uuid::new_v4();
+        s.registry.upsert_heartbeat(row(host_id, 1_000)).unwrap();
+
+        let Json(rows) = hosts_handler(Extension(platform_ctx()), State(s))
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cloud_provider, None);
+        assert_eq!(rows[0].cloud_instance_id, None);
+        assert_eq!(rows[0].cloud_region, None);
     }
 
     #[tokio::test]

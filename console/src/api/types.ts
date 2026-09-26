@@ -90,6 +90,9 @@ export interface HostSummary {
   enrolled_at: number;
   last_seen: number;
   status: "ONLINE" | "STALE";
+  cloud_provider: string | null;
+  cloud_instance_id: string | null;
+  cloud_region: string | null;
 }
 
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

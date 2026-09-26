@@ -129,13 +129,12 @@ async fn main() {
             cancellation.cancel();
         }
     });
-    // Phase 9d-1: the Fleet Manager host registry. Best-effort, like
-    // Baseline/Risk above, would be too weak a posture here — a missing
-    // registry silently drops fleet visibility for every host, not just one
-    // enrichment signal — but this crate has no other required-store
-    // ordering constraint, so it is opened here, ahead of `ingest_context`'s
-    // construction, using the same fail-fast `open_or_exit` helper the
-    // Incident/Evidence/tenant stores use below.
+    // Phase 9d-1: the Fleet Manager host registry. Unlike Baseline/Risk
+    // above (best-effort, degrade-in-place on open failure), a missing
+    // registry would silently drop fleet visibility for every host, not
+    // just one enrichment signal — so it is opened fail-fast instead, ahead
+    // of `ingest_context`'s construction, using the same `open_or_exit`
+    // helper the Incident/Evidence/tenant stores use below.
     let hosts_db_path = config
         .hosts_db_path
         .clone()

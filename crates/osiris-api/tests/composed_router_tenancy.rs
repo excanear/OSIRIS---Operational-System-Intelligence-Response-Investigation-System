@@ -172,6 +172,9 @@ fn tenancy() -> Tenancy {
         enrolled_at: t,
         last_seen: t,
         health_state: osiris_health::HealthState::Healthy,
+        cloud_provider: None,
+        cloud_instance_id: None,
+        cloud_region: None,
     };
     fleet_registry
         .upsert_heartbeat(heartbeat(acme_host))

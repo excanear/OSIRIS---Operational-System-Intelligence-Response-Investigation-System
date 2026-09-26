@@ -26,10 +26,11 @@ revisão final independente → merge → push.
   segurança dedicada (marco separado, conforme §13).
 
 ### 9d. Fleet Manager real (§21.2)
-- Hoje: `/api/v1/hosts` é só listagem derivada de eventos (24 h).
-- Entregar: registro de agentes (enrollment, versão, último contato, saúde) no control-plane store;
-  grupos de hosts; distribuição de política (nível de telemetria/config de sensores) via 9c;
-  API + telas do Console; integração com tenants.
+- Hoje (9d-1 entregue): `/api/v1/hosts` lê o registro de agentes real (`osiris-fleet`'s
+  `HostRegistry`), alimentado pelos heartbeats `AGENT_HEALTH` no ingest — não mais uma
+  listagem derivada de uma janela de eventos.
+- Entregar (9d-2/9d-3): grupos de hosts; distribuição de política (nível de telemetria/config
+  de sensores) via 9c; telas do Console além da lista; integração mais profunda com tenants.
 
 ## Fase 10 — Validação em Linux real
 - Rodar agente + sensores em VM/container Linux reais (Ubuntu 22.04, Debian 12, RHEL 8-like).
