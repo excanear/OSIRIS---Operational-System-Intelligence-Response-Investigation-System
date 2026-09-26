@@ -9,6 +9,8 @@ import { FileDetailScreen } from "./screens/files/FileDetailScreen";
 import { FileList } from "./screens/files/FileList";
 import { EntityGraph } from "./screens/graph/EntityGraph";
 import { EvidenceList } from "./screens/evidence/EvidenceList";
+import { GroupDetail } from "./screens/groups/GroupDetail";
+import { GroupList } from "./screens/groups/GroupList";
 import { HostList } from "./screens/hosts/HostList";
 import { IncidentDetailScreen } from "./screens/incidents/IncidentDetailScreen";
 import { IncidentList } from "./screens/incidents/IncidentList";
@@ -51,6 +53,8 @@ export function App() {
                 <Route path="/containers" element={<ContainerList />} />
                 <Route path="/containers/:containerId" element={<ContainerDetailScreen />} />
                 <Route path="/hosts" element={<HostList />} />
+                <Route path="/groups" element={<GroupList />} />
+                <Route path="/groups/:groupId" element={<GroupDetail />} />
                 <Route path="/timeline" element={<Timeline />} />
                 <Route path="/alerts" element={<Alerts />} />
                 <Route path="/incidents" element={<IncidentList />} />

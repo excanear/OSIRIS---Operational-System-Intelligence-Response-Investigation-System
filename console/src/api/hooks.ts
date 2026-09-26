@@ -1,8 +1,11 @@
 import type { TimeRange } from "./timeRange";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  addGroupMember,
   createEvidence,
+  createGroup,
   createIncident,
+  deleteGroup,
   fetchAlerts,
   fetchAllEvidence,
   fetchContainers,
@@ -11,6 +14,8 @@ import {
   fetchEvidence,
   fetchFiles,
   fetchFileStory,
+  fetchGroup,
+  fetchGroups,
   fetchHealth,
   fetchHosts,
   fetchIncident,
@@ -24,6 +29,8 @@ import {
   fetchSystemStory,
   login,
   patchIncidentStatus,
+  removeGroupMember,
+  renameGroup,
 } from "./client";
 import { useAuthStore } from "../store/authStore";
 import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
@@ -111,10 +118,71 @@ export function useContainers(range?: TimeRange) {
   });
 }
 
-export function useHosts() {
+export function useHosts(group?: string) {
   return useQuery({
-    queryKey: ["hosts"],
-    queryFn: fetchHosts,
+    queryKey: ["hosts", group ?? "all"],
+    queryFn: () => fetchHosts(group),
+  });
+}
+
+export function useGroups() {
+  return useQuery({ queryKey: ["groups"], queryFn: fetchGroups });
+}
+
+export function useGroup(groupId: string) {
+  return useQuery({
+    queryKey: ["group", groupId],
+    queryFn: () => fetchGroup(groupId),
+    enabled: groupId.length > 0,
+  });
+}
+
+function useInvalidateGroups() {
+  const queryClient = useQueryClient();
+  return (groupId?: string) => {
+    queryClient.invalidateQueries({ queryKey: ["groups"] });
+    queryClient.invalidateQueries({ queryKey: ["hosts"] });
+    if (groupId) queryClient.invalidateQueries({ queryKey: ["group", groupId] });
+  };
+}
+
+export function useCreateGroup() {
+  const invalidate = useInvalidateGroups();
+  return useMutation({
+    mutationFn: (name: string) => createGroup({ name }),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useRenameGroup(groupId: string) {
+  const invalidate = useInvalidateGroups();
+  return useMutation({
+    mutationFn: (name: string) => renameGroup(groupId, name),
+    onSuccess: () => invalidate(groupId),
+  });
+}
+
+export function useDeleteGroup(groupId: string) {
+  const invalidate = useInvalidateGroups();
+  return useMutation({
+    mutationFn: () => deleteGroup(groupId),
+    onSuccess: () => invalidate(groupId),
+  });
+}
+
+export function useAddGroupMember(groupId: string) {
+  const invalidate = useInvalidateGroups();
+  return useMutation({
+    mutationFn: (hostId: string) => addGroupMember(groupId, hostId),
+    onSuccess: () => invalidate(groupId),
+  });
+}
+
+export function useRemoveGroupMember(groupId: string) {
+  const invalidate = useInvalidateGroups();
+  return useMutation({
+    mutationFn: (hostId: string) => removeGroupMember(groupId, hostId),
+    onSuccess: () => invalidate(groupId),
   });
 }
 

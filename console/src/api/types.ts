@@ -93,6 +93,32 @@ export interface HostSummary {
   cloud_provider: string | null;
   cloud_instance_id: string | null;
   cloud_region: string | null;
+  groups: GroupRef[];
+}
+
+export interface GroupRef {
+  group_id: string;
+  name: string;
+}
+
+export interface HostGroup {
+  group_id: string;
+  name: string;
+  tenant_id: string | null;
+  created_at: number;
+  member_count: number;
+}
+
+export interface GroupMember {
+  host_id: string;
+  hostname: string;
+  status: "ONLINE" | "STALE";
+  agent_version: string;
+  last_seen: number;
+}
+
+export interface GroupDetail extends HostGroup {
+  members: GroupMember[];
 }
 
 export type AlertSeverity = "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

@@ -47,7 +47,7 @@ describe("HostList", () => {
     vi.mocked(hooks.useHosts).mockReturnValue(
       mockQueryResult({
         data: [
-          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 500, last_seen: 1000, status: "ONLINE" },
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 500, last_seen: 1000, status: "ONLINE", groups: [] },
         ],
       })
     );
@@ -67,7 +67,7 @@ describe("HostList", () => {
     vi.mocked(hooks.useHosts).mockReturnValue(
       mockQueryResult({
         data: [
-          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: enrolledAtNs, last_seen: 1000, status: "ONLINE" },
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: enrolledAtNs, last_seen: 1000, status: "ONLINE", groups: [] },
         ],
       })
     );
@@ -83,8 +83,8 @@ describe("HostList", () => {
     vi.mocked(hooks.useHosts).mockReturnValue(
       mockQueryResult({
         data: [
-          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "cloud-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 500, last_seen: 1000, status: "ONLINE", cloud_provider: "aws", cloud_instance_id: "i-0abc", cloud_region: "us-east-1" },
-          { host_id: "22222222-2222-2222-2222-222222222222", hostname: "onprem-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 400, last_seen: 900, status: "STALE", cloud_provider: null, cloud_instance_id: null, cloud_region: null },
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "cloud-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 500, last_seen: 1000, status: "ONLINE", cloud_provider: "aws", cloud_instance_id: "i-0abc", cloud_region: "us-east-1", groups: [] },
+          { host_id: "22222222-2222-2222-2222-222222222222", hostname: "onprem-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 400, last_seen: 900, status: "STALE", cloud_provider: null, cloud_instance_id: null, cloud_region: null, groups: [] },
         ],
       })
     );
@@ -99,12 +99,50 @@ describe("HostList", () => {
     vi.mocked(hooks.useHosts).mockReturnValue(
       mockQueryResult({
         data: [
-          { host_id: "33333333-3333-3333-3333-333333333333", hostname: "azure-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 300, last_seen: 800, status: "ONLINE", cloud_provider: "azure", cloud_instance_id: null, cloud_region: null },
+          { host_id: "33333333-3333-3333-3333-333333333333", hostname: "azure-host", distro: "ubuntu-22.04", kernel_version: "5.15.0", agent_version: "0.1.0", enrolled_at: 300, last_seen: 800, status: "ONLINE", cloud_provider: "azure", cloud_instance_id: null, cloud_region: null, groups: [] },
         ],
       })
     );
     renderWithRouter();
 
     expect(screen.getByText("azure")).toBeInTheDocument();
+  });
+
+  it("shows each host's groups as links to the group", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "d", kernel_version: "k", agent_version: "0.1.0", enrolled_at: 1, last_seen: 1, status: "ONLINE", cloud_provider: null, cloud_instance_id: null, cloud_region: null, groups: [{ group_id: "g1", name: "web" }] },
+        ],
+      })
+    );
+    renderWithRouter();
+    expect(screen.getByRole("columnheader", { name: "Groups" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "web" })).toHaveAttribute("href", "/groups/g1");
+  });
+
+  it("passes ?group= to useHosts and shows a clearable banner", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(
+      mockQueryResult({
+        data: [
+          { host_id: "11111111-1111-1111-1111-111111111111", hostname: "host-a", distro: "d", kernel_version: "k", agent_version: "0.1.0", enrolled_at: 1, last_seen: 1, status: "ONLINE", cloud_provider: null, cloud_instance_id: null, cloud_region: null, groups: [{ group_id: "g1", name: "web" }] },
+        ],
+      })
+    );
+    render(
+      <MemoryRouter initialEntries={["/hosts?group=g1"]}>
+        <HostList />
+      </MemoryRouter>
+    );
+    expect(hooks.useHosts).toHaveBeenCalledWith("g1");
+    expect(screen.getByText(/Filtered by group web/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Clear filter" })).toHaveAttribute("href", "/hosts");
+  });
+
+  it("calls useHosts without a group and shows no banner when unfiltered", () => {
+    vi.mocked(hooks.useHosts).mockReturnValue(mockQueryResult({ data: [] }));
+    renderWithRouter();
+    expect(hooks.useHosts).toHaveBeenCalledWith(undefined);
+    expect(screen.queryByText(/Filtered by group/)).not.toBeInTheDocument();
   });
 });

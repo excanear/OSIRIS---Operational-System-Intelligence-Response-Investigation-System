@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
 import type { HostSummary } from "../../api/types";
 
@@ -7,7 +7,8 @@ import type { HostSummary } from "../../api/types";
 // of scanning recent events: one row per host that has sent at least one
 // AGENT_HEALTH heartbeat, with `status` derived from how recent that host's
 // `last_seen` heartbeat is relative to the `EXPECTED_HEARTBEAT_INTERVAL_NS`
-// constant defined in that module.
+// constant defined in that module. Phase 9d-2: each row also carries its
+// host groups, and the list can be filtered to a single group via `?group=`.
 
 // Phase 8d: provider (+ region when known) from the host's cloud metadata
 // probe, or a dash for on-prem/bare-metal hosts (cloud is null there).
@@ -17,12 +18,22 @@ function formatCloud(row: HostSummary): string {
 }
 
 export function HostList() {
-  const hosts = useHosts();
+  const [params] = useSearchParams();
+  const groupFilter = params.get("group") ?? undefined;
+  const hosts = useHosts(groupFilter);
   const rows = hosts.data ?? [];
+  const filterName = groupFilter
+    ? (rows.flatMap((r) => r.groups).find((g) => g.group_id === groupFilter)?.name ?? groupFilter)
+    : undefined;
 
   return (
     <div>
       <h1>Hosts</h1>
+      {groupFilter && (
+        <p>
+          Filtered by group {filterName} <Link to="/hosts">Clear filter</Link>
+        </p>
+      )}
       {hosts.isLoading && <p>Loading hosts…</p>}
       {hosts.isError && (
         <p role="alert">Failed to load hosts: {(hosts.error as Error).message}</p>
@@ -40,6 +51,7 @@ export function HostList() {
               <th>Last Seen</th>
               <th>Status</th>
               <th>Cloud</th>
+              <th>Groups</th>
             </tr>
           </thead>
           <tbody>
@@ -55,6 +67,14 @@ export function HostList() {
                 <td>{new Date(row.last_seen / 1_000_000).toLocaleString()}</td>
                 <td>{row.status}</td>
                 <td>{formatCloud(row)}</td>
+                <td>
+                  {row.groups.map((g, i) => (
+                    <span key={g.group_id}>
+                      {i > 0 && ", "}
+                      <Link to={`/groups/${encodeURIComponent(g.group_id)}`}>{g.name}</Link>
+                    </span>
+                  ))}
+                </td>
               </tr>
             ))}
           </tbody>

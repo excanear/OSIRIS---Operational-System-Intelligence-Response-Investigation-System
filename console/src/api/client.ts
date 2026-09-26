@@ -9,6 +9,8 @@ import type {
   Evidence,
   EvidenceWithIncidents,
   FileSummary,
+  GroupDetail,
+  HostGroup,
   HostSummary,
   Incident,
   IncidentStatus,
@@ -76,6 +78,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       : `${method} ${path} failed with status ${response.status}`;
     throw new ApiError(response.status, message);
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return (await response.json()) as T;
 }
 
@@ -89,6 +94,14 @@ function apiPost<T>(path: string, body: unknown): Promise<T> {
 
 function apiPatch<T>(path: string, body: unknown): Promise<T> {
   return request<T>("PATCH", path, body);
+}
+
+function apiPut<T>(path: string): Promise<T> {
+  return request<T>("PUT", path);
+}
+
+function apiDelete<T>(path: string): Promise<T> {
+  return request<T>("DELETE", path);
 }
 
 export function fetchHealth(): Promise<ApiHealth> {
@@ -162,8 +175,40 @@ export function fetchContainers(range?: TimeRange): Promise<ContainerSummary[]> 
   return apiGet<ContainerSummary[]>(`/containers${timeRangeQuery(range)}`);
 }
 
-export function fetchHosts(): Promise<HostSummary[]> {
-  return apiGet<HostSummary[]>("/hosts");
+export function fetchHosts(group?: string): Promise<HostSummary[]> {
+  return apiGet<HostSummary[]>(group ? `/hosts?group=${encodeURIComponent(group)}` : "/hosts");
+}
+
+export function fetchGroups(): Promise<HostGroup[]> {
+  return apiGet<HostGroup[]>("/groups");
+}
+
+export function fetchGroup(groupId: string): Promise<GroupDetail> {
+  return apiGet<GroupDetail>(`/groups/${encodeURIComponent(groupId)}`);
+}
+
+export function createGroup(body: { name: string }): Promise<HostGroup> {
+  return apiPost<HostGroup>("/groups", body);
+}
+
+export function renameGroup(groupId: string, name: string): Promise<HostGroup> {
+  return apiPatch<HostGroup>(`/groups/${encodeURIComponent(groupId)}`, { name });
+}
+
+export function deleteGroup(groupId: string): Promise<void> {
+  return apiDelete<void>(`/groups/${encodeURIComponent(groupId)}`);
+}
+
+export function addGroupMember(groupId: string, hostId: string): Promise<void> {
+  return apiPut<void>(
+    `/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(hostId)}`
+  );
+}
+
+export function removeGroupMember(groupId: string, hostId: string): Promise<void> {
+  return apiDelete<void>(
+    `/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(hostId)}`
+  );
 }
 
 export function fetchFileStory(fileId: string): Promise<Story> {

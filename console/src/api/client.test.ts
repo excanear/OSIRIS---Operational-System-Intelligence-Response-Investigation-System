@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  addGroupMember,
   ApiError,
   createEvidence,
+  createGroup,
   createIncident,
+  deleteGroup,
   fetchAlerts,
   fetchAllEvidence,
   fetchContainers,
@@ -23,6 +26,7 @@ import {
   fetchSubgraph,
   fetchSystemStory,
   patchIncidentStatus,
+  removeGroupMember,
 } from "./client";
 import { useAuthStore } from "../store/authStore";
 
@@ -401,6 +405,46 @@ describe("api client", () => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ events: [], alerts: [] }), { status: 200 }));
     await fetchContainerStory("abc123");
     expect(fetch).toHaveBeenCalledWith("/api/v1/containers/story?container_id=abc123");
+  });
+
+  it("fetchHosts with a group adds an encoded group query param", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    await fetchHosts("g 1");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/hosts?group=g%201");
+  });
+
+  it("createGroup POSTs the name as JSON", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ group_id: "g", name: "web" }), { status: 201 })
+    );
+    await createGroup({ name: "web" });
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "web" }),
+    });
+  });
+
+  it("deleteGroup issues DELETE and resolves to undefined on 204", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    await expect(deleteGroup("g")).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g", { method: "DELETE" });
+  });
+
+  it("addGroupMember and removeGroupMember hit the member route", async () => {
+    vi.mocked(fetch).mockImplementation(async () => new Response(null, { status: 204 }));
+    await addGroupMember("g", "h");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/members/h", { method: "PUT" });
+    await removeGroupMember("g", "h");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/members/h", { method: "DELETE" });
+  });
+
+  it("a 409 rejects with an ApiError carrying the status", async () => {
+    vi.mocked(fetch).mockImplementation(
+      async () => new Response("a group with this name already exists", { status: 409 })
+    );
+    await expect(createGroup({ name: "web" })).rejects.toMatchObject({ status: 409 });
+    await expect(createGroup({ name: "web" })).rejects.toBeInstanceOf(ApiError);
   });
 
   describe("authenticated requests", () => {
