@@ -107,6 +107,11 @@ enum Command {
         #[command(subcommand)]
         action: PkiAction,
     },
+    /// Host groups (Phase 9d-2). Reads need a Viewer session, changes an Admin.
+    Groups {
+        #[command(subcommand)]
+        action: GroupsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,6 +283,28 @@ enum UsersAction {
 }
 
 #[derive(Subcommand)]
+enum GroupsAction {
+    /// List groups visible to this session.
+    List,
+    /// Create a group; platform Admins may bind it to a tenant.
+    Create {
+        name: String,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+    /// Show a group and its members.
+    Show { group_id: String },
+    /// Rename a group.
+    Rename { group_id: String, name: String },
+    /// Delete a group (its memberships go with it; hosts are untouched).
+    Delete { group_id: String },
+    /// Add a registered host to a group.
+    AddHost { group_id: String, host_id: String },
+    /// Remove a host from a group.
+    RemoveHost { group_id: String, host_id: String },
+}
+
+#[derive(Subcommand)]
 enum TenantsAction {
     /// Create a tenant (requires a platform Admin session).
     Create { name: String },
@@ -337,13 +364,11 @@ fn get(
     Ok(body)
 }
 
-fn post_json(
-    client: &reqwest::blocking::Client,
-    url: String,
-    body: serde_json::Value,
+fn send_json(
+    request: reqwest::blocking::RequestBuilder,
     attach_token: bool,
 ) -> Result<String, String> {
-    let mut request = client.post(url).json(&body);
+    let mut request = request;
     if attach_token {
         if let Some(token) = osiris_cli::auth::read_token() {
             request = request.bearer_auth(token);
@@ -363,6 +388,24 @@ fn post_json(
         return Err(format!("request failed: HTTP {}: {}", status, resp_body));
     }
     Ok(resp_body)
+}
+
+fn post_json(
+    client: &reqwest::blocking::Client,
+    url: String,
+    body: serde_json::Value,
+    attach_token: bool,
+) -> Result<String, String> {
+    send_json(client.post(url).json(&body), attach_token)
+}
+
+fn patch_json(
+    client: &reqwest::blocking::Client,
+    url: String,
+    body: serde_json::Value,
+    attach_token: bool,
+) -> Result<String, String> {
+    send_json(client.patch(url).json(&body), attach_token)
 }
 
 fn send_empty(
@@ -623,6 +666,48 @@ fn main() {
                 ),
             }
         }
+        Command::Groups { action } => {
+            let base = cli.server.trim_end_matches('/').to_string();
+            let group_url = |id: &str| format!("{base}/api/v1/groups/{}", percent_encode(id));
+            match action {
+                GroupsAction::List => get(&client, format!("{base}/api/v1/groups"), true),
+                GroupsAction::Create { name, tenant } => {
+                    let mut body = serde_json::json!({ "name": name });
+                    if let Some(t) = tenant {
+                        body["tenant_id"] = serde_json::Value::String(t.clone());
+                    }
+                    post_json(&client, format!("{base}/api/v1/groups"), body, true)
+                }
+                GroupsAction::Show { group_id } => get(&client, group_url(group_id), true),
+                GroupsAction::Rename { group_id, name } => patch_json(
+                    &client,
+                    group_url(group_id),
+                    serde_json::json!({ "name": name }),
+                    true,
+                ),
+                GroupsAction::Delete { group_id } => {
+                    delete_empty(&client, group_url(group_id), true)
+                }
+                GroupsAction::AddHost { group_id, host_id } => put_empty(
+                    &client,
+                    format!(
+                        "{}/members/{}",
+                        group_url(group_id),
+                        percent_encode(host_id)
+                    ),
+                    true,
+                ),
+                GroupsAction::RemoveHost { group_id, host_id } => delete_empty(
+                    &client,
+                    format!(
+                        "{}/members/{}",
+                        group_url(group_id),
+                        percent_encode(host_id)
+                    ),
+                    true,
+                ),
+            }
+        }
     };
 
     match result {
@@ -679,5 +764,64 @@ mod pki_tests {
         let vk = osiris_command::keys::load_verifying_key(&dir.path().join("command.pub")).unwrap();
         assert_eq!(sk.verifying_key(), vk);
         assert!(run_pki(&action).is_err());
+    }
+}
+
+#[cfg(test)]
+mod groups_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("osiris-cli").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn every_groups_subcommand_parses() {
+        assert!(matches!(
+            parse(&["groups", "list"]).command,
+            Command::Groups {
+                action: GroupsAction::List
+            }
+        ));
+        match parse(&["groups", "create", "web", "--tenant", "t1"]).command {
+            Command::Groups {
+                action: GroupsAction::Create { name, tenant },
+            } => {
+                assert_eq!(name, "web");
+                assert_eq!(tenant.as_deref(), Some("t1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(matches!(
+            parse(&["groups", "show", "g"]).command,
+            Command::Groups {
+                action: GroupsAction::Show { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["groups", "rename", "g", "n"]).command,
+            Command::Groups {
+                action: GroupsAction::Rename { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["groups", "delete", "g"]).command,
+            Command::Groups {
+                action: GroupsAction::Delete { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["groups", "add-host", "g", "h"]).command,
+            Command::Groups {
+                action: GroupsAction::AddHost { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["groups", "remove-host", "g", "h"]).command,
+            Command::Groups {
+                action: GroupsAction::RemoveHost { .. }
+            }
+        ));
     }
 }
