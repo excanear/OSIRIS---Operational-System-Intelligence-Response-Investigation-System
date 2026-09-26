@@ -139,11 +139,13 @@ async fn main() {
         .hosts_db_path
         .clone()
         .unwrap_or_else(|| "/var/lib/osiris/hosts.db".to_string());
-    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = Arc::new(open_or_exit(
+    let fleet_db = Arc::new(open_or_exit(
         osiris_fleet::SqliteHostRegistry::open(&hosts_db_path),
         &hosts_db_path,
         "hosts_db_path",
     ));
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
+    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db;
 
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
@@ -418,6 +420,12 @@ async fn main() {
             .merge(osiris_api::build_fleet_router(osiris_api::FleetState {
                 registry: fleet_registry.clone(),
                 tenants: tenant_store.clone(),
+            }))
+            .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
+                groups: group_store.clone(),
+                registry: fleet_registry.clone(),
+                tenants: tenant_store.clone(),
+                audit_log: audit_log.clone(),
             }))
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,

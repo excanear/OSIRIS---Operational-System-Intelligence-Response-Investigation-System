@@ -51,12 +51,15 @@ struct HostSummary {
     cloud_region: Option<String>,
 }
 
-fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
-    let status = if now_ns.saturating_sub(row.last_seen) <= 3 * EXPECTED_HEARTBEAT_INTERVAL_NS {
+pub(crate) fn host_status(last_seen: u64, now_ns: u64) -> &'static str {
+    if now_ns.saturating_sub(last_seen) <= 3 * EXPECTED_HEARTBEAT_INTERVAL_NS {
         "ONLINE"
     } else {
         "STALE"
-    };
+    }
+}
+
+fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
     HostSummary {
         host_id: row.host_id.to_string(),
         hostname: row.hostname,
@@ -65,14 +68,14 @@ fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
         agent_version: row.agent_version,
         enrolled_at: row.enrolled_at,
         last_seen: row.last_seen,
-        status: status.to_string(),
+        status: host_status(row.last_seen, now_ns).to_string(),
         cloud_provider: row.cloud_provider,
         cloud_instance_id: row.cloud_instance_id,
         cloud_region: row.cloud_region,
     }
 }
 
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

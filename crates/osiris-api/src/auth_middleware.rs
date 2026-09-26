@@ -85,6 +85,13 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
     {
         return Role::Admin;
     }
+    if path == "/api/v1/groups" || path.starts_with("/api/v1/groups/") {
+        return if method == Method::GET || method == Method::HEAD {
+            Role::Viewer
+        } else {
+            Role::Admin
+        };
+    }
     if method == Method::POST && path == "/api/v1/incidents" {
         return Role::Analyst;
     }
@@ -104,8 +111,10 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
 /// DENY: a route added later stays platform-only until someone deliberately
 /// allowlists it AND makes its handler tenant-aware. `/api/v1/audit` is
 /// allowed (Admin only, via `min_role_for`) and the handler narrows it to the
-/// tenant's own users' actions. Still platform-only: user administration and
-/// tenant administration.
+/// tenant's own users' actions. Host groups (`/api/v1/groups`, including
+/// membership) are allowlisted for reads and writes alike — the handler
+/// scopes every group to the caller's tenant. Still platform-only: user
+/// administration and tenant administration.
 pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
 
@@ -115,14 +124,31 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
     };
 
+    // /api/v1/groups/:group_id/members/:host_id — exactly two non-empty
+    // segments, nothing after the host id.
+    let group_member = || {
+        path.strip_prefix("/api/v1/groups/")
+            .and_then(|rest| rest.split_once("/members/"))
+            .is_some_and(|(g, h)| {
+                !g.is_empty() && !g.contains('/') && !h.is_empty() && !h.contains('/')
+            })
+    };
+
     if method == Method::POST {
         return path == "/api/v1/auth/logout"
             || path == "/api/v1/incidents"
             || path == "/api/v1/evidence"
-            || one_segment("/api/v1/response/");
+            || one_segment("/api/v1/response/")
+            || path == "/api/v1/groups";
     }
     if method == Method::PATCH {
-        return one_segment("/api/v1/incidents/");
+        return one_segment("/api/v1/incidents/") || one_segment("/api/v1/groups/");
+    }
+    if method == Method::PUT {
+        return group_member();
+    }
+    if method == Method::DELETE {
+        return one_segment("/api/v1/groups/") || group_member();
     }
     // HEAD is served by axum on every GET route, so it needs the same allowlist.
     if method != Method::GET && method != Method::HEAD {
@@ -151,6 +177,7 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
         "/api/v1/incidents",
         "/api/v1/evidence",
         "/api/v1/audit",
+        "/api/v1/groups",
     ];
     if EXACT.contains(&path) {
         return true;
@@ -166,6 +193,10 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
             return !seed.is_empty();
         }
         return !rest.is_empty() && !rest.contains('/');
+    }
+    // /api/v1/groups/:group_id (the handler scopes it to the tenant).
+    if one_segment("/api/v1/groups/") {
+        return true;
     }
     false
 }
@@ -645,6 +676,69 @@ mod tests {
                 StatusCode::OK,
                 "{method} {uri} should be allowed for an Analyst"
             );
+        }
+    }
+
+    #[test]
+    fn groups_routes_need_viewer_to_read_and_admin_to_write() {
+        use axum::http::Method;
+        assert_eq!(min_role_for(&Method::GET, "/api/v1/groups"), Role::Viewer);
+        assert_eq!(
+            min_role_for(&Method::HEAD, "/api/v1/groups/x"),
+            Role::Viewer
+        );
+        assert_eq!(min_role_for(&Method::POST, "/api/v1/groups"), Role::Admin);
+        assert_eq!(
+            min_role_for(&Method::PATCH, "/api/v1/groups/x"),
+            Role::Admin
+        );
+        assert_eq!(
+            min_role_for(&Method::DELETE, "/api/v1/groups/x"),
+            Role::Admin
+        );
+        assert_eq!(
+            min_role_for(&Method::PUT, "/api/v1/groups/x/members/y"),
+            Role::Admin
+        );
+        assert_eq!(
+            min_role_for(&Method::DELETE, "/api/v1/groups/x/members/y"),
+            Role::Admin
+        );
+    }
+
+    #[test]
+    fn tenant_group_allowlist_accepts_only_exact_shapes() {
+        use axum::http::Method;
+        let allowed = [
+            (Method::GET, "/api/v1/groups"),
+            (Method::HEAD, "/api/v1/groups"),
+            (Method::GET, "/api/v1/groups/g1"),
+            (Method::POST, "/api/v1/groups"),
+            (Method::PATCH, "/api/v1/groups/g1"),
+            (Method::DELETE, "/api/v1/groups/g1"),
+            (Method::PUT, "/api/v1/groups/g1/members/h1"),
+            (Method::DELETE, "/api/v1/groups/g1/members/h1"),
+        ];
+        for (m, p) in allowed {
+            assert!(tenant_route_allowed(&m, p), "{m} {p} should be allowed");
+        }
+        let denied = [
+            (Method::GET, "/api/v1/groups/g1/members/h1"),
+            (Method::GET, "/api/v1/groups/g1/other"),
+            (Method::POST, "/api/v1/groups/g1"),
+            (Method::PATCH, "/api/v1/groups"),
+            (Method::PATCH, "/api/v1/groups/g1/members/h1"),
+            (Method::PUT, "/api/v1/groups/g1"),
+            (Method::PUT, "/api/v1/groups//members/h1"),
+            (Method::PUT, "/api/v1/groups/g1/members/"),
+            (Method::PUT, "/api/v1/groups/g1/members/h1/z"),
+            (Method::DELETE, "/api/v1/groups"),
+            (Method::DELETE, "/api/v1/groups/g1/x/h1"),
+            (Method::PUT, "/api/v1/tenants/t/hosts/h"),
+            (Method::DELETE, "/api/v1/tenants/t/hosts/h"),
+        ];
+        for (m, p) in denied {
+            assert!(!tenant_route_allowed(&m, p), "{m} {p} should be denied");
         }
     }
 

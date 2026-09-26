@@ -12,9 +12,9 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use osiris_api::{
-    auth_gate, build_auth_router, build_fleet_router, build_incident_evidence_router,
-    build_response_router, build_router, build_stream_router, AuthState, FleetState,
-    IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
+    auth_gate, build_auth_router, build_fleet_router, build_groups_router,
+    build_incident_evidence_router, build_response_router, build_router, build_stream_router,
+    AuthState, FleetState, GroupsState, IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
 };
 use osiris_audit::FileAuditLog;
 use osiris_auth::{NewUser, Role, SqliteUserStore, UserStore};
@@ -79,21 +79,28 @@ fn harness() -> Harness {
         audit_log: audit_log.clone(),
     };
 
+    let fleet_db = Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap());
     let fleet_state = FleetState {
-        registry: Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap()),
+        registry: fleet_db.clone(),
         tenants: auth_state.tenants.clone(),
     };
 
     // The exact composition from `osiris-server/src/main.rs`: build_router,
     // build_incident_evidence_router, build_response_router,
-    // build_stream_router, build_auth_router, build_fleet_router, then the
-    // auth_gate layer.
+    // build_stream_router, build_auth_router, build_fleet_router,
+    // build_groups_router, then the auth_gate layer.
     let app = build_router(storage_for_router)
         .merge(build_incident_evidence_router(incident_evidence_state))
         .merge(build_response_router(response_state))
         .merge(build_stream_router(Arc::new(LiveEventBroadcaster::new())))
         .merge(build_auth_router(auth_state.clone()))
         .merge(build_fleet_router(fleet_state))
+        .merge(build_groups_router(GroupsState {
+            groups: fleet_db.clone(),
+            registry: fleet_db,
+            tenants: auth_state.tenants.clone(),
+            audit_log: audit_log.clone(),
+        }))
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_gate,
@@ -338,4 +345,42 @@ async fn the_restore_file_route_is_allowed_for_the_admin_token_on_the_composed_r
     // Control channel disabled in the harness: the dry-run falls back to the
     // server-side preview, proving the route is wired and authorised.
     assert_eq!(post_restore(h, Some(token)).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn groups_reads_need_viewer_and_writes_need_admin_on_the_composed_router() {
+    let h = harness();
+    let viewer = session_for_role(&h.auth_state, "composed-viewer", Role::Viewer);
+    let send = |method: &str, token: &str, body: Option<&str>| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri("/api/v1/groups")
+            .header("Authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(json) => {
+                b = b.header("content-type", "application/json");
+                Body::from(json.to_string())
+            }
+            None => Body::empty(),
+        };
+        h.app.clone().oneshot(b.body(body).unwrap())
+    };
+    assert_eq!(
+        send("GET", &viewer, None).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send("POST", &viewer, Some(r#"{"name":"web"}"#))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send("POST", &h.admin_token, Some(r#"{"name":"web"}"#))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
 }

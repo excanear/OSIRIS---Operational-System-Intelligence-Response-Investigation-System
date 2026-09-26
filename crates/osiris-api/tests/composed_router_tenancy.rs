@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use osiris_api::{
-    auth_gate, build_auth_router, build_fleet_router, build_incident_evidence_router,
-    build_response_router, build_router, build_stream_router, AuthState, FleetState,
-    IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
+    auth_gate, build_auth_router, build_fleet_router, build_groups_router,
+    build_incident_evidence_router, build_response_router, build_router, build_stream_router,
+    AuthState, FleetState, GroupsState, IncidentEvidenceState, LiveEventBroadcaster, ResponseState,
 };
 use osiris_audit::FileAuditLog;
 use osiris_auth::{NewUser, Role, SqliteUserStore, UserStore};
@@ -106,6 +106,7 @@ fn build_app(
     broadcaster: Arc<LiveEventBroadcaster>,
     auth_state: AuthState,
     fleet_state: FleetState,
+    groups_state: GroupsState,
 ) -> axum::Router {
     build_router(storage)
         .merge(build_incident_evidence_router(incident_evidence_state))
@@ -114,6 +115,7 @@ fn build_app(
         .merge(build_auth_router(auth_state.clone()))
         .merge(osiris_api::build_tenant_router(auth_state.clone()))
         .merge(build_fleet_router(fleet_state))
+        .merge(build_groups_router(groups_state))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate))
 }
 
@@ -161,8 +163,8 @@ fn tenancy() -> Tenancy {
     tenants.assign_host(acme_host, acme.tenant_id).unwrap();
     tenants.assign_host(globex_host, globex.tenant_id).unwrap();
 
-    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
-        Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap());
+    let fleet_db = Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap());
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
     let heartbeat = |host_id: Uuid| osiris_fleet::HostRow {
         host_id,
         hostname: format!("host-{host_id}"),
@@ -214,8 +216,14 @@ fn tenancy() -> Tenancy {
     };
     let broadcaster = Arc::new(LiveEventBroadcaster::new());
     let fleet_state = FleetState {
-        registry: fleet_registry,
+        registry: fleet_registry.clone(),
         tenants: tenants.clone(),
+    };
+    let groups_state = GroupsState {
+        groups: fleet_db.clone(),
+        registry: fleet_db.clone(),
+        tenants: tenants.clone(),
+        audit_log: audit_log.clone(),
     };
     let app = build_app(
         storage,
@@ -224,6 +232,7 @@ fn tenancy() -> Tenancy {
         broadcaster.clone(),
         auth_state.clone(),
         fleet_state,
+        groups_state,
     );
 
     Tenancy {
@@ -974,4 +983,94 @@ async fn a_tenant_admin_sees_only_its_own_tenants_audit_entries() {
         all.as_array().unwrap().len() >= 2,
         "the platform sees everything"
     );
+}
+
+#[tokio::test]
+async fn tenant_groups_are_isolated_through_the_real_gate() {
+    let t = tenancy();
+    let (status, group) = call(
+        &t.app,
+        "POST",
+        "/api/v1/groups",
+        Some(&t.acme_token),
+        Some(serde_json::json!({ "name": "acme-web" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let gid = group["group_id"].as_str().unwrap().to_string();
+    assert_eq!(group["tenant_id"], t.acme_tenant.to_string());
+
+    let own = format!("/api/v1/groups/{gid}/members/{}", t.acme_host);
+    let (status, _) = call(&t.app, "PUT", &own, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let foreign = format!("/api/v1/groups/{gid}/members/{}", t.globex_host);
+    let (status, _) = call(&t.app, "PUT", &foreign, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let detail_uri = format!("/api/v1/groups/{gid}");
+    let (status, detail) = call(&t.app, "GET", &detail_uri, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["members"][0]["host_id"], t.acme_host.to_string());
+    assert_eq!(detail["member_count"], 1);
+
+    let (status, _) = call(&t.app, "GET", &detail_uri, Some(&t.globex_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&t.app, "DELETE", &detail_uri, Some(&t.globex_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, list) = call(&t.app, "GET", "/api/v1/groups", Some(&t.globex_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list.as_array().unwrap().is_empty());
+
+    let (status, list) = call(&t.app, "GET", "/api/v1/groups", Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["name"] == "acme-web"));
+
+    // A malformed id passes the gate's shape check and is rejected by the
+    // handler's `Path<Uuid>` extractor.
+    let (status, _) = call(
+        &t.app,
+        "GET",
+        "/api/v1/groups/not-a-uuid",
+        Some(&t.acme_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn tenant_group_route_shapes_outside_the_allowlist_are_403() {
+    let t = tenancy();
+    let (g, h) = (Uuid::new_v4(), t.acme_host);
+    for (method, uri) in [
+        ("PUT", format!("/api/v1/groups/{g}/members/{h}/extra")),
+        ("GET", format!("/api/v1/groups/{g}/other")),
+        ("PUT", format!("/api/v1/groups/{g}")),
+        (
+            "PUT",
+            format!("/api/v1/tenants/{}/hosts/{h}", t.acme_tenant),
+        ),
+    ] {
+        let (status, _) = call(&t.app, method, &uri, Some(&t.acme_token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_user_passing_tenant_id_on_create_gets_400() {
+    let t = tenancy();
+    let (status, _) = call(
+        &t.app,
+        "POST",
+        "/api/v1/groups",
+        Some(&t.acme_token),
+        Some(serde_json::json!({ "name": "x", "tenant_id": t.acme_tenant })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

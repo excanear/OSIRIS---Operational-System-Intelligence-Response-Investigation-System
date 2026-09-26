@@ -2658,3 +2658,5 @@ pub use response::{build_response_router, ResponseState};
 pub mod fleet;
 pub mod tenant_scope;
 pub use fleet::{build_fleet_router, FleetState};
+pub mod groups;
+pub use groups::{build_groups_router, GroupsState};
