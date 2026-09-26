@@ -146,20 +146,20 @@ All store calls run in `tokio::task::spawn_blocking`; `JoinError` → 500 and lo
 
 ### 4.5 Audit
 
-Every successful mutation appends an `osiris_audit::NewAuditEntry` via `audit_log.append`, following `tenants.rs`'s `audit(...)` helper: actions `group.create`, `group.rename`, `group.delete`, `group.member_add`, `group.member_remove`; target includes the group_id (and host_id for member actions). Failed attempts rejected with 4xx are not audited (same as tenant administration).
+Every successful mutation appends an `osiris_audit::NewAuditEntry` via `audit_log.append`, following `tenants.rs`'s `audit(...)` helper: actions `group_create`, `group_rename`, `group_delete`, `group_member_add`, `group_member_remove` (snake_case, matching `tenants.rs`'s `tenant_create`); target includes the group_id (and host_id for member actions). Failed attempts rejected with 4xx are not audited (same as tenant administration).
 
 ## 5. CLI (`osiris-cli`)
 
-New `group` subcommand family, mirroring `tenant`:
+New `groups` subcommand family (plural, mirroring the existing `tenants` subcommand of the `osiris-cli` binary):
 
 ```
-osiris group list
-osiris group create <name> [--tenant <tenant_id>]
-osiris group show <group_id>
-osiris group rename <group_id> <name>
-osiris group delete <group_id>
-osiris group add-host <group_id> <host_id>
-osiris group remove-host <group_id> <host_id>
+osiris-cli groups list
+osiris-cli groups create <name> [--tenant <tenant_id>]
+osiris-cli groups show <group_id>
+osiris-cli groups rename <group_id> <name>
+osiris-cli groups delete <group_id>
+osiris-cli groups add-host <group_id> <host_id>
+osiris-cli groups remove-host <group_id> <host_id>
 ```
 
 Path segments are percent-encoded (existing helper). Output format matches existing `tenant list`/`hosts`-style tables.
