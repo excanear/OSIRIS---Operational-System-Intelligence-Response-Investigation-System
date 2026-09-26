@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
-use osiris_api::{auth_gate, build_auth_router, build_router, build_tenant_router, AuthState};
+use osiris_api::{
+    auth_gate, build_auth_router, build_fleet_router, build_router, build_tenant_router, AuthState,
+    FleetState,
+};
 use osiris_audit::FileAuditLog;
 use osiris_auth::{SqliteUserStore, UserStore};
 use osiris_baseline::BaselineEngine;
@@ -2354,6 +2357,139 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         .await
         .unwrap();
     assert_eq!(patched["status"], "INVESTIGATING");
+}
+
+/// Phase 9d-1: the real Agent's periodic AGENT_HEALTH heartbeat (Task 2)
+/// flows through the real ingestion loop's fleet-registry upsert (Task 3)
+/// and comes back out of the real, authenticated `GET /api/v1/hosts`
+/// (Task 4) — no hand-written spool line; the heartbeat is produced by the
+/// same background task a real deployed Agent runs, with
+/// `fleet.health_interval_secs` clamped to its minimum (1s) so the test
+/// doesn't wait for a realistic interval.
+#[tokio::test]
+async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_path = dir.path().join("spool.ndjson");
+    let db_path = dir.path().join("events.db");
+
+    let host = HostRef {
+        host_id: Uuid::new_v4(),
+        hostname: "e2e-fleet-host".to_string(),
+        distro: "test".to_string(),
+        kernel_version: "test".to_string(),
+        cloud: None,
+    };
+
+    let mut agent_config = AgentConfig {
+        forward: None,
+        control: None,
+        cloud_metadata: osiris_agent::CloudMetadataConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        k8s_context: osiris_agent::K8sContextConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        fleet: osiris_agent::FleetConfig::default(),
+        audit_log_path: None,
+        fs_audit_log_path: None,
+        network_proc_root: None,
+        identity_audit_log_path: None,
+        systemd_audit_log_path: None,
+        persistence_watch_paths: vec![],
+        container_cgroup_roots: vec![],
+        proc_root: None,
+        enable_synthetic: false,
+        synthetic_scenario: None,
+        spool_path: spool_path.to_string_lossy().to_string(),
+        status_addr: "127.0.0.1:0".to_string(),
+    };
+    // The minimum the Agent accepts (Task 2 clamps to `.max(1)`) — keeps
+    // this test's bounded poll below fast without hand-writing a spool line.
+    agent_config.fleet.health_interval_secs = 1;
+    let agent = Agent::start(agent_config, host.clone(), "e2e-boot".to_string())
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
+    let ingestion_cancellation = CancellationToken::new();
+    let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+        Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+    tokio::spawn(run_ingestion_loop(
+        spool_path.clone(),
+        storage.clone(),
+        Arc::new(DetectionEngine::new(vec![])),
+        baseline_engine,
+        risk_engine,
+        correlation_engine,
+        Arc::new(osiris_api::LiveEventBroadcaster::new()),
+        fleet_registry.clone(),
+        Duration::from_millis(50),
+        ingestion_cancellation.clone(),
+    ));
+
+    // Composed with the real auth layer and the real fleet router, mirroring
+    // osiris-server/src/main.rs's merge+layer order (fleet router merged
+    // before the auth_gate layer, same as every other router here).
+    let (auth_state, admin_token) = mint_admin_session(dir.path());
+    let app = build_router(storage.clone())
+        .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
+        .merge(build_fleet_router(FleetState {
+            registry: fleet_registry.clone(),
+            tenants: auth_state.tenants.clone(),
+        }))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = reqwest::Client::new();
+
+    // Bounded poll for the heartbeat to land: the health task fires after
+    // one full interval (1s, no heartbeat at startup — Task 2), plus the
+    // 50ms ingestion poll interval, plus scheduler slack. Poll rather than
+    // sleep a fixed amount, to avoid flakiness under load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let target_host_id = host.host_id.to_string();
+    let host_row = loop {
+        let hosts: Vec<serde_json::Value> = client
+            .get(format!("http://{}/api/v1/hosts", addr))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(row) = hosts.into_iter().find(|h| h["host_id"] == target_host_id) {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("host {target_host_id} never appeared in GET /api/v1/hosts within the deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(host_row["status"], "ONLINE");
+    assert_eq!(host_row["agent_version"], env!("CARGO_PKG_VERSION"));
+    let enrolled_at = host_row["enrolled_at"].as_u64().unwrap();
+    let last_seen = host_row["last_seen"].as_u64().unwrap();
+    assert!(
+        enrolled_at > 0,
+        "enrolled_at must be a real timestamp, not zero"
+    );
+    assert!(
+        enrolled_at <= last_seen,
+        "enrolled_at ({enrolled_at}) must not be after last_seen ({last_seen})"
+    );
+
+    agent.shutdown().await;
+    ingestion_cancellation.cancel();
 }
 
 /// Minimal ad-hoc percent-encoding for the one query-string value this test
