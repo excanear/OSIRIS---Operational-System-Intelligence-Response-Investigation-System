@@ -4,6 +4,12 @@ use osiris_health::HealthState;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+mod groups;
+pub use groups::{
+    validate_group_name, GroupError, GroupRef, GroupScope, HostGroup, HostGroupStore,
+    MAX_GROUP_NAME_CHARS,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
     #[error("io: {0}")]
@@ -12,7 +18,16 @@ pub enum FleetError {
     Sqlite(String),
     #[error("serde: {0}")]
     Serde(String),
+    #[error(
+        "hosts.db schema version {0} is newer than this build supports ({})",
+        SCHEMA_VERSION
+    )]
+    UnsupportedSchema(i64),
 }
+
+/// `PRAGMA user_version` of `hosts.db`. 0 = a 9d-1-era file (hosts table only,
+/// never stamped); 1 = hosts + host groups (Phase 9d-2).
+pub const SCHEMA_VERSION: i64 = 1;
 
 impl From<rusqlite::Error> for FleetError {
     fn from(e: rusqlite::Error) -> Self {
@@ -57,25 +72,50 @@ pub struct SqliteHostRegistry {
     conn: Mutex<Connection>,
 }
 
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS hosts (
+    host_id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL,
+    distro TEXT NOT NULL,
+    kernel_version TEXT NOT NULL,
+    agent_version TEXT NOT NULL,
+    enrolled_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    health_state TEXT NOT NULL,
+    cloud_provider TEXT,
+    cloud_instance_id TEXT,
+    cloud_region TEXT
+);
+CREATE TABLE IF NOT EXISTS host_groups (
+    group_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    tenant_id TEXT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_host_groups_scope_name
+    ON host_groups(COALESCE(tenant_id, ''), name);
+CREATE TABLE IF NOT EXISTS host_group_members (
+    group_id TEXT NOT NULL REFERENCES host_groups(group_id) ON DELETE CASCADE,
+    host_id TEXT NOT NULL REFERENCES hosts(host_id),
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, host_id)
+);
+CREATE INDEX IF NOT EXISTS idx_host_group_members_host ON host_group_members(host_id);
+";
+
 impl SqliteHostRegistry {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FleetError> {
         let conn = Connection::open(path)?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS hosts (
-                host_id TEXT PRIMARY KEY,
-                hostname TEXT NOT NULL,
-                distro TEXT NOT NULL,
-                kernel_version TEXT NOT NULL,
-                agent_version TEXT NOT NULL,
-                enrolled_at INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL,
-                health_state TEXT NOT NULL,
-                cloud_provider TEXT,
-                cloud_instance_id TEXT,
-                cloud_region TEXT
-            )",
-            [],
-        )?;
+        // Per-connection and OFF by default in SQLite: without it the
+        // members' ON DELETE CASCADE and the unknown-host rejection silently
+        // do nothing.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(FleetError::UnsupportedSchema(version));
+        }
+        conn.execute_batch(SCHEMA)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -197,7 +237,7 @@ mod tests {
     fn list_on_an_empty_store_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
-        assert_eq!(reg.list().unwrap(), vec![]);
+        assert_eq!(HostRegistry::list(&reg).unwrap(), vec![]);
     }
 
     #[test]
@@ -206,7 +246,7 @@ mod tests {
         let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
         let host_id = Uuid::new_v4();
         reg.upsert_heartbeat(row(host_id, 1_000)).unwrap();
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(got.host_id, host_id);
         assert_eq!(got.last_seen, 1_000);
         assert_eq!(got.enrolled_at, 1_000);
@@ -222,7 +262,7 @@ mod tests {
         second.enrolled_at = 5_000; // a buggy caller passing the wrong enrolled_at must still be ignored
         second.hostname = "h1-renamed".into();
         reg.upsert_heartbeat(second).unwrap();
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(got.last_seen, 5_000);
         assert_eq!(
             got.enrolled_at, 1_000,
@@ -241,7 +281,7 @@ mod tests {
         let host_id = Uuid::new_v4();
         reg.upsert_heartbeat(row(host_id, 5_000)).unwrap();
         reg.upsert_heartbeat(row(host_id, 1_000)).unwrap(); // arrives later, but is an OLDER event
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(
             got.last_seen, 5_000,
             "last_seen is the max timestamp ever seen, not the most recently upserted"
@@ -263,7 +303,7 @@ mod tests {
         stale_healthy.health_state = HealthState::Healthy;
         reg.upsert_heartbeat(stale_healthy).unwrap();
 
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(
             got.last_seen, 5_000,
             "last_seen must not regress on an out-of-order older heartbeat"
@@ -283,7 +323,11 @@ mod tests {
         let b = Uuid::new_v4();
         reg.upsert_heartbeat(row(a, 1_000)).unwrap();
         reg.upsert_heartbeat(row(b, 2_000)).unwrap();
-        let mut ids: Vec<Uuid> = reg.list().unwrap().into_iter().map(|r| r.host_id).collect();
+        let mut ids: Vec<Uuid> = HostRegistry::list(&reg)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.host_id)
+            .collect();
         ids.sort();
         let mut expected = vec![a, b];
         expected.sort();
@@ -294,7 +338,7 @@ mod tests {
     fn get_of_an_unknown_host_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let reg = SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap();
-        assert_eq!(reg.get(Uuid::new_v4()).unwrap(), None);
+        assert_eq!(HostRegistry::get(&reg, Uuid::new_v4()).unwrap(), None);
     }
 
     #[test]
@@ -308,7 +352,7 @@ mod tests {
         first.cloud_region = Some("us-east-1".into());
         reg.upsert_heartbeat(first).unwrap();
 
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(got.cloud_provider.as_deref(), Some("aws"));
         assert_eq!(got.cloud_instance_id.as_deref(), Some("i-0abc"));
         assert_eq!(got.cloud_region.as_deref(), Some("us-east-1"));
@@ -320,7 +364,7 @@ mod tests {
         second.cloud_instance_id = None;
         second.cloud_region = None;
         reg.upsert_heartbeat(second).unwrap();
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert_eq!(got.cloud_provider.as_deref(), Some("azure"));
         assert_eq!(got.cloud_instance_id, None);
         assert_eq!(got.cloud_region, None);
@@ -334,7 +378,7 @@ mod tests {
         // Above i64::MAX: a raw `as i64` cast would wrap negative.
         let huge = u64::MAX;
         reg.upsert_heartbeat(row(host_id, huge)).unwrap();
-        let got = reg.get(host_id).unwrap().unwrap();
+        let got = HostRegistry::get(&reg, host_id).unwrap().unwrap();
         assert!(
             got.last_seen > 0,
             "last_seen must not wrap negative for a u64 above i64::MAX, got {}",
