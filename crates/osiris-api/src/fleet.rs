@@ -7,14 +7,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::auth_middleware::AuthContext;
-use osiris_fleet::{HostRegistry, HostRow};
+use osiris_fleet::{GroupError, GroupRef, GroupScope, HostGroupStore, HostRegistry, HostRow};
 use osiris_tenancy::TenantStore;
 
 /// A host is considered `ONLINE` if its `last_seen` heartbeat is no older
@@ -28,12 +29,18 @@ const EXPECTED_HEARTBEAT_INTERVAL_NS: u64 = 60 * 1_000_000_000;
 pub struct FleetState {
     pub registry: Arc<dyn HostRegistry>,
     pub tenants: Arc<dyn TenantStore>,
+    pub groups: Arc<dyn HostGroupStore>,
 }
 
 pub fn build_fleet_router(state: FleetState) -> Router {
     Router::new()
         .route("/api/v1/hosts", get(hosts_handler))
         .with_state(state)
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct HostsQuery {
+    pub group: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -49,6 +56,7 @@ struct HostSummary {
     cloud_provider: Option<String>,
     cloud_instance_id: Option<String>,
     cloud_region: Option<String>,
+    groups: Vec<GroupRef>,
 }
 
 pub(crate) fn host_status(last_seen: u64, now_ns: u64) -> &'static str {
@@ -72,6 +80,7 @@ fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
         cloud_provider: row.cloud_provider,
         cloud_instance_id: row.cloud_instance_id,
         cloud_region: row.cloud_region,
+        groups: Vec::new(),
     }
 }
 
@@ -90,6 +99,7 @@ pub(crate) fn now_ns() -> u64 {
 async fn hosts_handler(
     Extension(ctx): Extension<AuthContext>,
     State(state): State<FleetState>,
+    Query(query): Query<HostsQuery>,
 ) -> Result<Json<Vec<HostSummary>>, (StatusCode, String)> {
     let scope =
         crate::tenant_scope::hosts_of_tenant(ctx.tenant_id, Some(state.tenants.clone())).await?;
@@ -101,8 +111,42 @@ async fn hosts_handler(
     if let Some(allowed) = scope {
         rows.retain(|r| allowed.contains(&r.host_id));
     }
+
+    let scope = match ctx.tenant_id {
+        Some(t) => GroupScope::Tenant(t),
+        None => GroupScope::Platform,
+    };
+    if let Some(group_id) = query.group {
+        let groups = state.groups.clone();
+        let members: std::collections::HashSet<Uuid> =
+            tokio::task::spawn_blocking(move || groups.members(&scope, group_id))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(|e| match e {
+                    GroupError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
+                    other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+                })?
+                .into_iter()
+                .collect();
+        rows.retain(|r| members.contains(&r.host_id));
+    }
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.host_id).collect();
+    let groups = state.groups.clone();
+    let mut by_host = tokio::task::spawn_blocking(move || groups.groups_of(&scope, &ids))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let now = now_ns();
-    let mut summaries: Vec<HostSummary> = rows.into_iter().map(|r| to_summary(r, now)).collect();
+    let mut summaries: Vec<HostSummary> = rows
+        .into_iter()
+        .map(|r| {
+            let groups = by_host.remove(&r.host_id).unwrap_or_default();
+            let mut summary = to_summary(r, now);
+            summary.groups = groups;
+            summary
+        })
+        .collect();
     summaries.sort_by(|a, b| {
         b.last_seen
             .cmp(&a.last_seen)
@@ -134,11 +178,12 @@ mod tests {
     }
 
     fn state(dir: &std::path::Path) -> FleetState {
+        let fleet_db =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.join("hosts.db")).unwrap());
         FleetState {
-            registry: Arc::new(
-                osiris_fleet::SqliteHostRegistry::open(dir.join("hosts.db")).unwrap(),
-            ),
+            registry: fleet_db.clone(),
             tenants: Arc::new(SqliteTenantStore::open(dir.join("tenants.db")).unwrap()),
+            groups: fleet_db,
         }
     }
 
@@ -172,9 +217,13 @@ mod tests {
     #[tokio::test]
     async fn an_empty_registry_returns_an_empty_array() {
         let dir = tempfile::tempdir().unwrap();
-        let Json(rows) = hosts_handler(Extension(platform_ctx()), State(state(dir.path())))
-            .await
-            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(state(dir.path())),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 0);
     }
 
@@ -189,9 +238,13 @@ mod tests {
         with_cloud.cloud_region = Some("us-east-1".into());
         s.registry.upsert_heartbeat(with_cloud).unwrap();
 
-        let Json(rows) = hosts_handler(Extension(platform_ctx()), State(s))
-            .await
-            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cloud_provider.as_deref(), Some("aws"));
@@ -206,9 +259,13 @@ mod tests {
         let host_id = Uuid::new_v4();
         s.registry.upsert_heartbeat(row(host_id, 1_000)).unwrap();
 
-        let Json(rows) = hosts_handler(Extension(platform_ctx()), State(s))
-            .await
-            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cloud_provider, None);
@@ -230,12 +287,116 @@ mod tests {
         // `hosts_of_tenant`'s existing contract must also be invisible
         // to a tenant-scoped caller.
 
-        let Json(rows) = hosts_handler(Extension(tenant_ctx(tenant_id)), State(s))
-            .await
-            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(tenant_ctx(tenant_id)),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
 
         let ids: Vec<String> = rows.iter().map(|r| r.host_id.clone()).collect();
         assert!(ids.contains(&mine.to_string()));
         assert!(!ids.contains(&theirs.to_string()));
+    }
+
+    #[tokio::test]
+    async fn each_host_lists_its_groups_sorted_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let h = Uuid::new_v4();
+        s.registry.upsert_heartbeat(row(h, 1_000)).unwrap();
+        let web = s.groups.create(&GroupScope::Platform, None, "web").unwrap();
+        let db = s.groups.create(&GroupScope::Platform, None, "db").unwrap();
+        s.groups
+            .add_member(&GroupScope::Platform, web.group_id, h)
+            .unwrap();
+        s.groups
+            .add_member(&GroupScope::Platform, db.group_id, h)
+            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = rows[0].groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["db", "web"]);
+    }
+
+    #[tokio::test]
+    async fn the_group_filter_returns_only_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let (inside, outside) = (Uuid::new_v4(), Uuid::new_v4());
+        s.registry.upsert_heartbeat(row(inside, 1_000)).unwrap();
+        s.registry.upsert_heartbeat(row(outside, 1_000)).unwrap();
+        let g = s.groups.create(&GroupScope::Platform, None, "g").unwrap();
+        s.groups
+            .add_member(&GroupScope::Platform, g.group_id, inside)
+            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery {
+                group: Some(g.group_id),
+            }),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = rows.iter().map(|r| r.host_id.clone()).collect();
+        assert_eq!(ids, vec![inside.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn filtering_by_an_out_of_scope_or_missing_group_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let t = s.tenants.create_tenant("acme").unwrap().tenant_id;
+        let platform_group = s.groups.create(&GroupScope::Platform, None, "p").unwrap();
+        for gid in [platform_group.group_id, Uuid::new_v4()] {
+            let err = hosts_handler(
+                Extension(tenant_ctx(t)),
+                State(s.clone()),
+                Query(HostsQuery { group: Some(gid) }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, (StatusCode::NOT_FOUND, "group not found".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_sees_only_its_own_groups_on_its_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path());
+        let t = s.tenants.create_tenant("acme").unwrap().tenant_id;
+        let h = Uuid::new_v4();
+        s.registry.upsert_heartbeat(row(h, 1_000)).unwrap();
+        s.tenants.assign_host(h, t).unwrap();
+        let platform_group = s
+            .groups
+            .create(&GroupScope::Platform, None, "platform-g")
+            .unwrap();
+        let tenant_group = s
+            .groups
+            .create(&GroupScope::Tenant(t), None, "acme-g")
+            .unwrap();
+        s.groups
+            .add_member(&GroupScope::Platform, platform_group.group_id, h)
+            .unwrap();
+        s.groups
+            .add_member(&GroupScope::Platform, tenant_group.group_id, h)
+            .unwrap();
+        let Json(rows) = hosts_handler(
+            Extension(tenant_ctx(t)),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = rows[0].groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["acme-g"]);
     }
 }

@@ -420,6 +420,7 @@ async fn main() {
             .merge(osiris_api::build_fleet_router(osiris_api::FleetState {
                 registry: fleet_registry.clone(),
                 tenants: tenant_store.clone(),
+                groups: group_store.clone(),
             }))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),

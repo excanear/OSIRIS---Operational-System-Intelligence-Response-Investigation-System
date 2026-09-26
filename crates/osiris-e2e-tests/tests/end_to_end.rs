@@ -2415,8 +2415,10 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
     let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::open(&db_path).unwrap());
     let ingestion_cancellation = CancellationToken::new();
     let (baseline_engine, risk_engine, correlation_engine) = phase6_engines(dir.path());
-    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+    let fleet_db =
         Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+    let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
+    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db;
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
@@ -2440,6 +2442,7 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
         .merge(build_fleet_router(FleetState {
             registry: fleet_registry.clone(),
             tenants: auth_state.tenants.clone(),
+            groups: group_store.clone(),
         }))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

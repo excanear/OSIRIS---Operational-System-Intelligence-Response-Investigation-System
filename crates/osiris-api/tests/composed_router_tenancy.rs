@@ -218,6 +218,7 @@ fn tenancy() -> Tenancy {
     let fleet_state = FleetState {
         registry: fleet_registry.clone(),
         tenants: tenants.clone(),
+        groups: fleet_db.clone(),
     };
     let groups_state = GroupsState {
         groups: fleet_db.clone(),
@@ -316,6 +317,42 @@ async fn a_platform_user_sees_every_host_including_unassigned() {
     ];
     expected.sort();
     assert_eq!(hosts, expected);
+}
+
+#[tokio::test]
+async fn hosts_group_filter_is_tenant_scoped_through_the_gate() {
+    let t = tenancy();
+    let (_, group) = call(
+        &t.app,
+        "POST",
+        "/api/v1/groups",
+        Some(&t.acme_token),
+        Some(serde_json::json!({ "name": "acme-web" })),
+    )
+    .await;
+    let gid = group["group_id"].as_str().unwrap().to_string();
+    let member = format!("/api/v1/groups/{gid}/members/{}", t.acme_host);
+    call(&t.app, "PUT", &member, Some(&t.acme_token), None).await;
+
+    let uri = format!("/api/v1/hosts?group={gid}");
+    let (status, hosts) = call(&t.app, "GET", &uri, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = hosts.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["host_id"], t.acme_host.to_string());
+    assert_eq!(rows[0]["groups"][0]["name"], "acme-web");
+
+    let (status, _) = call(&t.app, "GET", &uri, Some(&t.globex_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(
+        &t.app,
+        "GET",
+        "/api/v1/hosts?group=not-a-uuid",
+        Some(&t.acme_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

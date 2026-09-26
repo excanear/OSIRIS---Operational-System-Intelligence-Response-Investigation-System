@@ -83,6 +83,7 @@ fn harness() -> Harness {
     let fleet_state = FleetState {
         registry: fleet_db.clone(),
         tenants: auth_state.tenants.clone(),
+        groups: fleet_db.clone(),
     };
 
     // The exact composition from `osiris-server/src/main.rs`: build_router,
