@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use osiris_agent::{Agent, AgentConfig};
 use osiris_api::{
-    auth_gate, build_auth_router, build_fleet_router, build_router, build_tenant_router, AuthState,
-    FleetState,
+    auth_gate, build_auth_router, build_fleet_router, build_groups_router, build_router,
+    build_tenant_router, AuthState, FleetState, GroupsState,
 };
 use osiris_audit::FileAuditLog;
 use osiris_auth::{SqliteUserStore, UserStore};
@@ -2359,15 +2359,25 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
     assert_eq!(patched["status"], "INVESTIGATING");
 }
 
-/// Phase 9d-1: the real Agent's periodic AGENT_HEALTH heartbeat (Task 2)
-/// flows through the real ingestion loop's fleet-registry upsert (Task 3)
-/// and comes back out of the real, authenticated `GET /api/v1/hosts`
-/// (Task 4) — no hand-written spool line; the heartbeat is produced by the
-/// same background task a real deployed Agent runs, with
-/// `fleet.health_interval_secs` clamped to its minimum (1s) so the test
-/// doesn't wait for a realistic interval.
-#[tokio::test]
-async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registry() {
+/// Shared setup for the Phase 9d-1/9d-2 fleet scenarios below: a real Agent
+/// (with `fleet.health_interval_secs` clamped to its minimum, 1s) writing
+/// real `AGENT_HEALTH` heartbeats, the real ingestion loop applying them to
+/// a real `SqliteHostRegistry`, and a minted admin session — everything
+/// both scenarios need before they compose their own router (which routers
+/// to merge differs per scenario) and poll for the heartbeat to land.
+struct FleetHarness {
+    _dir: tempfile::TempDir,
+    agent: Arc<Agent>,
+    ingestion_cancellation: CancellationToken,
+    host: HostRef,
+    storage: Arc<dyn Storage>,
+    fleet_registry: Arc<dyn osiris_fleet::HostRegistry>,
+    group_store: Arc<dyn osiris_fleet::HostGroupStore>,
+    auth_state: AuthState,
+    admin_token: String,
+}
+
+async fn spawn_fleet_harness() -> FleetHarness {
     let dir = tempfile::tempdir().unwrap();
     let spool_path = dir.path().join("spool.ndjson");
     let db_path = dir.path().join("events.db");
@@ -2432,37 +2442,50 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
         ingestion_cancellation.clone(),
     ));
 
-    // Composed with the real auth layer and the real fleet router, mirroring
-    // osiris-server/src/main.rs's merge+layer order (fleet router merged
-    // before the auth_gate layer, same as every other router here).
     let (auth_state, admin_token) = mint_admin_session(dir.path());
-    let app = build_router(storage.clone())
-        .merge(build_auth_router(auth_state.clone()))
-        .merge(build_tenant_router(auth_state.clone()))
-        .merge(build_fleet_router(FleetState {
-            registry: fleet_registry.clone(),
-            tenants: auth_state.tenants.clone(),
-            groups: group_store.clone(),
-        }))
-        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
+
+    FleetHarness {
+        _dir: dir,
+        agent,
+        ingestion_cancellation,
+        host,
+        storage,
+        fleet_registry,
+        group_store,
+        auth_state,
+        admin_token,
+    }
+}
+
+/// Binds `app` to an ephemeral localhost port, spawns it serving in the
+/// background, and returns the address once it has had time to start
+/// accepting connections.
+async fn spawn_router(app: axum::Router) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let client = reqwest::Client::new();
+    addr
+}
 
-    // Bounded poll for the heartbeat to land: the health task fires after
-    // one full interval (1s, no heartbeat at startup — Task 2), plus the
-    // 50ms ingestion poll interval, plus scheduler slack. Poll rather than
-    // sleep a fixed amount, to avoid flakiness under load.
+/// Bounded poll (10s deadline, 100ms interval) for `target_host_id` to show
+/// up in `GET /api/v1/hosts`: the health task fires after one full interval
+/// (1s, no heartbeat at startup — Task 2), plus the 50ms ingestion poll
+/// interval, plus scheduler slack. Poll rather than sleep a fixed amount, to
+/// avoid flakiness under load.
+async fn wait_for_host_online(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    admin_token: &str,
+    target_host_id: &str,
+) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let target_host_id = host.host_id.to_string();
-    let host_row = loop {
+    loop {
         let hosts: Vec<serde_json::Value> = client
             .get(format!("http://{}/api/v1/hosts", addr))
-            .bearer_auth(&admin_token)
+            .bearer_auth(admin_token)
             .send()
             .await
             .unwrap()
@@ -2470,13 +2493,46 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
             .await
             .unwrap();
         if let Some(row) = hosts.into_iter().find(|h| h["host_id"] == target_host_id) {
-            break row;
+            return row;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("host {target_host_id} never appeared in GET /api/v1/hosts within the deadline");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    }
+}
+
+/// Phase 9d-1: the real Agent's periodic AGENT_HEALTH heartbeat (Task 2)
+/// flows through the real ingestion loop's fleet-registry upsert (Task 3)
+/// and comes back out of the real, authenticated `GET /api/v1/hosts`
+/// (Task 4) — no hand-written spool line; the heartbeat is produced by the
+/// same background task a real deployed Agent runs, with
+/// `fleet.health_interval_secs` clamped to its minimum (1s) so the test
+/// doesn't wait for a realistic interval.
+#[tokio::test]
+async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registry() {
+    let h = spawn_fleet_harness().await;
+
+    // Composed with the real auth layer and the real fleet router, mirroring
+    // osiris-server/src/main.rs's merge+layer order (fleet router merged
+    // before the auth_gate layer, same as every other router here).
+    let app = build_router(h.storage.clone())
+        .merge(build_auth_router(h.auth_state.clone()))
+        .merge(build_tenant_router(h.auth_state.clone()))
+        .merge(build_fleet_router(FleetState {
+            registry: h.fleet_registry.clone(),
+            tenants: h.auth_state.tenants.clone(),
+            groups: h.group_store.clone(),
+        }))
+        .layer(axum::middleware::from_fn_with_state(
+            h.auth_state.clone(),
+            auth_gate,
+        ));
+    let addr = spawn_router(app).await;
+    let client = reqwest::Client::new();
+
+    let target_host_id = h.host.host_id.to_string();
+    let host_row = wait_for_host_online(&client, addr, &h.admin_token, &target_host_id).await;
 
     assert_eq!(host_row["status"], "ONLINE");
     assert_eq!(host_row["agent_version"], env!("CARGO_PKG_VERSION"));
@@ -2491,8 +2547,129 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
         "enrolled_at ({enrolled_at}) must not be after last_seen ({last_seen})"
     );
 
-    agent.shutdown().await;
-    ingestion_cancellation.cancel();
+    h.agent.shutdown().await;
+    h.ingestion_cancellation.cancel();
+}
+
+/// Phase 9d-2: a host that has come ONLINE through the real fleet pipeline
+/// (same `FleetHarness` as the 9d-1 scenario above) is added to a group
+/// through the real, authenticated `osiris-api` groups router (Tasks 2-3),
+/// merged into the router composition the same way `main.rs` merges it —
+/// right after the fleet router, before the `auth_gate` layer, with
+/// `groups` and `registry` backed by the same `Arc<SqliteHostRegistry>`.
+/// The host then shows up filtered by that group in `GET /api/v1/hosts`
+/// and in the group's own detail view, and disappears from both once
+/// removed.
+#[tokio::test]
+async fn a_host_added_to_a_group_is_returned_by_the_group_filter_and_leaves_it_when_removed() {
+    let h = spawn_fleet_harness().await;
+    let audit_log: Arc<dyn osiris_audit::AuditLog + Send + Sync> =
+        Arc::new(FileAuditLog::open(h._dir.path().join("groups-audit.jsonl")).unwrap());
+
+    let app = build_router(h.storage.clone())
+        .merge(build_auth_router(h.auth_state.clone()))
+        .merge(build_tenant_router(h.auth_state.clone()))
+        .merge(build_fleet_router(FleetState {
+            registry: h.fleet_registry.clone(),
+            tenants: h.auth_state.tenants.clone(),
+            groups: h.group_store.clone(),
+        }))
+        .merge(build_groups_router(GroupsState {
+            groups: h.group_store.clone(),
+            registry: h.fleet_registry.clone(),
+            tenants: h.auth_state.tenants.clone(),
+            audit_log,
+        }))
+        .layer(axum::middleware::from_fn_with_state(
+            h.auth_state.clone(),
+            auth_gate,
+        ));
+    let addr = spawn_router(app).await;
+    let client = reqwest::Client::new();
+
+    let target_host_id = h.host.host_id.to_string();
+    let host_row = wait_for_host_online(&client, addr, &h.admin_token, &target_host_id).await;
+    assert_eq!(host_row["status"], "ONLINE");
+
+    // 1. Create the group.
+    let create_resp = client
+        .post(format!("http://{}/api/v1/groups", addr))
+        .json(&serde_json::json!({ "name": "e2e" }))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+    let created_group: serde_json::Value = create_resp.json().await.unwrap();
+    let group_id = created_group["group_id"].as_str().unwrap().to_string();
+
+    // 2. Add the host as a member.
+    let add_member_resp = client
+        .put(format!(
+            "http://{}/api/v1/groups/{}/members/{}",
+            addr, group_id, target_host_id
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add_member_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // 3. The group filter on GET /api/v1/hosts returns exactly this host,
+    //    carrying the group it was just added to.
+    let filtered_hosts: Vec<serde_json::Value> = client
+        .get(format!("http://{}/api/v1/hosts?group={}", addr, group_id))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(filtered_hosts.len(), 1);
+    assert_eq!(filtered_hosts[0]["host_id"], target_host_id);
+    assert_eq!(filtered_hosts[0]["status"], "ONLINE");
+    assert_eq!(filtered_hosts[0]["groups"][0]["name"], "e2e");
+
+    // 4. The group's own detail view reports the member.
+    let group_detail: serde_json::Value = client
+        .get(format!("http://{}/api/v1/groups/{}", addr, group_id))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(group_detail["member_count"], 1);
+    assert_eq!(group_detail["members"][0]["host_id"], target_host_id);
+
+    // 5. Removing the host from the group empties the group filter again.
+    let remove_member_resp = client
+        .delete(format!(
+            "http://{}/api/v1/groups/{}/members/{}",
+            addr, group_id, target_host_id
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove_member_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let filtered_hosts_after_removal: Vec<serde_json::Value> = client
+        .get(format!("http://{}/api/v1/hosts?group={}", addr, group_id))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(filtered_hosts_after_removal.is_empty());
+
+    // 6.
+    h.agent.shutdown().await;
+    h.ingestion_cancellation.cancel();
 }
 
 /// Minimal ad-hoc percent-encoding for the one query-string value this test

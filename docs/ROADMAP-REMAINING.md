@@ -29,8 +29,10 @@ revisão final independente → merge → push.
 - Hoje (9d-1 entregue): `/api/v1/hosts` lê o registro de agentes real (`osiris-fleet`'s
   `HostRegistry`), alimentado pelos heartbeats `AGENT_HEALTH` no ingest — não mais uma
   listagem derivada de uma janela de eventos.
-- Entregar (9d-2/9d-3): grupos de hosts; distribuição de política (nível de telemetria/config
-  de sensores) via 9c; telas do Console além da lista; integração mais profunda com tenants.
+- Hoje (9d-2 entregue): grupos de hosts (API `/api/v1/groups`, CLI, Console, filtro `?group=`
+  em `/api/v1/hosts`).
+- Entregar (9d-3): distribuição de política (nível de telemetria/config de sensores) a grupos
+  via 9c.
 
 ## Fase 10 — Validação em Linux real
 - Rodar agente + sensores em VM/container Linux reais (Ubuntu 22.04, Debian 12, RHEL 8-like).
