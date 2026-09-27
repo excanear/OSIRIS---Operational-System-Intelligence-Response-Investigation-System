@@ -7,7 +7,9 @@ pub mod replay;
 pub mod runner;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
-pub use envelope::{sign, verify, Command, CommandAction, CommandError, SignedCommand};
+pub use envelope::{
+    sign, verify, Command, CommandAction, CommandError, PolicyPayload, SignedCommand,
+};
 pub use executor::{
     ActionExecutor, CommandResult, ExecDetail, ExecFailure, FailCode, FakeExecutor,
 };

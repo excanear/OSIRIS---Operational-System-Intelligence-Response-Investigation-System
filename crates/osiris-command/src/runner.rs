@@ -24,6 +24,7 @@ pub fn run_command(
             device_id,
         } => exec.quarantine(path, *inode, *device_id, dry),
         CommandAction::RestoreFile { quarantine_id } => exec.restore(*quarantine_id, dry),
+        CommandAction::ApplyPolicy { policy } => exec.apply_policy(policy, dry),
     };
     match res {
         Ok(detail) if dry => CommandResult::DryRunOk {
@@ -118,6 +119,61 @@ mod tests {
         let calls = ex.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("dry_run=true"));
+    }
+
+    #[test]
+    fn apply_policy_reaches_the_executor_and_default_executors_refuse_it() {
+        let (_d, key, guard) = setup();
+        let ex = FakeExecutor::default();
+        let payload = crate::PolicyPayload::from_effective(&Default::default());
+        let sc = sign(
+            Command {
+                command_id: Uuid::new_v4(),
+                host_id: Uuid::from_u128(2),
+                action: CommandAction::ApplyPolicy {
+                    policy: payload.clone(),
+                },
+                dry_run: false,
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 30_000,
+                nonce: [1; 16],
+                actor: "policy-reconciler".into(),
+                reason: "r".into(),
+            },
+            &key,
+        );
+        assert!(matches!(
+            run_command(&guard, &ex, &sc, NOW),
+            CommandResult::Executed { .. }
+        ));
+        assert!(ex.calls.lock().unwrap()[0].starts_with("apply_policy hash="));
+
+        struct NoPolicy;
+        impl ActionExecutor for NoPolicy {
+            fn terminate(
+                &self,
+                _: u32,
+                _: &str,
+                _: u64,
+                _: bool,
+            ) -> Result<crate::ExecDetail, crate::ExecFailure> {
+                unreachable!()
+            }
+            fn quarantine(
+                &self,
+                _: &str,
+                _: u64,
+                _: u64,
+                _: bool,
+            ) -> Result<crate::ExecDetail, crate::ExecFailure> {
+                unreachable!()
+            }
+            fn restore(&self, _: Uuid, _: bool) -> Result<crate::ExecDetail, crate::ExecFailure> {
+                unreachable!()
+            }
+        }
+        let err = NoPolicy.apply_policy(&payload, false).unwrap_err();
+        assert_eq!(err.code, FailCode::Unsupported);
     }
 
     #[test]

@@ -10,6 +10,7 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
+osiris-policy = { path = "../osiris-policy" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

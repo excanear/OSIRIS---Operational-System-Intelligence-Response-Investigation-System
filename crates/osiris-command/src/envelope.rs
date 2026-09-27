@@ -1,4 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use osiris_policy::{EffectivePolicy, TelemetryLevel};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +28,48 @@ pub enum CommandAction {
     RestoreFile {
         quarantine_id: Uuid,
     },
+    ApplyPolicy {
+        policy: PolicyPayload,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyPayload {
+    pub telemetry_level: Option<TelemetryLevel>,
+    /// Sorted by name, unique.
+    pub sensors: Vec<(String, bool)>,
+    pub heartbeat_interval_secs: Option<u64>,
+    pub policy_hash: [u8; 32],
+}
+
+impl PolicyPayload {
+    pub fn from_effective(e: &EffectivePolicy) -> Self {
+        Self {
+            telemetry_level: e.telemetry_level,
+            sensors: e.sensors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            heartbeat_interval_secs: e.heartbeat_interval_secs,
+            policy_hash: e.hash(),
+        }
+    }
+
+    /// Rebuilds the policy, rejecting anything the server could not have
+    /// produced: unsorted/duplicate sensors, invalid fields, or a hash that
+    /// does not match the content.
+    pub fn to_effective(&self) -> Result<EffectivePolicy, String> {
+        if self.sensors.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err("sensors must be sorted by name and unique".into());
+        }
+        let e = EffectivePolicy {
+            telemetry_level: self.telemetry_level,
+            sensors: self.sensors.iter().cloned().collect(),
+            heartbeat_interval_secs: self.heartbeat_interval_secs,
+        };
+        e.validate().map_err(|err| err.to_string())?;
+        if e.hash() != self.policy_hash {
+            return Err("policy_hash does not match policy content".into());
+        }
+        Ok(e)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +134,20 @@ impl Command {
                 o.push(3);
                 o.extend_from_slice(quarantine_id.as_bytes());
             }
+            CommandAction::ApplyPolicy { policy } => {
+                o.push(4);
+                let sensors: Vec<(&str, bool)> = policy
+                    .sensors
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect();
+                o.extend_from_slice(&osiris_policy::encode_fields(
+                    policy.telemetry_level,
+                    &sensors,
+                    policy.heartbeat_interval_secs,
+                ));
+                o.extend_from_slice(&policy.policy_hash);
+            }
         }
         put_str(&mut o, &self.actor);
         put_str(&mut o, &self.reason);
@@ -134,6 +191,67 @@ mod tests {
             exe_path: "/bin/x".into(),
             observed_at_ns: 5,
         }
+    }
+    fn policy_action() -> CommandAction {
+        let mut e = osiris_policy::EffectivePolicy {
+            telemetry_level: Some(osiris_policy::TelemetryLevel::Standard),
+            heartbeat_interval_secs: Some(30),
+            ..Default::default()
+        };
+        e.sensors.insert("network".into(), false);
+        CommandAction::ApplyPolicy {
+            policy: PolicyPayload::from_effective(&e),
+        }
+    }
+    #[test]
+    fn apply_policy_canonical_bytes_are_stable() {
+        let a = sample(policy_action()).canonical_bytes();
+        let b = sample(policy_action()).canonical_bytes();
+        assert_eq!(a, b);
+    }
+    #[test]
+    fn changing_any_policy_field_breaks_the_signature() {
+        let key = crate::keys::generate_signing_key();
+        let signed = sign(sample(policy_action()), &key);
+        let mutate = |f: &dyn Fn(&mut PolicyPayload)| {
+            let mut s = signed.clone();
+            let CommandAction::ApplyPolicy { policy } = &mut s.command.action else {
+                unreachable!()
+            };
+            f(policy);
+            verify(&s, &key.verifying_key()).is_err()
+        };
+        assert!(mutate(
+            &|p| p.telemetry_level = Some(osiris_policy::TelemetryLevel::Minimal)
+        ));
+        assert!(mutate(&|p| p.telemetry_level = None));
+        assert!(mutate(&|p| p.sensors[0].1 = true));
+        assert!(mutate(&|p| p.sensors.push(("filesystem".into(), false))));
+        assert!(mutate(&|p| p.heartbeat_interval_secs = Some(31)));
+        assert!(mutate(&|p| p.policy_hash[0] ^= 1));
+        assert!(verify(&signed, &key.verifying_key()).is_ok());
+    }
+    #[test]
+    fn to_effective_rejects_tampered_or_invalid_payloads() {
+        let CommandAction::ApplyPolicy { policy } = policy_action() else {
+            unreachable!()
+        };
+        assert!(policy.to_effective().is_ok());
+        let mut bad_hash = policy.clone();
+        bad_hash.heartbeat_interval_secs = Some(60);
+        assert_eq!(
+            bad_hash.to_effective().unwrap_err(),
+            "policy_hash does not match policy content"
+        );
+        let mut unsorted = policy.clone();
+        unsorted.sensors = vec![("network".into(), false), ("filesystem".into(), true)];
+        assert_eq!(
+            unsorted.to_effective().unwrap_err(),
+            "sensors must be sorted by name and unique"
+        );
+        let mut unknown = PolicyPayload::from_effective(&Default::default());
+        unknown.sensors = vec![("dns".into(), true)];
+        assert_eq!(unknown.to_effective().unwrap_err(), "unknown sensor: dns");
     }
     #[test]
     fn canonical_bytes_start_with_domain_tag_and_are_stable() {

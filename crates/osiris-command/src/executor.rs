@@ -11,6 +11,7 @@ pub enum FailCode {
     DestinationExists,
     Io,
     Unsupported,
+    InvalidRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +52,19 @@ pub trait ActionExecutor: Send + Sync {
         dry_run: bool,
     ) -> Result<ExecDetail, ExecFailure>;
     fn restore(&self, id: Uuid, dry_run: bool) -> Result<ExecDetail, ExecFailure>;
+
+    /// Phase 9d-3. Executors that cannot apply policy (the OS-level
+    /// executors) keep this default.
+    fn apply_policy(
+        &self,
+        _policy: &crate::envelope::PolicyPayload,
+        _dry_run: bool,
+    ) -> Result<ExecDetail, ExecFailure> {
+        Err(ExecFailure {
+            code: FailCode::Unsupported,
+            message: "policy application is not supported by this executor".into(),
+        })
+    }
 }
 
 /// Test double: records every call and can be made to fail.
@@ -109,5 +123,18 @@ impl ActionExecutor for FakeExecutor {
     }
     fn restore(&self, id: Uuid, dry_run: bool) -> Result<ExecDetail, ExecFailure> {
         self.respond(format!("restore id={id} dry_run={dry_run}"), dry_run)
+    }
+    fn apply_policy(
+        &self,
+        policy: &crate::envelope::PolicyPayload,
+        dry_run: bool,
+    ) -> Result<ExecDetail, ExecFailure> {
+        self.respond(
+            format!(
+                "apply_policy hash={} dry_run={dry_run}",
+                hex::encode(policy.policy_hash)
+            ),
+            dry_run,
+        )
     }
 }

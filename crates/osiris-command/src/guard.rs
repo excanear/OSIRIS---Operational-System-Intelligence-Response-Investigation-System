@@ -112,6 +112,7 @@ impl Guard {
             CommandAction::TerminateProcess { pid, .. } => self.protected.check_pid(*pid),
             CommandAction::QuarantineFile { path, .. } => self.protected.check_path(path),
             CommandAction::RestoreFile { .. } => Ok(()),
+            CommandAction::ApplyPolicy { .. } => Ok(()),
         }
     }
 }

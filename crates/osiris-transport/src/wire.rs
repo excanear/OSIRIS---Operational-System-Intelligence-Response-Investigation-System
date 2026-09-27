@@ -26,7 +26,11 @@ pub enum ServerMsg {
 }
 
 /// Server → Agent on the control connection.
+// `Command`'s `SignedCommand` grew with Phase 9d-3's `ApplyPolicy` payload;
+// boxing it would ripple pattern-matching changes through the control-channel
+// call sites for a purely cosmetic size-difference lint, so it is allowed here.
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ControlServerMsg {
     Command(osiris_command::SignedCommand),
     Ping,
