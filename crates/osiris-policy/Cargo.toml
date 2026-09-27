@@ -1,0 +1,15 @@
+[package]
+name = "osiris-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osiris-schema = { path = "../osiris-schema" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
