@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import * as client from "./client";
@@ -10,6 +10,7 @@ import {
   useContainerStory,
   useCreateEvidence,
   useCreateIncident,
+  useDeleteGroup,
   useEvents,
   useEvidence,
   useFiles,
@@ -340,5 +341,29 @@ describe("api hooks", () => {
     const { result } = renderHook(() => useContainerStory("abc"), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual({ events: [], alerts: [] });
+  });
+
+  it("useDeleteGroup removes the deleted group's detail query instead of invalidating it", async () => {
+    vi.spyOn(client, "deleteGroup").mockResolvedValue(undefined);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Seed the cache as if GroupDetail had already loaded this group.
+    queryClient.setQueryData(["group", "g1"], { group_id: "g1", name: "web" });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const removeSpy = vi.spyOn(queryClient, "removeQueries");
+    function localWrapper({ children }: { children: ReactNode }) {
+      return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+    }
+
+    const { result } = renderHook(() => useDeleteGroup("g1"), { wrapper: localWrapper });
+    await act(async () => {
+      await result.current.mutateAsync();
+    });
+
+    expect(removeSpy).toHaveBeenCalledWith({ queryKey: ["group", "g1"] });
+    expect(queryClient.getQueryData(["group", "g1"])).toBeUndefined();
+    // The list and hosts queries are still invalidated as before.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["groups"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["hosts"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["group", "g1"] });
   });
 });

@@ -52,7 +52,7 @@ fn scope_of(ctx: &AuthContext) -> GroupScope {
     }
 }
 
-fn internal(cause: String) -> ApiError {
+pub(crate) fn internal(cause: String) -> ApiError {
     tracing::error!(error = %cause, "groups handler failure");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,7 +246,12 @@ async fn rename_group(
 ) -> Result<Json<HostGroup>, ApiError> {
     let scope = scope_of(&ctx);
     let store = state.groups.clone();
-    let group = run(move || store.rename(&scope, group_id, &body.name)).await?;
+    let mut group = run(move || store.rename(&scope, group_id, &body.name)).await?;
+    if let Some(allowed) = caller_hosts(&state, &ctx).await? {
+        let store = state.groups.clone();
+        let members = run(move || store.members(&scope, group_id)).await?;
+        group.member_count = retain_allowed(members, Some(&allowed)).len() as u64;
+    }
     audit(&state, &ctx, "group_rename", format!("group:{group_id}"));
     Ok(Json(group))
 }
@@ -660,6 +665,34 @@ mod tests {
             1,
             "a platform-created tenant group is visible to that tenant"
         );
+    }
+
+    #[tokio::test]
+    async fn rename_re_filters_member_count_for_a_tenant_whose_host_was_reassigned() {
+        let f = fx();
+        let a = f.state.tenants.create_tenant("a").unwrap().tenant_id;
+        let b = f.state.tenants.create_tenant("b").unwrap().tenant_id;
+        let h = host(&f.state, "moving");
+        f.state.tenants.assign_host(h, a).unwrap();
+        let ta = ctx(Some(a));
+        let g = create(&f.state, &ta, "g", None).await.unwrap();
+        add_member(
+            Extension(ta.clone()),
+            State(f.state.clone()),
+            Path((g.group_id, h)),
+        )
+        .await
+        .unwrap();
+        f.state.tenants.assign_host(h, b).unwrap();
+        let Json(renamed) = rename_group(
+            Extension(ta.clone()),
+            State(f.state.clone()),
+            Path(g.group_id),
+            Json(RenameGroupBody { name: "g2".into() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.member_count, 0);
     }
 
     #[tokio::test]

@@ -164,9 +164,16 @@ export function useRenameGroup(groupId: string) {
 
 export function useDeleteGroup(groupId: string) {
   const invalidate = useInvalidateGroups();
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => deleteGroup(groupId),
-    onSuccess: () => invalidate(groupId),
+    onSuccess: () => {
+      // The group is gone: remove its detail query instead of invalidating
+      // it, so a still-mounted `GroupDetail` doesn't refetch a 404 before
+      // navigating away.
+      queryClient.removeQueries({ queryKey: ["group", groupId] });
+      invalidate();
+    },
   });
 }
 

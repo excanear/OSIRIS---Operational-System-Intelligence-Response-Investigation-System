@@ -36,6 +36,15 @@ export function GroupDetail() {
   if (!g) return null;
   const memberIds = new Set(g.members.map((m) => m.host_id));
   const candidates = (hosts.data ?? []).filter((h) => !memberIds.has(h.host_id));
+  // Each mutation's `.error` sticks around until that same mutation runs
+  // again, so a naive `??` chain can keep showing an old failure after a
+  // different action has since succeeded. Reset the others whenever one
+  // starts, so the banner always reflects only the most recent mutation.
+  const resetOthers = (except: typeof rename | typeof del | typeof add | typeof remove) => {
+    for (const m of [rename, del, add, remove]) {
+      if (m !== except) m.reset();
+    }
+  };
   const mutationError = rename.error ?? del.error ?? add.error ?? remove.error;
 
   return (
@@ -56,6 +65,7 @@ export function GroupDetail() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            resetOthers(rename);
             rename.mutate(newName, { onSuccess: () => setEditing(false) });
           }}
         >
@@ -77,7 +87,13 @@ export function GroupDetail() {
       {isAdmin && confirmingDelete && (
         <div>
           <p>Delete group {g.name}?</p>
-          <button type="button" onClick={() => del.mutate(undefined, { onSuccess: () => navigate("/groups") })}>
+          <button
+            type="button"
+            onClick={() => {
+              resetOthers(del);
+              del.mutate(undefined, { onSuccess: () => navigate("/groups") });
+            }}
+          >
             Confirm delete
           </button>
           <button type="button" onClick={() => setConfirmingDelete(false)}>
@@ -109,7 +125,13 @@ export function GroupDetail() {
                 <td>{new Date(m.last_seen / 1_000_000).toLocaleString()}</td>
                 {isAdmin && (
                   <td>
-                    <button type="button" onClick={() => remove.mutate(m.host_id)}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        resetOthers(remove);
+                        remove.mutate(m.host_id);
+                      }}
+                    >
                       Remove
                     </button>
                   </td>
@@ -123,7 +145,10 @@ export function GroupDetail() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            if (hostToAdd) add.mutate(hostToAdd, { onSuccess: () => setHostToAdd("") });
+            if (hostToAdd) {
+              resetOthers(add);
+              add.mutate(hostToAdd, { onSuccess: () => setHostToAdd("") });
+            }
           }}
         >
           <label>

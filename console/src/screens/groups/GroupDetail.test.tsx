@@ -13,7 +13,7 @@ function query(overrides: Record<string, unknown>) {
 }
 
 function mutation() {
-  return { mutate: vi.fn(), isPending: false, isError: false, error: null };
+  return { mutate: vi.fn(), reset: vi.fn(), isPending: false, isError: false, error: null };
 }
 
 const detail = {
@@ -99,6 +99,18 @@ describe("GroupDetail", () => {
     expect(screen.getByText("Delete group web?")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     expect(m.del.mutate).toHaveBeenCalled();
+  });
+
+  it("resets other mutations' errors when a new mutation starts, so a stale error banner does not persist", () => {
+    const m = setup();
+    // Simulate Add having already failed (its `error` sticks around until
+    // it is reset or run again).
+    m.add.error = new ApiError(422, "unknown host") as never;
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(m.add.reset).toHaveBeenCalled();
+    expect(m.del.reset).toHaveBeenCalled();
+    expect(m.rename.reset).toHaveBeenCalled();
+    expect(m.remove.reset).not.toHaveBeenCalled();
   });
 
   it("is read-only for non-Admins", () => {

@@ -106,25 +106,25 @@ async fn hosts_handler(
     let registry = state.registry.clone();
     let mut rows = tokio::task::spawn_blocking(move || registry.list())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::groups::internal(e.to_string()))?
+        .map_err(|e| crate::groups::internal(e.to_string()))?;
     if let Some(allowed) = scope {
         rows.retain(|r| allowed.contains(&r.host_id));
     }
 
-    let scope = match ctx.tenant_id {
+    let group_scope = match ctx.tenant_id {
         Some(t) => GroupScope::Tenant(t),
         None => GroupScope::Platform,
     };
     if let Some(group_id) = query.group {
         let groups = state.groups.clone();
         let members: std::collections::HashSet<Uuid> =
-            tokio::task::spawn_blocking(move || groups.members(&scope, group_id))
+            tokio::task::spawn_blocking(move || groups.members(&group_scope, group_id))
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(|e| crate::groups::internal(e.to_string()))?
                 .map_err(|e| match e {
                     GroupError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
-                    other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+                    other => crate::groups::internal(other.to_string()),
                 })?
                 .into_iter()
                 .collect();
@@ -132,10 +132,10 @@ async fn hosts_handler(
     }
     let ids: Vec<Uuid> = rows.iter().map(|r| r.host_id).collect();
     let groups = state.groups.clone();
-    let mut by_host = tokio::task::spawn_blocking(move || groups.groups_of(&scope, &ids))
+    let mut by_host = tokio::task::spawn_blocking(move || groups.groups_of(&group_scope, &ids))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::groups::internal(e.to_string()))?
+        .map_err(|e| crate::groups::internal(e.to_string()))?;
 
     let now = now_ns();
     let mut summaries: Vec<HostSummary> = rows
@@ -158,8 +158,26 @@ async fn hosts_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osiris_fleet::FleetError;
     use osiris_tenancy::SqliteTenantStore;
     use uuid::Uuid;
+
+    /// A `HostRegistry` whose `list()` always fails, carrying a message that
+    /// must never reach a caller (Minor 1 of the final review: 500 bodies
+    /// must be exactly `internal error`, cause only in logs).
+    struct FailingRegistry;
+
+    impl HostRegistry for FailingRegistry {
+        fn upsert_heartbeat(&self, _row: HostRow) -> Result<(), FleetError> {
+            unimplemented!()
+        }
+        fn get(&self, _host_id: Uuid) -> Result<Option<HostRow>, FleetError> {
+            unimplemented!()
+        }
+        fn list(&self) -> Result<Vec<HostRow>, FleetError> {
+            Err(FleetError::Sqlite("secret sqlite text".into()))
+        }
+    }
 
     fn row(host_id: Uuid, last_seen: u64) -> HostRow {
         HostRow {
@@ -398,5 +416,32 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = rows[0].groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["acme-g"]);
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_is_a_generic_500_that_does_not_leak_the_backend_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_db =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let s = FleetState {
+            registry: Arc::new(FailingRegistry),
+            tenants: Arc::new(SqliteTenantStore::open(dir.path().join("tenants.db")).unwrap()),
+            groups: fleet_db,
+        };
+        let err = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string()
+            )
+        );
+        assert!(!err.1.contains("secret sqlite text"));
     }
 }
