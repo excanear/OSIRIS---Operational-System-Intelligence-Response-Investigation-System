@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,9 +10,10 @@ use osiris_generator::{
     ssh_sudo_escalation_scenario, web_shell_drop_scenario, SyntheticSensor,
 };
 use osiris_pipeline::Pipeline;
+use osiris_policy::EffectivePolicy;
 use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
-use osiris_sensor_api::{Sensor, SensorContext, SensorHealth};
+use osiris_sensor_api::{RawEvent, Sensor, SensorContext, SensorHealth};
 use osiris_sensors_container::ContainerSensor;
 use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_identity::IdentitySensor;
@@ -25,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
 use crate::lifecycle::AgentLifecycle;
+use crate::policy::{self, PolicyRuntime};
 use crate::status::{AgentStatus, SkippedSensor};
 
 #[derive(Debug, Error)]
@@ -56,6 +59,108 @@ pub struct Agent {
     /// and shutdown only ever runs once; a `tokio::sync::Mutex` because
     /// `shutdown` takes `&self`.
     background_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    config: AgentConfig,
+    /// Kept for sensors started later by policy.
+    raw_tx: mpsc::Sender<RawEvent>,
+    policy: Arc<PolicyRuntime>,
+    overlay_path: PathBuf,
+}
+
+const DISABLED_BY_POLICY: &str = "disabled by policy";
+
+/// Startup order of the policy-controllable sensors (the synthetic sensor
+/// follows and is not policy-controlled).
+const STARTUP_ORDER: [&str; 7] = [
+    "process_exec",
+    "filesystem",
+    "network",
+    "identity",
+    "systemd",
+    "persistence",
+    "container",
+];
+
+/// Outcome of switching one sensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SensorChange {
+    Started,
+    Stopped,
+    Unchanged,
+    NotConfigured,
+    Failed(String),
+}
+
+/// Builds one sensor by name; `None` when agent.yaml does not configure it.
+fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
+    match name {
+        "process_exec" => config
+            .audit_log_path
+            .clone()
+            .map(|p| Box::new(ProcessExecSensor::new(p)) as Box<dyn Sensor>),
+        "filesystem" => config
+            .fs_audit_log_path
+            .clone()
+            .map(|p| Box::new(FilesystemSensor::new(p)) as Box<dyn Sensor>),
+        "network" => config
+            .network_proc_root
+            .clone()
+            .map(|p| Box::new(NetworkSensor::new(p)) as Box<dyn Sensor>),
+        "identity" => config
+            .identity_audit_log_path
+            .clone()
+            .map(|p| Box::new(IdentitySensor::new(p)) as Box<dyn Sensor>),
+        "systemd" => config
+            .systemd_audit_log_path
+            .clone()
+            .map(|p| Box::new(SystemdSensor::new(p)) as Box<dyn Sensor>),
+        "persistence" => (!config.persistence_watch_paths.is_empty()).then(|| {
+            Box::new(PersistenceSensor::new(
+                config.persistence_watch_paths.clone(),
+            )) as Box<dyn Sensor>
+        }),
+        "container" => (!config.container_cgroup_roots.is_empty()).then(|| {
+            Box::new(ContainerSensor::new(config.container_cgroup_roots.clone())) as Box<dyn Sensor>
+        }),
+        _ => None,
+    }
+}
+
+/// Capability check, initialize and start; a sensor that cannot run is
+/// reported as skipped with its reason.
+async fn start_sensor(
+    mut sensor: Box<dyn Sensor>,
+    raw_tx: mpsc::Sender<RawEvent>,
+    cancellation: CancellationToken,
+) -> Result<Box<dyn Sensor>, SkippedSensor> {
+    let caps = sensor.capabilities();
+    if !caps.supported() {
+        let reason = caps
+            .unsupported_reason
+            .unwrap_or_else(|| "unsupported".to_string());
+        tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: unsupported on this host");
+        return Err(SkippedSensor {
+            name: sensor.name().to_string(),
+            reason,
+        });
+    }
+    let ctx = SensorContext::new(raw_tx, cancellation);
+    if let Err(e) = sensor.initialize(ctx).await {
+        let reason = e.to_string();
+        tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to initialize");
+        return Err(SkippedSensor {
+            name: sensor.name().to_string(),
+            reason,
+        });
+    }
+    if let Err(e) = sensor.start().await {
+        let reason = format!("start failed: {e}");
+        tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to start");
+        return Err(SkippedSensor {
+            name: sensor.name().to_string(),
+            reason,
+        });
+    }
+    Ok(sensor)
 }
 
 /// Locks a `Mutex`, recovering rather than panicking if a prior holder
@@ -78,31 +183,26 @@ impl Agent {
         let cancellation = CancellationToken::new();
         let (raw_tx, mut raw_rx) = mpsc::channel(1024);
 
+        let overlay_path = policy::overlay_path(&config.spool_path);
+        let (policy_rt, heartbeat_rx) = PolicyRuntime::new(config.fleet.health_interval_secs);
+        let overlay = policy::load_overlay(&overlay_path).unwrap_or_default();
+        policy_rt.set(&overlay);
+        let policy_rt = Arc::new(policy_rt);
+
         let mut candidate_sensors: Vec<Box<dyn Sensor>> = vec![];
-        if let Some(path) = &config.audit_log_path {
-            candidate_sensors.push(Box::new(ProcessExecSensor::new(path.clone())));
-        }
-        if let Some(path) = &config.fs_audit_log_path {
-            candidate_sensors.push(Box::new(FilesystemSensor::new(path.clone())));
-        }
-        if let Some(proc_root) = &config.network_proc_root {
-            candidate_sensors.push(Box::new(NetworkSensor::new(proc_root.clone())));
-        }
-        if let Some(path) = &config.identity_audit_log_path {
-            candidate_sensors.push(Box::new(IdentitySensor::new(path.clone())));
-        }
-        if let Some(path) = &config.systemd_audit_log_path {
-            candidate_sensors.push(Box::new(SystemdSensor::new(path.clone())));
-        }
-        if !config.persistence_watch_paths.is_empty() {
-            candidate_sensors.push(Box::new(PersistenceSensor::new(
-                config.persistence_watch_paths.clone(),
-            )));
-        }
-        if !config.container_cgroup_roots.is_empty() {
-            candidate_sensors.push(Box::new(ContainerSensor::new(
-                config.container_cgroup_roots.clone(),
-            )));
+        let mut skipped: Vec<SkippedSensor> = vec![];
+        for name in STARTUP_ORDER {
+            let Some(sensor) = build_sensor(&config, name) else {
+                continue;
+            };
+            if overlay.sensors.get(name) == Some(&false) {
+                skipped.push(SkippedSensor {
+                    name: name.to_string(),
+                    reason: DISABLED_BY_POLICY.into(),
+                });
+                continue;
+            }
+            candidate_sensors.push(sensor);
         }
         if config.enable_synthetic {
             let base_ts = SystemTime::now()
@@ -135,46 +235,13 @@ impl Agent {
         }
 
         let mut running_sensors: Vec<Box<dyn Sensor>> = vec![];
-        let mut skipped: Vec<SkippedSensor> = vec![];
-        for mut sensor in candidate_sensors {
-            let caps = sensor.capabilities();
-            if !caps.supported() {
-                let reason = caps
-                    .unsupported_reason
-                    .unwrap_or_else(|| "unsupported".to_string());
-                tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: unsupported on this host");
-                skipped.push(SkippedSensor {
-                    name: sensor.name().to_string(),
-                    reason,
-                });
-                continue;
-            }
-            let ctx = SensorContext::new(raw_tx.clone(), cancellation.clone());
-            match sensor.initialize(ctx).await {
-                Ok(()) => {
-                    if let Err(e) = sensor.start().await {
-                        let reason = format!("start failed: {e}");
-                        tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to start");
-                        skipped.push(SkippedSensor {
-                            name: sensor.name().to_string(),
-                            reason,
-                        });
-                        continue;
-                    }
-                    running_sensors.push(sensor);
-                }
-                Err(e) => {
-                    let reason = e.to_string();
-                    tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to initialize");
-                    skipped.push(SkippedSensor {
-                        name: sensor.name().to_string(),
-                        reason,
-                    });
-                }
+        for sensor in candidate_sensors {
+            match start_sensor(sensor, raw_tx.clone(), cancellation.clone()).await {
+                Ok(sensor) => running_sensors.push(sensor),
+                Err(skip) => skipped.push(skip),
             }
         }
         let health_raw_tx = raw_tx.clone();
-        drop(raw_tx);
 
         let metrics = Arc::new(MetricsRegistry::new());
         let (bus, receivers) = EventBus::new(metrics.clone());
@@ -203,6 +270,8 @@ impl Agent {
             };
         let pipeline_cancellation = cancellation.clone();
         let pipeline_bus = bus.clone();
+        let pipeline_policy = policy_rt.clone();
+        let dropped = metrics.counter("events_dropped_by_policy");
         let pipeline_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -210,7 +279,11 @@ impl Agent {
                         match maybe_raw {
                             Some(raw) => {
                                 let prioritized = pipeline.process(raw);
-                                pipeline_bus.enqueue(prioritized);
+                                if pipeline_policy.allows(prioritized.event.event_type) {
+                                    pipeline_bus.enqueue(prioritized);
+                                } else {
+                                    dropped.increment();
+                                }
                             }
                             None => break,
                         }
@@ -244,18 +317,6 @@ impl Agent {
             }));
         }
 
-        if let Some(control) = &config.control {
-            tasks.extend(
-                crate::control::start_control(
-                    control,
-                    host_id,
-                    &config.spool_path,
-                    cancellation.clone(),
-                )
-                .await,
-            );
-        }
-
         let health_cancellation = cancellation.clone();
         let agent = Arc::new(Self {
             lifecycle: Mutex::new(AgentLifecycle::Running),
@@ -263,18 +324,36 @@ impl Agent {
             skipped_sensors: Mutex::new(skipped),
             cancellation,
             background_tasks: tokio::sync::Mutex::new(tasks),
+            config: config.clone(),
+            raw_tx,
+            policy: policy_rt,
+            overlay_path,
         });
+
+        // Control starts after the Agent exists so it can drive it.
+        if let Some(control) = &config.control {
+            let handle = crate::control::start_control(
+                control,
+                host_id,
+                &config.spool_path,
+                agent.cancellation.clone(),
+            )
+            .await;
+            agent.background_tasks.lock().await.extend(handle);
+        }
 
         // Phase 9d-1: periodic AGENT_HEALTH heartbeat. Spawned after `agent`
         // exists so it can reuse status_snapshot()'s existing sensor-health
         // readout instead of re-polling sensors directly.
         {
-            let health_interval = Duration::from_secs(config.fleet.health_interval_secs.max(1));
+            let mut heartbeat_rx = heartbeat_rx;
             let health_agent = agent.clone();
             let handle = tokio::spawn(async move {
                 loop {
+                    let secs = (*heartbeat_rx.borrow()).max(1);
                     tokio::select! {
-                        _ = tokio::time::sleep(health_interval) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                        Ok(()) = heartbeat_rx.changed() => continue,
                         _ = health_cancellation.cancelled() => break,
                     }
                     let status = health_agent.status_snapshot().await;
@@ -290,6 +369,7 @@ impl Agent {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as u64,
+                            policy_hash: health_agent.policy.policy_hash_hex(),
                         },
                     );
                     if health_raw_tx.send(raw).await.is_err() {
@@ -301,6 +381,90 @@ impl Agent {
         }
 
         Ok(agent)
+    }
+
+    pub fn policy(&self) -> &Arc<PolicyRuntime> {
+        &self.policy
+    }
+
+    pub fn overlay_path(&self) -> &std::path::Path {
+        &self.overlay_path
+    }
+
+    pub async fn set_sensor_enabled(&self, name: &str, enabled: bool) -> SensorChange {
+        let mut sensors = self.sensors.lock().await;
+        let position = sensors.iter().position(|s| s.name() == name);
+        match (enabled, position) {
+            (false, Some(i)) => {
+                let mut sensor = sensors.remove(i);
+                drop(sensors);
+                let _ = sensor.stop().await;
+                self.mark_disabled(name, true);
+                SensorChange::Stopped
+            }
+            (false, None) => {
+                if build_sensor(&self.config, name).is_some() {
+                    self.mark_disabled(name, true);
+                }
+                SensorChange::Unchanged
+            }
+            (true, Some(_)) => SensorChange::Unchanged,
+            (true, None) => {
+                drop(sensors);
+                self.mark_disabled(name, false);
+                let Some(sensor) = build_sensor(&self.config, name) else {
+                    return SensorChange::NotConfigured;
+                };
+                match start_sensor(sensor, self.raw_tx.clone(), self.cancellation.clone()).await {
+                    Ok(sensor) => {
+                        self.sensors.lock().await.push(sensor);
+                        SensorChange::Started
+                    }
+                    Err(skipped) => {
+                        let reason = skipped.reason.clone();
+                        lock(&self.skipped_sensors).push(skipped);
+                        SensorChange::Failed(reason)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keeps exactly one "disabled by policy" entry per disabled sensor.
+    fn mark_disabled(&self, name: &str, disabled: bool) {
+        let mut skipped = lock(&self.skipped_sensors);
+        skipped.retain(|s| !(s.name == name && s.reason == DISABLED_BY_POLICY));
+        if disabled {
+            skipped.push(SkippedSensor {
+                name: name.to_string(),
+                reason: DISABLED_BY_POLICY.into(),
+            });
+        }
+    }
+
+    /// Applies an already-validated (and, by the caller, persisted) policy
+    /// live. Sensors the policy leaves unset follow agent.yaml (enabled).
+    pub async fn apply_policy(&self, policy: &EffectivePolicy) -> String {
+        self.policy.set(policy);
+        let mut notes = vec![format!(
+            "level {}",
+            policy
+                .telemetry_level
+                .map_or("unset".to_string(), |l| format!("{l:?}").to_uppercase())
+        )];
+        for name in osiris_policy::KNOWN_SENSORS {
+            let enabled = policy.sensors.get(name).copied().unwrap_or(true);
+            match self.set_sensor_enabled(name, enabled).await {
+                SensorChange::Started => notes.push(format!("{name} on")),
+                SensorChange::Stopped => notes.push(format!("{name} off")),
+                SensorChange::Failed(r) => notes.push(format!("{name} failed: {r}")),
+                SensorChange::Unchanged | SensorChange::NotConfigured => {}
+            }
+        }
+        if let Some(h) = policy.heartbeat_interval_secs {
+            notes.push(format!("heartbeat {h}s"));
+        }
+        notes.join("; ")
     }
 
     pub async fn status_snapshot(&self) -> AgentStatus {
@@ -910,6 +1074,98 @@ mod tests {
             .unwrap();
         let status = agent.status_snapshot().await;
         assert!(status.sensors.iter().any(|s| s.name == "container"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn minimal_level_drops_file_writes_but_keeps_agent_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.enable_synthetic = true;
+        config.synthetic_scenario = Some("web_shell_drop".to_string());
+        config.fleet.health_interval_secs = 1;
+        let overlay = crate::policy::overlay_path(&config.spool_path);
+        crate::policy::save_overlay(
+            &overlay,
+            &EffectivePolicy {
+                telemetry_level: Some(osiris_policy::TelemetryLevel::Minimal),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        agent.shutdown().await;
+        let spooled = std::fs::read_to_string(&spool).unwrap();
+        assert!(spooled.contains("\"event_type\":\"AGENT_HEALTH\""));
+        assert!(
+            !spooled.contains("\"event_type\":\"FILE_WRITE\""),
+            "{spooled}"
+        );
+        assert!(
+            spooled.contains("\"policy_hash\":\""),
+            "the heartbeat reports the applied hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_overlay_the_heartbeat_reports_a_null_policy_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        config.fleet.health_interval_secs = 1;
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        agent.shutdown().await;
+        assert!(std::fs::read_to_string(&spool)
+            .unwrap()
+            .contains("\"policy_hash\":null"));
+    }
+
+    #[tokio::test]
+    async fn a_policy_stops_and_restarts_a_real_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        let proc_root = dir.path().join("proc");
+        std::fs::create_dir_all(proc_root.join("net")).unwrap();
+        std::fs::write(
+            proc_root.join("net/tcp"),
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        )
+        .unwrap();
+        config.network_proc_root = Some(proc_root.to_string_lossy().to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let names = |s: &crate::status::AgentStatus| {
+            s.sensors.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
+        };
+        assert!(names(&agent.status_snapshot().await).contains(&"network".to_string()));
+
+        let mut off = EffectivePolicy::default();
+        off.sensors.insert("network".into(), false);
+        let summary = agent.apply_policy(&off).await;
+        assert!(summary.contains("network off"), "{summary}");
+        let status = agent.status_snapshot().await;
+        assert!(!names(&status).contains(&"network".to_string()));
+        assert!(status
+            .skipped_sensors
+            .iter()
+            .any(|s| s.name == "network" && s.reason == "disabled by policy"));
+
+        let summary = agent.apply_policy(&EffectivePolicy::default()).await;
+        assert!(summary.contains("network on"), "{summary}");
+        let status = agent.status_snapshot().await;
+        assert!(names(&status).contains(&"network".to_string()));
+        assert!(!status
+            .skipped_sensors
+            .iter()
+            .any(|s| s.reason == "disabled by policy"));
         agent.shutdown().await;
     }
 }

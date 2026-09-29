@@ -469,6 +469,8 @@ pub struct AgentHealthRaw {
     pub agent_version: String,
     pub health: osiris_health::AgentHealth,
     pub timestamp_ns: u64,
+    /// Lowercase-hex hash of the applied policy; `None` = no policy applied.
+    pub policy_hash: Option<String>,
 }
 
 /// The shape sensors emit onto their output channel (ARCHITECTURE.md §7.1

@@ -1278,6 +1278,7 @@ dependencies = [
  "osiris-health",
  "osiris-k8s-context",
  "osiris-pipeline",
+ "osiris-policy",
  "osiris-schema",
  "osiris-selftelemetry",
  "osiris-sensor-api",

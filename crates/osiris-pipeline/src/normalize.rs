@@ -134,6 +134,7 @@ fn normalize_agent_health(raw: AgentHealthRaw, host: &HostRef, boot_id: &str) ->
         event_data: serde_json::json!({
             "agent_version": raw.agent_version,
             "health": raw.health,
+            "policy_hash": raw.policy_hash,
         }),
     }
 }
@@ -1706,6 +1707,7 @@ mod tests {
                 sensors: vec![],
             },
             timestamp_ns: 1_700_000_000_000_000_000,
+            policy_hash: None,
         });
 
         let event = normalize(raw, &host, "boot-1");
@@ -1738,6 +1740,7 @@ mod tests {
                     sensors: vec![],
                 },
                 timestamp_ns: 1,
+                policy_hash: None,
             }),
             &host,
             "boot-1",
@@ -1754,10 +1757,40 @@ mod tests {
                     sensors: vec![],
                 },
                 timestamp_ns: 1,
+                policy_hash: None,
             }),
             &host,
             "boot-1",
         );
         assert_eq!(failed.severity, Severity::High);
+    }
+
+    #[test]
+    fn agent_health_carries_the_policy_hash_or_null() {
+        use osiris_health::{AgentHealth, HealthState};
+        use osiris_sensor_api::AgentHealthRaw;
+
+        let host = sample_host();
+        let make = |policy_hash: Option<String>| {
+            normalize(
+                RawEvent::AgentHealth(AgentHealthRaw {
+                    agent_version: "0.1.0".into(),
+                    health: AgentHealth {
+                        state: HealthState::Healthy,
+                        sensors: vec![],
+                    },
+                    timestamp_ns: 1,
+                    policy_hash,
+                }),
+                &host,
+                "boot-1",
+            )
+        };
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            make(Some(hash.clone())).event_data["policy_hash"],
+            serde_json::json!(hash)
+        );
+        assert!(make(None).event_data["policy_hash"].is_null());
     }
 }

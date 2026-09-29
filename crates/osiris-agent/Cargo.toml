@@ -37,6 +37,7 @@ osiris-sensors-persistence = { path = "../osiris-sensors/persistence" }
 osiris-sensors-container = { path = "../osiris-sensors/container" }
 osiris-generator = { path = "../../generator" }
 osiris-command = { path = "../osiris-command" }
+osiris-policy = { path = "../osiris-policy" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
