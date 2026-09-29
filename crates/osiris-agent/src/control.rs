@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use osiris_command::{
-    run_command, ActionExecutor, CommandResult, FailCode, Guard, ProtectedTargets, Refusal,
-    ReplayStore, SignedCommand,
+    run_command, ActionExecutor, CommandAction, CommandResult, FailCode, Guard, ProtectedTargets,
+    Refusal, ReplayStore, SignedCommand,
 };
 use osiris_transport::control::{run_control_client, CommandHandler, ControlClientConfig};
 use tokio::sync::Semaphore;
@@ -78,6 +78,22 @@ impl AgentCommandHandler {
     }
 }
 
+/// Log rendering of an action. `ApplyPolicy` would otherwise dump the whole
+/// payload (with a decimal hash array), so it shows only the short hash.
+fn describe_action(action: &CommandAction) -> String {
+    match action {
+        CommandAction::ApplyPolicy { policy } => {
+            let hex: String = policy
+                .policy_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("apply policy {}", &hex[..12])
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 fn failed(message: &str) -> CommandResult {
     CommandResult::Failed {
         code: FailCode::Io,
@@ -97,7 +113,7 @@ impl CommandHandler for AgentCommandHandler {
     async fn handle(&self, cmd: SignedCommand) -> CommandResult {
         // Never log the signature: only the id and the action.
         let command_id = cmd.command.command_id;
-        let action = format!("{:?}", cmd.command.action);
+        let action = describe_action(&cmd.command.action);
         let result = self.execute(cmd).await;
         match &result {
             CommandResult::Refused { reason } => {
@@ -195,6 +211,7 @@ pub async fn start_control(
     control: &ControlConfig,
     host_id: Uuid,
     spool_path: &str,
+    agent: std::sync::Weak<crate::agent::Agent>,
     cancel: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let key = match osiris_command::keys::load_verifying_key(Path::new(&control.command_public_key))
@@ -232,7 +249,11 @@ pub async fn start_control(
     };
     let handler: Arc<dyn CommandHandler> = Arc::new(AgentCommandHandler::new(
         guard,
-        default_executor(vault, protected),
+        Arc::new(crate::policy_exec::PolicyAwareExecutor::new(
+            default_executor(vault, protected),
+            agent,
+            tokio::runtime::Handle::current(),
+        )),
     ));
     let cfg = ControlClientConfig {
         server_addr: control.server_addr.clone(),
@@ -416,6 +437,29 @@ mod tests {
         gate.release.store(true, Ordering::SeqCst);
     }
 
+    #[test]
+    fn apply_policy_is_logged_as_its_short_hash_only() {
+        let payload = osiris_command::PolicyPayload::from_effective(&Default::default());
+        let action = CommandAction::ApplyPolicy {
+            policy: payload.clone(),
+        };
+        let hex: String = payload
+            .policy_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            describe_action(&action),
+            format!("apply policy {}", &hex[..12])
+        );
+        assert!(describe_action(&CommandAction::TerminateProcess {
+            pid: 1,
+            exe_path: "/bin/x".into(),
+            observed_at_ns: 1
+        })
+        .starts_with("TerminateProcess"));
+    }
+
     #[tokio::test]
     async fn missing_public_key_starts_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -429,11 +473,15 @@ mod tests {
             vault_dir: dir.path().join("vault").display().to_string(),
         };
         let spool = dir.path().join("spool").display().to_string();
-        assert!(
-            start_control(&cfg, Uuid::new_v4(), &spool, CancellationToken::new())
-                .await
-                .is_none()
-        );
+        assert!(start_control(
+            &cfg,
+            Uuid::new_v4(),
+            &spool,
+            std::sync::Weak::new(),
+            CancellationToken::new()
+        )
+        .await
+        .is_none());
     }
 
     #[cfg(unix)]

@@ -64,6 +64,9 @@ pub struct Agent {
     raw_tx: mpsc::Sender<RawEvent>,
     policy: Arc<PolicyRuntime>,
     overlay_path: PathBuf,
+    /// Serialises `apply_policy` so concurrent ApplyPolicy commands cannot
+    /// interleave sensor toggles (and double-start a sensor).
+    apply_lock: tokio::sync::Mutex<()>,
 }
 
 const DISABLED_BY_POLICY: &str = "disabled by policy";
@@ -328,6 +331,7 @@ impl Agent {
             raw_tx,
             policy: policy_rt,
             overlay_path,
+            apply_lock: tokio::sync::Mutex::new(()),
         });
 
         // Control starts after the Agent exists so it can drive it.
@@ -336,6 +340,7 @@ impl Agent {
                 control,
                 host_id,
                 &config.spool_path,
+                Arc::downgrade(&agent),
                 agent.cancellation.clone(),
             )
             .await;
@@ -455,6 +460,7 @@ impl Agent {
     /// Applies an already-validated (and, by the caller, persisted) policy
     /// live. Sensors the policy leaves unset follow agent.yaml (enabled).
     pub async fn apply_policy(&self, policy: &EffectivePolicy) -> String {
+        let _serialised = self.apply_lock.lock().await;
         self.policy.set(policy);
         let mut notes = vec![format!(
             "level {}",
@@ -531,11 +537,11 @@ impl Agent {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use uuid::Uuid;
 
-    fn test_host() -> HostRef {
+    pub(crate) fn test_host() -> HostRef {
         HostRef {
             host_id: Uuid::new_v4(),
             hostname: "h".to_string(),
@@ -545,7 +551,7 @@ mod tests {
         }
     }
 
-    fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
+    pub(crate) fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
         AgentConfig {
             forward: None,
             control: None,
@@ -752,6 +758,41 @@ mod tests {
         let status = agent.status_snapshot().await;
         assert_eq!(status.sensors.len(), 1);
         assert_eq!(status.sensors[0].name, "filesystem");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_applies_leave_exactly_one_running_instance_of_a_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs_log = dir.path().join("fs-audit.log");
+        std::fs::write(&fs_log, "").unwrap();
+        let mut config = base_config(&dir);
+        config.fs_audit_log_path = Some(fs_log.to_string_lossy().to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let mut off = EffectivePolicy::default();
+        off.sensors.insert("filesystem".into(), false);
+        agent.apply_policy(&off).await;
+        assert!(agent.status_snapshot().await.sensors.is_empty());
+
+        let on = EffectivePolicy::default();
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let (a, p) = (agent.clone(), on.clone());
+            joins.push(tokio::spawn(async move { a.apply_policy(&p).await }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+        let running = agent
+            .status_snapshot()
+            .await
+            .sensors
+            .into_iter()
+            .filter(|s| s.name == "filesystem")
+            .count();
+        assert_eq!(running, 1);
         agent.shutdown().await;
     }
 
