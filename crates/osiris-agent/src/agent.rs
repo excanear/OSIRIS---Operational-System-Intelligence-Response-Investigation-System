@@ -411,6 +411,14 @@ impl Agent {
             (true, Some(_)) => SensorChange::Unchanged,
             (true, None) => {
                 drop(sensors);
+                // Only a sensor this policy switched off is restarted; one
+                // that never ran keeps its startup skip entry untouched.
+                let disabled_by_policy = lock(&self.skipped_sensors)
+                    .iter()
+                    .any(|s| s.name == name && s.reason == DISABLED_BY_POLICY);
+                if !disabled_by_policy {
+                    return SensorChange::Unchanged;
+                }
                 self.mark_disabled(name, false);
                 let Some(sensor) = build_sensor(&self.config, name) else {
                     return SensorChange::NotConfigured;
@@ -422,7 +430,9 @@ impl Agent {
                     }
                     Err(skipped) => {
                         let reason = skipped.reason.clone();
-                        lock(&self.skipped_sensors).push(skipped);
+                        let mut list = lock(&self.skipped_sensors);
+                        list.retain(|s| s.name != name);
+                        list.push(skipped);
                         SensorChange::Failed(reason)
                     }
                 }
@@ -1166,6 +1176,47 @@ mod tests {
             .skipped_sensors
             .iter()
             .any(|s| s.reason == "disabled by policy"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reapplying_a_policy_does_not_retry_or_duplicate_a_never_runnable_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root = Some(
+            dir.path()
+                .join("no-such-proc")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+        let before = agent.skipped_sensors();
+        assert_eq!(before.len(), 1);
+
+        let policy = EffectivePolicy {
+            telemetry_level: Some(osiris_policy::TelemetryLevel::Standard),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let summary = agent.apply_policy(&policy).await;
+            assert!(!summary.contains("failed"), "{summary}");
+            let after = agent.skipped_sensors();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].reason, before[0].reason);
+        }
+
+        // Disabled by policy, then re-enabled while still not runnable:
+        // one entry, carrying the real failure reason.
+        let mut off = EffectivePolicy::default();
+        off.sensors.insert("network".into(), false);
+        agent.apply_policy(&off).await;
+        let summary = agent.apply_policy(&EffectivePolicy::default()).await;
+        assert!(summary.contains("network failed"), "{summary}");
+        let skipped = agent.skipped_sensors();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_ne!(skipped[0].reason, "disabled by policy");
         agent.shutdown().await;
     }
 }
