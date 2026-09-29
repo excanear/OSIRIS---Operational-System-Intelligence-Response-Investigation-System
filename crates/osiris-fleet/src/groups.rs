@@ -52,6 +52,8 @@ pub struct GroupRef {
 pub enum GroupError {
     #[error("{0}")]
     InvalidName(String),
+    #[error("{0}")]
+    InvalidPolicy(String),
     #[error("group not found")]
     NotFound,
     #[error("a group with this name already exists")]
@@ -161,7 +163,7 @@ fn group_from(r: &rusqlite::Row) -> rusqlite::Result<HostGroup> {
     })
 }
 
-fn get_in_scope(
+pub(crate) fn get_in_scope(
     conn: &Connection,
     scope: &GroupScope,
     group_id: Uuid,
@@ -385,6 +387,7 @@ mod tests {
             cloud_provider: None,
             cloud_instance_id: None,
             cloud_region: None,
+            applied_policy_hash: None,
         })
         .unwrap();
         host_id

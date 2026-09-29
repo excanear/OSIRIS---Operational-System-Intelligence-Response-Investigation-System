@@ -9,6 +9,8 @@ pub use groups::{
     validate_group_name, GroupError, GroupRef, GroupScope, HostGroup, HostGroupStore,
     MAX_GROUP_NAME_CHARS,
 };
+mod policies;
+pub use policies::{DeliveryResult, DeliveryRow, PolicyStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
@@ -26,8 +28,9 @@ pub enum FleetError {
 }
 
 /// `PRAGMA user_version` of `hosts.db`. 0 = a 9d-1-era file (hosts table only,
-/// never stamped); 1 = hosts + host groups (Phase 9d-2).
-pub const SCHEMA_VERSION: i64 = 1;
+/// never stamped); 1 = hosts + host groups (Phase 9d-2); 2 = + group
+/// policies, applied hash and delivery state (Phase 9d-3).
+pub const SCHEMA_VERSION: i64 = 2;
 
 impl From<rusqlite::Error> for FleetError {
     fn from(e: rusqlite::Error) -> Self {
@@ -52,6 +55,9 @@ pub struct HostRow {
     pub cloud_provider: Option<String>,
     pub cloud_instance_id: Option<String>,
     pub cloud_region: Option<String>,
+    /// Lowercase hex of the policy the agent last reported applying.
+    /// `None` = no policy (either none resolved, or the agent hasn't said).
+    pub applied_policy_hash: Option<String>,
 }
 
 /// Converts an agent-supplied timestamp into the signed representation SQLite
@@ -72,7 +78,7 @@ pub struct SqliteHostRegistry {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS hosts (
     host_id TEXT PRIMARY KEY,
     hostname TEXT NOT NULL,
@@ -103,6 +109,22 @@ CREATE TABLE IF NOT EXISTS host_group_members (
 CREATE INDEX IF NOT EXISTS idx_host_group_members_host ON host_group_members(host_id);
 ";
 
+const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS group_policies (
+    group_id TEXT PRIMARY KEY REFERENCES host_groups(group_id) ON DELETE CASCADE,
+    policy_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS host_policy_delivery (
+    host_id TEXT PRIMARY KEY REFERENCES hosts(host_id),
+    desired_hash TEXT NOT NULL,
+    last_sent_at INTEGER NOT NULL,
+    last_result TEXT NOT NULL,
+    last_error TEXT NULL
+);
+";
+
 impl SqliteHostRegistry {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FleetError> {
         let conn = Connection::open(path)?;
@@ -114,8 +136,26 @@ impl SqliteHostRegistry {
         if version > SCHEMA_VERSION {
             return Err(FleetError::UnsupportedSchema(version));
         }
-        conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        conn.execute_batch(SCHEMA_V1)?;
+        if version < 2 {
+            // v1 -> v2 as one unit: a crash mid-way leaves user_version < 2
+            // and the next open redoes it (every step is idempotent).
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V2)?;
+            let has_column: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('hosts') WHERE name = 'applied_policy_hash'",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_column == 0 {
+                tx.execute(
+                    "ALTER TABLE hosts ADD COLUMN applied_policy_hash TEXT NULL",
+                    [],
+                )?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -148,6 +188,7 @@ impl SqliteHostRegistry {
             cloud_provider: r.get(8)?,
             cloud_instance_id: r.get(9)?,
             cloud_region: r.get(10)?,
+            applied_policy_hash: r.get(11)?,
         })
     }
 }
@@ -158,8 +199,8 @@ impl HostRegistry for SqliteHostRegistry {
         let health_json = serde_json::to_string(&row.health_state)
             .map_err(|e| FleetError::Serde(e.to_string()))?;
         conn.execute(
-            "INSERT INTO hosts (host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO hosts (host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region, applied_policy_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(host_id) DO UPDATE SET
                 hostname = excluded.hostname,
                 distro = excluded.distro,
@@ -169,7 +210,8 @@ impl HostRegistry for SqliteHostRegistry {
                 health_state = excluded.health_state,
                 cloud_provider = excluded.cloud_provider,
                 cloud_instance_id = excluded.cloud_instance_id,
-                cloud_region = excluded.cloud_region
+                cloud_region = excluded.cloud_region,
+                applied_policy_hash = excluded.applied_policy_hash
              WHERE excluded.last_seen >= hosts.last_seen",
             params![
                 row.host_id.to_string(),
@@ -182,6 +224,7 @@ impl HostRegistry for SqliteHostRegistry {
                 row.cloud_provider,
                 row.cloud_instance_id,
                 row.cloud_region,
+                row.applied_policy_hash,
             ],
         )?;
         Ok(())
@@ -191,7 +234,7 @@ impl HostRegistry for SqliteHostRegistry {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         Ok(conn
             .query_row(
-                "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region
+                "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region, applied_policy_hash
                  FROM hosts WHERE host_id = ?1",
                 params![host_id.to_string()],
                 Self::row_from,
@@ -202,7 +245,7 @@ impl HostRegistry for SqliteHostRegistry {
     fn list(&self) -> Result<Vec<HostRow>, FleetError> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region FROM hosts",
+            "SELECT host_id, hostname, distro, kernel_version, agent_version, enrolled_at, last_seen, health_state, cloud_provider, cloud_instance_id, cloud_region, applied_policy_hash FROM hosts",
         )?;
         let rows = stmt
             .query_map([], Self::row_from)?
@@ -230,6 +273,7 @@ mod tests {
             cloud_provider: None,
             cloud_instance_id: None,
             cloud_region: None,
+            applied_policy_hash: None,
         }
     }
 

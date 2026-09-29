@@ -192,6 +192,7 @@ mod tests {
             cloud_provider: None,
             cloud_instance_id: None,
             cloud_region: None,
+            applied_policy_hash: None,
         }
     }
 

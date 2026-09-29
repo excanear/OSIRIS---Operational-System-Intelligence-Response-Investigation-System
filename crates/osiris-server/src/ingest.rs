@@ -235,6 +235,7 @@ impl IngestContext {
                                 cloud_provider: cloud.map(|c| c.provider.clone()),
                                 cloud_instance_id: cloud.and_then(|c| c.instance_id.clone()),
                                 cloud_region: cloud.and_then(|c| c.region.clone()),
+                                applied_policy_hash: None,
                             };
                             if let Err(e) = fleet_registry.upsert_heartbeat(row) {
                                 tracing::warn!(host_id = %event.host_id, error = %e, "fleet registry upsert failed");

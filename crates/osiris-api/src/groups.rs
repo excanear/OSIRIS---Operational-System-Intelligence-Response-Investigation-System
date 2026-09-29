@@ -62,7 +62,7 @@ pub(crate) fn internal(cause: String) -> ApiError {
 
 fn group_error(e: GroupError) -> ApiError {
     match e {
-        GroupError::InvalidName(m) => (StatusCode::BAD_REQUEST, m),
+        GroupError::InvalidName(m) | GroupError::InvalidPolicy(m) => (StatusCode::BAD_REQUEST, m),
         GroupError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
         GroupError::DuplicateName => (StatusCode::CONFLICT, e.to_string()),
         GroupError::UnknownHost => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
@@ -353,6 +353,7 @@ mod tests {
                 cloud_provider: None,
                 cloud_instance_id: None,
                 cloud_region: None,
+                applied_policy_hash: None,
             })
             .unwrap();
         host_id

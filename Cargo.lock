@@ -1533,6 +1533,7 @@ name = "osiris-fleet"
 version = "0.1.0"
 dependencies = [
  "osiris-health",
+ "osiris-policy",
  "rusqlite",
  "serde",
  "serde_json",

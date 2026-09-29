@@ -10,6 +10,7 @@ uuid = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 osiris-health = { path = "../osiris-health" }
+osiris-policy = { path = "../osiris-policy" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
