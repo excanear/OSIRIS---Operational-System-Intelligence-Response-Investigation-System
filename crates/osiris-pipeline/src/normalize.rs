@@ -1718,6 +1718,12 @@ mod tests {
         assert_eq!(event.source, Source::AgentInternal);
         assert_eq!(event.timestamp, 1_700_000_000_000_000_000);
         assert_eq!(event.event_data["agent_version"].as_str().unwrap(), "0.1.0");
+        // A 9d-3 agent always sends the field: `null` (no policy) is distinct
+        // from absent (a pre-9d-3 agent) on the server.
+        assert_eq!(
+            event.event_data.get("policy_hash"),
+            Some(&serde_json::Value::Null)
+        );
         assert_eq!(
             event.event_data["health"]["state"]["state"]
                 .as_str()

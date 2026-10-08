@@ -1,7 +1,7 @@
 //! Phase 9d-3: drives each host's applied policy toward its effective policy
 //! by sending signed `ApplyPolicy` commands over the 9c channel.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,12 @@ pub enum ReconcileOutcome {
     UnknownHost,
     InSync,
     Backoff,
+    /// Another reconciliation of this host is running; it re-runs once
+    /// when it finishes, so this request is not lost.
     InFlight,
+    /// The agent never reported a usable policy hash (a pre-9d-3 agent, or a
+    /// malformed report), so it cannot decode `ApplyPolicy`: nothing is sent.
+    Unsupported,
     Sent(DeliveryResult),
 }
 
@@ -29,7 +34,9 @@ pub struct PolicyReconciler {
     policies: Arc<dyn PolicyStore>,
     tenants: Arc<dyn TenantStore>,
     dispatcher: Option<Arc<dyn CommandDispatcher>>,
-    in_flight: Mutex<HashSet<Uuid>>,
+    /// Hosts being reconciled; the flag is set when another request for the
+    /// host arrived meanwhile and the pass must run again.
+    in_flight: Mutex<HashMap<Uuid, bool>>,
 }
 
 fn now_ns() -> u64 {
@@ -39,15 +46,24 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// Removes the host from the in-flight set however `reconcile_host` exits.
-struct InFlight<'a>(&'a Mutex<HashSet<Uuid>>, Uuid);
+/// Removes the host from the in-flight set however `reconcile_host` exits
+/// (return, panic or cancellation) and, if another request arrived while it
+/// ran, spawns one more pass so that request's desired policy is not lost.
+struct InFlight<'a>(&'a PolicyReconciler, Uuid);
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0
+        let dirty = self
+            .0
+            .in_flight
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.1);
+            .remove(&self.1)
+            .unwrap_or(false);
+        // No runtime (shutdown): nothing to re-run on, and spawning would panic.
+        if dirty && tokio::runtime::Handle::try_current().is_ok() {
+            self.0.spawn_reconcile(vec![self.1]);
+        }
     }
 }
 
@@ -64,7 +80,7 @@ impl PolicyReconciler {
             policies,
             tenants,
             dispatcher,
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -83,15 +99,15 @@ impl PolicyReconciler {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return ReconcileOutcome::Unmanaged;
         };
-        if !self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(host_id)
         {
-            return ReconcileOutcome::InFlight;
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(dirty) = in_flight.get_mut(&host_id) {
+                *dirty = true;
+                return ReconcileOutcome::InFlight;
+            }
+            in_flight.insert(host_id, false);
         }
-        let _guard = InFlight(&self.in_flight, host_id);
+        let _guard = InFlight(self, host_id);
 
         let (registry, policies, tenants) = (
             self.registry.clone(),
@@ -127,7 +143,17 @@ impl PolicyReconciler {
             }
         };
         let desired = effective.hash_hex();
-        if applied.unwrap_or_else(osiris_policy::empty_policy_hash_hex) == desired {
+        let Some(applied) = applied else {
+            // No usable hash reported: the agent is pre-9d-3 (or broken) and
+            // would drop its control session on an `ApplyPolicy` it cannot
+            // decode. It counts as "no policy" for status, but is never sent one.
+            return if desired == osiris_policy::empty_policy_hash_hex() {
+                ReconcileOutcome::InSync
+            } else {
+                ReconcileOutcome::Unsupported
+            };
+        };
+        if applied == desired {
             return ReconcileOutcome::InSync;
         }
         let now = now_ns();
@@ -205,6 +231,9 @@ mod tests {
     struct Scripted {
         sent: std::sync::Mutex<Vec<(Uuid, CommandAction, String, String)>>,
         reply: std::sync::Mutex<Option<ScriptedReply>>,
+        /// When set, each dispatch waits for a permit after recording itself.
+        gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        entered: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -221,6 +250,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((host_id, action, actor, reason));
+            self.entered.notify_one();
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             match self.reply.lock().unwrap().clone() {
                 Some(ScriptedReply::Result(r)) => Ok(r),
                 Some(ScriptedReply::Offline) => Err(DispatchError::Offline),
@@ -244,7 +278,12 @@ mod tests {
         host: Uuid,
     }
 
+    /// A 9d-3 agent that has reported "no policy".
     fn fx(managed: bool) -> Fx {
+        fx_applied(managed, Some(osiris_policy::empty_policy_hash_hex()))
+    }
+
+    fn fx_applied(managed: bool, applied: Option<String>) -> Fx {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
         let tenants: Arc<dyn TenantStore> =
@@ -262,7 +301,7 @@ mod tests {
             cloud_provider: None,
             cloud_instance_id: None,
             cloud_region: None,
-            applied_policy_hash: None,
+            applied_policy_hash: applied,
         })
         .unwrap();
         let dispatcher = Arc::new(Scripted::default());
@@ -285,17 +324,35 @@ mod tests {
         let g = f.db.create(&GroupScope::Platform, None, "g").unwrap();
         f.db.add_member(&GroupScope::Platform, g.group_id, f.host)
             .unwrap();
+        set_level(f, g.group_id, TelemetryLevel::Minimal)
+    }
+
+    /// Sets the group's policy to `level` only; returns the effective hash.
+    fn set_level(f: &Fx, group_id: Uuid, level: TelemetryLevel) -> String {
         let p = GroupPolicy {
-            telemetry_level: Some(TelemetryLevel::Minimal),
+            telemetry_level: Some(level),
             ..Default::default()
         };
-        f.db.set_policy(&GroupScope::Platform, g.group_id, &p, "u")
+        f.db.set_policy(&GroupScope::Platform, group_id, &p, "u")
             .unwrap();
         osiris_policy::EffectivePolicy {
-            telemetry_level: Some(TelemetryLevel::Minimal),
+            telemetry_level: Some(level),
             ..Default::default()
         }
         .hash_hex()
+    }
+
+    fn sent_hashes(f: &Fx) -> Vec<String> {
+        f.dispatcher
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, action, _, _)| match action {
+                CommandAction::ApplyPolicy { policy } => hex::encode(policy.policy_hash),
+                other => panic!("unexpected action {other:?}"),
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -370,6 +427,71 @@ mod tests {
             f.rec.reconcile_host(f.host).await,
             ReconcileOutcome::Sent(DeliveryResult::Offline)
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_never_reported_a_policy_hash_is_sent_nothing() {
+        // Pre-9d-3 agents omit `policy_hash`; ingest stores that as None.
+        let f = fx_applied(true, None);
+        assert_eq!(
+            f.rec.reconcile_host(f.host).await,
+            ReconcileOutcome::InSync,
+            "no policy desired"
+        );
+        with_policy(&f);
+        assert_eq!(
+            f.rec.reconcile_host(f.host).await,
+            ReconcileOutcome::Unsupported
+        );
+        assert!(f.dispatcher.sent.lock().unwrap().is_empty());
+        assert!(f.db.delivery(f.host).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_during_a_send_reruns_with_the_new_policy() {
+        let f = fx(true);
+        let g = f.db.create(&GroupScope::Platform, None, "g").unwrap();
+        f.db.add_member(&GroupScope::Platform, g.group_id, f.host)
+            .unwrap();
+        let p1 = set_level(&f, g.group_id, TelemetryLevel::Minimal);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.dispatcher.gate.lock().unwrap() = Some(gate.clone());
+
+        let (rec, host) = (f.rec.clone(), f.host);
+        let first = tokio::spawn(async move { rec.reconcile_host(host).await });
+        f.dispatcher.entered.notified().await;
+
+        // The policy changes while P1 is still in flight.
+        let p2 = set_level(&f, g.group_id, TelemetryLevel::Standard);
+        assert_eq!(
+            f.rec.reconcile_host(f.host).await,
+            ReconcileOutcome::InFlight
+        );
+        assert_eq!(sent_hashes(&f), vec![p1.clone()]);
+
+        gate.add_permits(10);
+        assert_eq!(
+            first.await.unwrap(),
+            ReconcileOutcome::Sent(DeliveryResult::Executed)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sent_hashes(&f).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dirty host is reconciled again");
+        assert_eq!(sent_hashes(&f), vec![p1, p2.clone()]);
+        // The re-run finishes and leaves nothing in flight or dirty.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !f.rec.in_flight.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight set drains");
+        assert_eq!(f.db.delivery(f.host).unwrap().unwrap().desired_hash, p2);
+        assert_eq!(sent_hashes(&f).len(), 2, "no further passes");
     }
 
     #[tokio::test]

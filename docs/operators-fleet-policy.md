@@ -70,6 +70,12 @@ channel, never receives or applies the policy. Its heartbeats keep reporting no
 policy hash, so it shows `PENDING` for as long as a policy is desired for it
 (not `UNMANAGED`). Add the `control:` section to the Agent to fix it.
 
+Agents older than 9d-3 cannot decode a policy command, and receiving one would
+drop their control connection. They do not send a policy hash in their
+heartbeat, and the Server never sends them a policy. Such a host shows
+`PENDING`, with no delivery recorded, for as long as a policy is desired for it.
+It shows `IN_SYNC` when no policy applies. Upgrade the Agent to apply the policy.
+
 The applied hash is only learned from the next heartbeat, so `IN_SYNC` appears
 after up to one heartbeat interval. A policy that sets
 `heartbeat_interval_secs: 10` is therefore confirmed within about 10 s.

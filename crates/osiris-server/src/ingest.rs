@@ -99,12 +99,16 @@ fn correlate_baseline_and_score(
     Ok(())
 }
 
-/// The policy hash an agent reports in its heartbeat. A missing or `null`
-/// value means "no policy" (the empty-policy hash); anything that is not 64
-/// lowercase hex characters is unusable and recorded as unknown.
+/// The policy hash an agent reports in its heartbeat. An explicit `null`
+/// means "no policy" (the empty-policy hash). A missing field means the agent
+/// predates 9d-3 and cannot apply policy, so it is recorded as unknown
+/// (`None`) and the reconciler sends it nothing; a 9d-3 agent always sends the
+/// field. Anything that is not 64 lowercase hex characters is unusable and is
+/// recorded as unknown too.
 fn reported_policy_hash(event_data: &serde_json::Value) -> Option<String> {
     match event_data.get("policy_hash") {
-        None | Some(serde_json::Value::Null) => Some(osiris_policy::empty_policy_hash_hex()),
+        None => None,
+        Some(serde_json::Value::Null) => Some(osiris_policy::empty_policy_hash_hex()),
         Some(v) => v
             .as_str()
             .filter(|s| {
@@ -601,12 +605,25 @@ mod tests {
                 "policy_hash {value}"
             );
         }
-        // Field absent entirely means "no policy".
+        // Field absent entirely: a pre-9d-3 agent, recorded as unknown.
         ts += 1_000_000_000;
         context
             .ingest(vec![agent_health_event(host_id, ts)])
             .await
             .unwrap();
+        assert_eq!(
+            fleet_registry
+                .get(host_id)
+                .unwrap()
+                .unwrap()
+                .applied_policy_hash,
+            None
+        );
+        // An explicit null after that is "no policy" again.
+        ts += 1_000_000_000;
+        let mut event = agent_health_event(host_id, ts);
+        event.event_data["policy_hash"] = serde_json::Value::Null;
+        context.ingest(vec![event]).await.unwrap();
         assert_eq!(
             fleet_registry
                 .get(host_id)
