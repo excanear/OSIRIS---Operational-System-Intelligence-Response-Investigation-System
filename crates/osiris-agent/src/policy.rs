@@ -116,11 +116,17 @@ impl PolicyRuntime {
             policy.telemetry_level.map_or(0, TelemetryLevel::code),
             Ordering::Relaxed,
         );
-        let _ = self.heartbeat_tx.send(
-            policy
-                .heartbeat_interval_secs
-                .unwrap_or(self.base_heartbeat_secs),
-        );
+        let secs = policy
+            .heartbeat_interval_secs
+            .unwrap_or(self.base_heartbeat_secs);
+        // Only a changed interval wakes the heartbeat task: waking it restarts
+        // its sleep, which would delay the confirming heartbeat by a full
+        // interval on every apply.
+        self.heartbeat_tx.send_if_modified(|current| {
+            let changed = *current != secs;
+            *current = secs;
+            changed
+        });
         *self.applied.lock().unwrap_or_else(|p| p.into_inner()) = policy.clone();
     }
 }
@@ -190,5 +196,22 @@ mod tests {
         rt.set(&EffectivePolicy::default());
         assert_eq!(*rx.borrow(), 60, "unset heartbeat falls back to agent.yaml");
         assert_eq!(rt.policy_hash_hex(), None);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_heartbeat_interval_does_not_wake_the_heartbeat_task() {
+        let (rt, mut rx) = PolicyRuntime::new(60);
+        rt.set(&sample());
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        let mut other = sample();
+        other.telemetry_level = Some(TelemetryLevel::Forensic);
+        rt.set(&other);
+        assert!(!rx.has_changed().unwrap(), "still 30 s");
+        rt.set(&EffectivePolicy::default());
+        assert!(rx.has_changed().unwrap(), "30 s -> 60 s");
+        rx.borrow_and_update();
+        rt.set(&EffectivePolicy::default());
+        assert!(!rx.has_changed().unwrap(), "still 60 s");
     }
 }
