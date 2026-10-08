@@ -63,7 +63,12 @@ platform source only as `{"tier": "PLATFORM"}`, without the group id or name.
 | `IN_SYNC` | The hash the Agent reported in its last heartbeat equals the desired hash. A heartbeat with no policy hash means "no policy" (the empty-policy hash), so a host with no policy is `IN_SYNC` too. |
 | `PENDING` | The Agent runs something else and no failed delivery is recorded for the current desired policy; the Server sends it (on policy change, membership change, or the next heartbeat). Resends of the same policy to one host are at least 60 s apart. |
 | `FAILED` | The last delivery of the current desired policy was refused or failed on the Agent; the error is in `last_delivery`. |
-| `UNMANAGED` | The Server has no control channel configured. Agents without a control channel cannot receive policy and also show `UNMANAGED`. |
+| `UNMANAGED` | The Server has no control channel configured (no `control:` in `server.yaml`), so it sends nothing. This is a server-side condition: every host reads `UNMANAGED`. |
+
+An Agent without `control:` in `agent.yaml`, under a Server that has the control
+channel, never receives or applies the policy. Its heartbeats keep reporting no
+policy hash, so it shows `PENDING` for as long as a policy is desired for it
+(not `UNMANAGED`). Add the `control:` section to the Agent to fix it.
 
 The applied hash is only learned from the next heartbeat, so `IN_SYNC` appears
 after up to one heartbeat interval. A policy that sets
