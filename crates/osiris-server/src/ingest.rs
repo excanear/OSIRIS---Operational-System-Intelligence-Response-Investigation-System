@@ -99,6 +99,23 @@ fn correlate_baseline_and_score(
     Ok(())
 }
 
+/// The policy hash an agent reports in its heartbeat. A missing or `null`
+/// value means "no policy" (the empty-policy hash); anything that is not 64
+/// lowercase hex characters is unusable and recorded as unknown.
+fn reported_policy_hash(event_data: &serde_json::Value) -> Option<String> {
+    match event_data.get("policy_hash") {
+        None | Some(serde_json::Value::Null) => Some(osiris_policy::empty_policy_hash_hex()),
+        Some(v) => v
+            .as_str()
+            .filter(|s| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .map(str::to_string),
+    }
+}
+
 /// Everything a batch of events flows through once it reaches the Server:
 /// storage, detection, baseline, risk, correlation, and the live-stream fan-out.
 /// Shared by the spool tailer and the mTLS Agent listener.
@@ -111,6 +128,9 @@ pub struct IngestContext {
     pub correlation_engine: Arc<CorrelationEngine>,
     pub broadcaster: Arc<osiris_api::LiveEventBroadcaster>,
     pub fleet_registry: Arc<dyn osiris_fleet::HostRegistry>,
+    /// Set once at startup when the command channel is configured; unset means
+    /// heartbeats trigger no policy reconciliation.
+    pub policy_reconciler: Arc<std::sync::OnceLock<Arc<crate::policy_reconcile::PolicyReconciler>>>,
 }
 
 impl IngestContext {
@@ -197,6 +217,14 @@ impl IngestContext {
                 }
                 if !health_events.is_empty() {
                     let fleet_registry = self.fleet_registry.clone();
+                    let heartbeat_hosts: Vec<uuid::Uuid> = {
+                        let mut seen = std::collections::HashSet::new();
+                        health_events
+                            .iter()
+                            .map(|e| e.host_id)
+                            .filter(|h| seen.insert(*h))
+                            .collect()
+                    };
                     // Computed once for the whole batch: an agent's clock is
                     // unbounded, so every timestamp that reaches the registry
                     // is capped at the server's own clock. Without this, a
@@ -235,7 +263,7 @@ impl IngestContext {
                                 cloud_provider: cloud.map(|c| c.provider.clone()),
                                 cloud_instance_id: cloud.and_then(|c| c.instance_id.clone()),
                                 cloud_region: cloud.and_then(|c| c.region.clone()),
-                                applied_policy_hash: None,
+                                applied_policy_hash: reported_policy_hash(&event.event_data),
                             };
                             if let Err(e) = fleet_registry.upsert_heartbeat(row) {
                                 tracing::warn!(host_id = %event.host_id, error = %e, "fleet registry upsert failed");
@@ -245,6 +273,8 @@ impl IngestContext {
                     .await;
                     if let Err(e) = join_result {
                         tracing::error!(error = %e, "fleet registry upsert task panicked or was cancelled");
+                    } else if let Some(reconciler) = self.policy_reconciler.get() {
+                        reconciler.spawn_reconcile(heartbeat_hosts);
                     }
                 }
                 Ok(())
@@ -289,7 +319,19 @@ pub async fn run_ingestion_loop(
         correlation_engine,
         broadcaster,
         fleet_registry,
+        policy_reconciler: Arc::new(std::sync::OnceLock::new()),
     };
+    run_ingestion_context_loop(spool_path, context, poll_interval, cancellation).await;
+}
+
+/// `run_ingestion_loop` with a caller-built context (so the spool path shares
+/// the server's policy reconciler slot).
+pub async fn run_ingestion_context_loop(
+    spool_path: impl Into<std::path::PathBuf>,
+    context: IngestContext,
+    poll_interval: Duration,
+    cancellation: CancellationToken,
+) {
     let mut tailer = LineTailer::new(spool_path);
     loop {
         if cancellation.is_cancelled() {
@@ -467,6 +509,7 @@ mod tests {
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         let host_id = uuid::Uuid::new_v4();
         let server_now = server_now_ns();
@@ -514,6 +557,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_heartbeats_policy_hash_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> =
+            Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage,
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: fleet_registry.clone(),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+        };
+        let host_id = uuid::Uuid::new_v4();
+        let base = server_now_ns() - 10_000_000_000;
+        let empty = osiris_policy::empty_policy_hash_hex();
+        let abab = "ab".repeat(32);
+        let cases: Vec<(serde_json::Value, Option<String>)> = vec![
+            (serde_json::json!(abab), Some(abab.clone())),
+            (serde_json::Value::Null, Some(empty.clone())),
+            (serde_json::json!("not-a-hash"), None),
+            (serde_json::json!("AB".repeat(32)), None),
+            (serde_json::json!(12345), None),
+        ];
+        let mut ts = base;
+        for (value, expected) in cases {
+            ts += 1_000_000_000;
+            let mut event = agent_health_event(host_id, ts);
+            event.event_data["policy_hash"] = value.clone();
+            context.ingest(vec![event]).await.unwrap();
+            assert_eq!(
+                fleet_registry
+                    .get(host_id)
+                    .unwrap()
+                    .unwrap()
+                    .applied_policy_hash,
+                expected,
+                "policy_hash {value}"
+            );
+        }
+        // Field absent entirely means "no policy".
+        ts += 1_000_000_000;
+        context
+            .ingest(vec![agent_health_event(host_id, ts)])
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet_registry
+                .get(host_id)
+                .unwrap()
+                .unwrap()
+                .applied_policy_hash,
+            Some(empty)
+        );
+    }
+
+    #[tokio::test]
     async fn ingesting_an_agent_health_event_upserts_the_fleet_registry() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> =
@@ -530,6 +634,7 @@ mod tests {
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         let host_id = uuid::Uuid::new_v4();
 
@@ -566,6 +671,7 @@ mod tests {
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         let host_id = uuid::Uuid::new_v4();
         let mut bad = agent_health_event(host_id, 1_000);
@@ -609,6 +715,7 @@ mod tests {
             correlation_engine,
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         // `sample_event()` (this file's existing test-only helper, defined
         // above at the top of this test module) builds a plain ProcessExec
@@ -690,6 +797,7 @@ mod tests {
             fleet_registry: Arc::new(
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         let tls = osiris_transport::tls::server_config(
             &dir.path().join("server.pem"),
@@ -779,6 +887,7 @@ mod tests {
             fleet_registry: Arc::new(
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         };
         let a = sample_event();
         context.ingest(vec![a.clone()]).await.unwrap();

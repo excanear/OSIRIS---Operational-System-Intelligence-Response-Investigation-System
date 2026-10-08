@@ -3,10 +3,11 @@ pub mod config;
 pub mod control;
 pub mod cors;
 pub mod ingest;
+pub mod policy_reconcile;
 
 pub use config::{ApiTlsConfig, ConfigError, ServerConfig};
 pub use cors::apply_dev_cors;
-pub use ingest::{run_ingestion_loop, IngestContext};
+pub use ingest::{run_ingestion_context_loop, run_ingestion_loop, IngestContext};
 
 /// Resolves on ctrl-c or (unix) SIGTERM.
 pub async fn shutdown_signal() {

@@ -18,7 +18,7 @@ use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
 use osiris_evidence::{SqliteEvidenceIncidentLinks, SqliteEvidenceStore, SqliteIncidentStore};
 use osiris_risk::RiskEngine;
-use osiris_server::{run_ingestion_loop, ServerConfig};
+use osiris_server::{run_ingestion_context_loop, ServerConfig};
 use osiris_storage::Storage;
 use osiris_storage_sqlite::SqliteStorage;
 use tokio_util::sync::CancellationToken;
@@ -147,8 +147,10 @@ async fn main() {
     let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
     let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db.clone();
     let policy_store: Arc<dyn osiris_fleet::PolicyStore> = fleet_db;
+    // Filled once the command channel and tenant store exist (below); unset
+    // means heartbeats trigger no policy reconciliation.
+    let policy_reconciler_slot = Arc::new(std::sync::OnceLock::new());
 
-    let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
     let ingest_context = osiris_server::IngestContext {
         storage: storage.clone(),
@@ -158,16 +160,11 @@ async fn main() {
         correlation_engine: correlation_engine.clone(),
         broadcaster: live_event_broadcaster.clone(),
         fleet_registry: fleet_registry.clone(),
+        policy_reconciler: policy_reconciler_slot.clone(),
     };
-    tokio::spawn(run_ingestion_loop(
+    tokio::spawn(run_ingestion_context_loop(
         spool_path,
-        ingest_storage,
-        detection_engine,
-        baseline_engine,
-        risk_engine,
-        correlation_engine,
-        live_event_broadcaster.clone(),
-        fleet_registry.clone(),
+        ingest_context.clone(),
         Duration::from_millis(200),
         cancellation.clone(),
     ));
@@ -369,7 +366,7 @@ async fn main() {
     };
 
     let response_state = ResponseState {
-        commands: command_dispatcher,
+        commands: command_dispatcher.clone(),
         storage: storage.clone(),
         evidence: incident_evidence_state.evidence.clone(),
         links: incident_evidence_state.links.clone(),
@@ -411,9 +408,16 @@ async fn main() {
         tenants: tenant_store.clone(),
     };
 
-    // No control channel yet (Task 7 wires the reconciler): nothing is pushed.
-    let policy_notifier: Arc<dyn osiris_api::PolicyNotifier> =
-        Arc::new(osiris_api::NoopPolicyNotifier);
+    // Pushes only when the command channel is configured; otherwise every host
+    // reads UNMANAGED and nothing is sent.
+    let policy_reconciler = osiris_server::policy_reconcile::PolicyReconciler::new(
+        fleet_registry.clone(),
+        policy_store.clone(),
+        tenant_store.clone(),
+        config.control.is_some().then(|| command_dispatcher.clone()),
+    );
+    let _ = policy_reconciler_slot.set(policy_reconciler.clone());
+    let policy_notifier: Arc<dyn osiris_api::PolicyNotifier> = policy_reconciler;
     let app = osiris_server::apply_dev_cors(
         build_router(storage)
             .merge(build_incident_evidence_router(incident_evidence_state))

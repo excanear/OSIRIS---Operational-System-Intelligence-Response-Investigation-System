@@ -38,6 +38,7 @@ osiris-command = { path = "../osiris-command" }
 osiris-response = { path = "../osiris-response" }
 osiris-fleet = { path = "../osiris-fleet" }
 osiris-health = { path = "../osiris-health" }
+osiris-policy = { path = "../osiris-policy" }
 rand = { workspace = true }
 async-trait = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -46,6 +47,7 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 tokio-tungstenite = { workspace = true }
