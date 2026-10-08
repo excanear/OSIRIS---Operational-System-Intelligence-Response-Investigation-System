@@ -11,6 +11,7 @@ import {
 import { ApiError } from "../../api/client";
 import { useAuthStore } from "../../store/authStore";
 import { groupErrorMessage } from "./groupErrors";
+import { GroupPolicyEditor } from "./GroupPolicyEditor";
 
 export function GroupDetail() {
   const { groupId = "" } = useParams();
@@ -167,6 +168,7 @@ export function GroupDetail() {
           </button>
         </form>
       )}
+      <GroupPolicyEditor groupId={g.group_id} memberCount={g.member_count} />
     </div>
   );
 }

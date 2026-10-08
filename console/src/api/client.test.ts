@@ -6,11 +6,14 @@ import {
   createGroup,
   createIncident,
   deleteGroup,
+  deleteGroupPolicy,
   fetchAlerts,
   fetchAllEvidence,
   fetchContainers,
   fetchContainerStory,
   fetchEvents,
+  fetchGroupPolicy,
+  fetchHostPolicy,
   fetchEvidence,
   fetchFiles,
   fetchFileStory,
@@ -26,6 +29,7 @@ import {
   fetchSubgraph,
   fetchSystemStory,
   patchIncidentStatus,
+  putGroupPolicy,
   removeGroupMember,
 } from "./client";
 import { useAuthStore } from "../store/authStore";
@@ -437,6 +441,31 @@ describe("api client", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/members/h", { method: "PUT" });
     await removeGroupMember("g", "h");
     expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/members/h", { method: "DELETE" });
+  });
+
+  it("putGroupPolicy PUTs the policy as JSON", async () => {
+    const policy = { telemetry_level: "STANDARD" as const, sensors: { network: false }, priority: 1 };
+    vi.mocked(fetch).mockImplementation(async () => Response.json({ policy }));
+    await expect(putGroupPolicy("g", policy)).resolves.toEqual({ policy });
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/policy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(policy),
+    });
+  });
+
+  it("deleteGroupPolicy DELETEs and resolves undefined on 204", async () => {
+    vi.mocked(fetch).mockImplementation(async () => new Response(null, { status: 204 }));
+    await expect(deleteGroupPolicy("g")).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/policy", { method: "DELETE" });
+  });
+
+  it("fetchGroupPolicy and fetchHostPolicy GET their routes", async () => {
+    vi.mocked(fetch).mockImplementation(async () => Response.json({ policy: null }));
+    await fetchGroupPolicy("g");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/groups/g/policy");
+    await fetchHostPolicy("h");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/hosts/h/policy");
   });
 
   it("a 409 rejects with an ApiError carrying the status", async () => {

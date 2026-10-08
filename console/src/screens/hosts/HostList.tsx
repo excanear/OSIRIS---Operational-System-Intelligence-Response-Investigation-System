@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useHosts } from "../../api/hooks";
 import type { HostSummary } from "../../api/types";
+import { HostPolicyPanel } from "./HostPolicyPanel";
 
 // GET /api/v1/hosts (hosts_handler in crates/osiris-api/src/fleet.rs, Phase
 // 9d-1) reads the real fleet registry (osiris-fleet's HostRegistry) instead
@@ -22,6 +24,7 @@ export function HostList() {
   const groupFilter = params.get("group") ?? undefined;
   const hosts = useHosts(groupFilter);
   const rows = hosts.data ?? [];
+  const [policyHost, setPolicyHost] = useState<string | null>(null);
   const filterName = groupFilter
     ? (rows.flatMap((r) => r.groups).find((g) => g.group_id === groupFilter)?.name ?? groupFilter)
     : undefined;
@@ -52,6 +55,7 @@ export function HostList() {
               <th>Status</th>
               <th>Cloud</th>
               <th>Groups</th>
+              <th>Policy</th>
             </tr>
           </thead>
           <tbody>
@@ -75,11 +79,20 @@ export function HostList() {
                     </span>
                   ))}
                 </td>
+                <td>
+                  <button
+                    type="button"
+                    onClick={() => setPolicyHost(policyHost === row.host_id ? null : row.host_id)}
+                  >
+                    {row.policy_status}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+      {policyHost && <HostPolicyPanel hostId={policyHost} />}
     </div>
   );
 }

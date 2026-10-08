@@ -40,6 +40,7 @@ const host = (host_id: string, hostname: string) => ({
   cloud_instance_id: null,
   cloud_region: null,
   groups: [],
+  policy_status: "IN_SYNC",
 });
 
 function setup(role: "ADMIN" | "VIEWER" = "ADMIN", groupResult = query({ data: detail })) {
@@ -51,6 +52,9 @@ function setup(role: "ADMIN" | "VIEWER" = "ADMIN", groupResult = query({ data: d
   vi.mocked(hooks.useDeleteGroup).mockReturnValue(m.del as never);
   vi.mocked(hooks.useAddGroupMember).mockReturnValue(m.add as never);
   vi.mocked(hooks.useRemoveGroupMember).mockReturnValue(m.remove as never);
+  vi.mocked(hooks.useGroupPolicy).mockReturnValue(query({ data: { policy: null } }));
+  vi.mocked(hooks.useSaveGroupPolicy).mockReturnValue(mutation() as never);
+  vi.mocked(hooks.useClearGroupPolicy).mockReturnValue(mutation() as never);
   render(
     <MemoryRouter initialEntries={["/groups/g1"]}>
       <Routes>
@@ -111,6 +115,12 @@ describe("GroupDetail", () => {
     expect(m.del.reset).toHaveBeenCalled();
     expect(m.rename.reset).toHaveBeenCalled();
     expect(m.remove.reset).not.toHaveBeenCalled();
+  });
+
+  it("mounts the group policy section below the members", () => {
+    setup();
+    expect(screen.getByRole("heading", { name: "Policy" })).toBeInTheDocument();
+    expect(hooks.useGroupPolicy).toHaveBeenCalledWith("g1");
   });
 
   it("is read-only for non-Admins", () => {

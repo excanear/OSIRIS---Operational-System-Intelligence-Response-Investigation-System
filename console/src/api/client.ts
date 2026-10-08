@@ -10,7 +10,9 @@ import type {
   EvidenceWithIncidents,
   FileSummary,
   GroupDetail,
+  GroupPolicy,
   HostGroup,
+  HostPolicyView,
   HostSummary,
   Incident,
   IncidentStatus,
@@ -96,8 +98,8 @@ function apiPatch<T>(path: string, body: unknown): Promise<T> {
   return request<T>("PATCH", path, body);
 }
 
-function apiPut<T>(path: string): Promise<T> {
-  return request<T>("PUT", path);
+function apiPut<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>("PUT", path, body);
 }
 
 function apiDelete<T>(path: string): Promise<T> {
@@ -209,6 +211,28 @@ export function removeGroupMember(groupId: string, hostId: string): Promise<void
   return apiDelete<void>(
     `/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(hostId)}`
   );
+}
+
+export function fetchGroupPolicy(groupId: string): Promise<{ policy: GroupPolicy | null }> {
+  return apiGet<{ policy: GroupPolicy | null }>(`/groups/${encodeURIComponent(groupId)}/policy`);
+}
+
+export function putGroupPolicy(
+  groupId: string,
+  policy: GroupPolicy
+): Promise<{ policy: GroupPolicy | null }> {
+  return apiPut<{ policy: GroupPolicy | null }>(
+    `/groups/${encodeURIComponent(groupId)}/policy`,
+    policy
+  );
+}
+
+export function deleteGroupPolicy(groupId: string): Promise<void> {
+  return apiDelete<void>(`/groups/${encodeURIComponent(groupId)}/policy`);
+}
+
+export function fetchHostPolicy(hostId: string): Promise<HostPolicyView> {
+  return apiGet<HostPolicyView>(`/hosts/${encodeURIComponent(hostId)}/policy`);
 }
 
 export function fetchFileStory(fileId: string): Promise<Story> {

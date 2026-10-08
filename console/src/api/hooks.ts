@@ -6,6 +6,7 @@ import {
   createGroup,
   createIncident,
   deleteGroup,
+  deleteGroupPolicy,
   fetchAlerts,
   fetchAllEvidence,
   fetchContainers,
@@ -15,7 +16,9 @@ import {
   fetchFiles,
   fetchFileStory,
   fetchGroup,
+  fetchGroupPolicy,
   fetchGroups,
+  fetchHostPolicy,
   fetchHealth,
   fetchHosts,
   fetchIncident,
@@ -29,11 +32,12 @@ import {
   fetchSystemStory,
   login,
   patchIncidentStatus,
+  putGroupPolicy,
   removeGroupMember,
   renameGroup,
 } from "./client";
 import { useAuthStore } from "../store/authStore";
-import type { CreateEvidenceBody, EntityRef, IncidentStatus } from "./types";
+import type { CreateEvidenceBody, EntityRef, GroupPolicy, IncidentStatus } from "./types";
 
 export function useHealth() {
   return useQuery({
@@ -190,6 +194,47 @@ export function useRemoveGroupMember(groupId: string) {
   return useMutation({
     mutationFn: (hostId: string) => removeGroupMember(groupId, hostId),
     onSuccess: () => invalidate(groupId),
+  });
+}
+
+export function useGroupPolicy(groupId: string) {
+  return useQuery({
+    queryKey: ["group-policy", groupId],
+    queryFn: () => fetchGroupPolicy(groupId),
+    enabled: groupId.length > 0,
+  });
+}
+
+function useInvalidatePolicy(groupId: string) {
+  const queryClient = useQueryClient();
+  return () => {
+    queryClient.invalidateQueries({ queryKey: ["group-policy", groupId] });
+    queryClient.invalidateQueries({ queryKey: ["hosts"] });
+    queryClient.invalidateQueries({ queryKey: ["host-policy"] });
+  };
+}
+
+export function useSaveGroupPolicy(groupId: string) {
+  const invalidate = useInvalidatePolicy(groupId);
+  return useMutation({
+    mutationFn: (policy: GroupPolicy) => putGroupPolicy(groupId, policy),
+    onSuccess: invalidate,
+  });
+}
+
+export function useClearGroupPolicy(groupId: string) {
+  const invalidate = useInvalidatePolicy(groupId);
+  return useMutation({
+    mutationFn: () => deleteGroupPolicy(groupId),
+    onSuccess: invalidate,
+  });
+}
+
+export function useHostPolicy(hostId: string) {
+  return useQuery({
+    queryKey: ["host-policy", hostId],
+    queryFn: () => fetchHostPolicy(hostId),
+    enabled: hostId.length > 0,
   });
 }
 

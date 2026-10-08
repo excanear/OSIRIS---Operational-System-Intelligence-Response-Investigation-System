@@ -94,6 +94,7 @@ export interface HostSummary {
   cloud_instance_id: string | null;
   cloud_region: string | null;
   groups: GroupRef[];
+  policy_status: PolicyStatus;
 }
 
 export interface GroupRef {
@@ -232,4 +233,49 @@ export interface LoginResponse {
   expires_at: number;
   tenant_id?: string | null;
   tenant_name?: string | null;
+}
+
+export type TelemetryLevel = "MINIMAL" | "STANDARD" | "DETAILED" | "FORENSIC";
+
+export const KNOWN_SENSORS = [
+  "container",
+  "filesystem",
+  "identity",
+  "network",
+  "persistence",
+  "process_exec",
+  "systemd",
+] as const;
+
+export interface GroupPolicy {
+  telemetry_level?: TelemetryLevel | null;
+  sensors: Record<string, boolean>;
+  heartbeat_interval_secs?: number | null;
+  priority: number;
+}
+
+export type PolicyStatus = "IN_SYNC" | "PENDING" | "FAILED" | "UNMANAGED";
+
+export interface PolicySource {
+  tier: "PLATFORM" | "TENANT";
+  group_id?: string;
+  group_name?: string | null;
+}
+
+export interface HostPolicyView {
+  host_id: string;
+  effective: {
+    telemetry_level: TelemetryLevel | null;
+    sensors: Record<string, boolean>;
+    heartbeat_interval_secs: number | null;
+  };
+  sources: {
+    telemetry_level?: PolicySource | null;
+    sensors: Record<string, PolicySource>;
+    heartbeat_interval_secs?: PolicySource | null;
+  };
+  desired_hash: string;
+  applied_hash: string | null;
+  status: PolicyStatus;
+  last_delivery: { sent_at: number; result: string; error: string | null } | null;
 }
