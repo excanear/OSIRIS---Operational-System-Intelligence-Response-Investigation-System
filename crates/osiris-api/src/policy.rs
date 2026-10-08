@@ -123,11 +123,21 @@ fn audit_with_why(
     });
 }
 
-async fn notify_group_members(state: &PolicyState, group_id: Uuid) -> Result<(), ApiError> {
+/// Best effort: the change is already stored and audited, so a failed member
+/// lookup is logged, not returned. The members converge on their next heartbeat.
+async fn notify_group_members(state: &PolicyState, group_id: Uuid) {
     let policies = state.policies.clone();
-    let hosts = blocking(move || policies.hosts_of_group_raw(group_id)).await?;
-    state.notifier.hosts_changed(hosts);
-    Ok(())
+    match tokio::task::spawn_blocking(move || policies.hosts_of_group_raw(group_id)).await {
+        Ok(Ok(hosts)) => state.notifier.hosts_changed(hosts),
+        Ok(Err(e)) => tracing::error!(
+            %group_id, error = %e,
+            "cannot list group members to push the policy change; they converge on their next heartbeat"
+        ),
+        Err(e) => tracing::error!(
+            %group_id, error = %e,
+            "group member lookup task failed; members converge on their next heartbeat"
+        ),
+    }
 }
 
 async fn get_group_policy(
@@ -164,7 +174,7 @@ async fn put_group_policy(
         format!("group:{group_id}"),
         serde_json::to_string(&policy).ok(),
     );
-    notify_group_members(&state, group_id).await?;
+    notify_group_members(&state, group_id).await;
     Ok(Json(json!({ "policy": policy })))
 }
 
@@ -183,7 +193,7 @@ async fn delete_group_policy(
         format!("group:{group_id}"),
         None,
     );
-    notify_group_members(&state, group_id).await?;
+    notify_group_members(&state, group_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -457,6 +467,99 @@ mod tests {
             .map(|e| e.what)
             .collect();
         assert_eq!(whats, vec!["group_policy_set", "group_policy_clear"]);
+    }
+
+    /// Delegates to the real store but cannot list a group's members.
+    struct NoMemberLookup(Arc<SqliteHostRegistry>);
+    impl PolicyStore for NoMemberLookup {
+        fn get_policy(
+            &self,
+            scope: &GroupScope,
+            group_id: Uuid,
+        ) -> Result<Option<GroupPolicy>, GroupError> {
+            self.0.get_policy(scope, group_id)
+        }
+        fn set_policy(
+            &self,
+            scope: &GroupScope,
+            group_id: Uuid,
+            policy: &GroupPolicy,
+            updated_by: &str,
+        ) -> Result<(), GroupError> {
+            self.0.set_policy(scope, group_id, policy, updated_by)
+        }
+        fn clear_policy(&self, scope: &GroupScope, group_id: Uuid) -> Result<(), GroupError> {
+            self.0.clear_policy(scope, group_id)
+        }
+        fn policies_for_host(
+            &self,
+            host_id: Uuid,
+        ) -> Result<Vec<osiris_policy::GroupPolicyInput>, GroupError> {
+            self.0.policies_for_host(host_id)
+        }
+        fn all_host_policies(
+            &self,
+        ) -> Result<HashMap<Uuid, Vec<osiris_policy::GroupPolicyInput>>, GroupError> {
+            self.0.all_host_policies()
+        }
+        fn hosts_of_group_raw(&self, _group_id: Uuid) -> Result<Vec<Uuid>, GroupError> {
+            Err(GroupError::Backend("disk I/O error".into()))
+        }
+        fn record_delivery(&self, row: &DeliveryRow) -> Result<(), GroupError> {
+            self.0.record_delivery(row)
+        }
+        fn delivery(&self, host_id: Uuid) -> Result<Option<DeliveryRow>, GroupError> {
+            self.0.delivery(host_id)
+        }
+        fn all_deliveries(&self) -> Result<HashMap<Uuid, DeliveryRow>, GroupError> {
+            self.0.all_deliveries()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_member_lookup_after_a_committed_change_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let notes = Arc::new(Recorder(Default::default(), true));
+        let f = Fx {
+            state: PolicyState {
+                groups: db.clone(),
+                policies: Arc::new(NoMemberLookup(db.clone())),
+                registry: db.clone(),
+                tenants: Arc::new(
+                    osiris_tenancy::SqliteTenantStore::open(dir.path().join("tenants.db")).unwrap(),
+                ),
+                audit_log: Arc::new(
+                    osiris_audit::FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap(),
+                ),
+                notifier: notes.clone(),
+            },
+            notes,
+            _dir: dir,
+        };
+        let admin = ctx(None);
+        let g = db.create(&GroupScope::Platform, None, "g").unwrap();
+        let Json(v) = put(
+            &f,
+            &admin,
+            g.group_id,
+            json!({"telemetry_level": "MINIMAL"}),
+        )
+        .await
+        .expect("stored and audited, so the PUT succeeds");
+        assert_eq!(v["policy"]["telemetry_level"], "MINIMAL");
+        assert_eq!(
+            delete_group_policy(
+                Extension(admin.clone()),
+                State(f.state.clone()),
+                Path(g.group_id)
+            )
+            .await
+            .expect("cleared and audited, so the DELETE succeeds"),
+            StatusCode::NO_CONTENT
+        );
+        assert!(f.notes.0.lock().unwrap().is_empty());
+        assert_eq!(f.state.audit_log.read_all().unwrap().len(), 2);
     }
 
     #[tokio::test]
