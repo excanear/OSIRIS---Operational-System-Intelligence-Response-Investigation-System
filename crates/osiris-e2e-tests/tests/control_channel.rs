@@ -26,10 +26,11 @@ use osiris_storage_sqlite::SqliteStorage;
 use osiris_transport::control::{
     run_control_client, ControlClientConfig, ControlHub, ControlListener,
 };
-use osiris_transport::pki::{generate_ca, issue_agent, issue_server, write_issued};
 use osiris_transport::tls;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod common;
 
 /// Wraps a `FakeExecutor` and gives quarantine a fixed vault id, so restore can
 /// be driven from the first response.
@@ -147,19 +148,7 @@ impl Harness {
         let cancel = CancellationToken::new();
 
         // PKI.
-        let pki = dir.path().join("pki");
-        std::fs::create_dir_all(&pki).unwrap();
-        let ca = generate_ca("e2e-ca").unwrap();
-        write_issued(&pki, "ca", &ca).unwrap();
-        let server = issue_server(
-            &ca.cert_pem,
-            &ca.key_pem,
-            &["localhost".into(), "127.0.0.1".into()],
-        )
-        .unwrap();
-        write_issued(&pki, "server", &server).unwrap();
-        let agent = issue_agent(&ca.cert_pem, &ca.key_pem, host).unwrap();
-        write_issued(&pki, "agent", &agent).unwrap();
+        let pki = common::write_control_pki(dir.path(), host);
 
         // Control listener + hub.
         let hub = ControlHub::new();

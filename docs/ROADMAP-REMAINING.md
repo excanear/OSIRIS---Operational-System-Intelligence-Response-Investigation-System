@@ -31,8 +31,10 @@ revisão final independente → merge → push.
   listagem derivada de uma janela de eventos.
 - Hoje (9d-2 entregue): grupos de hosts (API `/api/v1/groups`, CLI, Console, filtro `?group=`
   em `/api/v1/hosts`).
-- Entregar (9d-3): distribuição de política (nível de telemetria/config de sensores) a grupos
-  via 9c.
+- Hoje (9d-3 entregue): distribuição de política (nível de telemetria, sensores ligados/desligados,
+  intervalo de heartbeat) a grupos via comandos `ApplyPolicy` assinados sobre o canal 9c; o Agente
+  persiste o overlay e reporta o hash no heartbeat (status `IN_SYNC|PENDING|FAILED|UNMANAGED`).
+  Ver `docs/operators-fleet-policy.md`. Com isso o Fleet Manager (§21.2) está completo.
 
 ## Fase 10 — Validação em Linux real
 - Rodar agente + sensores em VM/container Linux reais (Ubuntu 22.04, Debian 12, RHEL 8-like).

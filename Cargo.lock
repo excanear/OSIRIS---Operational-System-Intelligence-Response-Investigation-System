@@ -1493,6 +1493,7 @@ dependencies = [
  "osiris-investigate",
  "osiris-pipeline",
  "osiris-query",
+ "osiris-response",
  "osiris-risk",
  "osiris-schema",
  "osiris-sensor-api",
