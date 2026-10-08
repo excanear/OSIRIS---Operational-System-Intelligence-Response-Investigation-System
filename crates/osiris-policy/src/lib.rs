@@ -486,6 +486,31 @@ mod tests {
         assert!(!p.is_empty());
     }
 
+    /// Known-answer vectors pinning the spec §3.5 wire format. Agents and
+    /// servers are deployed separately, so these must never change: a new
+    /// encoding needs a new domain tag. Derived independently of this crate
+    /// (SHA-256 over the §3.5 bytes, built by hand).
+    #[test]
+    fn hash_matches_the_golden_vectors() {
+        assert_eq!(
+            empty_policy_hash_hex(),
+            "82bc62e7947525f434da5a10e137d23fd6e4b9191d71d5005ee42aa1875f3d15"
+        );
+        // Level FORENSIC (4); sensors in name order: network=false,
+        // process_exec=true; heartbeat 30.
+        let mut p = EffectivePolicy {
+            telemetry_level: Some(TelemetryLevel::Forensic),
+            heartbeat_interval_secs: Some(30),
+            ..Default::default()
+        };
+        p.sensors.insert("process_exec".into(), true);
+        p.sensors.insert("network".into(), false);
+        assert_eq!(
+            p.hash_hex(),
+            "f9ae099a3831675a8a9bb517451c3c6e5bacd8be5221db713356055f23ce9933"
+        );
+    }
+
     #[test]
     fn level_serializes_screaming_snake_case() {
         assert_eq!(
