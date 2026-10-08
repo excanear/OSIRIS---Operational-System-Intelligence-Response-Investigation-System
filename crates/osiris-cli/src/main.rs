@@ -112,6 +112,11 @@ enum Command {
         #[command(subcommand)]
         action: GroupsAction,
     },
+    /// Host inspection (Phase 9d-3).
+    Hosts {
+        #[command(subcommand)]
+        action: HostsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -302,6 +307,73 @@ enum GroupsAction {
     AddHost { group_id: String, host_id: String },
     /// Remove a host from a group.
     RemoveHost { group_id: String, host_id: String },
+    /// Group telemetry policy (Phase 9d-3).
+    Policy {
+        #[command(subcommand)]
+        action: GroupPolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupPolicyAction {
+    /// Show a group's policy.
+    Show { group_id: String },
+    /// Replace a group's policy: flags not given are unset.
+    Set {
+        group_id: String,
+        /// minimal|standard|detailed|forensic
+        #[arg(long)]
+        level: Option<String>,
+        /// NAME=on|off, repeatable
+        #[arg(long)]
+        sensor: Vec<String>,
+        #[arg(long)]
+        heartbeat: Option<u64>,
+        #[arg(long)]
+        priority: Option<i32>,
+    },
+    /// Remove a group's policy.
+    Clear { group_id: String },
+}
+
+#[derive(Subcommand)]
+enum HostsAction {
+    /// Show a host's effective policy and sync status.
+    Policy { host_id: String },
+}
+
+/// `set` replaces the whole policy: flags not given are unset.
+fn policy_body(
+    level: Option<&str>,
+    sensors: &[String],
+    heartbeat: Option<u64>,
+    priority: Option<i32>,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({ "sensors": {}, "priority": priority.unwrap_or(0) });
+    if let Some(l) = level {
+        let l = l.to_ascii_lowercase();
+        if !["minimal", "standard", "detailed", "forensic"].contains(&l.as_str()) {
+            return Err(format!(
+                "unknown level: {l} (minimal|standard|detailed|forensic)"
+            ));
+        }
+        body["telemetry_level"] = serde_json::Value::String(l.to_ascii_uppercase());
+    }
+    for s in sensors {
+        let (name, state) = s
+            .split_once('=')
+            .ok_or_else(|| format!("--sensor expects NAME=on|off, got {s}"))?;
+        let enabled = match state {
+            "on" => true,
+            "off" => false,
+            _ => return Err(format!("--sensor expects NAME=on|off, got {s}")),
+        };
+        body["sensors"][name] = serde_json::Value::Bool(enabled);
+    }
+    if let Some(h) = heartbeat {
+        body["heartbeat_interval_secs"] = serde_json::json!(h);
+    }
+    Ok(body)
 }
 
 #[derive(Subcommand)]
@@ -406,6 +478,15 @@ fn patch_json(
     attach_token: bool,
 ) -> Result<String, String> {
     send_json(client.patch(url).json(&body), attach_token)
+}
+
+fn put_json(
+    client: &reqwest::blocking::Client,
+    url: String,
+    body: serde_json::Value,
+    attach_token: bool,
+) -> Result<String, String> {
+    send_json(client.put(url).json(&body), attach_token)
 }
 
 fn send_empty(
@@ -706,6 +787,39 @@ fn main() {
                     ),
                     true,
                 ),
+                GroupsAction::Policy { action } => match action {
+                    GroupPolicyAction::Show { group_id } => {
+                        get(&client, format!("{}/policy", group_url(group_id)), true)
+                    }
+                    GroupPolicyAction::Set {
+                        group_id,
+                        level,
+                        sensor,
+                        heartbeat,
+                        priority,
+                    } => match policy_body(level.as_deref(), sensor, *heartbeat, *priority) {
+                        Ok(body) => put_json(
+                            &client,
+                            format!("{}/policy", group_url(group_id)),
+                            body,
+                            true,
+                        ),
+                        Err(e) => Err(e),
+                    },
+                    GroupPolicyAction::Clear { group_id } => {
+                        delete_empty(&client, format!("{}/policy", group_url(group_id)), true)
+                    }
+                },
+            }
+        }
+        Command::Hosts { action } => {
+            let base = cli.server.trim_end_matches('/').to_string();
+            match action {
+                HostsAction::Policy { host_id } => get(
+                    &client,
+                    format!("{base}/api/v1/hosts/{}/policy", percent_encode(host_id)),
+                    true,
+                ),
             }
         }
     };
@@ -823,5 +937,95 @@ mod groups_cli_tests {
                 action: GroupsAction::RemoveHost { .. }
             }
         ));
+    }
+
+    #[test]
+    fn policy_subcommands_parse() {
+        match parse(&[
+            "groups",
+            "policy",
+            "set",
+            "g",
+            "--level",
+            "minimal",
+            "--sensor",
+            "network=off",
+            "--sensor",
+            "filesystem=on",
+            "--heartbeat",
+            "30",
+            "--priority",
+            "5",
+        ])
+        .command
+        {
+            Command::Groups {
+                action:
+                    GroupsAction::Policy {
+                        action:
+                            GroupPolicyAction::Set {
+                                group_id,
+                                level,
+                                sensor,
+                                heartbeat,
+                                priority,
+                            },
+                    },
+            } => {
+                assert_eq!(group_id, "g");
+                assert_eq!(level.as_deref(), Some("minimal"));
+                assert_eq!(
+                    sensor,
+                    vec!["network=off".to_string(), "filesystem=on".to_string()]
+                );
+                assert_eq!(heartbeat, Some(30));
+                assert_eq!(priority, Some(5));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(matches!(
+            parse(&["groups", "policy", "show", "g"]).command,
+            Command::Groups {
+                action: GroupsAction::Policy {
+                    action: GroupPolicyAction::Show { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            parse(&["groups", "policy", "clear", "g"]).command,
+            Command::Groups {
+                action: GroupsAction::Policy {
+                    action: GroupPolicyAction::Clear { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            parse(&["hosts", "policy", "h"]).command,
+            Command::Hosts {
+                action: HostsAction::Policy { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn policy_body_is_built_from_flags() {
+        let body = policy_body(
+            Some("detailed"),
+            &["network=off".into(), "filesystem=on".into()],
+            Some(30),
+            Some(5),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"telemetry_level":"DETAILED","sensors":{"network":false,"filesystem":true},"heartbeat_interval_secs":30,"priority":5})
+        );
+        assert_eq!(
+            policy_body(None, &[], None, None).unwrap(),
+            serde_json::json!({"sensors":{},"priority":0})
+        );
+        assert!(policy_body(Some("loud"), &[], None, None).is_err());
+        assert!(policy_body(None, &["network".into()], None, None).is_err());
+        assert!(policy_body(None, &["network=maybe".into()], None, None).is_err());
     }
 }
