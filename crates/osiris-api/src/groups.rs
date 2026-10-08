@@ -29,6 +29,7 @@ pub struct GroupsState {
     pub registry: Arc<dyn HostRegistry>,
     pub tenants: Arc<dyn TenantStore>,
     pub audit_log: Arc<dyn AuditLog + Send + Sync>,
+    pub notifier: Arc<dyn crate::policy::PolicyNotifier>,
 }
 
 pub fn build_groups_router(state: GroupsState) -> Router {
@@ -45,7 +46,7 @@ pub fn build_groups_router(state: GroupsState) -> Router {
         .with_state(state)
 }
 
-fn scope_of(ctx: &AuthContext) -> GroupScope {
+pub(crate) fn scope_of(ctx: &AuthContext) -> GroupScope {
     match ctx.tenant_id {
         Some(t) => GroupScope::Tenant(t),
         None => GroupScope::Platform,
@@ -60,7 +61,7 @@ pub(crate) fn internal(cause: String) -> ApiError {
     )
 }
 
-fn group_error(e: GroupError) -> ApiError {
+pub(crate) fn group_error(e: GroupError) -> ApiError {
     match e {
         GroupError::InvalidName(m) | GroupError::InvalidPolicy(m) => (StatusCode::BAD_REQUEST, m),
         GroupError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
@@ -263,8 +264,16 @@ async fn delete_group(
 ) -> Result<StatusCode, ApiError> {
     let scope = scope_of(&ctx);
     let store = state.groups.clone();
-    run(move || store.delete(&scope, group_id)).await?;
+    // Deleting a group drops its policy from its members' effective policy,
+    // so capture them first (the scoped read also 404s a foreign group).
+    let members = run(move || {
+        let members = store.members(&scope, group_id)?;
+        store.delete(&scope, group_id)?;
+        Ok(members)
+    })
+    .await?;
     audit(&state, &ctx, "group_delete", format!("group:{group_id}"));
+    state.notifier.hosts_changed(members);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -292,6 +301,7 @@ async fn add_member(
         "group_member_add",
         format!("group:{group_id}/host:{host_id}"),
     );
+    state.notifier.hosts_changed(vec![host_id]);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -309,6 +319,7 @@ async fn remove_member(
         "group_member_remove",
         format!("group:{group_id}/host:{host_id}"),
     );
+    state.notifier.hosts_changed(vec![host_id]);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -320,21 +331,38 @@ mod tests {
     use osiris_health::HealthState;
     use osiris_tenancy::SqliteTenantStore;
 
+    struct Recorder(std::sync::Mutex<Vec<Uuid>>);
+    impl crate::policy::PolicyNotifier for Recorder {
+        fn hosts_changed(&self, hosts: Vec<Uuid>) {
+            self.0.lock().unwrap().extend(hosts);
+        }
+        fn managed(&self) -> bool {
+            true
+        }
+    }
+
     struct Fx {
         _dir: tempfile::TempDir,
         state: GroupsState,
+        recorder: Arc<Recorder>,
     }
 
     fn fx() -> Fx {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
+        let recorder = Arc::new(Recorder(Default::default()));
         let state = GroupsState {
             groups: db.clone(),
             registry: db,
             tenants: Arc::new(SqliteTenantStore::open(dir.path().join("tenants.db")).unwrap()),
             audit_log: Arc::new(FileAuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+            notifier: recorder.clone(),
         };
-        Fx { _dir: dir, state }
+        Fx {
+            _dir: dir,
+            state,
+            recorder,
+        }
     }
 
     fn host(state: &GroupsState, name: &str) -> Uuid {
@@ -384,6 +412,43 @@ mod tests {
         )
         .await
         .map(|(_, Json(g))| g)
+    }
+
+    #[tokio::test]
+    async fn member_add_remove_and_group_delete_notify_the_affected_hosts() {
+        let f = fx();
+        let admin = ctx(None);
+        let h = host(&f.state, "h");
+        let g = create(&f.state, &admin, "g", None).await.unwrap();
+        add_member(
+            Extension(admin.clone()),
+            State(f.state.clone()),
+            Path((g.group_id, h)),
+        )
+        .await
+        .unwrap();
+        remove_member(
+            Extension(admin.clone()),
+            State(f.state.clone()),
+            Path((g.group_id, h)),
+        )
+        .await
+        .unwrap();
+        add_member(
+            Extension(admin.clone()),
+            State(f.state.clone()),
+            Path((g.group_id, h)),
+        )
+        .await
+        .unwrap();
+        delete_group(
+            Extension(admin.clone()),
+            State(f.state.clone()),
+            Path(g.group_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*f.recorder.0.lock().unwrap(), vec![h, h, h, h]);
     }
 
     #[tokio::test]

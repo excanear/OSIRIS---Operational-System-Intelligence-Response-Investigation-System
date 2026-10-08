@@ -80,10 +80,13 @@ fn harness() -> Harness {
     };
 
     let fleet_db = Arc::new(osiris_fleet::SqliteHostRegistry::open(p("hosts.db")).unwrap());
+    let notifier: Arc<dyn osiris_api::PolicyNotifier> = Arc::new(osiris_api::NoopPolicyNotifier);
     let fleet_state = FleetState {
         registry: fleet_db.clone(),
         tenants: auth_state.tenants.clone(),
         groups: fleet_db.clone(),
+        policies: fleet_db.clone(),
+        notifier: notifier.clone(),
     };
 
     // The exact composition from `osiris-server/src/main.rs`: build_router,
@@ -98,9 +101,18 @@ fn harness() -> Harness {
         .merge(build_fleet_router(fleet_state))
         .merge(build_groups_router(GroupsState {
             groups: fleet_db.clone(),
+            registry: fleet_db.clone(),
+            tenants: auth_state.tenants.clone(),
+            audit_log: audit_log.clone(),
+            notifier: notifier.clone(),
+        }))
+        .merge(osiris_api::build_policy_router(osiris_api::PolicyState {
+            groups: fleet_db.clone(),
+            policies: fleet_db.clone(),
             registry: fleet_db,
             tenants: auth_state.tenants.clone(),
             audit_log: audit_log.clone(),
+            notifier,
         }))
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
@@ -383,5 +395,70 @@ async fn groups_reads_need_viewer_and_writes_need_admin_on_the_composed_router()
             .unwrap()
             .status(),
         StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn group_policy_reads_need_viewer_and_writes_need_admin_on_the_composed_router() {
+    let h = harness();
+    let viewer = session_for_role(&h.auth_state, "composed-policy-viewer", Role::Viewer);
+    let send = |method: &str, uri: &str, token: &str, body: Option<&str>| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(json) => {
+                b = b.header("content-type", "application/json");
+                Body::from(json.to_string())
+            }
+            None => Body::empty(),
+        };
+        h.app.clone().oneshot(b.body(body).unwrap())
+    };
+    let created = send(
+        "POST",
+        "/api/v1/groups",
+        &h.admin_token,
+        Some(r#"{"name":"web"}"#),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(created.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let gid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["group_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/api/v1/groups/{gid}/policy");
+    assert_eq!(
+        send("GET", &uri, &viewer, None).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            "PUT",
+            &uri,
+            &viewer,
+            Some(r#"{"telemetry_level":"MINIMAL"}"#)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            "PUT",
+            &uri,
+            &h.admin_token,
+            Some(r#"{"telemetry_level":"MINIMAL"}"#)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
     );
 }

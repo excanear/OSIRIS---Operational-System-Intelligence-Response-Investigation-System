@@ -134,6 +134,14 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
             })
     };
 
+    // /api/v1/<prefix>/{one segment}<suffix>, e.g. a group's or host's policy.
+    let seg_then = |prefix: &str, suffix: &str| {
+        path.strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(suffix))
+            .is_some_and(|s| !s.is_empty() && !s.contains('/'))
+    };
+    let group_policy = || seg_then("/api/v1/groups/", "/policy");
+
     if method == Method::POST {
         return path == "/api/v1/auth/logout"
             || path == "/api/v1/incidents"
@@ -145,10 +153,10 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
         return one_segment("/api/v1/incidents/") || one_segment("/api/v1/groups/");
     }
     if method == Method::PUT {
-        return group_member();
+        return group_member() || group_policy();
     }
     if method == Method::DELETE {
-        return one_segment("/api/v1/groups/") || group_member();
+        return one_segment("/api/v1/groups/") || group_member() || group_policy();
     }
     // HEAD is served by axum on every GET route, so it needs the same allowlist.
     if method != Method::GET && method != Method::HEAD {
@@ -198,7 +206,8 @@ pub(crate) fn tenant_route_allowed(method: &axum::http::Method, path: &str) -> b
     if one_segment("/api/v1/groups/") {
         return true;
     }
-    false
+    // Group and host effective policy (the handlers scope them to the tenant).
+    group_policy() || seg_then("/api/v1/hosts/", "/policy")
 }
 
 pub async fn auth_gate(State(state): State<AuthState>, mut req: Request, next: Next) -> Response {
@@ -718,6 +727,10 @@ mod tests {
             (Method::DELETE, "/api/v1/groups/g1"),
             (Method::PUT, "/api/v1/groups/g1/members/h1"),
             (Method::DELETE, "/api/v1/groups/g1/members/h1"),
+            (Method::GET, "/api/v1/groups/g1/policy"),
+            (Method::PUT, "/api/v1/groups/g1/policy"),
+            (Method::DELETE, "/api/v1/groups/g1/policy"),
+            (Method::GET, "/api/v1/hosts/h1/policy"),
         ];
         for (m, p) in allowed {
             assert!(tenant_route_allowed(&m, p), "{m} {p} should be allowed");
@@ -736,6 +749,11 @@ mod tests {
             (Method::DELETE, "/api/v1/groups/g1/x/h1"),
             (Method::PUT, "/api/v1/tenants/t/hosts/h"),
             (Method::DELETE, "/api/v1/tenants/t/hosts/h"),
+            (Method::POST, "/api/v1/groups/g1/policy"),
+            (Method::PUT, "/api/v1/hosts/h1/policy"),
+            (Method::GET, "/api/v1/groups//policy"),
+            (Method::GET, "/api/v1/groups/g1/x/policy"),
+            (Method::GET, "/api/v1/hosts/h1/policy/x"),
         ];
         for (m, p) in denied {
             assert!(!tenant_route_allowed(&m, p), "{m} {p} should be denied");

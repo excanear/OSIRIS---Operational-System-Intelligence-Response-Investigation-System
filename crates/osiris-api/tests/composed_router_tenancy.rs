@@ -99,6 +99,7 @@ struct Tenancy {
     acme_process_key: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_app(
     storage: Arc<dyn Storage>,
     incident_evidence_state: IncidentEvidenceState,
@@ -107,6 +108,7 @@ fn build_app(
     auth_state: AuthState,
     fleet_state: FleetState,
     groups_state: GroupsState,
+    policy_state: osiris_api::PolicyState,
 ) -> axum::Router {
     build_router(storage)
         .merge(build_incident_evidence_router(incident_evidence_state))
@@ -116,6 +118,7 @@ fn build_app(
         .merge(osiris_api::build_tenant_router(auth_state.clone()))
         .merge(build_fleet_router(fleet_state))
         .merge(build_groups_router(groups_state))
+        .merge(osiris_api::build_policy_router(policy_state))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate))
 }
 
@@ -216,16 +219,28 @@ fn tenancy() -> Tenancy {
         tenants: tenants.clone(),
     };
     let broadcaster = Arc::new(LiveEventBroadcaster::new());
+    let notifier: Arc<dyn osiris_api::PolicyNotifier> = Arc::new(osiris_api::NoopPolicyNotifier);
     let fleet_state = FleetState {
         registry: fleet_registry.clone(),
         tenants: tenants.clone(),
         groups: fleet_db.clone(),
+        policies: fleet_db.clone(),
+        notifier: notifier.clone(),
     };
     let groups_state = GroupsState {
         groups: fleet_db.clone(),
         registry: fleet_db.clone(),
         tenants: tenants.clone(),
         audit_log: audit_log.clone(),
+        notifier: notifier.clone(),
+    };
+    let policy_state = osiris_api::PolicyState {
+        groups: fleet_db.clone(),
+        policies: fleet_db.clone(),
+        registry: fleet_db.clone(),
+        tenants: tenants.clone(),
+        audit_log: audit_log.clone(),
+        notifier,
     };
     let app = build_app(
         storage,
@@ -235,6 +250,7 @@ fn tenancy() -> Tenancy {
         auth_state.clone(),
         fleet_state,
         groups_state,
+        policy_state,
     );
 
     Tenancy {
@@ -1111,4 +1127,56 @@ async fn a_tenant_user_passing_tenant_id_on_create_gets_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn tenant_policy_routes_are_isolated_through_the_gate() {
+    let t = tenancy();
+    let (status, group) = call(
+        &t.app,
+        "POST",
+        "/api/v1/groups",
+        Some(&t.acme_token),
+        Some(serde_json::json!({ "name": "acme-web" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let gid = group["group_id"].as_str().unwrap().to_string();
+    let uri = format!("/api/v1/groups/{gid}/policy");
+    let policy = serde_json::json!({ "telemetry_level": "MINIMAL" });
+
+    let (status, body) = call(
+        &t.app,
+        "PUT",
+        &uri,
+        Some(&t.acme_token),
+        Some(policy.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["policy"]["telemetry_level"], "MINIMAL");
+
+    // Another tenant's group is invisible, valid body or not.
+    let (status, _) = call(&t.app, "PUT", &uri, Some(&t.globex_token), Some(policy)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let bad = serde_json::json!({ "sensors": { "dns": true } });
+    let (status, _) = call(&t.app, "PUT", &uri, Some(&t.globex_token), Some(bad)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&t.app, "GET", &uri, Some(&t.globex_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let host_uri = format!("/api/v1/hosts/{}/policy", t.globex_host);
+    let (status, _) = call(&t.app, "GET", &host_uri, Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Exact shapes only: POST on the policy path never passes the tenant gate.
+    let (status, _) = call(
+        &t.app,
+        "POST",
+        &uri,
+        Some(&t.acme_token),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

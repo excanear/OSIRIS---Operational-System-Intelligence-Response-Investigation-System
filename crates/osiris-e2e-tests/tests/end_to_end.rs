@@ -2373,6 +2373,7 @@ struct FleetHarness {
     storage: Arc<dyn Storage>,
     fleet_registry: Arc<dyn osiris_fleet::HostRegistry>,
     group_store: Arc<dyn osiris_fleet::HostGroupStore>,
+    policy_store: Arc<dyn osiris_fleet::PolicyStore>,
     auth_state: AuthState,
     admin_token: String,
 }
@@ -2428,7 +2429,8 @@ async fn spawn_fleet_harness() -> FleetHarness {
     let fleet_db =
         Arc::new(osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap());
     let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
-    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db;
+    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db.clone();
+    let policy_store: Arc<dyn osiris_fleet::PolicyStore> = fleet_db;
     tokio::spawn(run_ingestion_loop(
         spool_path.clone(),
         storage.clone(),
@@ -2452,6 +2454,7 @@ async fn spawn_fleet_harness() -> FleetHarness {
         storage,
         fleet_registry,
         group_store,
+        policy_store,
         auth_state,
         admin_token,
     }
@@ -2523,6 +2526,8 @@ async fn an_agent_health_event_makes_the_host_appear_online_in_the_fleet_registr
             registry: h.fleet_registry.clone(),
             tenants: h.auth_state.tenants.clone(),
             groups: h.group_store.clone(),
+            policies: h.policy_store.clone(),
+            notifier: Arc::new(osiris_api::NoopPolicyNotifier),
         }))
         .layer(axum::middleware::from_fn_with_state(
             h.auth_state.clone(),
@@ -2573,12 +2578,15 @@ async fn a_host_added_to_a_group_is_returned_by_the_group_filter_and_leaves_it_w
             registry: h.fleet_registry.clone(),
             tenants: h.auth_state.tenants.clone(),
             groups: h.group_store.clone(),
+            policies: h.policy_store.clone(),
+            notifier: Arc::new(osiris_api::NoopPolicyNotifier),
         }))
         .merge(build_groups_router(GroupsState {
             groups: h.group_store.clone(),
             registry: h.fleet_registry.clone(),
             tenants: h.auth_state.tenants.clone(),
             audit_log,
+            notifier: Arc::new(osiris_api::NoopPolicyNotifier),
         }))
         .layer(axum::middleware::from_fn_with_state(
             h.auth_state.clone(),

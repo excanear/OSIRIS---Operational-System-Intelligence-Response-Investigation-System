@@ -2660,3 +2660,5 @@ pub mod tenant_scope;
 pub use fleet::{build_fleet_router, FleetState};
 pub mod groups;
 pub use groups::{build_groups_router, GroupsState};
+pub mod policy;
+pub use policy::{build_policy_router, NoopPolicyNotifier, PolicyNotifier, PolicyState};

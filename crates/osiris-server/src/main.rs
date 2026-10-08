@@ -145,7 +145,8 @@ async fn main() {
         "hosts_db_path",
     ));
     let fleet_registry: Arc<dyn osiris_fleet::HostRegistry> = fleet_db.clone();
-    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db;
+    let group_store: Arc<dyn osiris_fleet::HostGroupStore> = fleet_db.clone();
+    let policy_store: Arc<dyn osiris_fleet::PolicyStore> = fleet_db;
 
     let ingest_storage = storage.clone();
     let spool_path = config.spool_path.clone();
@@ -410,6 +411,9 @@ async fn main() {
         tenants: tenant_store.clone(),
     };
 
+    // No control channel yet (Task 7 wires the reconciler): nothing is pushed.
+    let policy_notifier: Arc<dyn osiris_api::PolicyNotifier> =
+        Arc::new(osiris_api::NoopPolicyNotifier);
     let app = osiris_server::apply_dev_cors(
         build_router(storage)
             .merge(build_incident_evidence_router(incident_evidence_state))
@@ -421,12 +425,23 @@ async fn main() {
                 registry: fleet_registry.clone(),
                 tenants: tenant_store.clone(),
                 groups: group_store.clone(),
+                policies: policy_store.clone(),
+                notifier: policy_notifier.clone(),
             }))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),
                 registry: fleet_registry.clone(),
                 tenants: tenant_store.clone(),
                 audit_log: audit_log.clone(),
+                notifier: policy_notifier.clone(),
+            }))
+            .merge(osiris_api::build_policy_router(osiris_api::PolicyState {
+                groups: group_store.clone(),
+                policies: policy_store.clone(),
+                registry: fleet_registry.clone(),
+                tenants: tenant_store.clone(),
+                audit_log: audit_log.clone(),
+                notifier: policy_notifier.clone(),
             }))
             .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
         config.dev_cors,

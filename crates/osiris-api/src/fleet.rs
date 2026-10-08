@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth_middleware::AuthContext;
-use osiris_fleet::{GroupError, GroupRef, GroupScope, HostGroupStore, HostRegistry, HostRow};
+use osiris_fleet::{
+    GroupError, GroupRef, GroupScope, HostGroupStore, HostRegistry, HostRow, PolicyStore,
+};
 use osiris_tenancy::TenantStore;
 
 /// A host is considered `ONLINE` if its `last_seen` heartbeat is no older
@@ -30,6 +32,8 @@ pub struct FleetState {
     pub registry: Arc<dyn HostRegistry>,
     pub tenants: Arc<dyn TenantStore>,
     pub groups: Arc<dyn HostGroupStore>,
+    pub policies: Arc<dyn PolicyStore>,
+    pub notifier: Arc<dyn crate::policy::PolicyNotifier>,
 }
 
 pub fn build_fleet_router(state: FleetState) -> Router {
@@ -57,6 +61,7 @@ struct HostSummary {
     cloud_instance_id: Option<String>,
     cloud_region: Option<String>,
     groups: Vec<GroupRef>,
+    policy_status: String,
 }
 
 pub(crate) fn host_status(last_seen: u64, now_ns: u64) -> &'static str {
@@ -81,6 +86,7 @@ fn to_summary(row: HostRow, now_ns: u64) -> HostSummary {
         cloud_instance_id: row.cloud_instance_id,
         cloud_region: row.cloud_region,
         groups: Vec::new(),
+        policy_status: String::new(),
     }
 }
 
@@ -137,13 +143,48 @@ async fn hosts_handler(
         .map_err(|e| crate::groups::internal(e.to_string()))?
         .map_err(|e| crate::groups::internal(e.to_string()))?;
 
+    // Policy status in bulk: three reads plus one per tenant, never one
+    // resolution query per host.
+    let (policies, tenants) = (state.policies.clone(), state.tenants.clone());
+    let (all_policies, deliveries, host_tenant) = tokio::task::spawn_blocking(move || {
+        let all_policies = policies.all_host_policies().map_err(|e| e.to_string())?;
+        let deliveries = policies.all_deliveries().map_err(|e| e.to_string())?;
+        let mut host_tenant: std::collections::HashMap<Uuid, Uuid> =
+            std::collections::HashMap::new();
+        for t in tenants.list_tenants().map_err(|e| e.to_string())? {
+            for h in tenants.hosts_of(t.tenant_id).map_err(|e| e.to_string())? {
+                host_tenant.insert(h, t.tenant_id);
+            }
+        }
+        Ok::<_, String>((all_policies, deliveries, host_tenant))
+    })
+    .await
+    .map_err(|e| crate::groups::internal(e.to_string()))?
+    .map_err(crate::groups::internal)?;
+    let managed = state.notifier.managed();
+
     let now = now_ns();
     let mut summaries: Vec<HostSummary> = rows
         .into_iter()
         .map(|r| {
             let groups = by_host.remove(&r.host_id).unwrap_or_default();
+            let desired = osiris_policy::resolve(
+                host_tenant.get(&r.host_id).copied(),
+                all_policies
+                    .get(&r.host_id)
+                    .map_or(&[][..], |v| v.as_slice()),
+            )
+            .effective
+            .hash_hex();
+            let status = crate::policy::policy_status(
+                managed,
+                &desired,
+                r.applied_policy_hash.as_deref(),
+                deliveries.get(&r.host_id),
+            );
             let mut summary = to_summary(r, now);
             summary.groups = groups;
+            summary.policy_status = status.to_string();
             summary
         })
         .collect();
@@ -202,7 +243,9 @@ mod tests {
         FleetState {
             registry: fleet_db.clone(),
             tenants: Arc::new(SqliteTenantStore::open(dir.join("tenants.db")).unwrap()),
-            groups: fleet_db,
+            groups: fleet_db.clone(),
+            policies: fleet_db,
+            notifier: Arc::new(crate::policy::NoopPolicyNotifier),
         }
     }
 
@@ -427,7 +470,9 @@ mod tests {
         let s = FleetState {
             registry: Arc::new(FailingRegistry),
             tenants: Arc::new(SqliteTenantStore::open(dir.path().join("tenants.db")).unwrap()),
-            groups: fleet_db,
+            groups: fleet_db.clone(),
+            policies: fleet_db,
+            notifier: Arc::new(crate::policy::NoopPolicyNotifier),
         };
         let err = hosts_handler(
             Extension(platform_ctx()),
@@ -444,5 +489,76 @@ mod tests {
             )
         );
         assert!(!err.1.contains("secret sqlite text"));
+    }
+
+    #[tokio::test]
+    async fn hosts_rows_carry_policy_status() {
+        struct Managed;
+        impl crate::policy::PolicyNotifier for Managed {
+            fn hosts_changed(&self, _: Vec<Uuid>) {}
+            fn managed(&self) -> bool {
+                true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = state(dir.path());
+        let (pending, in_sync, plain) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let g = s.groups.create(&GroupScope::Platform, None, "g").unwrap();
+        let policy = osiris_policy::GroupPolicy {
+            telemetry_level: Some(osiris_policy::TelemetryLevel::Minimal),
+            ..Default::default()
+        };
+        s.policies
+            .set_policy(&GroupScope::Platform, g.group_id, &policy, "u")
+            .unwrap();
+        let desired = osiris_policy::resolve(
+            None,
+            &[osiris_policy::GroupPolicyInput {
+                group_id: g.group_id,
+                group_tenant: None,
+                policy: policy.clone(),
+            }],
+        )
+        .effective
+        .hash_hex();
+        for h in [pending, in_sync, plain] {
+            let mut r = row(h, 1_000);
+            if h == in_sync {
+                r.applied_policy_hash = Some(desired.clone());
+            }
+            s.registry.upsert_heartbeat(r).unwrap();
+        }
+        for h in [pending, in_sync] {
+            s.groups
+                .add_member(&GroupScope::Platform, g.group_id, h)
+                .unwrap();
+        }
+        let status_of = |rows: &[HostSummary], h: Uuid| {
+            rows.iter()
+                .find(|r| r.host_id == h.to_string())
+                .unwrap()
+                .policy_status
+                .clone()
+        };
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s.clone()),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(rows.iter().all(|r| r.policy_status == "UNMANAGED"));
+
+        s.notifier = Arc::new(Managed);
+        let Json(rows) = hosts_handler(
+            Extension(platform_ctx()),
+            State(s),
+            Query(HostsQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status_of(&rows, pending), "PENDING");
+        assert_eq!(status_of(&rows, in_sync), "IN_SYNC");
+        assert_eq!(status_of(&rows, plain), "IN_SYNC");
     }
 }

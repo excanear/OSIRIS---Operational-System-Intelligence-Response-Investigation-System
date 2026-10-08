@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 osiris-tenancy = { path = "../osiris-tenancy" }
 osiris-fleet = { path = "../osiris-fleet" }
 osiris-health = { path = "../osiris-health" }
+osiris-policy = { path = "../osiris-policy" }
 uuid = { workspace = true }
 tracing = { workspace = true }
 
