@@ -178,15 +178,16 @@ impl Stack {
                 health_interval_secs: 5,
             };
             std::fs::write(d.join("agent.yaml"), agent_yaml.render()).unwrap();
-            let mut child = spawn(
+            // Owned by the Stack before the wait so a panic there still reaps it in Drop.
+            stack.agent = Some(spawn(
                 &bin_path("osiris-agent"),
                 &d.join("agent.yaml"),
                 &d.join("agent.log"),
-            );
+            ));
             let host = host_id.unwrap().to_string();
             let hosts_url = format!("{}/api/v1/hosts", stack.base_url);
             wait_ready_or_exit(
-                &mut child,
+                stack.agent.as_mut().unwrap(),
                 "osiris-agent",
                 READY_DEADLINE,
                 || {
@@ -205,7 +206,6 @@ impl Stack {
                     )
                 },
             );
-            stack.agent = Some(child);
         }
         stack
     }
