@@ -24,6 +24,8 @@ jobs:
       - name: Prepare auditd and watch dirs
         run: sudo tools/real-linux/setup.sh
       - name: Run the real-Linux suite as root
+        # Build ~5 min + suite ~2 min; a hang fails here, not at the job cap.
+        timeout-minutes: 25
         # Root needs the runner's toolchain: keep PATH and cargo/rustup homes.
         # TMPDIR makes the harness's kept stack dirs findable for the artifact.
         run: |

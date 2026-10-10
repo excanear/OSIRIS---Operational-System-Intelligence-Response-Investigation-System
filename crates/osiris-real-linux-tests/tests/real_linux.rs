@@ -25,13 +25,19 @@ fn now_ns() -> u128 {
         .as_nanos()
 }
 
+/// Bound on one scenario's shell action (global constraint #5: every wait
+/// is bounded); coreutils `timeout` kills it and exits 124.
+const SH_TIMEOUT_SECS: &str = "60";
+
 fn sh(script: &str) {
-    let st = Command::new("/bin/bash")
-        .arg("-c")
-        .arg(script)
+    let st = Command::new("timeout")
+        .args(["--kill-after=5", SH_TIMEOUT_SECS, "/bin/bash", "-c", script])
         .status()
         .unwrap();
-    assert!(st.success(), "script failed: {script}");
+    assert!(
+        st.success(),
+        "script failed ({st}; 124 = timed out after {SH_TIMEOUT_SECS}s): {script}"
+    );
 }
 
 /// One stack per test: agent on the real audit log, persistence watch on a
