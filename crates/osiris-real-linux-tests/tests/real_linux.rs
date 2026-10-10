@@ -156,7 +156,15 @@ fn persistence_write_is_observed() {
     let unit = dir.join(format!("{m}.service"));
     let t0 = now_ns();
     std::fs::write(&unit, "[Service]\nExecStart=/bin/true\n").unwrap();
-    events(&s, "PERSISTENCE_CREATED", t0, |v| contains_str(v, &m));
+    // Baseline is taken at sensor start (before Stack::start returns); rescans
+    // run every 30s and the interval is not configurable. A systemd unit file
+    // is reported as SERVICE_CREATE (PERSISTENCE_CREATED is for non-unit
+    // checkpoints). Deadline = scan interval + 15s.
+    s.wait_for(
+        &format!("/api/v1/events?event_type=SERVICE_CREATE&since={t0}&limit=1000"),
+        Duration::from_secs(30 + 15),
+        |v| contains_str(v, &m),
+    );
 }
 
 #[test]
