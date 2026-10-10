@@ -39,6 +39,7 @@ pub fn run(rate: u64, duration_s: u64) -> Record {
     let end = Duration::from_secs(duration_s);
     let (mut prev_ticks, _) = read().expect("agent /proc readable");
     let mut next_sample = Duration::from_secs(1);
+    let mut prev_at = Instant::now();
     let (mut cpu, mut rss) = (vec![], vec![]);
     let mut spawned = 0u64;
     let mut children = vec![];
@@ -52,11 +53,14 @@ pub fn run(rate: u64, duration_s: u64) -> Record {
         children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
         if start.elapsed() >= next_sample {
             if let Some((ticks, kib)) = read() {
-                cpu.push((ticks - prev_ticks) as f64 / tick_hz * 100.0); // % of one core over 1 s
+                // % of one core over the real interval: a loaded spawn loop samples late.
+                let secs = prev_at.elapsed().as_secs_f64();
+                cpu.push((ticks - prev_ticks) as f64 / tick_hz / secs * 100.0);
+                prev_at = Instant::now();
                 rss.push(kib as f64 / 1024.0);
                 prev_ticks = ticks;
             }
-            next_sample += Duration::from_secs(1);
+            next_sample = start.elapsed() + Duration::from_secs(1);
         }
         std::thread::sleep(Duration::from_millis(1));
     }
