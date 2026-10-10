@@ -29,7 +29,8 @@ pub trait Sink: Send + Sync {
 /// Appends each event as one NDJSON line to a local file. The Server binary
 /// (Task 8) tails this same path and ingests via `Storage::batch_write` —
 /// this is the entire Agent→Server "transport" for Phase 1. A tokio Mutex
-/// serializes concurrent `send` calls onto one file handle.
+/// serializes concurrent `send` calls; each `send` returns only once its
+/// complete line (event + `\n`) has been written.
 pub struct SpoolFileSink {
     path: PathBuf,
     lock: tokio::sync::Mutex<()>,
@@ -59,28 +60,27 @@ impl SpoolFileSink {
 #[async_trait]
 impl Sink for SpoolFileSink {
     async fn send(&self, event: CanonicalEvent) -> Result<(), SinkError> {
-        let line = serde_json::to_string(&event)?;
+        // One buffer, one append: the line and its terminator reach the
+        // kernel in a single O_APPEND write, so no other append can land
+        // between an event and its newline.
+        let mut line = serde_json::to_string(&event)?;
+        line.push('\n');
+        let write_err = |source| SinkError::Write {
+            path: self.path.clone(),
+            source,
+        };
         let _guard = self.lock.lock().await;
         let mut file = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
             .await
-            .map_err(|source| SinkError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|source| SinkError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|source| SinkError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(write_err)?;
+        file.write_all(line.as_bytes()).await.map_err(write_err)?;
+        // tokio's File finishes a write on a blocking-pool task after
+        // `write_all` returns, and dropping the handle does not wait for it.
+        // Without this flush the previous send's bytes could land after the
+        // next send's (Phase 10 real-Linux finding: two events on one line).
+        file.flush().await.map_err(write_err)?;
         Ok(())
     }
 }
@@ -199,6 +199,66 @@ mod tests {
         }
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(contents.lines().count(), 2);
+    }
+
+    /// Real-Linux finding (Phase 10, Ubuntu 24.04 agent spool): two events
+    /// landed on one line followed by an empty line, and the forwarder
+    /// skipped the merged line as unparsable. Every line written by
+    /// concurrent senders must be exactly one complete event, and every
+    /// write must be on disk by the time `send` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_senders_never_interleave_ndjson_lines() {
+        const TASKS: usize = 16;
+        const PER_TASK: usize = 50;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let sink = Arc::new(SpoolFileSink::open(&path).await.unwrap());
+        let handles: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    for _ in 0..PER_TASK {
+                        sink.send(sample_event()).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'), "the last line must be complete");
+        let lines: Vec<&str> = contents.split_terminator('\n').collect();
+        for (i, line) in lines.iter().enumerate() {
+            serde_json::from_str::<CanonicalEvent>(line).unwrap_or_else(|e| {
+                panic!("spool line {} is not one event ({e}): {line:.200}", i + 1)
+            });
+        }
+        assert_eq!(lines.len(), TASKS * PER_TASK);
+    }
+
+    /// The root cause of the interleaving: tokio's `File::poll_write` hands
+    /// the bytes to a blocking-pool task and returns before they are
+    /// written; dropping the handle does not wait. So `send` N's trailing
+    /// "\n" could still be pending when `send` N+1 wrote its line from a
+    /// fresh handle. `send` must not return before its line is on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn send_returns_only_after_the_whole_line_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let sink = SpoolFileSink::open(&path).await.unwrap();
+        let mut expected_len = 0u64;
+        for i in 0..200 {
+            let event = sample_event();
+            expected_len += serde_json::to_string(&event).unwrap().len() as u64 + 1;
+            sink.send(event).await.unwrap();
+            let on_disk = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(
+                on_disk, expected_len,
+                "after send #{i} returned, the spool holds {on_disk} bytes, expected {expected_len}"
+            );
+        }
     }
 
     #[tokio::test]
