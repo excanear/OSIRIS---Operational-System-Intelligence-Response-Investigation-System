@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use osiris_real_linux_tests::json::{contains_str, has_kv};
+use osiris_real_linux_tests::json::{contains_str, has_kv, ids_containing};
 use osiris_real_linux_tests::stack::{AgentOptions, Stack, StackOptions};
 use serde_json::json;
 
@@ -178,10 +178,15 @@ fn web_root_drop_raises_an_alert() {
     sh(&format!(
         "/bin/bash -c 'echo \"<?php system($_GET[c]); ?>\" > {path}'"
     ));
+    // Alerts cite events by id only: find the marker's FILE_CREATE first,
+    // then the alert whose evidence names it.
+    let created = events(&s, "FILE_CREATE", t0, |v| contains_str(v, &path));
+    let ids = ids_containing(&created, "event_id", &path);
+    assert!(!ids.is_empty(), "no FILE_CREATE event_id for {path}");
     s.wait_for(
         &format!("/api/v1/alerts?rule_id=shell_wrote_file_to_web_root&since={t0}"),
         DEADLINE,
-        |v| contains_str(v, &m),
+        |v| ids.iter().any(|id| contains_str(v, id)),
     );
 }
 

@@ -19,6 +19,27 @@ pub fn has_kv(v: &Value, key: &str, want: &Value) -> bool {
     }
 }
 
+/// The `id_key` string of every object (at any depth) that has one and
+/// contains `needle` somewhere inside it — e.g. the `event_id`s of the
+/// events that mention a marker. Alerts cite events only by id, so this is
+/// how a scenario ties an alert back to its marker.
+pub fn ids_containing(v: &Value, id_key: &str, needle: &str) -> Vec<String> {
+    let mut out = vec![];
+    collect_ids(v, id_key, needle, &mut out);
+    out
+}
+
+fn collect_ids(v: &Value, id_key: &str, needle: &str, out: &mut Vec<String>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| collect_ids(x, id_key, needle, out)),
+        Value::Object(o) => match o.get(id_key) {
+            Some(Value::String(id)) if contains_str(v, needle) => out.push(id.clone()),
+            _ => o.values().for_each(|x| collect_ids(x, id_key, needle, out)),
+        },
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +58,30 @@ mod tests {
         assert!(has_kv(&v, "dst_port", &json!(4242)));
         assert!(!has_kv(&v, "dst_port", &json!(4243)));
         assert!(has_kv(&v, "proto", &json!("tcp")));
+    }
+
+    /// Real-Linux finding (Phase 10, GH run 38073738001): an alert carries
+    /// only evidence event ids — never the file path — so a scenario must
+    /// resolve the marker's event ids first and match alerts on those.
+    #[test]
+    fn ids_containing_ties_an_alert_back_to_its_marker_event() {
+        let events = json!([
+            {"event_id": "e-other", "file": {"path": "/var/www/unrelated.php"}},
+            {"event_id": "e-marker", "file": {"path": "/var/www/osirisp10abc.php"}}
+        ]);
+        let ids = ids_containing(&events, "event_id", "osirisp10abc");
+        assert_eq!(ids, ["e-marker"]);
+
+        // Shape of the real alert body from the run (trimmed).
+        let alerts = json!([{
+            "alert_id": "a1",
+            "evidence": ["e-marker"],
+            "rule_id": "shell_wrote_file_to_web_root"
+        }]);
+        assert!(
+            !contains_str(&alerts, "osirisp10abc"),
+            "alerts never echo the path"
+        );
+        assert!(ids.iter().any(|id| contains_str(&alerts, id)));
     }
 }
