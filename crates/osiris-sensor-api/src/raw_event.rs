@@ -19,8 +19,9 @@ pub enum RawEventSource {
     ContainerApi,
 }
 
-/// A Process/Exec creation record at MINIMAL telemetry (ARCHITECTURE.md §6:
-/// "create/exit, pid/ppid/uid/exe" — no argv/env at this level).
+/// A Process/Exec creation record (ARCHITECTURE.md §6: MINIMAL is
+/// "create/exit, pid/ppid/uid/exe"; argv joins at STANDARD — the Agent
+/// clears `cmdline` when an explicit policy level is below STANDARD).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessExecRaw {
     pub pid: u32,
@@ -28,6 +29,12 @@ pub struct ProcessExecRaw {
     pub uid: u32,
     pub exe_path: String,
     pub comm: String,
+    /// argv as executed (`argv[0]` first), from the audit `EXECVE` record
+    /// that shares the SYSCALL's msg serial; empty when that record was
+    /// not seen. Bounded by the producing sensor (see
+    /// `osiris_sensors_process::execve`).
+    #[serde(default)]
+    pub cmdline: Vec<String>,
     /// Wall-clock nanoseconds, UTC, from the originating backend.
     pub timestamp_ns: u64,
     /// Best-effort process start time for process_key hashing
@@ -564,6 +571,7 @@ mod tests {
             uid: 0,
             exe_path: "/bin/init".to_string(),
             comm: "init".to_string(),
+            cmdline: vec![],
             timestamp_ns: 42,
             start_time_mono: 42,
             source: RawEventSource::Synthetic,

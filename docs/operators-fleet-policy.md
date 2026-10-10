@@ -35,6 +35,11 @@ Levels are cumulative. `AgentHealth`, `SensorHealth`, `AgentStart` and
 - **Detailed:** Standard + `FileModify`, `FileWrite`, `FileAttributeChange`, `SocketCreate`, `SocketBind`, `SocketListen`, `CapabilityUse`.
 - **Forensic:** every event type.
 
+Fields follow the same ladder: a process's argv (`process.cmdline`) is
+Standard data, so at Minimal a `ProcessExec` event is still sent but with an
+empty `cmdline`. The Agent keeps at most 128 arguments and 16 KiB of argv
+per exec (a longer argv is cut to that prefix).
+
 Lowering the level or switching a sensor off reduces visibility: detections
 that depend on the dropped events stop firing for those hosts.
 

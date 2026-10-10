@@ -566,6 +566,7 @@ fn exec(pid: u32, ppid: u32, exe_path: &str, comm: &str, timestamp_ns: u64) -> R
         uid: 1000,
         exe_path: exe_path.to_string(),
         comm: comm.to_string(),
+        cmdline: vec![],
         timestamp_ns,
         start_time_mono: timestamp_ns,
         source: RawEventSource::Synthetic,

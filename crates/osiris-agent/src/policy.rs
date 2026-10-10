@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
-use osiris_policy::{allows, EffectivePolicy, TelemetryLevel};
-use osiris_schema::EventType;
+use osiris_policy::{allows, includes_argv, EffectivePolicy, TelemetryLevel};
+use osiris_schema::{CanonicalEvent, EventType};
 use tokio::sync::watch;
 
 pub fn overlay_path(spool_path: &str) -> PathBuf {
@@ -96,6 +96,20 @@ impl PolicyRuntime {
             TelemetryLevel::from_code(self.level.load(Ordering::Relaxed)),
             t,
         )
+    }
+
+    /// Drops the fields of an allowed event that the current level does
+    /// not include (today: argv below STANDARD).
+    pub fn apply_field_rules(&self, event: &mut CanonicalEvent) {
+        let level = TelemetryLevel::from_code(self.level.load(Ordering::Relaxed));
+        if !includes_argv(level) {
+            for process in [event.process.as_mut(), event.parent_process.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                process.cmdline.clear();
+            }
+        }
     }
 
     pub fn applied(&self) -> EffectivePolicy {
@@ -196,6 +210,41 @@ mod tests {
         rt.set(&EffectivePolicy::default());
         assert_eq!(*rx.borrow(), 60, "unset heartbeat falls back to agent.yaml");
         assert_eq!(rt.policy_hash_hex(), None);
+    }
+
+    fn exec_with_argv() -> CanonicalEvent {
+        let raw = osiris_sensor_api::RawEvent::ProcessExec(osiris_sensor_api::ProcessExecRaw {
+            pid: 1,
+            ppid: 0,
+            uid: 0,
+            exe_path: "/usr/bin/dash".into(),
+            comm: "sh".into(),
+            cmdline: vec!["/bin/sh".into(), "-c".into(), "secret".into()],
+            timestamp_ns: 1,
+            start_time_mono: 1,
+            source: osiris_sensor_api::RawEventSource::Audit,
+        });
+        osiris_pipeline::normalize(raw, &crate::agent::tests::test_host(), "b")
+    }
+
+    fn cmdline_after(rt: &PolicyRuntime) -> Vec<String> {
+        let mut event = exec_with_argv();
+        rt.apply_field_rules(&mut event);
+        event.process.unwrap().cmdline
+    }
+
+    /// ARCHITECTURE.md §6: argv is STANDARD data, so an explicit MINIMAL
+    /// policy keeps the PROCESS_EXEC event but not its cmdline.
+    #[tokio::test]
+    async fn argv_is_stripped_only_below_standard() {
+        let (rt, _rx) = PolicyRuntime::new(60);
+        assert_eq!(cmdline_after(&rt).len(), 3, "no policy keeps argv");
+        rt.set(&sample());
+        assert!(cmdline_after(&rt).is_empty(), "MINIMAL strips argv");
+        let mut standard = sample();
+        standard.telemetry_level = Some(TelemetryLevel::Standard);
+        rt.set(&standard);
+        assert_eq!(cmdline_after(&rt).len(), 3);
     }
 
     #[tokio::test]

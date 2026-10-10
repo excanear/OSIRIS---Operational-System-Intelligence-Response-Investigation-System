@@ -1,21 +1,29 @@
+use std::collections::HashMap;
+
 use osiris_fileutil::{parse_audit_msg_id, tokenize};
 use osiris_sensor_api::{ProcessExecRaw, RawEventSource};
 
 /// execve/execveat syscall numbers on x86_64 — the only syscalls this
-/// parser extracts at MINIMAL telemetry (ARCHITECTURE.md §6's Process/Exec
-/// MINIMAL row: "create/exit, pid/ppid/uid/exe", no argv).
+/// parser extracts. argv is not on this record: it comes from the EXECVE
+/// record of the same event (see `assembler::ExecAssembler`).
 const EXECVE_SYSCALL: &str = "59";
 const EXECVEAT_SYSCALL: &str = "322";
 
 /// Parses one `type=SYSCALL ...` line from a Linux audit log
-/// (auditd-style, e.g. `/var/log/audit/audit.log`) into a ProcessExecRaw.
-/// Returns None for any line that isn't a SYSCALL record for execve(at),
-/// or that's missing a required field.
+/// (auditd-style, e.g. `/var/log/audit/audit.log`) into a ProcessExecRaw
+/// with an empty `cmdline`. Returns None for any line that isn't a SYSCALL
+/// record for execve(at), or that's missing a required field.
 pub fn parse_audit_line(line: &str) -> Option<ProcessExecRaw> {
     let fields = tokenize(line);
     if fields.get("type").map(String::as_str) != Some("SYSCALL") {
         return None;
     }
+    exec_from_syscall_fields(&fields)
+}
+
+/// The SYSCALL-record half of `parse_audit_line`, for callers that have
+/// already tokenized the line and checked `type=SYSCALL`.
+pub(crate) fn exec_from_syscall_fields(fields: &HashMap<String, String>) -> Option<ProcessExecRaw> {
     let syscall = fields.get("syscall")?;
     if syscall != EXECVE_SYSCALL && syscall != EXECVEAT_SYSCALL {
         return None;
@@ -37,6 +45,7 @@ pub fn parse_audit_line(line: &str) -> Option<ProcessExecRaw> {
         uid,
         exe_path,
         comm,
+        cmdline: vec![],
         timestamp_ns,
         start_time_mono: timestamp_ns,
         source: RawEventSource::Audit,

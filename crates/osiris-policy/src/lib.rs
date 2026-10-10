@@ -218,6 +218,12 @@ pub fn allows(level: Option<TelemetryLevel>, t: EventType) -> bool {
     }
 }
 
+/// Whether a process's argv (`cmdline`) is kept at this level. A field
+/// rule, not an event rule: the PROCESS_EXEC event itself is MINIMAL.
+pub fn includes_argv(level: Option<TelemetryLevel>) -> bool {
+    level.is_none_or(|level| level >= TelemetryLevel::Standard)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PolicyTier {
@@ -341,6 +347,17 @@ mod tests {
     fn no_policy_allows_everything() {
         assert!(allows(None, EventType::FileWrite));
         assert!(allows(None, EventType::SocketCreate));
+    }
+
+    /// ARCHITECTURE.md §6: Process/Exec MINIMAL is "pid/ppid/uid/exe";
+    /// argv joins at STANDARD.
+    #[test]
+    fn argv_is_standard_data() {
+        use TelemetryLevel::*;
+        assert!(!includes_argv(Some(Minimal)));
+        assert!(includes_argv(Some(Standard)));
+        assert!(includes_argv(Some(Forensic)));
+        assert!(includes_argv(None), "no policy keeps everything");
     }
 
     #[test]

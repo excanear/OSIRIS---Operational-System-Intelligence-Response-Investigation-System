@@ -69,7 +69,7 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
             process_key,
             pid: raw.pid,
             exe_path: raw.exe_path,
-            cmdline: vec![],
+            cmdline: raw.cmdline,
             exe_hash: None,
             start_time_mono: raw.start_time_mono,
         }),
@@ -920,6 +920,7 @@ mod tests {
             uid: 1000,
             exe_path: "/usr/bin/curl".to_string(),
             comm: "curl".to_string(),
+            cmdline: vec![],
             timestamp_ns: 1_700_000_000_000_000_000,
             start_time_mono: 123_456,
             source: RawEventSource::Audit,
@@ -932,6 +933,28 @@ mod tests {
         assert_eq!(event.process.unwrap().exe_path, "/usr/bin/curl");
     }
 
+    /// argv captured by the sensor (from the audit EXECVE record) is the
+    /// canonical event's cmdline.
+    #[test]
+    fn process_exec_cmdline_is_carried_into_the_canonical_event() {
+        let raw = RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 8404,
+            ppid: 8363,
+            uid: 0,
+            exe_path: "/usr/bin/dash".to_string(),
+            comm: "sh".to_string(),
+            cmdline: vec!["/bin/sh".into(), "-c".into(), "true marker".into()],
+            timestamp_ns: 1,
+            start_time_mono: 1,
+            source: RawEventSource::Audit,
+        });
+        let event = normalize(raw, &sample_host(), "boot-1");
+        assert_eq!(
+            event.process.unwrap().cmdline,
+            ["/bin/sh", "-c", "true marker"]
+        );
+    }
+
     #[test]
     fn synthetic_source_maps_correctly() {
         let host = sample_host();
@@ -941,6 +964,7 @@ mod tests {
             uid: 0,
             exe_path: "/bin/init".to_string(),
             comm: "init".to_string(),
+            cmdline: vec![],
             timestamp_ns: 1,
             start_time_mono: 1,
             source: RawEventSource::Synthetic,

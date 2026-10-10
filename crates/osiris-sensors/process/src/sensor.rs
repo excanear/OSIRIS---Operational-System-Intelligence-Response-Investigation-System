@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use osiris_sensor_api::{
@@ -9,7 +9,7 @@ use osiris_sensor_api::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::audit_line::parse_audit_line;
+use crate::assembler::ExecAssembler;
 use crate::proc_stat::read_process_start_time;
 use osiris_fileutil::LineTailer;
 
@@ -36,10 +36,13 @@ impl Default for HealthState {
 }
 
 /// The Process/Exec sensor (ARCHITECTURE.md §4.3), Phase 1 scope: audit
-/// log-file backend only (plan Global Constraints #1/#2 — no eBPF).
+/// log-file backend only (plan Global Constraints #1/#2 — no eBPF). Each
+/// execve SYSCALL record is joined with its EXECVE record for argv
+/// (`ExecAssembler`).
 pub struct ProcessExecSensor {
     audit_log_path: PathBuf,
     poll_interval: Duration,
+    completion_timeout: Duration,
     cancellation: Option<CancellationToken>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     health: Arc<Mutex<HealthState>>,
@@ -50,6 +53,7 @@ impl ProcessExecSensor {
         Self {
             audit_log_path: audit_log_path.into(),
             poll_interval: Duration::from_millis(200),
+            completion_timeout: Duration::from_millis(500),
             cancellation: None,
             task_handle: None,
             health: Arc::new(Mutex::new(HealthState::default())),
@@ -58,6 +62,14 @@ impl ProcessExecSensor {
 
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// How long an execve SYSCALL waits for its EXECVE record before it is
+    /// reported without argv (only the last event of a quiet log ever waits:
+    /// any later record releases it at once).
+    pub fn with_completion_timeout(mut self, timeout: Duration) -> Self {
+        self.completion_timeout = timeout;
         self
     }
 }
@@ -113,37 +125,33 @@ impl Sensor for ProcessExecSensor {
 
         let path = self.audit_log_path.clone();
         let poll_interval = self.poll_interval;
+        let completion_timeout = self.completion_timeout;
         let output = ctx.output;
         let cancellation = ctx.cancellation;
         let health = self.health.clone();
 
         let handle = tokio::spawn(async move {
             let mut tailer = LineTailer::new(path);
+            let mut assembler = ExecAssembler::new(completion_timeout);
             loop {
                 if cancellation.is_cancelled() {
+                    // Report the exec still waiting for its EXECVE record
+                    // rather than dropping it on shutdown.
+                    if let Some(raw) = assembler.flush() {
+                        emit(&output, raw, &health).await;
+                    }
                     lock_health(&health).state = SensorState::Stopped;
                     return;
                 }
                 match tailer.poll() {
                     Ok(lines) => {
                         for line in lines {
-                            if let Some(raw) = parse_audit_line(&line) {
-                                let start_time_mono =
-                                    read_process_start_time(raw.pid).unwrap_or(raw.timestamp_ns);
-                                let event_ts = raw.timestamp_ns;
-                                let event = ProcessExecRaw {
-                                    start_time_mono,
-                                    ..raw
-                                };
-                                if output.send(RawEvent::ProcessExec(event)).await.is_ok() {
-                                    let mut h = lock_health(&health);
-                                    h.events_emitted_total += 1;
-                                    h.last_event_at = Some(event_ts);
-                                    h.state = SensorState::Healthy;
-                                } else {
-                                    lock_health(&health).events_dropped_total += 1;
-                                }
+                            for raw in assembler.offer(&line, Instant::now()) {
+                                emit(&output, raw, &health).await;
                             }
+                        }
+                        if let Some(raw) = assembler.tick(Instant::now()) {
+                            emit(&output, raw, &health).await;
                         }
                     }
                     Err(e) => {
@@ -155,6 +163,9 @@ impl Sensor for ProcessExecSensor {
                 tokio::select! {
                     _ = tokio::time::sleep(poll_interval) => {}
                     _ = cancellation.cancelled() => {
+                        if let Some(raw) = assembler.flush() {
+                            emit(&output, raw, &health).await;
+                        }
                         lock_health(&health).state = SensorState::Stopped;
                         return;
                     }
@@ -205,6 +216,27 @@ impl Sensor for ProcessExecSensor {
             events_emitted_total: h.events_emitted_total,
             events_dropped_total: h.events_dropped_total,
         }
+    }
+}
+
+async fn emit(
+    output: &tokio::sync::mpsc::Sender<RawEvent>,
+    raw: ProcessExecRaw,
+    health: &Mutex<HealthState>,
+) {
+    let start_time_mono = read_process_start_time(raw.pid).unwrap_or(raw.timestamp_ns);
+    let event_ts = raw.timestamp_ns;
+    let event = ProcessExecRaw {
+        start_time_mono,
+        ..raw
+    };
+    if output.send(RawEvent::ProcessExec(event)).await.is_ok() {
+        let mut h = lock_health(health);
+        h.events_emitted_total += 1;
+        h.last_event_at = Some(event_ts);
+        h.state = SensorState::Healthy;
+    } else {
+        lock_health(health).events_dropped_total += 1;
     }
 }
 
@@ -267,5 +299,51 @@ mod tests {
         sensor.stop().await.unwrap();
         let health = sensor.health();
         assert_eq!(health.events_emitted_total, 1);
+    }
+
+    /// End to end through the sensor task: the real Ubuntu 24.04 records
+    /// for `/bin/sh -c 'true <marker>'` yield events that carry argv.
+    #[tokio::test]
+    async fn sensor_attaches_argv_from_the_real_execve_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, "").unwrap();
+        let mut sensor = ProcessExecSensor::new(&path)
+            .with_poll_interval(Duration::from_millis(20))
+            .with_completion_timeout(Duration::from_millis(40));
+        let (tx, mut rx) = mpsc::channel(16);
+        sensor
+            .initialize(SensorContext::new(tx, CancellationToken::new()))
+            .await
+            .unwrap();
+        sensor.start().await.unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(
+            include_str!("../tests/fixtures/ubuntu2404-exec-sh-c-marker.log").as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let mut cmdlines = vec![];
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some(RawEvent::ProcessExec(raw))) => cmdlines.push(raw.cmdline),
+                other => panic!("expected a ProcessExec event, got {other:?}"),
+            }
+        }
+        sensor.stop().await.unwrap();
+        assert_eq!(
+            cmdlines[1],
+            [
+                "/bin/sh",
+                "-c",
+                "true osirisp10cfe49a0ea24b4218aad021ee0c8b56d2"
+            ]
+        );
+        assert_eq!(cmdlines[0][0], "/bin/bash");
     }
 }

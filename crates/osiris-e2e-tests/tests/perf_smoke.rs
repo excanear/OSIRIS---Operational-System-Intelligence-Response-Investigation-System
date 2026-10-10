@@ -31,6 +31,7 @@ fn pipeline_processes_synthetic_events_above_a_generous_throughput_floor() {
             uid: 1000,
             exe_path: "/usr/bin/example".to_string(),
             comm: "example".to_string(),
+            cmdline: vec![],
             timestamp_ns: i,
             start_time_mono: i,
             source: RawEventSource::Synthetic,

@@ -281,8 +281,9 @@ impl Agent {
                     maybe_raw = raw_rx.recv() => {
                         match maybe_raw {
                             Some(raw) => {
-                                let prioritized = pipeline.process(raw);
+                                let mut prioritized = pipeline.process(raw);
                                 if pipeline_policy.allows(prioritized.event.event_type) {
+                                    pipeline_policy.apply_field_rules(&mut prioritized.event);
                                     pipeline_bus.enqueue(prioritized);
                                 } else {
                                     dropped.increment();
