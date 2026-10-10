@@ -9,7 +9,7 @@ trees, in-process Agent/Server wiring) and the Console has never been opened in 
 Phase 10 closes that gap:
 
 1. **Real-Linux validation harness** — the production `osiris-server` and `osiris-agent`
-   binaries, configured by real TOML files, running against a real kernel + real `auditd`,
+   binaries, configured by real YAML files, running against a real kernel + real `auditd`,
    driven by real user-space actions; assertions made through the real authenticated API.
 2. **First benchmark pass** (ARCHITECTURE.md §19.2) — an `osiris-bench` binary that measures
    throughput, end-to-end latency, Agent CPU/RSS and query latency and writes `PERFORMANCE.md`.
@@ -25,7 +25,7 @@ In scope:
   `CONFIG_AUDIT`, rustup+gcc) and **Debian** imported into WSL (whatever release the WSL store
   ships — recorded in the validation report). Same WSL kernel, different user lands (auditd
   version, systemd version, paths, default shells).
-* Scenarios: process exec, file create/write/rename/delete, network connect + DNS, login/sudo
+* Scenarios: process exec, file create/write/rename/delete, network connect, sudo
   (identity/privilege), systemd unit start, persistence-path writes.
 * Benchmarks at 1K and 10K events/s; a 100K events/s attempt whose result is recorded as-is.
 * Playwright smoke for every Console screen.
@@ -37,6 +37,8 @@ Out of scope (recorded as debt in the roadmap):
 * New CI gates. CI keeps `perf_smoke` as its only perf check; the real-Linux suite, the bench
   and Playwright run locally/WSL. A CI job for Playwright is a follow-up.
 * eBPF (Phase 11).
+* DNS: no real DNS sensor exists (DNS events are synthetic-only); real DNS capture needs
+  eBPF/packet capture and is Phase 11 debt.
 
 ## 3. Real-Linux validation harness
 
@@ -44,12 +46,16 @@ Out of scope (recorded as debt in the roadmap):
 
 ```text
 crates/osiris-real-linux-tests/       new crate, publish = false, no lib code shipped
-  Cargo.toml                          dev-deps: reqwest, tokio, serde_json, tempfile,
-                                      osiris-auth, osiris-transport (pki), uuid
-  src/lib.rs                          the harness (pub mod harness) — usable by tests only
+  Cargo.toml                          deps: reqwest (blocking), serde_json, tempfile, uuid,
+                                      osiris-auth, osiris-transport (pki), osiris-command
+                                      (keys), osiris-config (HostIdentity), osiris-generator,
+                                      osiris-pipeline, osiris-schema
+  src/lib.rs                          the harness library (config rendering, PKI, users,
+                                      process spawning, API polling) — dev tooling only
+  src/bin/osiris-stack.rs             seeded server for the Console Playwright suite (§5.1)
   tests/real_linux.rs                 scenarios; every test #[ignore] + #[cfg(target_os="linux")]
 tools/real-linux/
-  setup.sh                            idempotent: apt install auditd (+ dnsutils, curl, sudo),
+  setup.sh                            idempotent: apt install auditd (+ curl, sudo),
                                       enable/start auditd, load osiris.rules, sanity check
   osiris.rules                        audit rules the sensors depend on (execve, file syscalls
                                       on watched dirs, identity/USER_* is default, systemd)
@@ -66,13 +72,14 @@ test binary. `tools/check-dep-graph.sh` gets an entry allowing it to depend on t
 `Stack::start(opts)`:
 
 1. Creates a temp dir; writes PKI via `osiris_transport::pki` (CA, server cert for
-   `127.0.0.1`/`localhost`, agent cert for a fresh host UUID) and a command signing key.
+   `127.0.0.1`/`localhost`, agent cert for the host id the Agent binary will use — it reads/creates
+   `/etc/osiris/host_id`, so the harness calls `HostIdentity::load_or_create` on that path first) and a command signing key.
 2. Pre-creates `users.db` with `SqliteUserStore::open`, takes the bootstrap admin and mints a
    session token (server opens the same file — this is how the harness authenticates without
    scraping stdout).
-3. Writes `server.toml` (API on `127.0.0.1:<free port>`, agent listener, control listener,
+3. Writes `server.yaml` (API on `127.0.0.1:<free port>`, agent listener, control listener,
    rules dir = repo `config/rules`, risk weights = repo `config/risk/weights.yaml`, all DBs in
-   the temp dir) and `agent.toml` (forward + control to the server, `audit_log_path` /
+   the temp dir) and `agent.yaml` (forward + control to the server, `audit_log_path` /
    `fs_audit_log_path` / `identity_audit_log_path` / `systemd_audit_log_path` =
    `/var/log/audit/audit.log`, `proc_root=/proc`, persistence watch on a temp dir and on
    `/etc/systemd/system`, synthetic off).
@@ -81,8 +88,9 @@ test binary. `tools/check-dep-graph.sh` gets an entry allowing it to depend on t
 5. Waits (bounded, 30 s) for `GET /api/v1/health` and for the host to appear in
    `GET /api/v1/hosts`.
 
-`Drop` kills both children (SIGTERM, then SIGKILL after 5 s) and keeps the temp dir when the
-test panicked (path printed) for post-mortem.
+`Drop` kills both children (`Child::kill` + `wait`) and keeps the temp dir when the
+test panicked (path printed) for post-mortem. The harness is synchronous (blocking reqwest);
+server-only mode works on every OS (the Console stack uses it), Agent mode is Linux-only.
 
 Helpers: `stack.api_get(path) -> serde_json::Value`, and
 `stack.wait_for(path, deadline, predicate)` — bounded poll (250 ms) that panics with the last
@@ -97,12 +105,12 @@ test can find *its* event among everything else the real host is doing.
 |---|---|---|
 | `exec_is_observed` | spawn `/bin/sh -c "true <marker>"` | `/api/v1/processes` has the exe + argv containing marker, correct ppid chain |
 | `file_lifecycle_is_observed` | create, write, rename, delete `<tmp>/<marker>` | `/api/v1/files` shows create/write/rename/delete for one file identity |
-| `network_connect_and_dns_are_observed` | `getent hosts <marker>.example.invalid`, TCP connect to the server's own listener | `/api/v1/network` connection with correct remote addr; DNS query with the marker name |
+| `network_connect_is_observed` | test binds a listener on a random loopback port; a child `bash` opens `/dev/tcp/127.0.0.1/<port>` and holds it ~6 s (the sensor polls `/proc/net/tcp`, so the connection must outlive a poll) | a `NETWORK_CONNECT` event with `dst_port == <port>` |
 | `sudo_is_observed` | `sudo -u nobody true` as root, `su` login of a throwaway user created by the test | identity/privilege events in `/api/v1/events` for the session |
 | `systemd_unit_start_is_observed` | write + start a transient unit `osiris-<marker>.service` (`/bin/true`), then remove it | systemd service-start event for the unit |
 | `persistence_write_is_observed` | write a file into the watched persistence dir | persistence event for that path |
 | `web_root_drop_raises_an_alert` | `bash -c 'echo x > /var/www/osiris-<marker>.php'` (rule `shell_wrote_file_to_web_root` matches the fixed prefix `/var/www/`; `osiris.rules` watches `/var/www`; the test removes the file) | `/api/v1/alerts` has the rule's alert for the file |
-| `agent_reports_healthy_sensors` | none | `/api/v1/hosts` row: every enabled sensor `HEALTHY`, real distro + kernel strings |
+| `agent_reports_healthy_sensors` | none | `/api/v1/hosts` row has real distro + kernel strings (today `main.rs` hard-codes `"unknown"` — a known finding fixed in this phase by reading `/etc/os-release` `PRETTY_NAME` and `/proc/sys/kernel/osrelease`); the latest `AGENT_HEALTH` event lists every configured sensor as healthy |
 
 The alert test is the only detection-level check; the others validate sensors end to end.
 Known suspect it is expected to surface: on merged-`/usr` distros the kernel reports the
@@ -177,13 +185,14 @@ the shipped binaries depends on either.)
 
 * `console/e2e/` with `@playwright/test` (devDependency) and `console/playwright.config.ts`,
   Chromium only, `npm run e2e`.
-* `console/e2e/global-setup.ts` runs `tools/console-e2e/start-stack.sh` (bash; works in WSL
-  and Git Bash): builds and starts `osiris-server` with a generated config and `dev_cors`,
-  seeds data by running the agent with `enable_synthetic` through each generator scenario
-  (exec chain, web shell drop, network beacon, ssh/sudo escalation, systemd persistence,
-  container deploy) so alerts and incidents exist, creates a known admin password, and starts
-  `vite preview` against the built console proxying `/api` to the server. Teardown stops
-  everything.
+* `console/e2e/global-setup.ts` spawns `osiris-stack` (the harness's server-only mode, any OS):
+  it starts the real `osiris-server` on port 8080 (the port Vite's proxy targets), seeds data by
+  pushing every generator scenario (exec chain, web shell drop, network beacon, download then
+  write, ssh/sudo escalation, systemd persistence, container deploy) through the real
+  `Pipeline` into the server's spool file so alerts and incidents exist, and writes
+  `{base_url, username, password}` (the bootstrap admin) to a JSON file the specs read.
+  Playwright's `webServer` starts `vite preview` (built console, `/api` proxied to the
+  server). Teardown kills the stack.
 * One spec per screen: login, overview, alerts, incidents, processes (+ process story), files,
   network, containers, graph, timeline, hunting, evidence, live events, hosts (+ host policy),
   groups (+ group policy editor), sensors. Each spec asserts: the screen's main heading and at
