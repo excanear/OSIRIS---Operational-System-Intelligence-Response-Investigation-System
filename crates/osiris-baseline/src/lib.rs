@@ -98,14 +98,11 @@ impl BaselineEngine {
 
     fn upsert(
         &self,
+        conn: &Connection,
         kind: FrequencyKind,
         key: &str,
         timestamp: u64,
     ) -> Result<Observation, BaselineError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| BaselineError::Storage("poisoned lock".to_string()))?;
         let existing_count: Option<i64> = conn
             .query_row(
                 "SELECT count FROM baseline_frequency WHERE kind = ?1 AND key = ?2",
@@ -147,11 +144,48 @@ impl BaselineEngine {
     /// event with no `process`) simply contributes no observation for that
     /// dimension — never an error.
     pub fn observe(&self, event: &CanonicalEvent) -> Result<Vec<Observation>, BaselineError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| BaselineError::Storage("poisoned lock".to_string()))?;
+        self.observe_on(&conn, event)
+    }
+
+    /// `observe` for each event in order, in ONE transaction: event `i` sees
+    /// the counts of events `0..i`, exactly as one-by-one calls would, but the
+    /// batch costs one commit instead of one per frequency pair (Phase 10
+    /// finding F1). All or nothing: on error no count from the batch is kept.
+    pub fn observe_batch<'e>(
+        &self,
+        events: impl IntoIterator<Item = &'e CanonicalEvent>,
+    ) -> Result<Vec<Vec<Observation>>, BaselineError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| BaselineError::Storage("poisoned lock".to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| BaselineError::Storage(e.to_string()))?;
+        let observations = events
+            .into_iter()
+            .map(|event| self.observe_on(&tx, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit()
+            .map_err(|e| BaselineError::Storage(e.to_string()))?;
+        Ok(observations)
+    }
+
+    fn observe_on(
+        &self,
+        conn: &Connection,
+        event: &CanonicalEvent,
+    ) -> Result<Vec<Observation>, BaselineError> {
         let mut observations = Vec::new();
 
         if let (Some(parent), Some(process)) = (&event.parent_process, &event.process) {
             let key = format!("{}\u{1}{}", parent.exe_path, process.exe_path);
             observations.push(self.upsert(
+                conn,
                 FrequencyKind::ParentChildExec,
                 &key,
                 event.timestamp,
@@ -162,15 +196,25 @@ impl BaselineEngine {
                 "{}\u{1}{}:{}",
                 process.exe_path, network.dst_ip, network.dst_port
             );
-            observations.push(self.upsert(FrequencyKind::ProcessNetwork, &key, event.timestamp)?);
+            observations.push(self.upsert(
+                conn,
+                FrequencyKind::ProcessNetwork,
+                &key,
+                event.timestamp,
+            )?);
         }
         if let (Some(process), Some(dns)) = (&event.process, &event.dns) {
             let key = format!("{}\u{1}{}", process.exe_path, dns.query);
-            observations.push(self.upsert(FrequencyKind::ProcessDns, &key, event.timestamp)?);
+            observations.push(self.upsert(
+                conn,
+                FrequencyKind::ProcessDns,
+                &key,
+                event.timestamp,
+            )?);
         }
         if let (Some(user), Some(process)) = (&event.user, &event.process) {
             let key = format!("{}\u{1}{}", user.uid, process.exe_path);
-            observations.push(self.upsert(FrequencyKind::UserExe, &key, event.timestamp)?);
+            observations.push(self.upsert(conn, FrequencyKind::UserExe, &key, event.timestamp)?);
         }
 
         Ok(observations)
@@ -238,6 +282,38 @@ mod tests {
             exe_hash: None,
             start_time_mono: 1,
         }
+    }
+
+    /// Phase 10 finding F1: one commit per upsert put two fsyncs per exec
+    /// event on the ingest path. A batch is now one transaction.
+    #[test]
+    fn a_batch_is_observed_in_one_commit_with_the_same_counts_as_one_by_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            BaselineEngine::open_with_threshold(dir.path().join("baseline.db"), 2).unwrap();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = commits.clone();
+        engine.conn.lock().unwrap().commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        let mut event = base_event();
+        event.parent_process = Some(process_ref("/bin/bash", event.host_id));
+        event.process = Some(process_ref("/usr/bin/curl", event.host_id));
+
+        let observations = engine.observe_batch(&vec![event; 3]).unwrap();
+
+        let seen: Vec<(u64, Rarity)> = observations
+            .iter()
+            .map(|o| (o[0].count, o[0].rarity))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(1, Rarity::New), (2, Rarity::Rare), (3, Rarity::Common)]
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

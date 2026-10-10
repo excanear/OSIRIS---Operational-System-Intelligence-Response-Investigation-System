@@ -10,6 +10,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# hooks: tests count commits with a commit hook.
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }

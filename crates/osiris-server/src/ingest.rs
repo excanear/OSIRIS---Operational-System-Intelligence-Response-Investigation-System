@@ -67,23 +67,17 @@ impl EdgeSource for StorageEdgeSource<'_> {
 /// the caller persists the whole batch's records in one transaction (one
 /// commit per batch rather than per event — Phase 10 finding F1). Nothing in
 /// this function reads risk scores back, so deferring the write is invisible.
-fn correlate_baseline_and_score(
+/// `observations` are the event's Baseline observations, taken for the whole
+/// batch up front in one transaction (`BaselineEngine::observe_batch`).
+fn correlate_and_score(
     storage: &dyn Storage,
-    baseline_engine: &BaselineEngine,
     risk_engine: &RiskEngine,
     correlation_engine: &CorrelationEngine,
     event: &CanonicalEvent,
     alerts_for_event: &[Alert],
+    observations: &[osiris_baseline::Observation],
 ) -> Option<RiskScoreRecord> {
     let process = event.process.as_ref()?;
-    let observations = match baseline_engine.observe(event) {
-        Ok(obs) => obs,
-        Err(e) => {
-            tracing::warn!(error = %e, event_id = %event.event_id, "baseline observe failed; scoring without baseline input");
-            vec![]
-        }
-    };
-
     let seed = EntityRef::Process {
         process_key: process.process_key,
     };
@@ -94,7 +88,7 @@ fn correlate_baseline_and_score(
     let chain: BehavioralChain =
         correlation_engine.build_chain(&edge_source, seed, event.timestamp);
 
-    risk_engine.score(event, alerts_for_event, &observations, Some(&chain))
+    risk_engine.score(event, alerts_for_event, observations, Some(&chain))
 }
 
 /// The policy hash an agent reports in its heartbeat. An explicit `null`
@@ -192,20 +186,34 @@ impl IngestContext {
                     storage.write_relationships(&edges)?;
                 }
 
+                // Baseline counts only process events (the ones that are scored).
+                let process_events: Vec<&CanonicalEvent> =
+                    events.iter().filter(|e| e.process.is_some()).collect();
+                let mut observations = match baseline_engine
+                    .observe_batch(process_events.iter().copied())
+                {
+                    Ok(obs) => obs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, events = process_events.len(), "baseline observe failed; scoring the batch without baseline input");
+                        vec![vec![]; process_events.len()]
+                    }
+                }
+                .into_iter();
                 let mut risk_records = Vec::new();
-                for event in &events {
+                for event in process_events {
                     let alerts_for_event: Vec<Alert> = alerts
                         .iter()
                         .filter(|a| a.evidence().contains(&event.event_id))
                         .cloned()
                         .collect();
-                    risk_records.extend(correlate_baseline_and_score(
+                    let observations = observations.next().unwrap_or_default();
+                    risk_records.extend(correlate_and_score(
                         storage.as_ref(),
-                        &baseline_engine,
                         &risk_engine,
                         &correlation_engine,
                         event,
                         &alerts_for_event,
+                        &observations,
                     ));
                 }
                 if !risk_records.is_empty() {
