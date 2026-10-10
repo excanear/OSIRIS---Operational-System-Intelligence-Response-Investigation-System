@@ -1,0 +1,204 @@
+# Real-Linux validation (Phase 10)
+
+The Phase 10 suite (`crates/osiris-real-linux-tests/tests/real_linux.rs`) runs the production
+`osirisd` agent and `osiris-server` binaries on a real Linux host, performs real actions
+(exec, file writes, sudo, systemd units, TCP connects) and asserts that the matching canonical
+events and alerts appear through the server API. Every test filters on a unique per-test marker,
+never on counts of host activity, and every wait is bounded.
+
+Results below are for code HEAD `ef7171d`. A later `setup.sh` fix (libssl-dev) and this document
+come after it. Authoritative audit-backed results come from GitHub Actions, because auditd cannot
+run under WSL2 (see "Deferred").
+
+## How to reproduce
+
+### GitHub Actions (audit-backed, Ubuntu 22.04 and 24.04)
+
+Push the commit to a `real-linux/**` branch, or dispatch the workflow manually:
+
+```
+git push origin HEAD:refs/heads/real-linux/<name>
+```
+
+`.github/workflows/real-linux.yml` runs on `ubuntu-22.04` and `ubuntu-24.04`: it calls
+`sudo tools/real-linux/setup.sh`, then `tools/real-linux/run.sh` as root, and uploads
+`audit.log`, the test output and any kept stack dirs as the `real-linux-<os>` artifact.
+It is not a merge gate (CI keeps only `perf_smoke`). Delete the `real-linux/*` branches after use.
+
+### A VM or host with a working auditd
+
+As root:
+
+```
+tools/real-linux/setup.sh     # installs auditd, build tools, libssl-dev, rust; loads tools/real-linux/osiris.rules
+tools/real-linux/run.sh       # release build into $CARGO_TARGET_DIR (default /root/osiris-target), then the suite
+tools/real-linux/run.sh exec  # optional: test-name filter
+```
+
+The suite is `#[ignore]` and `#[cfg(target_os = "linux")]`, runs serially
+(`--test-threads=1`) and needs root. On failure each test panics with the last API body and the
+tail of both process logs, and keeps its stack dir (`/tmp/osiris-p10-*`) for post-mortem.
+
+### WSL2 (no auditd)
+
+```
+wsl -d Ubuntu-24.04 -- bash -lc "cd '<worktree>' && tools/real-linux/run.sh"
+wsl -d Debian -u root -- bash -lc "cd '<worktree>' && tools/real-linux/run.sh"
+```
+
+WSL2 cannot run auditd: the distro lives in a child PID namespace and the kernel refuses audit
+control (`auditctl -s`: Operation not permitted; auditd logs `DAEMON_ABORT`). `setup.sh` therefore
+stops at `systemctl enable --now auditd` with a message. On WSL install rust yourself
+(`rustup`) and `libssl-dev`, run `mkdir -p /tmp/osiris-p10 /var/www /etc/osiris`, then run
+`run.sh`. Only the non-audit scenarios can pass there. Builds use a Linux-side target dir
+(`/root/osiris-target`), never the Windows `target/`. The Windows host clock can drift from real
+UTC; do not use it for timing.
+
+## Ubuntu 22.04 (GitHub Actions, audit-backed)
+
+| Item | Value |
+|---|---|
+| Distro | Ubuntu 22.04 (GitHub-hosted runner image `ubuntu-22.04`) |
+| Kernel | 6.8.0-1064-azure |
+| auditd | 3.0.7 (from the `DAEMON_START` record) |
+| systemd | n/a (not captured; the runner image's stock package) |
+| Date / run | 2026-10-10, runs 38074649377 and 38075037549 (both at `ef7171d`) |
+
+| Scenario | Result |
+|---|---|
+| agent_reports_real_host_facts_and_healthy_sensors | pass |
+| exec_is_observed | pass |
+| file_lifecycle_is_observed | pass |
+| network_connect_is_observed | pass |
+| sudo_is_observed | pass |
+| systemd_unit_start_is_observed | pass |
+| persistence_write_is_observed | pass |
+| web_root_drop_raises_an_alert | pass |
+
+8/8 in both runs (suite about 80 s).
+
+## Ubuntu 24.04 (GitHub Actions, audit-backed)
+
+| Item | Value |
+|---|---|
+| Distro | Ubuntu 24.04 (GitHub-hosted runner image `ubuntu-24.04`) |
+| Kernel | 6.17.0-1022-azure |
+| auditd | 3.1.2 (from the `DAEMON_START` record) |
+| systemd | n/a (not captured; the runner image's stock package) |
+| Date / run | 2026-10-10, runs 38074649377 and 38075037549 (both at `ef7171d`) |
+
+| Scenario | Result |
+|---|---|
+| agent_reports_real_host_facts_and_healthy_sensors | pass |
+| exec_is_observed | pass |
+| file_lifecycle_is_observed | pass |
+| network_connect_is_observed | pass |
+| sudo_is_observed | pass |
+| systemd_unit_start_is_observed | pass |
+| persistence_write_is_observed | pass |
+| web_root_drop_raises_an_alert | pass |
+
+8/8 in both runs (suite about 79 s).
+
+Kernel and auditd versions come from the run artifacts (agent `kernel_version` in the spool,
+`DAEMON_START` in `audit.log`); the runner image can change between runs.
+
+## Ubuntu 24.04 (WSL2, non-audit scenarios only)
+
+| Item | Value |
+|---|---|
+| Distro | Ubuntu 24.04 under WSL2 |
+| Kernel | 6.18.40.1-microsoft-standard-WSL2 |
+| auditd | installed, cannot run (EPERM on audit netlink) |
+| systemd | PID 1 |
+| Date | 2026-10-09/10 (Task 3; host clock about 3 h ahead of real UTC) |
+
+Task 3's full run was 2/8 (host facts, network). `persistence_write_is_observed` was fixed
+afterwards (574fec3) and passes alone in WSL (1 passed in about 32 s). The audit-dependent
+scenarios cannot pass without auditd and were not weakened to make them pass.
+
+| Scenario | Result |
+|---|---|
+| agent_reports_real_host_facts_and_healthy_sensors | pass (audit.log existed, all six sensors started) |
+| network_connect_is_observed | pass |
+| persistence_write_is_observed | pass |
+| exec_is_observed | expected fail: environmental (audit) |
+| file_lifecycle_is_observed | expected fail: environmental (audit) |
+| sudo_is_observed | expected fail: environmental (audit) |
+| systemd_unit_start_is_observed | expected fail: environmental (the systemd sensor tails the audit log) |
+| web_root_drop_raises_an_alert | expected fail: environmental (needs audit exec and file events) |
+
+## Debian 13 "trixie" (WSL2, non-audit scenarios only)
+
+| Item | Value |
+|---|---|
+| Distro | Debian GNU/Linux 13 (trixie) under WSL2 (`wsl --install -d Debian --no-launch`) |
+| Kernel | 6.18.40.1-microsoft-standard-WSL2 |
+| auditd | 4.0.2 package installed, cannot run (same WSL2 limitation) |
+| systemd | 257 (PID 1) |
+| Date | 2026-10-10 (host clock about 3 h ahead of real UTC) |
+
+All eight tests were run (`tools/real-linux/run.sh`, `--test-threads=1`, root): 2 passed, 6 failed,
+303 s. The six failures are environmental (no audit data), not product defects.
+
+| Scenario | Result |
+|---|---|
+| network_connect_is_observed | pass |
+| persistence_write_is_observed | pass |
+| agent_reports_real_host_facts_and_healthy_sensors | fail, environmental. The distro and kernel assertions pass (`Debian GNU/Linux 13 (trixie)`, real kernel). The test then fails because `/var/log/audit/audit.log` does not exist: the agent correctly skips `process_exec`, `filesystem`, `identity` and `systemd` ("unsupported on this host"), so AGENT_HEALTH lists only `network` and `persistence` |
+| exec_is_observed | fail, environmental: no PROCESS_EXEC within 45 s |
+| file_lifecycle_is_observed | fail, environmental: no FILE_CREATE within 45 s |
+| sudo_is_observed | fail, environmental: no PRIVILEGE_SUDO within 45 s |
+| systemd_unit_start_is_observed | fail, environmental: no SERVICE_START within 45 s (`systemd-run` itself succeeded) |
+| web_root_drop_raises_an_alert | fail, environmental: no FILE_CREATE within 45 s, so no alert |
+
+Debian-specific finding: a bare Debian needs `libssl-dev` for `openssl-sys`, and `setup.sh` did
+not install it (the GitHub runner images ship it). Fixed in the `setup.sh` apt line. No product
+code change was needed for Debian. Debian with a working auditd is not covered (it needs a VM; the
+workflow matrix has only Ubuntu runners).
+
+## Findings
+
+| Finding | Distro | Fix commit |
+|---|---|---|
+| Agent reported distro and kernel as "unknown" instead of the real values | Ubuntu 24.04 (WSL) | 5e2d96a |
+| Harness spawned the agent by the wrong binary name (`osiris-agent` instead of `osirisd`) | Ubuntu 24.04 (WSL) | e3463ca |
+| Harness did not own the agent child before the readiness wait, so a timeout panic leaked the process | Ubuntu 24.04 (WSL) | 73995e1 |
+| Agent could not create its quarantine vault when the harness pre-created it at 0755 (control connection refused) | Ubuntu 24.04 (WSL) | a213fc3 |
+| Persistence scenario expected PERSISTENCE_CREATED, but a unit file normalises to SERVICE_CREATE and the scan interval is 30 s | Ubuntu 24.04 (WSL) | 574fec3 |
+| `run.sh` / `setup.sh` were not executable in git | all | b015be2 |
+| Shipped shell rules listed only `/bin/*` shell paths; merged-/usr hosts report `/usr/bin/bash`, so the web-root and DNS rules never fired | Ubuntu 22.04, 24.04 | 265d678 |
+| Spool NDJSON lines interleaved (tokio `write_all` returned before the bytes were written, so one send's newline landed after the next line) | Ubuntu 22.04, 24.04 | 5a7f082 |
+| `tokenize` did not treat auditd's ENRICHED `\x1d` separator as a field boundary (latent: the audit `key` carried the enrichment) | Ubuntu 24.04 | dd68664 |
+| Process sensor never captured argv (execve arguments live in a separate EXECVE record) | Ubuntu 22.04, 24.04 | 0010a58 |
+| Web-root scenario matched the alert on the marker, but alerts carry only evidence event ids | Ubuntu 22.04, 24.04 | e3741a2 |
+| Scenario shell actions had no bound (`systemd-run --wait`, `sudo`) and the CI suite step had no timeout | Ubuntu 22.04, 24.04 | ef7171d |
+| `setup.sh` omitted `libssl-dev`, so the release build failed on a bare Debian | Debian 13 (WSL) | commit "fix(10): setup.sh installs libssl-dev" (after ef7171d) |
+
+Each product fix has a fixture-based or unit regression test that runs in normal CI on any OS, for
+example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
+`send_returns_only_after_the_whole_line_is_written`,
+`the_enriched_gs_separator_is_a_field_boundary`, `tests/real_audit_fixtures.rs` and
+`ids_containing_ties_an_alert_back_to_its_marker_event`.
+
+## Deferred
+
+- M1 (Task 4 review): the process sensor's `ExecAssembler` holds one pending exec at a time. When
+  audit records of another event interleave on a busy host, the exec is released early and its argv
+  is silently lost (the event is still reported, with an empty `cmdline`).
+- M3 (Task 4 review): on a host with no policy set the agent sends the full argv, and there is no
+  secret redaction of argument values. Argv is stripped only below the STANDARD policy level.
+- WSL auditd gap: auditd cannot run under WSL2, so audit-dependent scenarios can be validated only
+  on GitHub Actions or a real VM. The WSL runs (Ubuntu and Debian) cover the non-audit scenarios.
+- Debian with a working auditd is not validated.
+
+## Console
+
+Filled by Task 11.
+
+## Known gaps
+
+- No DNS sensor exists, so DNS detections are not exercised on real hosts.
+- No container or Kubernetes scenarios.
+- RHEL-like distributions (auditd paths, SELinux) are not covered.
+- eBPF is out of scope.
