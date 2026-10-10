@@ -180,7 +180,7 @@ impl Stack {
             std::fs::write(d.join("agent.yaml"), agent_yaml.render()).unwrap();
             // Owned by the Stack before the wait so a panic there still reaps it in Drop.
             stack.agent = Some(spawn(
-                &bin_path("osiris-agent"),
+                &bin_path("osirisd"),
                 &d.join("agent.yaml"),
                 &d.join("agent.log"),
             ));
