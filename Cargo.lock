@@ -1378,6 +1378,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "osiris-generator",
+ "osiris-pipeline",
+ "osiris-real-linux-tests",
+ "osiris-schema",
+ "osiris-sensor-api",
+ "osiris-storage",
+ "osiris-storage-sqlite",
+ "osiris-transport",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-bus"
 version = "0.1.0"
 dependencies = [

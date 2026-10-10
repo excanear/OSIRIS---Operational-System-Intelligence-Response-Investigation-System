@@ -1,0 +1,23 @@
+[package]
+name = "osiris-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
+osiris-pipeline = { path = "../osiris-pipeline" }
+osiris-schema = { path = "../osiris-schema" }
+osiris-sensor-api = { path = "../osiris-sensor-api" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+osiris-transport = { path = "../osiris-transport" }
+osiris-generator = { path = "../../generator" }
+osiris-real-linux-tests = { path = "../osiris-real-linux-tests" }
