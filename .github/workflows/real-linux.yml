@@ -1,0 +1,50 @@
+name: real-linux
+
+# Not a CI gate: runs only on manual dispatch, or when a branch named real-linux/** is pushed (master, feature branches and PRs never trigger it).
+on:
+  workflow_dispatch:
+  push:
+    branches: ['real-linux/**']
+
+permissions:
+  contents: read
+
+jobs:
+  real-linux:
+    name: real-linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare auditd and watch dirs
+        run: sudo tools/real-linux/setup.sh
+      - name: Run the real-Linux suite as root
+        # Root needs the runner's toolchain: keep PATH and cargo/rustup homes.
+        # TMPDIR makes the harness's kept stack dirs findable for the artifact.
+        run: |
+          mkdir -p "$RUNNER_TEMP/osiris-kept"
+          sudo chmod 1777 "$RUNNER_TEMP/osiris-kept"
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+            "TMPDIR=$RUNNER_TEMP/osiris-kept" CARGO_TARGET_DIR=/root/osiris-target \
+            tools/real-linux/run.sh 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
+          exit "${PIPESTATUS[0]}"
+      - name: Collect audit log
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          sudo cp /var/log/audit/audit.log "$RUNNER_TEMP/artifacts/audit.log" || true
+          sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
+          cp "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/artifacts/" || true
+          sudo cp -r "$RUNNER_TEMP/osiris-kept" "$RUNNER_TEMP/artifacts/kept-stack-dirs" || true
+          sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-linux-${{ matrix.os }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn
