@@ -127,6 +127,11 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
         latencies.extend(poll_markers(&reader, &mut pending));
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Server-side throughput: what reached events.db over the whole run (send + drain).
+    let run_elapsed = start.elapsed();
+    let stored: u64 = reader
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap_or(0);
     cancel.cancel();
     let achieved = sent as f64 / send_elapsed.as_secs_f64();
     let delivered = summarize(&mut latencies);
@@ -141,6 +146,8 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
             "achieved_eps": achieved,
             "saturated": saturated,
             "max_behind_events": max_behind,
+            "stored_events": stored,
+            "stored_eps_over_run": stored as f64 / run_elapsed.as_secs_f64(),
             "markers_sent": markers_sent,
             "markers_lost": pending.len(),
             // Percentiles cover only markers that became visible; lost markers
