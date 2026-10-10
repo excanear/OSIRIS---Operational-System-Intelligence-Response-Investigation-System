@@ -80,7 +80,7 @@ impl Stack {
             .tempdir()
             .unwrap();
         let d = dir.path().to_path_buf();
-        for sub in ["pki", "keys", "vault"] {
+        for sub in ["pki", "keys"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
 
