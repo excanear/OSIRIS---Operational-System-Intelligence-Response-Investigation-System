@@ -1854,6 +1854,7 @@ dependencies = [
  "osiris-fleet",
  "osiris-health",
  "osiris-policy",
+ "osiris-query",
  "osiris-response",
  "osiris-risk",
  "osiris-schema",

@@ -5,7 +5,7 @@ use osiris_baseline::BaselineEngine;
 use osiris_correlate::{BehavioralChain, CorrelationEngine, EdgeSource};
 use osiris_detect::DetectionEngine;
 use osiris_risk::RiskEngine;
-use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship};
+use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship, RiskScoreRecord};
 use osiris_storage::{RelationshipQueryPlan, Storage};
 use tokio_util::sync::CancellationToken;
 
@@ -63,7 +63,10 @@ impl EdgeSource for StorageEdgeSource<'_> {
 /// Correlation... Baseline", then Risk annotates from both). Runs after
 /// `storage.write_relationships` for the whole batch, so a chain built for
 /// an early event in the batch can already see relationships persisted by
-/// this same batch.
+/// this same batch. Returns the event's risk record instead of writing it:
+/// the caller persists the whole batch's records in one transaction (one
+/// commit per batch rather than per event — Phase 10 finding F1). Nothing in
+/// this function reads risk scores back, so deferring the write is invisible.
 fn correlate_baseline_and_score(
     storage: &dyn Storage,
     baseline_engine: &BaselineEngine,
@@ -71,10 +74,8 @@ fn correlate_baseline_and_score(
     correlation_engine: &CorrelationEngine,
     event: &CanonicalEvent,
     alerts_for_event: &[Alert],
-) -> Result<(), osiris_storage::StorageError> {
-    let Some(process) = &event.process else {
-        return Ok(());
-    };
+) -> Option<RiskScoreRecord> {
+    let process = event.process.as_ref()?;
     let observations = match baseline_engine.observe(event) {
         Ok(obs) => obs,
         Err(e) => {
@@ -93,10 +94,7 @@ fn correlate_baseline_and_score(
     let chain: BehavioralChain =
         correlation_engine.build_chain(&edge_source, seed, event.timestamp);
 
-    if let Some(record) = risk_engine.score(event, alerts_for_event, &observations, Some(&chain)) {
-        storage.write_risk_scores(std::slice::from_ref(&record))?;
-    }
-    Ok(())
+    risk_engine.score(event, alerts_for_event, &observations, Some(&chain))
 }
 
 /// The policy hash an agent reports in its heartbeat. An explicit `null`
@@ -194,20 +192,24 @@ impl IngestContext {
                     storage.write_relationships(&edges)?;
                 }
 
+                let mut risk_records = Vec::new();
                 for event in &events {
                     let alerts_for_event: Vec<Alert> = alerts
                         .iter()
                         .filter(|a| a.evidence().contains(&event.event_id))
                         .cloned()
                         .collect();
-                    correlate_baseline_and_score(
+                    risk_records.extend(correlate_baseline_and_score(
                         storage.as_ref(),
                         &baseline_engine,
                         &risk_engine,
                         &correlation_engine,
                         event,
                         &alerts_for_event,
-                    )?;
+                    ));
+                }
+                if !risk_records.is_empty() {
+                    storage.write_risk_scores(&risk_records)?;
                 }
 
                 report
@@ -933,6 +935,148 @@ mod tests {
         let mut plan = osiris_storage::RelationshipQueryPlan::new();
         plan.limit = 100;
         assert_eq!(storage.query_relationships(&plan).unwrap().len(), 0);
+    }
+
+    /// Delegates to SQLite and counts `write_risk_scores` calls: each call is
+    /// one SQLite transaction (one fsync), so the count is the commit cost.
+    struct CountingStorage {
+        inner: SqliteStorage,
+        risk_writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Storage for CountingStorage {
+        fn write(&self, event: &CanonicalEvent) -> Result<(), osiris_storage::StorageError> {
+            self.inner.write(event)
+        }
+        fn batch_write(
+            &self,
+            events: &[CanonicalEvent],
+        ) -> Result<osiris_storage::WriteReport, osiris_storage::StorageError> {
+            self.inner.batch_write(events)
+        }
+        fn event_owner(&self, id: Uuid) -> Result<Option<Uuid>, osiris_storage::StorageError> {
+            self.inner.event_owner(id)
+        }
+        fn query(
+            &self,
+            plan: &QueryPlan,
+        ) -> Result<Vec<CanonicalEvent>, osiris_storage::StorageError> {
+            self.inner.query(plan)
+        }
+        fn query_events(
+            &self,
+            plan: &osiris_query::EventQueryPlan,
+        ) -> Result<Vec<CanonicalEvent>, osiris_storage::StorageError> {
+            self.inner.query_events(plan)
+        }
+        fn get_event(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<CanonicalEvent>, osiris_storage::StorageError> {
+            self.inner.get_event(id)
+        }
+        fn delete(
+            &self,
+            criteria: &osiris_storage::DeleteCriteria,
+        ) -> Result<u64, osiris_storage::StorageError> {
+            self.inner.delete(criteria)
+        }
+        fn retention_apply(
+            &self,
+            policy: &osiris_storage::RetentionPolicy,
+        ) -> Result<osiris_storage::RetentionReport, osiris_storage::StorageError> {
+            self.inner.retention_apply(policy)
+        }
+        fn health(&self) -> osiris_storage::StorageHealth {
+            self.inner.health()
+        }
+        fn write_alerts(
+            &self,
+            alerts: &[Alert],
+        ) -> Result<osiris_storage::WriteReport, osiris_storage::StorageError> {
+            self.inner.write_alerts(alerts)
+        }
+        fn query_alerts(
+            &self,
+            plan: &AlertQueryPlan,
+        ) -> Result<Vec<Alert>, osiris_storage::StorageError> {
+            self.inner.query_alerts(plan)
+        }
+        fn write_relationships(
+            &self,
+            edges: &[EntityRelationship],
+        ) -> Result<osiris_storage::WriteReport, osiris_storage::StorageError> {
+            self.inner.write_relationships(edges)
+        }
+        fn query_relationships(
+            &self,
+            plan: &RelationshipQueryPlan,
+        ) -> Result<Vec<EntityRelationship>, osiris_storage::StorageError> {
+            self.inner.query_relationships(plan)
+        }
+        fn write_risk_scores(
+            &self,
+            scores: &[osiris_schema::RiskScoreRecord],
+        ) -> Result<osiris_storage::WriteReport, osiris_storage::StorageError> {
+            self.risk_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.write_risk_scores(scores)
+        }
+        fn query_risk_scores(
+            &self,
+            plan: &osiris_storage::RiskQueryPlan,
+        ) -> Result<Vec<osiris_schema::RiskScoreRecord>, osiris_storage::StorageError> {
+            self.inner.query_risk_scores(plan)
+        }
+    }
+
+    /// Phase 10 finding F1: risk scores used to be written one transaction per
+    /// event before the ack, which capped real-Linux ingest at ~100-140 eps.
+    #[tokio::test]
+    async fn a_batch_is_scored_with_one_risk_score_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let counting = Arc::new(CountingStorage {
+            inner: SqliteStorage::open(dir.path().join("events.db")).unwrap(),
+            risk_writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: counting.clone(),
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
+            ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+        };
+        let host_id = Uuid::new_v4();
+        let events: Vec<CanonicalEvent> = (0..20u32)
+            .map(|i| {
+                let mut e = network_connect_event(host_id, 1000 + i, 1_000_000 + i as u64);
+                // A distinct destination per event: each is a NEW baseline pair, so each scores.
+                e.network.as_mut().unwrap().dst_port = 1000 + i as u16;
+                e
+            })
+            .collect();
+        context.ingest(events).await.unwrap();
+
+        let scores = counting
+            .query_risk_scores(&osiris_storage::RiskQueryPlan {
+                limit: 100,
+                ..osiris_storage::RiskQueryPlan::new()
+            })
+            .unwrap();
+        assert_eq!(scores.len(), 20, "every process event is scored");
+        assert_eq!(
+            counting
+                .risk_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the whole batch's scores are persisted in one write"
+        );
     }
 
     #[tokio::test]
