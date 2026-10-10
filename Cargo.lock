@@ -1638,6 +1638,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-real-linux-tests"
+version = "0.1.0"
+dependencies = [
+ "osiris-agent",
+ "osiris-auth",
+ "osiris-command",
+ "osiris-config",
+ "osiris-generator",
+ "osiris-pipeline",
+ "osiris-schema",
+ "osiris-server",
+ "osiris-transport",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-response"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,22 @@
+[package]
+name = "osiris-real-linux-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+osiris-auth = { path = "../osiris-auth" }
+osiris-transport = { path = "../osiris-transport" }
+osiris-command = { path = "../osiris-command" }
+osiris-config = { path = "../osiris-config" }
+osiris-generator = { path = "../../generator" }
+osiris-pipeline = { path = "../osiris-pipeline" }
+osiris-schema = { path = "../osiris-schema" }
+
+[dev-dependencies]
+osiris-server = { path = "../osiris-server" }
+osiris-agent = { path = "../osiris-agent" }
