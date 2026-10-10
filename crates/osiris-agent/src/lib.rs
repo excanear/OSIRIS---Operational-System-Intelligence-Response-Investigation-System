@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cloud;
 pub mod config;
 pub mod control;
+pub mod host_info;
 pub mod k8s;
 pub mod lifecycle;
 pub mod linux_exec;

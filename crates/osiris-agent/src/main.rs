@@ -71,11 +71,12 @@ async fn main() {
         Some(c) => tracing::info!(provider = %c.provider, "cloud metadata detected"),
         None => tracing::debug!("no cloud metadata detected (on-prem, disabled, or unreachable)"),
     }
+    let (distro, kernel_version) = osiris_agent::host_info::detect();
     let host = HostRef {
         host_id,
         hostname,
-        distro: "unknown".to_string(),
-        kernel_version: "unknown".to_string(),
+        distro,
+        kernel_version,
         cloud,
     };
 
