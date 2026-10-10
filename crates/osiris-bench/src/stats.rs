@@ -1,6 +1,3 @@
-// Pacer and the /proc parsers are consumed by the ingest/agent benches (Task 7).
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use serde::Serialize;
@@ -58,6 +55,7 @@ impl Pacer {
 
 /// utime + stime (clock ticks) from /proc/<pid>/stat. Parses after the LAST
 /// ')' because comm may contain spaces and parentheses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux agent bench reads /proc
 pub fn parse_proc_stat_ticks(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let f: Vec<&str> = rest.split_whitespace().collect();
@@ -67,6 +65,7 @@ pub fn parse_proc_stat_ticks(stat: &str) -> Option<u64> {
     Some(utime + stime)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux agent bench reads /proc
 pub fn parse_vm_rss_kib(status: &str) -> Option<u64> {
     status
         .lines()

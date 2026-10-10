@@ -35,7 +35,15 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         duration: u64,
     },
-    All,
+    /// The full matrix. Agent benches need real auditd, so they can be split off.
+    All {
+        /// Everything except the agent bench (hosts without auditd, e.g. WSL2).
+        #[arg(long, conflicts_with = "agent_only")]
+        skip_agent: bool,
+        /// Only the agent bench (the GitHub Actions workflow).
+        #[arg(long)]
+        agent_only: bool,
+    },
 }
 
 fn main() {
@@ -44,16 +52,24 @@ fn main() {
         Cmd::Query { events } => vec![query::run(events)],
         Cmd::Ingest { rate, duration } => vec![ingest::run(rate, duration)],
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
-        Cmd::All => {
-            let mut v = vec![pipeline::run(200_000)];
-            for n in [10_000, 100_000, 1_000_000] {
-                v.push(query::run(n));
+        Cmd::All {
+            skip_agent,
+            agent_only,
+        } => {
+            let mut v = vec![];
+            if !agent_only {
+                v.push(pipeline::run(200_000));
+                for n in [10_000, 100_000, 1_000_000] {
+                    v.push(query::run(n));
+                }
+                for r in [1_000, 10_000, 100_000] {
+                    v.push(ingest::run(r, 30));
+                }
             }
-            for r in [1_000, 10_000, 100_000] {
-                v.push(ingest::run(r, 30));
-            }
-            for r in [0, 1_000, 10_000] {
-                v.push(agent::run(r, 30));
+            if !skip_agent {
+                for r in [0, 1_000, 10_000] {
+                    v.push(agent::run(r, 30));
+                }
             }
             v
         }

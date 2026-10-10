@@ -1,8 +1,9 @@
 use std::time::Instant;
 
-use osiris_schema::{CanonicalEvent, EventType};
+use osiris_schema::{Alert, CanonicalEvent, EventType, Severity};
 use osiris_storage::{AlertQueryPlan, QueryPlan, Storage};
 use osiris_storage_sqlite::SqliteStorage;
+use uuid::Uuid;
 
 use crate::pipeline::{new_pipeline, scenario};
 use crate::stats::{percentile, Record};
@@ -50,6 +51,27 @@ pub fn run(events: u64) -> Record {
             .expect("batch_write")
             .written_count;
     }
+    // One alert per 100 events, so the alerts query reads a populated table.
+    let host_id = Uuid::new_v4();
+    let alerts: Vec<Alert> = (0..(events / 100).max(1))
+        .map(|i| {
+            Alert::new(
+                "bench_rule",
+                1,
+                "bench-hash",
+                Severity::High,
+                1_000_000_000 + i,
+                host_id,
+                vec!["bench alert".to_string()],
+                vec![Uuid::new_v4()],
+            )
+            .expect("alert")
+        })
+        .collect();
+    let alerts_written = storage
+        .write_alerts(&alerts)
+        .expect("write_alerts")
+        .written_count;
     let fill_ms = fill.elapsed().as_secs_f64() * 1000.0;
 
     let list_ms = median_ms(|| {
@@ -79,7 +101,7 @@ pub fn run(events: u64) -> Record {
             "fill_ms": fill_ms,
             "list_default": { "median_ms": list_ms },
             "process_exec": { "median_ms": exec_ms },
-            "alerts": { "median_ms": alerts_ms },
+            "alerts": { "rows": alerts_written, "median_ms": alerts_ms },
         }),
     }
 }

@@ -1,0 +1,55 @@
+name: real-linux-bench
+
+# Not a CI gate: runs only on manual dispatch, or when a branch named real-linux-bench/** is pushed.
+# The agent benchmark needs real auditd, which WSL2 cannot run, so it runs here.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['real-linux-bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  agent-bench:
+    name: agent-bench (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare auditd and watch dirs
+        run: sudo tools/real-linux/setup.sh
+      - name: Record runner facts
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          {
+            echo "nproc: $(nproc)"
+            echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "kernel: $(uname -r)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "--- free -h ---"
+            free -h
+            echo "--- lscpu ---"
+            lscpu
+          } > "$RUNNER_TEMP/artifacts/runner-facts.txt"
+      - name: Run the agent benchmark as root
+        # Build ~5 min + 3 x 30 s runs; a hang fails here, not at the job cap.
+        timeout-minutes: 25
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+            CARGO_TARGET_DIR=/root/osiris-target \
+            tools/real-linux/bench.sh --agent-only "$RUNNER_TEMP/artifacts/bench-agent.jsonl" 2>&1 \
+            | tee "$RUNNER_TEMP/artifacts/bench-output.txt"
+          exit "${PIPESTATUS[0]}"
+      - name: Collect audit log tail
+        if: always()
+        run: |
+          sudo tail -n 2000 /var/log/audit/audit.log > "$RUNNER_TEMP/artifacts/audit-tail.log" || true
+          sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-bench-ubuntu-24.04
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn
