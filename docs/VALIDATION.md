@@ -6,9 +6,10 @@ The Phase 10 suite (`crates/osiris-real-linux-tests/tests/real_linux.rs`) runs t
 events and alerts appear through the server API. Every test filters on a unique per-test marker,
 never on counts of host activity, and every wait is bounded.
 
-Results below are for code HEAD `ef7171d`. A later `setup.sh` fix (libssl-dev) and this document
-come after it. Authoritative audit-backed results come from GitHub Actions, because auditd cannot
-run under WSL2 (see "Deferred").
+Each result section states the code it ran against: GitHub Actions results are from `ef7171d`,
+the Debian WSL run is from `564f50a` (`ef7171d` plus the `setup.sh` libssl-dev fix), and the Ubuntu
+WSL data is from Task 3 (older code, before the Task 4 fixes). Authoritative audit-backed results
+come from GitHub Actions, because auditd cannot run under WSL2 (see "Deferred").
 
 ## How to reproduce
 
@@ -30,7 +31,7 @@ It is not a merge gate (CI keeps only `perf_smoke`). Delete the `real-linux/*` b
 As root:
 
 ```
-tools/real-linux/setup.sh     # installs auditd, build tools, libssl-dev, rust; loads tools/real-linux/osiris.rules
+tools/real-linux/setup.sh     # installs auditd, build tools, libssl-dev, and rust if cargo is absent; loads tools/real-linux/osiris.rules
 tools/real-linux/run.sh       # release build into $CARGO_TARGET_DIR (default /root/osiris-target), then the suite
 tools/real-linux/run.sh exec  # optional: test-name filter
 ```
@@ -41,18 +42,27 @@ tail of both process logs, and keeps its stack dir (`/tmp/osiris-p10-*`) for pos
 
 ### WSL2 (no auditd)
 
+Run these inside the distro as root (`wsl -d Debian -u root -- bash -lc "..."`; for Ubuntu use
+`wsl -d Ubuntu-24.04 -- bash -lc "..."`), from the worktree (WSL path under `/mnt/f/...`, quoted):
+
 ```
-wsl -d Ubuntu-24.04 -- bash -lc "cd '<worktree>' && tools/real-linux/run.sh"
-wsl -d Debian -u root -- bash -lc "cd '<worktree>' && tools/real-linux/run.sh"
+tools/real-linux/setup.sh
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+tools/real-linux/run.sh
 ```
 
-WSL2 cannot run auditd: the distro lives in a child PID namespace and the kernel refuses audit
-control (`auditctl -s`: Operation not permitted; auditd logs `DAEMON_ABORT`). `setup.sh` therefore
-stops at `systemctl enable --now auditd` with a message. On WSL install rust yourself
-(`rustup`) and `libssl-dev`, run `mkdir -p /tmp/osiris-p10 /var/www /etc/osiris`, then run
-`run.sh`. Only the non-audit scenarios can pass there. Builds use a Linux-side target dir
-(`/root/osiris-target`), never the Windows `target/`. The Windows host clock can drift from real
-UTC; do not use it for timing.
+1. `setup.sh` installs the packages (auditd, curl, sudo, build-essential, pkg-config, libssl-dev)
+   and creates `/tmp/osiris-p10`, `/var/www` and `/etc/osiris`, then stops with exit code 1 at
+   `systemctl enable --now auditd` and prints a message. On WSL2 this stop is expected: the distro
+   lives in a child PID namespace and the kernel refuses audit control (`auditctl -s`: Operation
+   not permitted; auditd logs `DAEMON_ABORT`).
+2. Because `setup.sh` exits before its rustup step, install rust yourself (the one remaining manual
+   step; `run.sh` sources `~/.cargo/env`).
+3. `run.sh` builds into the Linux-side `/root/osiris-target` (never the Windows `target/`) and runs
+   the suite. Only the non-audit scenarios can pass; pass a name filter (for example
+   `run.sh persistence`) to run a subset.
+
+The Windows host clock can drift from real UTC; do not use it for timing.
 
 ## Ubuntu 22.04 (GitHub Actions, audit-backed)
 
@@ -62,6 +72,7 @@ UTC; do not use it for timing.
 | Kernel | 6.8.0-1064-azure |
 | auditd | 3.0.7 (from the `DAEMON_START` record) |
 | systemd | n/a (not captured; the runner image's stock package) |
+| Code | `ef7171d` |
 | Date / run | 2026-10-10, runs 38074649377 and 38075037549 (both at `ef7171d`) |
 
 | Scenario | Result |
@@ -85,6 +96,7 @@ UTC; do not use it for timing.
 | Kernel | 6.17.0-1022-azure |
 | auditd | 3.1.2 (from the `DAEMON_START` record) |
 | systemd | n/a (not captured; the runner image's stock package) |
+| Code | `ef7171d` |
 | Date / run | 2026-10-10, runs 38074649377 and 38075037549 (both at `ef7171d`) |
 
 | Scenario | Result |
@@ -111,6 +123,7 @@ Kernel and auditd versions come from the run artifacts (agent `kernel_version` i
 | Kernel | 6.18.40.1-microsoft-standard-WSL2 |
 | auditd | installed, cannot run (EPERM on audit netlink) |
 | systemd | PID 1 |
+| Code | Task 3-era code (before the Task 4 fixes); only persistence was re-run later (574fec3) |
 | Date | 2026-10-09/10 (Task 3; host clock about 3 h ahead of real UTC) |
 
 Task 3's full run was 2/8 (host facts, network). `persistence_write_is_observed` was fixed
@@ -122,11 +135,11 @@ scenarios cannot pass without auditd and were not weakened to make them pass.
 | agent_reports_real_host_facts_and_healthy_sensors | pass (audit.log existed, all six sensors started) |
 | network_connect_is_observed | pass |
 | persistence_write_is_observed | pass |
-| exec_is_observed | expected fail: environmental (audit) |
-| file_lifecycle_is_observed | expected fail: environmental (audit) |
-| sudo_is_observed | expected fail: environmental (audit) |
-| systemd_unit_start_is_observed | expected fail: environmental (the systemd sensor tails the audit log) |
-| web_root_drop_raises_an_alert | expected fail: environmental (needs audit exec and file events) |
+| exec_is_observed | expected fail, not re-run at HEAD: environmental (audit) |
+| file_lifecycle_is_observed | expected fail, not re-run at HEAD: environmental (audit) |
+| sudo_is_observed | expected fail, not re-run at HEAD: environmental (audit) |
+| systemd_unit_start_is_observed | expected fail, not re-run at HEAD: environmental (the systemd sensor tails the audit log) |
+| web_root_drop_raises_an_alert | expected fail, not re-run at HEAD: environmental (needs audit exec and file events) |
 
 ## Debian 13 "trixie" (WSL2, non-audit scenarios only)
 
@@ -136,10 +149,11 @@ scenarios cannot pass without auditd and were not weakened to make them pass.
 | Kernel | 6.18.40.1-microsoft-standard-WSL2 |
 | auditd | 4.0.2 package installed, cannot run (same WSL2 limitation) |
 | systemd | 257 (PID 1) |
+| Code | `564f50a` |
 | Date | 2026-10-10 (host clock about 3 h ahead of real UTC) |
 
 All eight tests were run (`tools/real-linux/run.sh`, `--test-threads=1`, root): 2 passed, 6 failed,
-303 s. The six failures are environmental (no audit data), not product defects.
+303 s (output saved as `debian-wsl-run.txt` in the SDD directory). The six failures are environmental (no audit data), not product defects.
 
 | Scenario | Result |
 |---|---|
@@ -173,7 +187,7 @@ workflow matrix has only Ubuntu runners).
 | Process sensor never captured argv (execve arguments live in a separate EXECVE record) | Ubuntu 22.04, 24.04 | 0010a58 |
 | Web-root scenario matched the alert on the marker, but alerts carry only evidence event ids | Ubuntu 22.04, 24.04 | e3741a2 |
 | Scenario shell actions had no bound (`systemd-run --wait`, `sudo`) and the CI suite step had no timeout | Ubuntu 22.04, 24.04 | ef7171d |
-| `setup.sh` omitted `libssl-dev`, so the release build failed on a bare Debian | Debian 13 (WSL) | commit "fix(10): setup.sh installs libssl-dev" (after ef7171d) |
+| `setup.sh` omitted `libssl-dev`, so the release build failed on a bare Debian | Debian 13 (WSL) | 564f50a |
 
 Each product fix has a fixture-based or unit regression test that runs in normal CI on any OS, for
 example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
