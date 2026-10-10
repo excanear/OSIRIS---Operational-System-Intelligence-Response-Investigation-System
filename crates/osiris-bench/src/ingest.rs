@@ -11,14 +11,18 @@ use uuid::Uuid;
 
 use crate::stats::{summarize, Pacer, Record};
 
+/// A read-only handle on events.db, opened once and reused by `poll_markers`.
+fn open_reader(db: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open events.db read-only")
+}
+
 /// Returns latencies (ms) of markers now visible in events.db, removing them
 /// from `pending`.
-pub(crate) fn poll_markers(db: &Path, pending: &mut Vec<(Uuid, Instant)>) -> Vec<f64> {
-    let Ok(conn) =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return vec![];
-    };
+pub(crate) fn poll_markers(
+    conn: &rusqlite::Connection,
+    pending: &mut Vec<(Uuid, Instant)>,
+) -> Vec<f64> {
     let mut seen = vec![];
     pending.retain(|(id, sent)| {
         let found = conn
@@ -74,7 +78,10 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
         .append(true)
         .open(&spool)
         .unwrap();
+    let reader = open_reader(&stack.events_db());
     let mut pacer = Pacer::new(rate);
+    let mut max_behind = 0u64;
+    let mut markers_sent = 0u64;
     let (start, end) = (Instant::now(), Duration::from_secs(duration_s));
     let mut sent = 0u64;
     let mut next_marker = Duration::ZERO;
@@ -85,8 +92,10 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
     let mut queue = VecDeque::new();
     let mut scenario_i = 0u64;
     while start.elapsed() < end {
+        max_behind = max_behind.max(pacer.behind(start.elapsed()));
         let n = pacer.due(start.elapsed());
         let mut buf = String::new();
+        let mut batch_markers = vec![];
         for _ in 0..n {
             if queue.is_empty() {
                 queue.extend(osiris_generator::exec_chain_scenario(scenario_i));
@@ -94,7 +103,7 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
             }
             let ev = pipeline.process(queue.pop_front().unwrap()).event;
             if start.elapsed() >= next_marker {
-                pending.push((ev.event_id, Instant::now()));
+                batch_markers.push(ev.event_id);
                 next_marker += Duration::from_millis(100);
             }
             buf.push_str(&serde_json::to_string(&ev).unwrap());
@@ -102,24 +111,42 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
             sent += 1;
         }
         out.write_all(buf.as_bytes()).unwrap();
-        latencies.extend(poll_markers(&stack.events_db(), &mut pending));
-        std::thread::sleep(Duration::from_millis(5));
+        // Stamped once the bytes are in the spool, so driver time is not counted as server latency.
+        let written_at = Instant::now();
+        markers_sent += batch_markers.len() as u64;
+        pending.extend(batch_markers.into_iter().map(|id| (id, written_at)));
+        latencies.extend(poll_markers(&reader, &mut pending));
+        if pacer.behind(start.elapsed()) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     let send_elapsed = start.elapsed();
     // Drain: give stragglers up to 30 s, then count the rest as not delivered.
     let drain_end = Instant::now() + Duration::from_secs(30);
     while !pending.is_empty() && Instant::now() < drain_end {
-        latencies.extend(poll_markers(&stack.events_db(), &mut pending));
+        latencies.extend(poll_markers(&reader, &mut pending));
         std::thread::sleep(Duration::from_millis(50));
     }
     cancel.cancel();
     let achieved = sent as f64 / send_elapsed.as_secs_f64();
-    let lat = summarize(&mut latencies);
+    let delivered = summarize(&mut latencies);
+    // The driver could not keep pace if it ever lagged by more than one slice.
+    let saturated = max_behind > pacer.slice();
     Record {
         bench: "ingest".into(),
         params: serde_json::json!({"rate": rate, "duration_s": duration_s}),
-        metrics: serde_json::json!({"sent": sent, "achieved_eps": achieved,
-            "markers_lost": pending.len(), "latency_ms": lat}),
+        metrics: serde_json::json!({
+            "sent": sent,
+            "target_eps": rate,
+            "achieved_eps": achieved,
+            "saturated": saturated,
+            "max_behind_events": max_behind,
+            "markers_sent": markers_sent,
+            "markers_lost": pending.len(),
+            // Percentiles cover only markers that became visible; lost markers
+            // are censored at the 30 s drain bound and are NOT in these numbers.
+            "latency_ms_delivered_only": delivered,
+        }),
     }
 }
 
@@ -136,13 +163,14 @@ mod tests {
             .unwrap();
         let id = uuid::Uuid::new_v4();
         let mut pending = vec![(id, std::time::Instant::now())];
-        assert!(poll_markers(&db, &mut pending).is_empty());
+        let reader = open_reader(&db);
+        assert!(poll_markers(&reader, &mut pending).is_empty());
         conn.execute(
             "INSERT INTO events (event_id) VALUES (?1)",
             [id.to_string()],
         )
         .unwrap();
-        let seen = poll_markers(&db, &mut pending);
+        let seen = poll_markers(&reader, &mut pending);
         assert_eq!(seen.len(), 1);
         assert!(pending.is_empty());
     }

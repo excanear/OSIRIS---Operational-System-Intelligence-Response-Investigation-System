@@ -37,41 +37,72 @@ pub fn run(rate: u64, duration_s: u64) -> Record {
     let mut pacer = Pacer::new(rate);
     let start = Instant::now();
     let end = Duration::from_secs(duration_s);
-    let (mut prev_ticks, _) = read().expect("agent /proc readable");
-    let mut next_sample = Duration::from_secs(1);
-    let mut prev_at = Instant::now();
-    let (mut cpu, mut rss) = (vec![], vec![]);
-    let mut spawned = 0u64;
-    let mut children = vec![];
-    while start.elapsed() < end {
-        for _ in 0..pacer.due(start.elapsed()) {
-            if let Ok(c) = std::process::Command::new("/bin/true").spawn() {
-                children.push(c);
-                spawned += 1;
+    // Sampling runs on its own fixed 1 s tick, so a saturated spawn loop cannot skew it.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (mut max_behind, mut spawned) = (0u64, 0u64);
+    let (cpu, rss, read_failures, spawned_elapsed) = std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let (mut cpu, mut rss, mut failures) = (vec![], vec![], 0u64);
+            let (mut prev_ticks, _) = read().expect("agent /proc readable");
+            let mut prev_at = Instant::now();
+            let mut tick = 1u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let due = start + Duration::from_secs(tick);
+                while Instant::now() < due && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tick += 1;
+                match read() {
+                    Some((ticks, kib)) => {
+                        let secs = prev_at.elapsed().as_secs_f64();
+                        cpu.push((ticks - prev_ticks) as f64 / tick_hz / secs * 100.0);
+                        rss.push(kib as f64 / 1024.0);
+                        prev_ticks = ticks;
+                        prev_at = Instant::now();
+                    }
+                    None => failures += 1, // agent gone: visible in the record
+                }
+            }
+            (cpu, rss, failures)
+        });
+        let mut children = vec![];
+        while start.elapsed() < end {
+            max_behind = max_behind.max(pacer.behind(start.elapsed()));
+            for _ in 0..pacer.due(start.elapsed()) {
+                if let Ok(c) = std::process::Command::new("/bin/true").spawn() {
+                    children.push(c);
+                    spawned += 1;
+                }
+            }
+            children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+            if pacer.behind(start.elapsed()) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
-        children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
-        if start.elapsed() >= next_sample {
-            if let Some((ticks, kib)) = read() {
-                // % of one core over the real interval: a loaded spawn loop samples late.
-                let secs = prev_at.elapsed().as_secs_f64();
-                cpu.push((ticks - prev_ticks) as f64 / tick_hz / secs * 100.0);
-                prev_at = Instant::now();
-                rss.push(kib as f64 / 1024.0);
-                prev_ticks = ticks;
-            }
-            next_sample = start.elapsed() + Duration::from_secs(1);
+        let elapsed = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = sampler.join().expect("sampler thread");
+        for mut c in children {
+            let _ = c.wait();
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let achieved = spawned as f64 / start.elapsed().as_secs_f64();
-    for mut c in children {
-        let _ = c.wait();
-    }
+        (out.0, out.1, out.2, elapsed)
+    });
+    let achieved = spawned as f64 / spawned_elapsed.as_secs_f64();
+    let saturated = max_behind > pacer.slice();
     Record {
         bench: "agent".into(),
         params: serde_json::json!({"rate": rate, "duration_s": duration_s}),
-        metrics: serde_json::json!({"achieved_exec_per_sec": achieved,
-            "cpu_pct_one_core": summarize(&mut cpu), "rss_mib": summarize(&mut rss)}),
+        metrics: serde_json::json!({
+            "target_exec_per_sec": rate,
+            "achieved_exec_per_sec": achieved,
+            "saturated": saturated,
+            "max_behind_events": max_behind,
+            "sample_read_failures": read_failures,
+            "cpu_pct_one_core": summarize(&mut { cpu }),
+            "rss_mib": summarize(&mut { rss }),
+        }),
     }
 }

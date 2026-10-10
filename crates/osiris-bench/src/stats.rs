@@ -31,7 +31,10 @@ pub fn summarize(samples: &mut [f64]) -> Summary {
     }
 }
 
-/// Emits `rate * elapsed` events in total, however irregularly it is polled.
+/// Emits `rate * elapsed` events in total, however irregularly it is polled,
+/// but never more than one 100 ms slice of load per call. A driver that cannot
+/// keep up falls behind (see `behind`) instead of bursting, so its sampling and
+/// marker timing stay regular.
 pub struct Pacer {
     rate: u64,
     emitted: u64,
@@ -45,9 +48,19 @@ impl Pacer {
         }
     }
 
-    pub fn due(&mut self, elapsed: Duration) -> u64 {
+    /// Largest batch `due` returns: 100 ms of load.
+    pub fn slice(&self) -> u64 {
+        self.rate / 10 + 1
+    }
+
+    /// Events owed but not yet handed out.
+    pub fn behind(&self, elapsed: Duration) -> u64 {
         let target = (self.rate as u128 * elapsed.as_millis() / 1000) as u64;
-        let n = target.saturating_sub(self.emitted);
+        target.saturating_sub(self.emitted)
+    }
+
+    pub fn due(&mut self, elapsed: Duration) -> u64 {
+        let n = self.behind(elapsed).min(self.slice());
         self.emitted += n;
         n
     }
@@ -112,6 +125,16 @@ mod tests {
         }
         assert_eq!(total, 1000);
         assert_eq!(p.due(Duration::from_millis(1000)), 0);
+    }
+
+    #[test]
+    fn pacer_never_bursts_more_than_a_slice_and_reports_the_deficit() {
+        let mut p = Pacer::new(1000);
+        // Polled once after 10 s: 10000 owed, but only one 100 ms slice is released.
+        let n = p.due(Duration::from_secs(10));
+        assert_eq!(n, p.slice());
+        assert!(n <= 101);
+        assert_eq!(p.behind(Duration::from_secs(10)), 10_000 - n);
     }
 
     #[test]
