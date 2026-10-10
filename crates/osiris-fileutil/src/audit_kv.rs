@@ -13,6 +13,10 @@ pub struct AuditMsgId {
     pub serial: u64,
 }
 
+/// The byte auditd's ENRICHED log format writes between the kernel's
+/// fields and its own interpreted ones.
+pub const ENRICHMENT_SEPARATOR: char = '\u{1d}';
+
 /// Tokenizes one auditd record line into `key=value` pairs, honoring
 /// auditd's double-quoting convention for values that may contain spaces
 /// (`comm="curl"`, `exe="/usr/bin/curl"`).
@@ -35,12 +39,24 @@ pub struct AuditMsgId {
 /// say — never do); that decoding is the caller's job for whichever fields
 /// carry untrusted strings (see `osiris_sensors_fs::audit_record::
 /// parse_record`'s handling of `name=`/`cwd=`).
+///
+/// auditd's `log_format = ENRICHED` (the Ubuntu default) appends its
+/// interpreted fields after a `\x1d` (GS) byte, e.g.
+/// `key="osiris_fs"<GS>ARCH=x86_64 UID="root"`. GS is a field boundary; the
+/// enriched keys are UPPERCASE, so they never collide with the kernel's.
 pub fn tokenize(line: &str) -> HashMap<String, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
     for c in line.chars() {
-        if c == '"' {
+        if c == ENRICHMENT_SEPARATOR {
+            // Never inside a kernel-quoted value (those are printable ASCII
+            // only), so it always ends the current field.
+            in_quotes = false;
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if c == '"' {
             in_quotes = !in_quotes;
             current.push(c);
         } else if c.is_whitespace() && !in_quotes {
@@ -149,6 +165,25 @@ mod tests {
         let syscall_id = parse_audit_msg_id(tokenize(SYSCALL_LINE).get("msg").unwrap()).unwrap();
         let path_id = parse_audit_msg_id(tokenize(path_line).get("msg").unwrap()).unwrap();
         assert_eq!(syscall_id, path_id);
+    }
+
+    /// Real-Linux fixture (Ubuntu 24.04, auditd `log_format = ENRICHED`):
+    /// auditd appends its interpreted fields after a `\x1d` (GS) byte,
+    /// e.g. `key="osiris_exec"\x1dARCH=x86_64 ... UID="root"`. GS is not
+    /// Unicode whitespace, so it must be treated as a field boundary of its
+    /// own — otherwise the kernel's last field swallows the enrichment.
+    #[test]
+    fn the_enriched_gs_separator_is_a_field_boundary() {
+        let line = include_str!("../tests/fixtures/ubuntu2404-enriched-syscall.log").trim_end();
+        assert!(line.contains('\u{1d}'), "fixture must keep the raw GS byte");
+        let fields = tokenize(line);
+        assert_eq!(fields.get("key").map(String::as_str), Some("osiris_exec"));
+        assert_eq!(fields.get("ARCH").map(String::as_str), Some("x86_64"));
+        assert_eq!(fields.get("UID").map(String::as_str), Some("root"));
+        // The kernel's own (lowercase) fields are untouched by enrichment.
+        assert_eq!(fields.get("uid").map(String::as_str), Some("0"));
+        assert_eq!(fields.get("pid").map(String::as_str), Some("8404"));
+        assert_eq!(fields.get("exe").map(String::as_str), Some("/usr/bin/bash"));
     }
 
     #[test]
