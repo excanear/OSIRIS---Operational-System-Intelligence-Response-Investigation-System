@@ -1,0 +1,10 @@
+## OSIRIS Phase 10 validation rules (loaded by setup.sh into /etc/audit/rules.d/)
+## Process sensor: every execve.
+-a always,exit -F arch=b64 -S execve -k osiris_exec
+-a always,exit -F arch=b32 -S execve -k osiris_exec
+## Filesystem sensor: writes/creates/renames/deletes under the watched trees.
+-w /tmp/osiris-p10 -p wa -k osiris_fs
+-w /var/www -p wa -k osiris_fs
+-w /etc/systemd/system -p wa -k osiris_fs
+## Identity/privilege: setuid/setgid family (USER_* records are on by default).
+-a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid,setresuid,setresgid -k osiris_priv
