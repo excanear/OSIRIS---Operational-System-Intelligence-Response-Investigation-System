@@ -94,8 +94,13 @@ impl SqliteStorage {
                 event_id TEXT NOT NULL,
                 timestamp INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_relationships_from ON relationships(from_key);
-            CREATE INDEX IF NOT EXISTS idx_relationships_to ON relationships(to_key);
+            -- (key, timestamp): a correlation lookup reads only its time window,
+            -- not every edge a long-lived entity (pid 1, a busy daemon) ever had
+            -- (Phase 10 finding F2). They replace the key-only indexes.
+            DROP INDEX IF EXISTS idx_relationships_from;
+            DROP INDEX IF EXISTS idx_relationships_to;
+            CREATE INDEX IF NOT EXISTS idx_relationships_from_ts ON relationships(from_key, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_relationships_to_ts ON relationships(to_key, timestamp);
             CREATE INDEX IF NOT EXISTS idx_relationships_timestamp ON relationships(timestamp);
 
             -- Phase 6: Risk Engine output (ARCHITECTURE.md §11.4), mirroring
@@ -320,6 +325,60 @@ fn push_host_filter(
         params.push(Box::new(id.clone()));
     }
     Ok(())
+}
+
+/// The SQL and parameters for `query_relationships`.
+fn relationships_sql(
+    plan: &RelationshipQueryPlan,
+) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>), StorageError> {
+    let mut sql =
+        "SELECT from_key, to_key, relation, event_id, timestamp FROM relationships WHERE 1=1"
+            .to_string();
+    let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+    if let Some(entity) = &plan.entity {
+        sql.push_str(" AND (from_key = ? OR to_key = ?)");
+        let key = entity.storage_key();
+        sql_params.push(Box::new(key.clone()));
+        sql_params.push(Box::new(key));
+    }
+    if let Some(ids) = &plan.host_ids {
+        if ids.len() > MAX_TENANT_HOSTS {
+            return Err(host_set_too_large());
+        }
+        if ids.is_empty() {
+            sql.push_str(" AND 1=0");
+        } else {
+            // A per-row primary-key probe, not `event_id IN (SELECT ... WHERE
+            // host_id IN ..)`: SQLite materialised that list of every event the
+            // host ever stored on each call (Phase 10 finding F2).
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM events e WHERE e.event_id = relationships.event_id                  AND e.host_id IN ({}))",
+                vec!["?"; ids.len()].join(",")
+            ));
+            for id in ids {
+                sql_params.push(Box::new(id.clone()));
+            }
+        }
+    }
+    if let Some(since) = plan.since {
+        sql.push_str(" AND timestamp >= ?");
+        // Clamp rather than cast directly: a caller-supplied window can
+        // legitimately be `u64::MAX`/near it (e.g. the Correlation
+        // Engine's "effectively unbounded" test configuration), and
+        // SQLite has no unsigned column type — an un-clamped cast would
+        // silently wrap into a negative i64, making a wide-open time
+        // range filter out every real (small, positive) timestamp.
+        sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
+    }
+    if let Some(until) = plan.until {
+        sql.push_str(" AND timestamp <= ?");
+        sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
+    }
+    sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
+    let limit = if plan.limit == 0 { 1000 } else { plan.limit };
+    sql_params.push(Box::new(limit as i64));
+    Ok((sql, sql_params))
 }
 
 impl SqliteStorage {
@@ -869,50 +928,7 @@ impl Storage for SqliteStorage {
             .conn
             .lock()
             .map_err(|_| StorageError::Backend("poisoned lock".to_string()))?;
-        let mut sql =
-            "SELECT from_key, to_key, relation, event_id, timestamp FROM relationships WHERE 1=1"
-                .to_string();
-        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        if let Some(entity) = &plan.entity {
-            sql.push_str(" AND (from_key = ? OR to_key = ?)");
-            let key = entity.storage_key();
-            sql_params.push(Box::new(key.clone()));
-            sql_params.push(Box::new(key));
-        }
-        if let Some(ids) = &plan.host_ids {
-            if ids.len() > MAX_TENANT_HOSTS {
-                return Err(host_set_too_large());
-            }
-            if ids.is_empty() {
-                sql.push_str(" AND 1=0");
-            } else {
-                sql.push_str(&format!(
-                    " AND event_id IN (SELECT event_id FROM events WHERE host_id IN ({}))",
-                    vec!["?"; ids.len()].join(",")
-                ));
-                for id in ids {
-                    sql_params.push(Box::new(id.clone()));
-                }
-            }
-        }
-        if let Some(since) = plan.since {
-            sql.push_str(" AND timestamp >= ?");
-            // Clamp rather than cast directly: a caller-supplied window can
-            // legitimately be `u64::MAX`/near it (e.g. the Correlation
-            // Engine's "effectively unbounded" test configuration), and
-            // SQLite has no unsigned column type — an un-clamped cast would
-            // silently wrap into a negative i64, making a wide-open time
-            // range filter out every real (small, positive) timestamp.
-            sql_params.push(Box::new(since.min(i64::MAX as u64) as i64));
-        }
-        if let Some(until) = plan.until {
-            sql.push_str(" AND timestamp <= ?");
-            sql_params.push(Box::new(until.min(i64::MAX as u64) as i64));
-        }
-        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
-        let limit = if plan.limit == 0 { 1000 } else { plan.limit };
-        sql_params.push(Box::new(limit as i64));
+        let (sql, sql_params) = relationships_sql(plan)?;
 
         let mut stmt = conn
             .prepare(&sql)
@@ -3167,6 +3183,44 @@ mod tests {
             })
             .unwrap()
             .is_empty());
+    }
+
+    /// Phase 10 finding F2: an edge lookup must cost what the correlation
+    /// window holds, not what the host has ever stored. The tenant host filter
+    /// used to materialise every event id of the host (`LIST SUBQUERY`) and
+    /// the key indexes had no timestamp, so each `build_chain` step grew with
+    /// the database (0.5-2.8 s per lookup at 80-200k events of one host).
+    #[test]
+    fn a_windowed_host_scoped_edge_lookup_is_bounded_by_its_indexes() {
+        let storage = SqliteStorage::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap();
+        let plan = RelationshipQueryPlan {
+            entity: Some(EntityRef::Ip {
+                addr: "10.0.0.1".to_string(),
+            }),
+            since: Some(1),
+            until: Some(2),
+            host_ids: Some(vec![Uuid::new_v4().to_string()]),
+            ..RelationshipQueryPlan::new()
+        };
+        let (sql, params) = relationships_sql(&plan).unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let steps: Vec<String> = stmt
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan_text = steps.join(" | ");
+        assert!(
+            plan_text.contains("(from_key=? AND timestamp>? AND timestamp<?)")
+                && plan_text.contains("(to_key=? AND timestamp>? AND timestamp<?)"),
+            "both key lookups must be time-bounded by the index: {plan_text}"
+        );
+        assert!(
+            !plan_text.contains("LIST SUBQUERY") && !plan_text.contains("SCAN"),
+            "the host filter must not scan or materialise the host's events: {plan_text}"
+        );
     }
 
     fn too_many_hosts() -> Vec<String> {
