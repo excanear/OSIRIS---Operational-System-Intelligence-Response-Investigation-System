@@ -554,6 +554,36 @@ match:
             .is_empty());
     }
 
+    /// Real-Linux finding (Phase 10, Ubuntu 22.04/24.04): on merged-/usr
+    /// hosts the kernel reports the resolved exe, so `bash -c '... > /var/www/x'`
+    /// arrives as `/usr/bin/bash` and `/bin/sh` as `/usr/bin/dash`. The
+    /// fixture values are the exe_path the real process sensor emitted
+    /// (GH run 38016185683, ubuntu-24.04 spool / audit.log).
+    #[test]
+    fn the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/shell_wrote_file_to_web_root.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![crate::rule::Rule::from_yaml_str(
+            &yaml,
+            "shell_wrote_file_to_web_root.yaml",
+        )
+        .unwrap()]);
+        for exe in ["/usr/bin/bash", "/usr/bin/dash", "/usr/bin/sh", "/bin/dash"] {
+            assert_eq!(
+                engine
+                    .evaluate(&event(
+                        EventType::FileCreate,
+                        "/var/www/osirisp10marker.php",
+                        exe
+                    ))
+                    .len(),
+                1,
+                "a {exe} writer under /var/www/ must match"
+            );
+        }
+    }
+
     fn dns_event(query: &str, exe_path: &str) -> CanonicalEvent {
         let host_id = Uuid::new_v4();
         CanonicalEvent {
@@ -632,6 +662,27 @@ match:
         assert!(engine
             .evaluate(&dns_event("example.com", "/usr/bin/curl"))
             .is_empty());
+    }
+
+    /// Same merged-/usr finding as the web-root rule: `/bin/sh` resolves to
+    /// `/usr/bin/dash` on Ubuntu, so the shell actor list needs both spellings.
+    #[test]
+    fn the_shipped_dns_suspicious_tld_rule_fires_on_merged_usr_shell_spellings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/rules/dns_query_to_suspicious_tld.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let engine = DetectionEngine::new(vec![crate::rule::Rule::from_yaml_str(
+            &yaml,
+            "dns_query_to_suspicious_tld.yaml",
+        )
+        .unwrap()]);
+        for exe in ["/usr/bin/dash", "/usr/bin/bash"] {
+            assert_eq!(
+                engine.evaluate(&dns_event("cdn-assets.xyz", exe)).len(),
+                1,
+                "a {exe} DNS query for a .xyz domain must match"
+            );
+        }
     }
 
     /// The rule loaded alongside the Phase 2 rule (via `load_from_dir`) must

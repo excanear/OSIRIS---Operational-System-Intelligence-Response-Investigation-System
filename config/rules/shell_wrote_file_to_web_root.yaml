@@ -6,7 +6,7 @@
 #
 # MITRE ATT&CK: T1505.003 (Server Software Component: Web Shell).
 id: shell_wrote_file_to_web_root
-version: 1
+version: 2
 severity: HIGH
 match:
   - field: event_type
@@ -19,5 +19,7 @@ match:
     reason: "The file was written inside the web-served directory /var/www/"
   - field: process.exe_path
     op: in
-    value: ["/bin/sh", "/bin/bash", "/usr/bin/curl", "/usr/bin/wget"]
+    # Both spellings: merged-/usr hosts (Ubuntu, Debian 12+) report the
+    # resolved exe, e.g. /bin/sh -> /usr/bin/dash, /bin/bash -> /usr/bin/bash.
+    value: ["/bin/sh", "/bin/bash", "/bin/dash", "/usr/bin/sh", "/usr/bin/bash", "/usr/bin/dash", "/usr/bin/curl", "/usr/bin/wget"]
     reason: "The writing process is an interactive shell or download tool, not the web server"
