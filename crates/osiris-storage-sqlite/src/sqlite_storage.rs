@@ -27,6 +27,17 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StorageError> {
         let conn = Connection::open(path).map_err(|e| StorageError::Backend(e.to_string()))?;
+        // WAL + synchronous=NORMAL (Phase 10 finding F1): the default rollback
+        // journal with synchronous=FULL fsyncs the journal and the database on
+        // every commit, which capped ingest on real disks. Trade-off: a power
+        // loss or OS crash may lose the last few committed transactions; the
+        // database is never corrupted, and an application crash loses nothing.
+        // WAL also lets readers run while the ingest path writes. rusqlite
+        // already sets a 5 s busy_timeout on open. (A ":memory:" database
+        // reports journal_mode "memory"; that is fine.)
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .and_then(|()| conn.execute_batch("PRAGMA synchronous = NORMAL;"))
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -1422,6 +1433,23 @@ mod tests {
         let mut plan = osiris_query::EventQueryPlan::new();
         plan.limit = 7;
         assert_eq!(storage.query_events_batched(&plan, 5).unwrap().len(), 7);
+    }
+
+    /// Phase 10 finding F1: the default rollback journal with synchronous=FULL
+    /// fsyncs several times per commit; the ingest path runs in WAL mode.
+    #[test]
+    fn opens_in_wal_mode_with_normal_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(sync, 1, "synchronous=NORMAL");
     }
 
     #[test]
