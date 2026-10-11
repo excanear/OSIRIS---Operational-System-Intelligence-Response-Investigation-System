@@ -16,6 +16,7 @@ osiris-config = { path = "../osiris-config" }
 osiris-generator = { path = "../../generator" }
 osiris-pipeline = { path = "../osiris-pipeline" }
 osiris-schema = { path = "../osiris-schema" }
+osiris-sensor-api = { path = "../osiris-sensor-api" }
 
 [dev-dependencies]
 osiris-server = { path = "../osiris-server" }

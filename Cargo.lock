@@ -1670,6 +1670,7 @@ dependencies = [
  "osiris-generator",
  "osiris-pipeline",
  "osiris-schema",
+ "osiris-sensor-api",
  "osiris-server",
  "osiris-transport",
  "reqwest",
