@@ -1,6 +1,7 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { rewriteWsOrigin } from "./proxyOrigin";
 
 export default defineConfig({
   plugins: [react()],
@@ -21,6 +22,7 @@ export default defineConfig({
         // needs this explicitly — Vite's dev proxy does not forward
         // WebSocket upgrades by default.
         ws: true,
+        configure: rewriteWsOrigin("http://127.0.0.1:8080"),
       },
     },
   },
@@ -28,5 +30,6 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./vitest.setup.ts"],
+    exclude: ["e2e/**", "node_modules/**"],
   },
 });

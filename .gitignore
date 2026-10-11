@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 /.worktrees
+
+console/test-results/
+console/playwright-report/
+console/e2e/.stack.json
