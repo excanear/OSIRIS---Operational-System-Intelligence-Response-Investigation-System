@@ -110,9 +110,13 @@ to 1 591.01 (same tree, pragmas disabled versus enabled). The final matrix run a
   dominant cost. With one transaction per batch for each store, the server keeps up with 1 000 eps
   with zero lost markers.
 - **Durability trade-off.** `events.db` and `baseline.db` now open with `journal_mode=WAL` and
-  `synchronous=NORMAL`. A power loss or OS crash can lose the last few committed transactions, but
-  never corrupts the database. An application crash loses nothing. The forwarder already resends
-  anything that was not acknowledged, but an acknowledged batch lost to a power cut is not resent.
+  `synchronous=NORMAL`. Commits are no longer fsynced one by one, so a power loss or OS crash can
+  lose every transaction committed since the last WAL sync (checkpoint, by default up to about
+  1 000 WAL pages, which is seconds of telemetry at these rates). The database is never corrupted,
+  and an application crash loses nothing. Those lost batches were already acknowledged, so the
+  forwarder does not resend them (it advances its offset on ack). The raw lines remain in the
+  agent's spool and can only be replayed by hand. A file-copy backup must include the `-wal` file,
+  or use SQLite's backup API or `VACUUM INTO`.
   The other SQLite stores (incidents, evidence, users, tenants, hosts) are not on the ingest hot
   path and keep their defaults.
 - **Current ceiling.** On this WSL host the server stores about 1 600-1 700 eps (10 000 eps

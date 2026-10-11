@@ -194,7 +194,7 @@ impl IngestContext {
                 {
                     Ok(obs) => obs,
                     Err(e) => {
-                        tracing::warn!(error = %e, events = process_events.len(), "baseline observe failed; scoring the batch without baseline input");
+                        tracing::warn!(error = %e, events = process_events.len(), "baseline observe failed; scoring the batch without baseline input, and none of its frequency counts were recorded");
                         vec![vec![]; process_events.len()]
                     }
                 }

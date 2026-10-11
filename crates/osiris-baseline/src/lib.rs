@@ -81,14 +81,23 @@ impl BaselineEngine {
         let conn = Connection::open(path).map_err(|e| BaselineError::Storage(e.to_string()))?;
         // WAL + synchronous=NORMAL (Phase 10 finding F1): the default rollback
         // journal with synchronous=FULL fsyncs the journal and the database on
-        // every commit, which capped ingest on real disks. Trade-off: a power
-        // loss or OS crash may lose the last few committed transactions; the
-        // database is never corrupted, and an application crash loses nothing.
-        // WAL also lets readers run while the ingest path writes. rusqlite
-        // already sets a 5 s busy_timeout on open. (A ":memory:" database
-        // reports journal_mode "memory"; that is fine.)
-        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
-            .and_then(|()| conn.execute_batch("PRAGMA synchronous = NORMAL;"))
+        // every commit, which capped ingest on real disks. Trade-off: commits
+        // are not fsynced individually, so a power loss or OS crash can lose
+        // every transaction committed since the last WAL sync (checkpoint, up
+        // to ~1000 pages by default). Those batches were already acknowledged,
+        // so the forwarder will not resend them (they stay in the agent's spool
+        // and can only be replayed by hand). The database is never corrupted,
+        // and an application crash loses nothing. WAL also lets readers run
+        // while the ingest path writes; rusqlite already sets a 5 s busy_timeout.
+        // A file-copy backup must include the `-wal` file (or use the backup API).
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .map_err(|e| BaselineError::Storage(e.to_string()))?;
+        // SQLite returns the mode it kept; ":memory:" databases report "memory".
+        if mode != "wal" && mode != "memory" {
+            tracing::warn!(%mode, "WAL journal mode unavailable; commits fall back to the slower journal");
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")
             .map_err(|e| BaselineError::Storage(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS baseline_frequency (

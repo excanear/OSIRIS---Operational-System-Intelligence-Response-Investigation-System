@@ -7,6 +7,7 @@ edition.workspace = true
 serde_json = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-query = { path = "../osiris-query" }

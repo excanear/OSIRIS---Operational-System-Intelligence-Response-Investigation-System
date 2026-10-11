@@ -30,7 +30,10 @@ pub(crate) const MAX_CONNECTIONS: usize = 1024;
 pub(crate) const MAX_CONNECTIONS_PER_IP: usize = 16;
 
 /// Processes a batch that has already been authenticated and host-checked.
-/// `Ok` means the batch was durably handled (it is then acknowledged).
+/// `Ok` means the batch was handled and committed (it is then acknowledged and
+/// never resent). The server's SQLite stores run WAL with synchronous=NORMAL, so a
+/// commit survives an application crash but not necessarily a power loss or OS
+/// crash before the next WAL sync (PERFORMANCE.md, Interpretation).
 #[async_trait]
 pub trait BatchHandler: Send + Sync {
     async fn handle(&self, host_id: Uuid, events: Vec<CanonicalEvent>) -> Result<(), String>;
