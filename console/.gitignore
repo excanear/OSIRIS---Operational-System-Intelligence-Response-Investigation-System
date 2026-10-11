@@ -2,7 +2,3 @@ node_modules
 dist
 *.local
 *.tsbuildinfo
-vite.config.js
-vite.config.d.ts
-proxyOrigin.js
-proxyOrigin.d.ts
