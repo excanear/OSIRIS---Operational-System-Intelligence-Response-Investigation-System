@@ -1087,6 +1087,48 @@ mod tests {
         );
     }
 
+    /// Phase 10 finding F1: per-event baseline upserts (one autocommit each)
+    /// were the dominant ingest cost. Ingest must observe a batch in one
+    /// baseline transaction.
+    #[tokio::test]
+    async fn a_batch_is_baseline_observed_in_one_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = commits.clone();
+        baseline_engine.set_commit_hook(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        let context = IngestContext {
+            storage,
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
+            ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+        };
+        let host_id = Uuid::new_v4();
+        // Each event carries a process and a network block: one baseline pair each.
+        let events: Vec<CanonicalEvent> = (0..20u32)
+            .map(|i| network_connect_event(host_id, 1000 + i, 1_000_000 + i as u64))
+            .collect();
+        context.ingest(events).await.unwrap();
+
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "the whole batch's baseline counts are committed in one transaction"
+        );
+    }
+
     #[tokio::test]
     async fn ingested_events_are_published_to_the_broadcaster() {
         let dir = tempfile::tempdir().unwrap();

@@ -9,6 +9,10 @@ rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Test-only: exposes a commit hook so dependants can count this engine's commits.
+test-hooks = ["rusqlite/hooks"]
+
 [dev-dependencies]
 # hooks: tests count commits with a commit hook.
 rusqlite = { workspace = true, features = ["hooks"] }

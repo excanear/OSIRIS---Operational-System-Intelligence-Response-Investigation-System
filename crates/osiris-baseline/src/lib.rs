@@ -186,6 +186,17 @@ impl BaselineEngine {
         Ok(observations)
     }
 
+    /// Test-only: runs `hook` on every commit of this engine's database, so a
+    /// caller can assert how many transactions a code path costs.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_commit_hook(&self, hook: impl FnMut() -> bool + Send + 'static) {
+        self.conn
+            .lock()
+            .expect("baseline lock")
+            .commit_hook(Some(hook));
+    }
+
     fn observe_on(
         &self,
         conn: &Connection,
