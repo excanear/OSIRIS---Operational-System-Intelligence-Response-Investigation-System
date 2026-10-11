@@ -188,9 +188,14 @@ workflow matrix has only Ubuntu runners).
 | Web-root scenario matched the alert on the marker, but alerts carry only evidence event ids | Ubuntu 22.04, 24.04 | e3741a2 |
 | Scenario shell actions had no bound (`systemd-run --wait`, `sudo`) and the CI suite step had no timeout | Ubuntu 22.04, 24.04 | ef7171d |
 | `setup.sh` omitted `libssl-dev`, so the release build failed on a bare Debian | Debian 13 (WSL) | 564f50a |
+| F1: server ingest committed baseline frequencies (two commits per exec event) and risk scores (one per event) before the ack, with the default rollback journal and synchronous=FULL; about 100-140 eps stored at a 1000 eps target, most markers lost | Ubuntu 24.04 (WSL, ingest bench) | 3f4fe59, 5c73537, 3a22003 |
+| F2: every correlation edge lookup materialised all of the host's stored event ids (tenant host filter) and read every edge an entity ever had (key-only indexes), so lookup cost grew with the database: 35 ms at 5k events, 2.8 s at 200k | any (storage) | 4b450e1 |
 
 Each product fix has a fixture-based or unit regression test that runs in normal CI on any OS, for
 example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
+`a_batch_is_scored_with_one_risk_score_write`,
+`a_batch_is_observed_in_one_commit_with_the_same_counts_as_one_by_one`,
+`opens_in_wal_mode_with_normal_sync`, `a_windowed_host_scoped_edge_lookup_is_bounded_by_its_indexes`,
 `send_returns_only_after_the_whole_line_is_written`,
 `the_enriched_gs_separator_is_a_field_boundary`, `tests/real_audit_fixtures.rs` and
 `ids_containing_ties_an_alert_back_to_its_marker_event`.
@@ -205,6 +210,14 @@ example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
 - WSL auditd gap: auditd cannot run under WSL2, so audit-dependent scenarios can be validated only
   on GitHub Actions or a real VM. The WSL runs (Ubuntu and Debian) cover the non-audit scenarios.
 - Debian with a working auditd is not validated.
+- F2 remainder (correlation fan-out): `build_chain` walks up to depth 5 with up to 1000 edges per
+  lookup and no other bound. When a hub entity (a domain, an IP, a shared file) links many entities
+  inside one correlation window, every process event walks the whole connected component, so the
+  per-event cost grows with the component. The ingest bench's 5-scenario mix shows it in the
+  extreme (all synthetic timestamps fall in one 5 ms span, so one window covers the whole run):
+  about 75 eps stored at 1000 eps, one server thread at 100 % CPU in `query_relationships`. Fixing it
+  needs a design choice (degree cap, edge budget per chain, or hub exclusion). See PERFORMANCE.md
+  "Known limits".
 
 ## Console
 
