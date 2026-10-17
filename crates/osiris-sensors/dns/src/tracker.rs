@@ -71,8 +71,6 @@ pub struct Tracker {
     /// Insertion order: seq -> key.
     order: BTreeMap<u64, TxKey>,
     next_seq: u64,
-    /// Evicted transactions, emitted as timeouts by the next `expire`.
-    evicted: Vec<DnsEventRaw>,
     counters: TrackerCounters,
 }
 
@@ -84,7 +82,6 @@ impl Tracker {
             pending: HashMap::new(),
             order: BTreeMap::new(),
             next_seq: 0,
-            evicted: Vec::new(),
             counters: TrackerCounters::default(),
         }
     }
@@ -93,6 +90,8 @@ impl Tracker {
         self.counters
     }
 
+    /// Register a query. When the table is full the oldest pending
+    /// transaction is evicted and returned, to be emitted as a timeout.
     pub fn on_query(
         &mut self,
         key: TxKey,
@@ -100,17 +99,18 @@ impl Tracker {
         attribution: Attribution,
         timestamp_ns: u64,
         now: Instant,
-    ) {
-        let Some(q) = &msg.question else { return };
+    ) -> Option<DnsEventRaw> {
+        let q = msg.question.as_ref()?;
         if self.pending.contains_key(&key) {
             self.counters.duplicates += 1;
-            return;
+            return None;
         }
+        let mut evicted = None;
         if self.pending.len() >= self.capacity {
             if let Some((_, oldest)) = self.order.pop_first() {
                 if let Some(p) = self.pending.remove(&oldest) {
                     self.counters.overflow_evictions += 1;
-                    self.evicted.push(p.into_event(Vec::new(), None));
+                    evicted = Some(p.into_event(Vec::new(), None));
                 }
             }
         }
@@ -128,6 +128,12 @@ impl Tracker {
                 timestamp_ns,
             },
         );
+        evicted
+    }
+
+    /// Number of transactions currently pending (always <= capacity).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn on_response(&mut self, key: TxKey, msg: &DnsMessage) -> Option<DnsEventRaw> {
@@ -150,22 +156,21 @@ impl Tracker {
         Some(p.into_event(ips, ttl))
     }
 
-    /// Emit overflow-evicted transactions plus every pending one whose
-    /// deadline has passed, all as timeouts (empty ips, no ttl).
+    /// Emit every pending transaction whose deadline has passed as a
+    /// timeout (empty ips, no ttl). Deadlines are monotonic in insertion
+    /// order, so scanning stops at the first entry not yet due.
     pub fn expire(&mut self, now: Instant) -> Vec<DnsEventRaw> {
-        let mut out = std::mem::take(&mut self.evicted);
-        let due: Vec<u64> = self
-            .order
-            .iter()
-            .filter(|(_, k)| self.pending.get(k).is_some_and(|p| p.deadline <= now))
-            .map(|(s, _)| *s)
-            .collect();
-        for seq in due {
-            if let Some(key) = self.order.remove(&seq) {
-                if let Some(p) = self.pending.remove(&key) {
-                    self.counters.timeouts += 1;
-                    out.push(p.into_event(Vec::new(), None));
-                }
+        let mut out = Vec::new();
+        while let Some(entry) = self.order.first_entry() {
+            let key = *entry.get();
+            let due = self.pending.get(&key).is_none_or(|p| p.deadline <= now);
+            if !due {
+                break;
+            }
+            entry.remove();
+            if let Some(p) = self.pending.remove(&key) {
+                self.counters.timeouts += 1;
+                out.push(p.into_event(Vec::new(), None));
             }
         }
         out
@@ -322,14 +327,37 @@ mod tests {
         let now = Instant::now();
         t.on_query(key(1, 1), &query("a.com"), attr(), 1, now);
         t.on_query(key(2, 1), &query("b.com"), attr(), 2, now);
-        t.on_query(key(3, 1), &query("c.com"), attr(), 3, now);
+        let ev = t
+            .on_query(key(3, 1), &query("c.com"), attr(), 3, now)
+            .unwrap();
         assert_eq!(t.counters().overflow_evictions, 1);
-        let evs = t.expire(now);
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].query, "a.com");
-        assert!(evs[0].response_ips.is_empty());
-        assert_eq!(evs[0].ttl, None);
+        assert_eq!(ev.query, "a.com");
+        assert!(ev.response_ips.is_empty());
+        assert_eq!(ev.ttl, None);
+        assert!(t.expire(now).is_empty());
         assert!(t.on_response(key(1, 1), &response(0, vec![])).is_none());
+    }
+
+    #[test]
+    fn flood_keeps_memory_bounded() {
+        let mut t = Tracker::new(Duration::from_secs(5), 4);
+        let now = Instant::now();
+        let mut evicted = 0;
+        for i in 0..10_000u32 {
+            let k = TxKey {
+                server: format!("10.1.{}.{}", (i >> 8) & 255, i & 255)
+                    .parse()
+                    .unwrap(),
+                ..key(1000, 1)
+            };
+            if t.on_query(k, &query("x.com"), attr(), 1, now).is_some() {
+                evicted += 1;
+            }
+            assert!(t.pending_len() <= 4);
+        }
+        assert_eq!(evicted, 9_996);
+        assert_eq!(t.counters().overflow_evictions, 9_996);
+        assert_eq!(t.pending_len(), 4);
     }
 
     #[test]
