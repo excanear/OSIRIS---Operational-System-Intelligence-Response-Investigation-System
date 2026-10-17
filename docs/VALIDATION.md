@@ -229,6 +229,10 @@ hunt-template run, a graph load with a node hover and click, and a group policy 
 confirm step (the saved values persist after a reload). No page errors or HTTP 4xx/5xx were
 seen.
 
+Provenance: the pass ran on binaries built on 2026-10-10, before the WAL and batched-baseline
+ingest commits of the Task 8 performance work. The Console does not touch those paths, but the pass
+was not repeated on the final binaries.
+
 ### Bugs (fixed)
 
 | Finding | Fix commit | Regression test |
