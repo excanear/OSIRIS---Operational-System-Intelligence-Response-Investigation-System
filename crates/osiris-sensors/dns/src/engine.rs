@@ -23,6 +23,8 @@ pub const MAX_PENDING: usize = 4096;
 pub struct EngineMetrics {
     pub packets: u64,
     pub parse_errors: u64,
+    /// Packets whose QR bit contradicted the port-derived direction.
+    pub direction_mismatches: u64,
     pub emitted: u64,
     pub attributed: u64,
     pub unattributed: u64,
@@ -34,6 +36,7 @@ pub struct Engine {
     tracker: Tracker,
     packets: u64,
     parse_errors: u64,
+    direction_mismatches: u64,
     emitted: u64,
     attributed: u64,
     unattributed: u64,
@@ -46,6 +49,7 @@ impl Engine {
             tracker: Tracker::new(timeout, capacity),
             packets: 0,
             parse_errors: 0,
+            direction_mismatches: 0,
             emitted: 0,
             attributed: 0,
             unattributed: 0,
@@ -56,6 +60,7 @@ impl Engine {
         EngineMetrics {
             packets: self.packets,
             parse_errors: self.parse_errors,
+            direction_mismatches: self.direction_mismatches,
             emitted: self.emitted,
             attributed: self.attributed,
             unattributed: self.unattributed,
@@ -80,17 +85,26 @@ impl Engine {
         let Some(dg) = decode_l3(l3) else {
             return Vec::new();
         };
-        let Some(direction) = classify(&dg) else {
+        let Some(mut direction) = classify(&dg) else {
             return Vec::new();
         };
         let Ok(msg) = parse_message(dg.payload) else {
             self.parse_errors += 1;
             return Vec::new();
         };
+        // 53->53 is ambiguous by ports alone; the QR bit decides.
+        if dg.src.port() == 53 && dg.dst.port() == 53 {
+            direction = if msg.is_response {
+                Direction::Response
+            } else {
+                Direction::Query
+            };
+        }
         let mut raw: Vec<DnsEventRaw> = Vec::new();
         match direction {
             Direction::Query => {
                 if msg.is_response {
+                    self.direction_mismatches += 1;
                     return Vec::new();
                 }
                 let key = TxKey {
@@ -115,6 +129,7 @@ impl Engine {
             }
             Direction::Response => {
                 if !msg.is_response {
+                    self.direction_mismatches += 1;
                     return Vec::new();
                 }
                 let key = TxKey {
@@ -352,6 +367,44 @@ mod tests {
             .collect();
         // Remote: default attribution (uid 0). Local: the table row was used.
         assert_eq!(uids, vec![0, 1000]);
+    }
+
+    #[test]
+    fn port53_to_port53_query_then_response_emits() {
+        let (mut e, _d) = engine();
+        let now = Instant::now();
+        let q = v4(
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            &udp(53, 53, &dns(5, 0x0100, "rr.example.com", 1, None)),
+        );
+        let r = v4(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            &udp(
+                53,
+                53,
+                &dns(5, 0x8180, "rr.example.com", 1, Some((1, &[1, 2, 3, 4]))),
+            ),
+        );
+        assert!(e.on_packet(&q, false, 1, now).is_empty());
+        let ev = only_dns(e.on_packet(&r, false, 2, now));
+        assert_eq!(ev.query, "rr.example.com");
+        assert_eq!(ev.response_ips, vec!["1.2.3.4"]);
+        assert_eq!(e.metrics().direction_mismatches, 0);
+    }
+
+    #[test]
+    fn qr_direction_mismatch_is_counted() {
+        let (mut e, _d) = engine();
+        let now = Instant::now();
+        let p = v4(
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            &udp(41000, 53, &dns(5, 0x8180, "x.example.com", 1, None)),
+        );
+        assert!(e.on_packet(&p, true, 1, now).is_empty());
+        assert_eq!(e.metrics().direction_mismatches, 1);
     }
 
     #[test]
