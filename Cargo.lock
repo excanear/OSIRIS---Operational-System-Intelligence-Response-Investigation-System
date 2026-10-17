@@ -1765,6 +1765,7 @@ name = "osiris-sensors-dns"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "osiris-sensor-api",
  "osiris-sensors-net",
  "serde_json",

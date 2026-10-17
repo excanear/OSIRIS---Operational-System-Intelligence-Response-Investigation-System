@@ -13,3 +13,6 @@ osiris-sensors-net = { path = "../net" }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
