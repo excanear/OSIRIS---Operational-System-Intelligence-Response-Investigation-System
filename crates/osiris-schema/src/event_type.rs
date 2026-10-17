@@ -37,6 +37,8 @@ pub enum Source {
     Dbus,
     ContainerApi,
     Synthetic,
+    /// Passive packet capture (AF_PACKET) — no audit serial.
+    Packet,
     /// The Agent's own internal state (health, lifecycle) — not sensed
     /// from any external backend, so none of the above apply.
     AgentInternal,
@@ -138,6 +140,14 @@ mod tests {
     fn serializes_as_screaming_snake_case() {
         let json = serde_json::to_string(&EventType::ProcessExec).unwrap();
         assert_eq!(json, "\"PROCESS_EXEC\"");
+    }
+
+    #[test]
+    fn source_packet_serialises_as_packet() {
+        let json = serde_json::to_string(&Source::Packet).unwrap();
+        assert_eq!(json, "\"PACKET\"");
+        let back: Source = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Source::Packet);
     }
 
     #[test]

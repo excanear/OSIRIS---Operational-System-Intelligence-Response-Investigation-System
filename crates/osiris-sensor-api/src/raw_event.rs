@@ -17,6 +17,8 @@ pub enum RawEventSource {
     /// `RawEventSource::Procfs`) — added now so the deferred primary
     /// backend is a value change, not a type change, when implemented.
     ContainerApi,
+    /// Passive packet capture (AF_PACKET) — carries no audit serial.
+    Packet,
 }
 
 /// A Process/Exec creation record (ARCHITECTURE.md §6: MINIMAL is

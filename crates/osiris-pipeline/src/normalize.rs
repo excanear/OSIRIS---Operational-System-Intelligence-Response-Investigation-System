@@ -44,12 +44,14 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
         // in this codebase; handled for match exhaustiveness only.
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
+        RawEventSource::Packet => Source::Packet,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "process_exec_sensor/audit",
         RawEventSource::Synthetic => "process_exec_sensor/synthetic",
         RawEventSource::Procfs => "process_exec_sensor/procfs",
         RawEventSource::ContainerApi => "process_exec_sensor/container_api",
+        RawEventSource::Packet => "process_exec_sensor/packet",
     };
     let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, raw.start_time_mono);
     CanonicalEvent {
@@ -147,12 +149,14 @@ fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> Can
         // in this codebase; handled for match exhaustiveness only.
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
+        RawEventSource::Packet => Source::Packet,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "filesystem_sensor/audit",
         RawEventSource::Synthetic => "filesystem_sensor/synthetic",
         RawEventSource::Procfs => "filesystem_sensor/procfs",
         RawEventSource::ContainerApi => "filesystem_sensor/container_api",
+        RawEventSource::Packet => "filesystem_sensor/packet",
     };
     let event_type = match raw.operation {
         FileOperation::Create => EventType::FileCreate,
@@ -252,12 +256,14 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
         // No network backend uses the container API in this codebase;
         // handled for match exhaustiveness only.
         RawEventSource::ContainerApi => Source::ContainerApi,
+        RawEventSource::Packet => Source::Packet,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "network_sensor/audit",
         RawEventSource::Synthetic => "network_sensor/synthetic",
         RawEventSource::Procfs => "network_sensor/procfs",
         RawEventSource::ContainerApi => "network_sensor/container_api",
+        RawEventSource::Packet => "network_sensor/packet",
     };
     let event_type = match raw.operation {
         NetworkOperation::Connect => EventType::NetworkConnect,
@@ -335,21 +341,21 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
     let source = match raw.source {
         RawEventSource::Audit => Source::Audit,
         RawEventSource::Synthetic => Source::Synthetic,
-        // No live DNS sensor ships this phase (Phase 3 plan Global
-        // Constraint #6); this branch is unreachable today. A future DNS
-        // backend is more likely pcap/eBPF than audit-based, so this
-        // provider string is intentionally backend-neutral rather than
-        // implying an audit-based DNS sensor exists.
+        // Procfs/ContainerApi have no DNS backend; the "unknown" provider is
+        // intentionally backend-neutral. The live DNS sensor is a passive
+        // AF_PACKET capture (Phase 11a), reported as `RawEventSource::Packet`.
         RawEventSource::Procfs => Source::Procfs,
         // No DNS backend uses the container API in this codebase; handled
         // for match exhaustiveness only.
         RawEventSource::ContainerApi => Source::ContainerApi,
+        RawEventSource::Packet => Source::Packet,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "dns_sensor/unknown",
         RawEventSource::Synthetic => "dns_sensor/synthetic",
         RawEventSource::Procfs => "dns_sensor/unknown",
         RawEventSource::ContainerApi => "dns_sensor/unknown",
+        RawEventSource::Packet => "dns_sensor/af_packet",
     };
     let process = provisional_process(raw.pid, &raw.exe_path, host.host_id, boot_id);
     CanonicalEvent {
@@ -442,6 +448,7 @@ fn identity_provider(source: RawEventSource) -> &'static str {
         // No identity/privilege backend uses the container API in this
         // codebase; handled for match exhaustiveness only.
         RawEventSource::ContainerApi => "identity_sensor/container_api",
+        RawEventSource::Packet => "identity_sensor/packet",
     }
 }
 
@@ -451,6 +458,7 @@ fn schema_source(source: RawEventSource) -> Source {
         RawEventSource::Synthetic => Source::Synthetic,
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
+        RawEventSource::Packet => Source::Packet,
     }
 }
 
@@ -1223,6 +1231,16 @@ mod tests {
         assert_eq!(event.event_type, EventType::DnsQuery);
         assert_eq!(event.category, Category::Dns);
         assert_eq!(event.provider, "dns_sensor/unknown");
+    }
+
+    #[test]
+    fn dns_packet_source_maps_to_packet_and_af_packet_provider() {
+        let host = sample_host();
+        let mut raw = dns_raw(Some(300));
+        raw.source = RawEventSource::Packet;
+        let event = normalize(RawEvent::Dns(raw), &host, "boot-1");
+        assert_eq!(event.source, Source::Packet);
+        assert_eq!(event.provider, "dns_sensor/af_packet");
     }
 
     #[test]
