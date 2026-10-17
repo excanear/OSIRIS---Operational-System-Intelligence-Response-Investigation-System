@@ -40,6 +40,11 @@ Standard data, so at Minimal a `ProcessExec` event is still sent but with an
 empty `cmdline`. The Agent keeps at most 128 arguments and 16 KiB of argv
 per exec (a longer argv is cut to that prefix).
 
+With no `telemetry_level` set, the Agent sends the full argv (the filter is off, so
+argv is included). Argv can contain secrets, such as passwords or tokens passed on a
+command line, and the Agent does no redaction. Set the level to `MINIMAL` to stop
+argv from leaving the host.
+
 Lowering the level or switching a sensor off reduces visibility: detections
 that depend on the dropped events stop firing for those hosts.
 

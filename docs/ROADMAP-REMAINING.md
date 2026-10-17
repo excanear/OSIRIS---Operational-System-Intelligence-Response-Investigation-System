@@ -1,4 +1,4 @@
-# OSIRIS — o que falta finalizar (backlog pós-Fase 8g)
+# OSIRIS — o que falta finalizar (backlog pós-Fase 10)
 
 Estado em 2026-10-17: fases 1–7, 8a–8g, 9 e 10 concluídas, testes/clippy/fmt/lint verdes.
 Este documento lista tudo que o `ARCHITECTURE.md` pede e ainda não existe, na ordem de execução.
@@ -42,14 +42,14 @@ revisão final independente → merge → push.
   produção e verifica, via API, eventos e alertas de ações reais (exec, arquivo, sudo, unit systemd,
   conexão TCP, persistência, drop em web-root). Validado em Ubuntu 22.04 e 24.04 (GitHub Actions, com
   auditd) e Ubuntu 24.04 e Debian 13 sob WSL2 (só cenários sem auditd).
-- 14 achados corrigidos, cada um com teste de regressão que roda no CI comum: distro/kernel
+- 15 achados corrigidos, cada um com teste de regressão que roda no CI comum: distro/kernel
   "unknown", regras de shell só para `/bin/*`, linhas do spool intercaladas, separador `\x1d` do
   auditd ENRICHED, argv do processo (registro EXECVE separado), ids de alerta vs. evidência,
   `libssl-dev` no Debian, o gargalo de ingest (F1: commits por evento; WAL + `observe_batch` levou
   de ~100 para ~1000 eps armazenados, sem perda de marcadores) e o custo do lookup de arestas (F2,
   parte 1).
 - Primeira passada de benchmarks contra o orçamento do §19.2: `PERFORMANCE.md`.
-- Console verificado no navegador (Playwright, 17 specs em `console/e2e`, 1440x900 e 390x844): 3 bugs
+- Console verificado no navegador (Playwright, 17 testes em `console/e2e`, 1440x900 e 390x844): 3 bugs
   corrigidos (Origin no proxy WS, reescrita só da própria origem, arestas do grafo invisíveis).
 - Detalhes e tabelas: `docs/VALIDATION.md` e `PERFORMANCE.md`.
 

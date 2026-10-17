@@ -6,7 +6,10 @@ The Phase 10 suite (`crates/osiris-real-linux-tests/tests/real_linux.rs`) runs t
 events and alerts appear through the server API. Every test filters on a unique per-test marker,
 never on counts of host activity, and every wait is bounded.
 
-Each result section states the code it ran against: GitHub Actions results are from `ef7171d`,
+Each result section states the code it ran against: GitHub Actions results are from `ef7171d`
+(the Task 8 WAL and batched-ingest changes landed later; the final re-run, GitHub Actions run
+38999490611 on branch `real-linux/t12-1` at `964e894`, 2026-10-17, was green on `ubuntu-22.04` and
+`ubuntu-24.04` and covers them),
 the Debian WSL run is from `564f50a` (`ef7171d` plus the `setup.sh` libssl-dev fix), and the Ubuntu
 WSL data is from Task 3 (older code, before the Task 4 fixes). Authoritative audit-backed results
 come from GitHub Actions, because auditd cannot run under WSL2 (see "Deferred").
@@ -153,7 +156,7 @@ scenarios cannot pass without auditd and were not weakened to make them pass.
 | Date | 2026-10-10 (host clock about 3 h ahead of real UTC) |
 
 All eight tests were run (`tools/real-linux/run.sh`, `--test-threads=1`, root): 2 passed, 6 failed,
-303 s (output saved as `debian-wsl-run.txt` in the SDD directory). The six failures are environmental (no audit data), not product defects.
+303 s (the raw output was not committed). The six failures are environmental (no audit data), not product defects.
 
 | Scenario | Result |
 |---|---|
