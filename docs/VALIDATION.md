@@ -221,7 +221,54 @@ example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
 
 ## Console
 
-Filled by Task 11.
+Visual pass over every screen at 1440x900 and 390x844 against `osiris-stack` (spool-only seed: the
+seven generator scenarios, 46 events and 8 alerts, no agent) served by `vite preview`. Each
+screen's primary interaction was exercised: the process filter, the process, file, network and
+container detail views, Timeline "Last 1 hour" and a host deep link, the alerts rule filter, a
+hunt-template run, a graph load with a node hover and click, and a group policy edit through its
+confirm step (the saved values persist after a reload). No page errors or HTTP 4xx/5xx were
+seen.
+
+### Bugs (fixed)
+
+| Finding | Fix commit | Regression test |
+|---|---|---|
+| The Vite dev/preview proxy forwarded the browser's Origin on WebSocket upgrades, so the API's CSWSH guard rejected Live Events with 403 | 5bb2999 | `console/proxyOrigin.test.ts`, the Live Events spec in `console/e2e/screens.spec.ts` |
+| That fix rewrote Origin unconditionally, so any foreign page could get past the API's Origin check through the dev/preview proxy. Origin is now rewritten only when it is the Console's own origin. Also, a stale `tsc -b` emit (`proxyOrigin.js`) shadowed the TypeScript source | 977889f | `console/proxyOrigin.test.ts` (own origin rewritten; foreign and missing Origin left alone) |
+| Entity Graph edges were invisible: react-force-graph-2d's default link colour (`rgba(0,0,0,0.2)`) does not show on the dark background, so a subgraph looked like disconnected dots | 73d78e4 | `EntityGraph.test.tsx` "draws edges in a colour that is visible on the dark background" |
+
+### Empty states (seed has no agent, so Hosts, Incidents, Evidence and Sensors are empty)
+
+- Hosts: "No hosts found." is clear, but it does not say that hosts appear once an agent enrols.
+- Incidents: "No incidents found." under the New-incident form is clear.
+- Timeline: the host picker only lists hosts that sent SENSOR_HEALTH in the last hour. With a
+  spool-only seed the picker is empty while the page says "Select a host to load its timeline."
+  This is a dead end: nothing explains why no host is offered, although the host has 46 events.
+  `?host=<id>` works and renders all 46 events. "Last 1 hour" with no host only fills Since.
+- Evidence ("No evidence recorded.") and Sensors ("No sensor health data reported yet.") are clear.
+
+### Phase 13 UX debt
+
+- No layout or styling beyond the base colours: the navigation is a plain bulleted list above
+  every page, there is no sidebar or header, and forms run together inline (labels touch their
+  inputs, and on Group policy "Heartbeat" wraps away from its input).
+- Timestamps are raw nanoseconds everywhere (lists, Timeline, Alerts, Hunting), and time-range
+  inputs take nanoseconds. Groups alone shows a local date, which is inconsistent.
+- Detail screens (process, file, network, container) show "Events (N)" with no event list under it.
+  This matches the 7b-2/7b-5 plans, but it reads as missing data.
+- File detail is titled with `device:inode` only. The path is not shown.
+- Alerts show the host id (UUID) where other lists show the hostname. Alert rows do not link to
+  the evidence events or a detail view.
+- Overview: "Alerts8" and "Incidents0" lack a separator.
+- Containers: an empty image renders as a blank cell. Pod shows "—".
+- Entity Graph: nodes have no labels (hover tooltip only), there is no legend for the kind colours,
+  and a node click does nothing (no pivot to the entity's detail screen). The canvas is 600 px
+  high, so the graph sits far below the form.
+- Threat Hunting: the OQL textarea is tiny and shows about one line of the template query.
+- Mobile (390 px): tables overflow horizontally (Files, Network, Containers and Alerts).
+  Long ids in headings (process key, container id) overflow the viewport. The Alerts reasons
+  column wraps to one or two words per line.
+- Live Events shows a bare "Live" status word above the filter, with no explanation.
 
 ## Known gaps
 
