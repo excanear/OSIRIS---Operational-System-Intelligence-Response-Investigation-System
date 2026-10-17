@@ -73,7 +73,7 @@ impl BatchHandler for Recorder {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self
             .fail_first
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err("simulated storage failure".to_string());

@@ -183,8 +183,8 @@ fn decode_hex(raw: &str) -> Option<String> {
         return None;
     }
     let mut bytes = Vec::with_capacity(raw.len() / 2);
-    for pair in raw.as_bytes().chunks_exact(2) {
-        let hex_pair = std::str::from_utf8(pair).ok()?;
+    for pair in raw.as_bytes().as_chunks::<2>().0 {
+        let hex_pair = std::str::from_utf8(pair.as_slice()).ok()?;
         bytes.push(u8::from_str_radix(hex_pair, 16).ok()?);
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
