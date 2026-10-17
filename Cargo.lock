@@ -1767,6 +1767,7 @@ dependencies = [
  "async-trait",
  "osiris-sensor-api",
  "osiris-sensors-net",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

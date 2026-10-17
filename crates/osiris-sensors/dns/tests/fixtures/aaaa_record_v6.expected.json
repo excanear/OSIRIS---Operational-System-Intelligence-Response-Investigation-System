@@ -1,0 +1,7 @@
+{
+  "query": "ipv6.example.org",
+  "qtype": "AAAA",
+  "response_ips": [
+    "2001:db8::1"
+  ]
+}

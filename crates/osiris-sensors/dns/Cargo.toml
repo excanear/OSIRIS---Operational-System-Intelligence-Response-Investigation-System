@@ -12,3 +12,4 @@ osiris-sensors-net = { path = "../net" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }

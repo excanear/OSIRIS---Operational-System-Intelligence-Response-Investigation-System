@@ -1,0 +1,7 @@
+{
+  "query": "example.com",
+  "qtype": "A",
+  "response_ips": [
+    "93.184.216.34"
+  ]
+}
