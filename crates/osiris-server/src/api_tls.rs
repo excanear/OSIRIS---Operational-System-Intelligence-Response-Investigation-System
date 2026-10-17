@@ -589,6 +589,8 @@ mod tests {
         tokio_tungstenite::tungstenite::Error,
     >;
 
+    // The error type is tungstenite's; this is test-only helper code.
+    #[allow(clippy::result_large_err)]
     async fn ws_connect(
         addr: std::net::SocketAddr,
         ca: &str,

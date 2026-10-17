@@ -1,6 +1,6 @@
 # OSIRIS — o que falta finalizar (backlog pós-Fase 8g)
 
-Estado em 2026-09-19 (`master` @ `0c1fac2`+): fases 1–7 e 8a–8g concluídas, testes/clippy/fmt/lint verdes.
+Estado em 2026-10-17: fases 1–7, 8a–8g, 9 e 10 concluídas, testes/clippy/fmt/lint verdes.
 Este documento lista tudo que o `ARCHITECTURE.md` pede e ainda não existe, na ordem de execução.
 Cada fase segue o processo do projeto: brainstorming → spec → plano → implementação (TDD, worktree) →
 revisão final independente → merge → push.
@@ -36,14 +36,52 @@ revisão final independente → merge → push.
   persiste o overlay e reporta o hash no heartbeat (status `IN_SYNC|PENDING|FAILED|UNMANAGED`).
   Ver `docs/operators-fleet-policy.md`. Com isso o Fleet Manager (§21.2) está completo.
 
-## Fase 10 — Validação em Linux real
-- Rodar agente + sensores em VM/container Linux reais (Ubuntu 22.04, Debian 12, RHEL 8-like).
-- Cenários reais: exec, arquivo, rede/DNS, login/sudo, systemd, container, k8s (kind/minikube).
-- Descobrir e corrigir diferenças entre os testes sintéticos e o kernel real.
-- Verificação visual do Console no navegador (Playwright) — nunca feita até hoje.
-- Primeira passada de benchmarks (§19): eventos/s, latência, memória do agente; orçamento vs. §19.2.
+## Fase 10 — Validação em Linux real (concluída em 2026-10-17)
+- Entregue: harness real-Linux (`crates/osiris-real-linux-tests`, `tools/real-linux/{setup,run,bench}.sh`,
+  workflows `real-linux.yml` e `real-linux-bench.yml`) que sobe o `osirisd` e o `osiris-server` de
+  produção e verifica, via API, eventos e alertas de ações reais (exec, arquivo, sudo, unit systemd,
+  conexão TCP, persistência, drop em web-root). Validado em Ubuntu 22.04 e 24.04 (GitHub Actions, com
+  auditd) e Ubuntu 24.04 e Debian 13 sob WSL2 (só cenários sem auditd).
+- 14 achados corrigidos, cada um com teste de regressão que roda no CI comum: distro/kernel
+  "unknown", regras de shell só para `/bin/*`, linhas do spool intercaladas, separador `\x1d` do
+  auditd ENRICHED, argv do processo (registro EXECVE separado), ids de alerta vs. evidência,
+  `libssl-dev` no Debian, o gargalo de ingest (F1: commits por evento; WAL + `observe_batch` levou
+  de ~100 para ~1000 eps armazenados, sem perda de marcadores) e o custo do lookup de arestas (F2,
+  parte 1).
+- Primeira passada de benchmarks contra o orçamento do §19.2: `PERFORMANCE.md`.
+- Console verificado no navegador (Playwright, 17 specs em `console/e2e`, 1440x900 e 390x844): 3 bugs
+  corrigidos (Origin no proxy WS, reescrita só da própria origem, arestas do grafo invisíveis).
+- Detalhes e tabelas: `docs/VALIDATION.md` e `PERFORMANCE.md`.
+
+### Dívidas da Fase 10
+- **Fora de escopo, ainda por fazer**: cenários reais de container e Kubernetes (exige Docker/kind);
+  distros RHEL-like (caminhos do auditd, SELinux); Debian com auditd funcionando (exige VM, o
+  workflow só tem runners Ubuntu); captura real de DNS (não existe sensor, Fase 11).
+- **CI**: jobs de real-Linux e de Playwright seguem fora do CI (a Fase 10 manteve só `perf_smoke`
+  como gate). Falta decidir quais viram gate ou job agendado; o Playwright precisa de
+  `osiris-stack` em release e navegador no runner.
+- **F2, fan-out do `build_chain`**: profundidade 5 com até 1000 arestas por lookup e nenhum outro
+  limite; com hubs (domínio, IP, arquivo compartilhado) o custo por evento cresce com o componente
+  (~75 eps no mix de 5 cenários). Precisa de decisão de desenho (teto de grau, orçamento de arestas
+  por cadeia ou exclusão de hubs). Ver `PERFORMANCE.md` "Known limits".
+- **M1**: o `ExecAssembler` do sensor de processo mantém um exec pendente; com registros de outros
+  eventos intercalados em host ocupado o argv se perde em silêncio (o evento sai com `cmdline` vazio).
+- **M3**: sem política definida o agente envia o argv completo e não há redação de segredos nos
+  valores dos argumentos; só abaixo do nível STANDARD o argv é removido.
+- **Bench**: o gerador de ingest só dirige cadeias de exec, então os números são um teto para mixes
+  mais ricos; o forwarder é stop-and-wait (um lote de 500 em voo), o que limita a vazão por conexão.
+- **Menores**: caminho de upgrade da migração de índices e aviso de fallback do WAL sem teste;
+  `open_reader` do bench faz `expect` se `events.db` não existe; `free_port()` pode repetir portas.
+- **Console**: itens de UX da seção "Phase 13 UX debt" de `docs/VALIDATION.md` entram na Fase 13.
+  Em aberto (nunca foi especificado, não é regressão): o clique em nó do Entity Graph não faz nada,
+  falta o pivô para a tela de detalhe da entidade, a definir no desenho. A Timeline não oferece hosts
+  em seed só-spool.
+- **Limpeza no merge**: apagar `console/vite.config.js` e `console/vite.config.d.ts` obsoletos do
+  checkout principal (o Vite prefere o `.js`).
 
 ## Fase 11 — Backends de telemetria (§5, §10)
+- **Sensor de DNS real** (dívida da Fase 10): hoje não existe, então as detecções de DNS só rodam
+  em fixtures.
 - **eBPF/CO-RE** (§5): loader libbpf-rs, programas para exec/fork/exit, file, net; capability probe;
   fallbacks atuais (audit/procfs) mantidos. Hoje: nenhum código eBPF.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
