@@ -93,6 +93,7 @@ check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiri
 check_forbidden osiris-sensors-fs osiris-server osiris-api
 check_forbidden osiris-sensors-process osiris-server osiris-api
 check_forbidden osiris-sensors-net osiris-server osiris-api
+check_forbidden osiris-sensors-dns osiris-server osiris-api
 check_forbidden osiris-sensors-identity osiris-server osiris-api
 check_forbidden osiris-sensors-systemd osiris-server osiris-api
 check_forbidden osiris-sensors-persistence osiris-server osiris-api
