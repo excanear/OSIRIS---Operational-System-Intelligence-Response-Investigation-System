@@ -11,6 +11,9 @@ import { useUiStore } from "../../store/uiStore";
 // `unknown` is required to satisfy tsc while returning an actual HTMLElement.
 type NodeLabelProp = ComponentProps<typeof ForceGraph2D>["nodeLabel"];
 
+// index.css --fg (#c9d1d9) at 60% opacity.
+const LINK_COLOR = "rgba(201, 209, 217, 0.6)";
+
 export function EntityGraph() {
   const selectedEntity = useUiStore((state) => state.selectedEntity);
   const [entityInput, setEntityInput] = useState(selectedEntity ?? "");
@@ -88,6 +91,11 @@ export function EntityGraph() {
               }) as unknown as NodeLabelProp
             }
             nodeAutoColorBy="kind"
+            // The library default (rgba(0,0,0,0.2)) is invisible on the
+            // Console's dark background; use the foreground colour (--fg).
+            linkColor={() => LINK_COLOR}
+            linkDirectionalArrowLength={4}
+            linkDirectionalArrowRelPos={1}
           />
         </div>
       )}

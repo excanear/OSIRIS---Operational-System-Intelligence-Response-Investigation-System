@@ -7,10 +7,16 @@ import { EntityGraph } from "./EntityGraph";
 vi.mock("../../api/hooks");
 
 let lastNodeLabel: unknown;
+let lastLinkColor: unknown;
 
 vi.mock("react-force-graph-2d", () => ({
-  default: (props: { graphData: { nodes: unknown[]; links: unknown[] }; nodeLabel?: unknown }) => {
+  default: (props: {
+    graphData: { nodes: unknown[]; links: unknown[] };
+    nodeLabel?: unknown;
+    linkColor?: unknown;
+  }) => {
     lastNodeLabel = props.nodeLabel;
+    lastLinkColor = props.linkColor;
     return (
       <div data-testid="force-graph" data-node-count={props.graphData.nodes.length} data-link-count={props.graphData.links.length} />
     );
@@ -126,5 +132,22 @@ describe("EntityGraph", () => {
     expect(typeof result).not.toBe("string");
     expect(result).toBeInstanceOf(HTMLElement);
     expect((result as HTMLElement).textContent).toBe("IP:203.0.113.10");
+  });
+
+  it("draws edges in a colour that is visible on the dark background", () => {
+    // react-force-graph-2d's default link colour is near-black
+    // (rgba(0,0,0,0.2)), which vanishes on the Console's #0d1117 page.
+    vi.mocked(hooks.useSubgraph).mockReturnValue(
+      mockQueryResult({ data: { nodes: [], edges: [], truncated: false } })
+    );
+    useUiStore.setState({ selectedEntity: "IP:203.0.113.10" }, false);
+    render(<EntityGraph />);
+
+    const color = typeof lastLinkColor === "function" ? (lastLinkColor as () => unknown)() : lastLinkColor;
+    expect(typeof color).toBe("string");
+    const [r, g, b] = (color as string).match(/\d+/g)!.map(Number);
+    // Relative luminance well above the background's (~0.006).
+    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    expect(luminance).toBeGreaterThan(0.5);
   });
 });
