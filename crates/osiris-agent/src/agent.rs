@@ -139,7 +139,8 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
 }
 
 /// Capability check, initialize and start; a sensor that cannot run is
-/// reported as skipped with its reason.
+/// reported as skipped with its reason. `cancellation` is the agent-wide
+/// token; the sensor receives a child of it.
 async fn start_sensor(
     mut sensor: Box<dyn Sensor>,
     raw_tx: mpsc::Sender<RawEvent>,
@@ -156,7 +157,10 @@ async fn start_sensor(
             reason,
         });
     }
-    let ctx = SensorContext::new(raw_tx, cancellation);
+    // Each sensor gets its own child token: agent shutdown still reaches it,
+    // but the sensor's `stop()` (which cancels its token) stops only that
+    // sensor, and a policy restart gets a fresh, uncancelled child.
+    let ctx = SensorContext::new(raw_tx, cancellation.child_token());
     if let Err(e) = sensor.initialize(ctx).await {
         let reason = e.to_string();
         tracing::warn!(sensor = sensor.name(), reason = %reason, "skipping sensor: failed to initialize");
@@ -1245,6 +1249,66 @@ pub(crate) mod tests {
             .iter()
             .any(|s| s.reason == "disabled by policy"));
         agent.shutdown().await;
+    }
+
+    /// Regression (Phase 11a final review I-1): switching one sensor off at
+    /// runtime must cancel only that sensor, not the agent-wide token that
+    /// the pipeline, drain loop, heartbeat, forwarder and control channel
+    /// select on; and a re-enabled sensor must get a live token again.
+    #[tokio::test]
+    async fn a_runtime_sensor_stop_leaves_the_agent_running_and_a_restart_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        let mut config = base_config(&dir);
+        let proc_root = dir.path().join("proc");
+        std::fs::create_dir_all(proc_root.join("net")).unwrap();
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        std::fs::write(proc_root.join("net/tcp"), header).unwrap();
+        config.network_proc_root = Some(proc_root.to_string_lossy().to_string());
+        let agent = Agent::start(config, test_host(), "boot-1".to_string())
+            .await
+            .unwrap();
+
+        let mut off = EffectivePolicy::default();
+        off.sensors.insert("network".into(), false);
+        let summary = agent.apply_policy(&off).await;
+        assert!(summary.contains("network off"), "{summary}");
+        assert!(
+            !agent.cancellation.is_cancelled(),
+            "stopping one sensor must not cancel the whole agent"
+        );
+
+        let summary = agent.apply_policy(&EffectivePolicy::default()).await;
+        assert!(summary.contains("network on"), "{summary}");
+
+        // The restarted sensor must poll again, and its event must make it
+        // through the (still running) pipeline into the spool.
+        std::fs::write(
+            proc_root.join("net/tcp"),
+            format!("{header}  0: 0500000A:C738 32671BCB:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0 100 0 0 10 0\n"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let emitted = |s: &crate::status::AgentStatus| {
+            s.sensors
+                .iter()
+                .find(|h| h.name == "network")
+                .map(|h| h.events_emitted_total)
+                .unwrap_or(0)
+        };
+        while emitted(&agent.status_snapshot().await) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            emitted(&agent.status_snapshot().await) >= 1,
+            "the re-enabled sensor must emit again"
+        );
+        agent.shutdown().await;
+        let spooled = std::fs::read_to_string(&spool).unwrap();
+        assert!(
+            spooled.contains("203.27.103.50"),
+            "the pipeline must still ship events after a sensor stop: {spooled}"
+        );
     }
 
     #[tokio::test]
