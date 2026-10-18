@@ -149,8 +149,8 @@ impl Capture {
         setsockopt(&fd, libc::SO_ATTACH_FILTER, &fprog).map_err(|_| os_err("SO_ATTACH_FILTER"))?;
 
         let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: RECV_TIMEOUT.as_micros() as libc::suseconds_t,
+            tv_sec: RECV_TIMEOUT.as_secs() as libc::time_t,
+            tv_usec: RECV_TIMEOUT.subsec_micros() as libc::suseconds_t,
         };
         setsockopt(&fd, libc::SO_RCVTIMEO, &tv).map_err(|_| os_err("SO_RCVTIMEO"))?;
 

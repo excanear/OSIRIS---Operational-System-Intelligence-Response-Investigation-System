@@ -101,7 +101,9 @@ fn decode_udp(seg: &[u8], src: IpAddr, dst: IpAddr) -> Option<UdpDatagram<'_>> {
     })
 }
 
-/// Source port 53 is a response (even 53->53); destination 53 otherwise a query.
+/// Port-based guess: source port 53 is a response, otherwise destination 53
+/// is a query. For 53->53 traffic this guess is not final: the engine
+/// decides the direction from the DNS header's QR bit.
 pub fn classify(d: &UdpDatagram) -> Option<Direction> {
     if d.src.port() == DNS_PORT {
         Some(Direction::Response)
