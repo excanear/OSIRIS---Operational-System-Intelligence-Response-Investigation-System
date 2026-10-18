@@ -56,7 +56,7 @@ revisão final independente → merge → push.
 ### Dívidas da Fase 10
 - **Fora de escopo, ainda por fazer**: cenários reais de container e Kubernetes (exige Docker/kind);
   distros RHEL-like (caminhos do auditd, SELinux); Debian com auditd funcionando (exige VM, o
-  workflow só tem runners Ubuntu); captura real de DNS (não existe sensor, Fase 11).
+  workflow só tem runners Ubuntu); captura real de DNS (resolvida na Fase 11a).
 - **CI**: jobs de real-Linux e de Playwright seguem fora do CI (a Fase 10 manteve só `perf_smoke`
   como gate). Falta decidir quais viram gate ou job agendado; o Playwright precisa de
   `osiris-stack` em release e navegador no runner.
@@ -80,8 +80,10 @@ revisão final independente → merge → push.
   checkout principal (o Vite prefere o `.js`).
 
 ## Fase 11 — Backends de telemetria (§5, §10)
-- **Sensor de DNS real** (dívida da Fase 10): hoje não existe, então as detecções de DNS só rodam
-  em fixtures.
+- **Fase 11a (feita)**: sensor de DNS real via AF_PACKET (dívida da Fase 10), validado em Linux real
+  (run 39087535939, Ubuntu 22.04 e 24.04). Ver `docs/VALIDATION.md` e `docs/operators-dns-sensor.md`.
+  Dívida: backend eBPF uprobe (11b); pontos cegos DNS sobre TCP, DoT, DoH e mDNS; o sensor não
+  tenta reabrir o socket se o `initialize` falhar.
 - **eBPF/CO-RE** (§5): loader libbpf-rs, programas para exec/fork/exit, file, net; capability probe;
   fallbacks atuais (audit/procfs) mantidos. Hoje: nenhum código eBPF.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.

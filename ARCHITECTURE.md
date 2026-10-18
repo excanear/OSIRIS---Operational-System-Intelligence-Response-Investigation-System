@@ -253,6 +253,8 @@ Sensors do not import each other. Cross-sensor relationships (e.g., "this networ
 | Security (LSM/capabilities) | eBPF LSM hooks where kernel supports `CONFIG_BPF_LSM`; audit for capability use | audit only | DETAILED |
 | Module/generic Security | see above | — | DETAILED |
 
+**DNS sensor status (Phase 11a).** The AF_PACKET backend is implemented (`crates/osiris-sensors/dns`, source `PACKET`, provider `dns_sensor/af_packet`, UDP port 53 over IPv4/IPv6, cBPF-filtered). The eBPF uprobe backend is pending Phase 11b. Level discrepancy: the table lists DNS as DETAILED, but the shipped telemetry levels emit `DnsQuery` from STANDARD upward (see `docs/operators-fleet-policy.md`); the code is the source of truth. Blind spots: DNS over TCP, DoT, DoH and mDNS. See `docs/operators-dns-sensor.md` and `docs/VALIDATION.md`.
+
 Justification for the fallback design, not an afterthought: RHEL 8 (kernel 4.18 backported), Amazon Linux 2 (kernel 4.14/5.10), Ubuntu 22.04 (5.15), Debian 12 (6.1) span a real spread of eBPF/BTF/LSM support (§20). A sensor that only works on the newest kernel is not "Linux-first," it is "Ubuntu-24.04-first." Every sensor above is designed with a non-eBPF path from day one, even if the MVP implements only the eBPF path first and stubs the fallback as a tracked follow-up — the **interface** must accommodate it so retrofitting isn't a rewrite.
 
 ---
@@ -436,7 +438,7 @@ CanonicalEvent {
   kernel: Optional<KernelRef>   { module_name, syscall_nr: Optional<u32> }
 
   // Provenance
-  source: enum (EBPF, AUDIT, FANOTIFY, PROCFS, DBUS, CONTAINER_API, SYNTHETIC)
+  source: enum (EBPF, AUDIT, FANOTIFY, PROCFS, DBUS, CONTAINER_API, PACKET, SYNTHETIC, AGENT_INTERNAL)
   provider: string              // specific sensor name + backend, e.g. "exec_sensor/ebpf"
   raw_event: Optional<bytes>    // bounded, original payload for forensic replay
   normalized_event: CanonicalEvent (self — the record itself IS this)

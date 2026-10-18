@@ -174,6 +174,37 @@ not install it (the GitHub runner images ship it). Fixed in the `setup.sh` apt l
 code change was needed for Debian. Debian with a working auditd is not covered (it needs a VM; the
 workflow matrix has only Ubuntu runners).
 
+## DNS sensor (Phase 11a)
+
+The passive AF_PACKET DNS sensor (`crates/osiris-sensors/dns`) was validated on GitHub Actions
+run 39087535939 (commit `bf85f37`, branch `real-linux/t11a-1`), green on `ubuntu-22.04` and
+`ubuntu-24.04`. The scenario `dns_query_is_observed_and_alerts` passed: a real `curl` lookup of
+`<marker>.xyz` produced a `DNS_QUERY` event attributed to curl and a
+`dns_query_to_suspicious_tld` alert citing it. The DNS crate's unit tests, including the
+Linux-only cBPF, loopback and symlink attribution tests, also passed on the runner (65 unit tests
+plus the replay test on 24.04). A real capture (24.04, SLL2 header stripped) is kept as the replay
+fixture `crates/osiris-sensors/dns/tests/fixtures/ubuntu2404-curl-xyz.hex`.
+
+### Observed behaviour (documented, not fixed)
+
+- On `lo` the kernel delivers every packet twice (outgoing and incoming). The sensor skips the
+  outgoing loopback copy, so no duplicate event is produced.
+- On the Azure runner systemd-resolved sends each upstream query on two interfaces. The copies are
+  merged into one transaction (no duplicate event), but the `duplicates` counter rises by one per
+  upstream query. Health is unaffected (only parse errors and overflow evictions degrade it).
+- One `curl` lookup of a `.xyz` name yields 4 `DNS_QUERY` events: A and AAAA from curl through the
+  127.0.0.53 stub (these alert), and A and AAAA from systemd-resolved upstream (no alert, its exe
+  is not in the rule). glibc search-domain variants add more events that do not end in `.xyz`.
+- Attribution is racy for clients that close the socket before the query packet is processed;
+  such events carry no process and do not feed the `(exe, domain)` baseline.
+
+### Known limitations
+
+- If the AF_PACKET socket cannot be opened at initialize (no `CAP_NET_RAW`, unknown interface),
+  the sensor is reported unsupported or failed and is not retried. Socket errors after start are
+  retried with backoff.
+- DNS over TCP, DoT, DoH and mDNS are not captured. The eBPF resolver uprobe is Phase 11b.
+
 ## Findings
 
 | Finding | Distro | Fix commit |
@@ -279,7 +310,7 @@ was not repeated on the final binaries.
 
 ## Known gaps
 
-- No DNS sensor exists, so DNS detections are not exercised on real hosts.
+- DNS over TCP, DoT, DoH and mDNS are not captured (see "DNS sensor (Phase 11a)").
 - No container or Kubernetes scenarios.
 - RHEL-like distributions (auditd paths, SELinux) are not covered.
 - eBPF is out of scope.
