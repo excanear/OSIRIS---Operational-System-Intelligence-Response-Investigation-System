@@ -19,6 +19,9 @@ pub enum RawEventSource {
     ContainerApi,
     /// Passive packet capture (AF_PACKET) — carries no audit serial.
     Packet,
+    /// Kernel eBPF programs (tracepoints) via the shared eBPF engine —
+    /// carries no audit serial.
+    Ebpf,
 }
 
 /// A Process/Exec creation record (ARCHITECTURE.md §6: MINIMAL is
@@ -43,6 +46,28 @@ pub struct ProcessExecRaw {
     /// (ARCHITECTURE.md §9.2). Falls back to `timestamp_ns` when the real
     /// monotonic start time (e.g. /proc/<pid>/stat's starttime) isn't
     /// available.
+    pub start_time_mono: u64,
+    pub source: RawEventSource,
+}
+
+/// A Process/Exit record. Carries the same identity inputs as
+/// [`ProcessExecRaw`] (`pid` + `start_time_mono` + boot id) so the exit
+/// event normalizes to the exact `process_key` of the matching exec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExitRaw {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub comm: String,
+    pub exe_path: String,
+    /// Exit status when the process exited normally; `None` when it was
+    /// killed by a signal.
+    pub exit_code: Option<i32>,
+    /// Terminating signal when the process was killed by one.
+    pub signal: Option<u32>,
+    /// Wall-clock nanoseconds, UTC, from the originating backend.
+    pub timestamp_ns: u64,
+    /// Process start time in clock ticks (same unit as the exec event's).
     pub start_time_mono: u64,
     pub source: RawEventSource,
 }
@@ -490,6 +515,7 @@ pub struct AgentHealthRaw {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     ProcessExec(ProcessExecRaw),
+    ProcessExit(ProcessExitRaw),
     File(FileEventRaw),
     Network(NetworkEventRaw),
     Dns(DnsEventRaw),
@@ -508,6 +534,7 @@ impl RawEvent {
     pub fn timestamp_ns(&self) -> u64 {
         match self {
             RawEvent::ProcessExec(p) => p.timestamp_ns,
+            RawEvent::ProcessExit(p) => p.timestamp_ns,
             RawEvent::File(f) => f.timestamp_ns,
             RawEvent::Network(n) => n.timestamp_ns,
             RawEvent::Dns(d) => d.timestamp_ns,

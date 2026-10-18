@@ -25,12 +25,10 @@ pub struct SessionRecord {
 /// where the identity↔process linkage is made, exactly as `ProcessResolver`
 /// is where the pid↔process_key linkage is made.
 ///
-/// KNOWN LIMITATION (bounded only by logout): `by_pid` grows one entry per
-/// process that joins a session and is pruned only when that session ends
-/// (`forget`), because no sensor in this codebase emits `PROCESS_EXIT` yet
-/// (Phase 4a plan Global Constraint #5). A long-lived session that spawns
-/// very many short-lived processes therefore accumulates entries until it
-/// logs out. Per-pid eviction belongs with a real process-exit sensor.
+/// Growth is bounded by per-pid eviction: `forget_pid` drops a pid when its
+/// `PROCESS_EXIT` is observed (eBPF backend), and `forget` drops a whole
+/// session on logout. Hosts whose process sensor has no exit source (the
+/// audit backend) still only prune on logout.
 #[derive(Default)]
 pub struct SessionResolver {
     by_pid: HashMap<u32, String>,
@@ -81,6 +79,17 @@ impl SessionResolver {
 
     pub fn record_for(&self, session_id: &str) -> Option<&SessionRecord> {
         self.sessions.get(session_id)
+    }
+
+    /// Per-pid eviction on `PROCESS_EXIT`: drops `pid`'s mapping and its
+    /// membership entry, leaving the session and its other members intact.
+    /// Called by Enrich after the exit event itself has been attributed.
+    pub fn forget_pid(&mut self, pid: u32) {
+        if let Some(session_id) = self.by_pid.remove(&pid) {
+            if let Some(pids) = self.members.get_mut(&session_id) {
+                pids.remove(&pid);
+            }
+        }
     }
 
     /// Drops a session and every pid mapped to it (called on
@@ -210,5 +219,23 @@ mod tests {
         // (the first `forget` pass would only remove one of two identical
         // entries) — asserting `None` here is the actual proof.
         assert_eq!(sessions.attach(100, 1), None);
+    }
+
+    #[test]
+    fn forget_pid_drops_only_that_pid() {
+        let mut sessions = SessionResolver::new();
+        sessions.record_login(100, ssh_session());
+        assert_eq!(sessions.attach(200, 100), Some("3".to_string()));
+        assert_eq!(sessions.attach(300, 100), Some("3".to_string()));
+        sessions.forget_pid(200);
+        // 200 no longer resolves on its own (ppid 1 is not a member)...
+        assert_eq!(sessions.attach(200, 1), None);
+        // ...while the root and the sibling keep the session.
+        assert_eq!(sessions.attach(100, 1), Some("3".to_string()));
+        assert_eq!(sessions.attach(300, 1), Some("3".to_string()));
+        assert!(sessions.record_for("3").is_some());
+        // Logout still cleans up cleanly after a pid was evicted.
+        sessions.forget("3");
+        assert_eq!(sessions.attach(300, 1), None);
     }
 }

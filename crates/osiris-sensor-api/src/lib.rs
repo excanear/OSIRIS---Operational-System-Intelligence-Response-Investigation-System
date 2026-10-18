@@ -13,7 +13,7 @@ pub use raw_event::{
     AgentHealthRaw, ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw,
     FileOperation, IdentityEventRaw, IdentityOperation, NetworkDirection, NetworkEventRaw,
     NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw, PersistenceOperation,
-    PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent, RawEventSource,
-    SystemdEventRaw, SystemdOperation,
+    PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, ProcessExitRaw, RawEvent,
+    RawEventSource, SystemdEventRaw, SystemdOperation,
 };
 pub use sensor::{Sensor, SensorMetrics};

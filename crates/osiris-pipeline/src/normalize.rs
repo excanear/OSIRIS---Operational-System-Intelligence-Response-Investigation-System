@@ -10,8 +10,8 @@ use osiris_sensor_api::{
     AgentHealthRaw, ContainerEventRaw, ContainerOperation, DnsEventRaw, FileEventRaw,
     FileOperation, IdentityEventRaw, IdentityOperation, NetworkDirection as RawNetworkDirection,
     NetworkEventRaw, NetworkOperation, PersistenceCheckpointKind, PersistenceEventRaw,
-    PersistenceOperation, PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, RawEvent,
-    RawEventSource, SystemdEventRaw, SystemdOperation,
+    PersistenceOperation, PrivilegeEventRaw, PrivilegeOperation, ProcessExecRaw, ProcessExitRaw,
+    RawEvent, RawEventSource, SystemdEventRaw, SystemdOperation,
 };
 
 /// Maps a RawEvent to a CanonicalEvent (ARCHITECTURE.md §7.1 step 2).
@@ -24,6 +24,7 @@ use osiris_sensor_api::{
 pub fn normalize(raw: RawEvent, host: &HostRef, boot_id: &str) -> CanonicalEvent {
     match raw {
         RawEvent::ProcessExec(p) => normalize_process_exec(p, host, boot_id),
+        RawEvent::ProcessExit(p) => normalize_process_exit(p, host, boot_id),
         RawEvent::File(f) => normalize_file_event(f, host, boot_id),
         RawEvent::Network(n) => normalize_network_event(n, host, boot_id),
         RawEvent::Dns(d) => normalize_dns_event(d, host, boot_id),
@@ -45,6 +46,7 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
         RawEventSource::Packet => Source::Packet,
+        RawEventSource::Ebpf => Source::Ebpf,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "process_exec_sensor/audit",
@@ -52,6 +54,7 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
         RawEventSource::Procfs => "process_exec_sensor/procfs",
         RawEventSource::ContainerApi => "process_exec_sensor/container_api",
         RawEventSource::Packet => "process_exec_sensor/packet",
+        RawEventSource::Ebpf => "process_exec_sensor/ebpf",
     };
     let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, raw.start_time_mono);
     CanonicalEvent {
@@ -93,6 +96,70 @@ fn normalize_process_exec(raw: ProcessExecRaw, host: &HostRef, boot_id: &str) ->
         tags: vec![],
         risk: None,
         event_data: serde_json::json!({ "comm": raw.comm, "ppid": raw.ppid, "uid": raw.uid }),
+    }
+}
+
+fn normalize_process_exit(raw: ProcessExitRaw, host: &HostRef, boot_id: &str) -> CanonicalEvent {
+    // Same provider family as the exec backend that produced the raw
+    // record; `schema_source` is the shared RawEventSource -> Source map.
+    let provider = match raw.source {
+        RawEventSource::Audit => "process_exec_sensor/audit",
+        RawEventSource::Synthetic => "process_exec_sensor/synthetic",
+        RawEventSource::Procfs => "process_exec_sensor/procfs",
+        RawEventSource::ContainerApi => "process_exec_sensor/container_api",
+        RawEventSource::Packet => "process_exec_sensor/packet",
+        RawEventSource::Ebpf => "process_exec_sensor/ebpf",
+    };
+    // Identical derivation to `normalize_process_exec`, so the exit event
+    // joins the exec event's process identity.
+    let process_key = ProcessKey::new(host.host_id, boot_id, raw.pid, raw.start_time_mono);
+    CanonicalEvent {
+        event_id: Uuid::now_v7(),
+        schema_version: SCHEMA_VERSION.to_string(),
+        host_id: host.host_id,
+        boot_id: boot_id.to_string(),
+        timestamp: raw.timestamp_ns,
+        monotonic_timestamp: raw.start_time_mono,
+        event_type: EventType::ProcessExit,
+        category: Category::Process,
+        severity: Severity::Info,
+        host: host.clone(),
+        user: None,
+        session: None,
+        process: Some(ProcessRef {
+            process_key,
+            pid: raw.pid,
+            exe_path: raw.exe_path,
+            cmdline: vec![],
+            exe_hash: None,
+            start_time_mono: raw.start_time_mono,
+        }),
+        parent_process: None,
+        thread: None,
+        file: None,
+        network: None,
+        dns: None,
+        device: None,
+        service: None,
+        container: None,
+        namespace: None,
+        cgroup: None,
+        kernel: None,
+        source: schema_source(raw.source),
+        provider: provider.to_string(),
+        raw_event: None,
+        relationships: vec![],
+        tags: vec![],
+        risk: None,
+        // `comm`/`ppid`/`uid` mirror the exec event's data so Enrich can
+        // resolve parent and session for the exit event the same way.
+        event_data: serde_json::json!({
+            "exit_code": raw.exit_code,
+            "signal": raw.signal,
+            "comm": raw.comm,
+            "ppid": raw.ppid,
+            "uid": raw.uid,
+        }),
     }
 }
 
@@ -150,6 +217,7 @@ fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> Can
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
         RawEventSource::Packet => Source::Packet,
+        RawEventSource::Ebpf => Source::Ebpf,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "filesystem_sensor/audit",
@@ -157,6 +225,7 @@ fn normalize_file_event(raw: FileEventRaw, host: &HostRef, boot_id: &str) -> Can
         RawEventSource::Procfs => "filesystem_sensor/procfs",
         RawEventSource::ContainerApi => "filesystem_sensor/container_api",
         RawEventSource::Packet => "filesystem_sensor/packet",
+        RawEventSource::Ebpf => "filesystem_sensor/ebpf",
     };
     let event_type = match raw.operation {
         FileOperation::Create => EventType::FileCreate,
@@ -257,6 +326,7 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
         // handled for match exhaustiveness only.
         RawEventSource::ContainerApi => Source::ContainerApi,
         RawEventSource::Packet => Source::Packet,
+        RawEventSource::Ebpf => Source::Ebpf,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "network_sensor/audit",
@@ -264,6 +334,7 @@ fn normalize_network_event(raw: NetworkEventRaw, host: &HostRef, boot_id: &str) 
         RawEventSource::Procfs => "network_sensor/procfs",
         RawEventSource::ContainerApi => "network_sensor/container_api",
         RawEventSource::Packet => "network_sensor/packet",
+        RawEventSource::Ebpf => "network_sensor/ebpf",
     };
     let event_type = match raw.operation {
         NetworkOperation::Connect => EventType::NetworkConnect,
@@ -349,6 +420,7 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
         // for match exhaustiveness only.
         RawEventSource::ContainerApi => Source::ContainerApi,
         RawEventSource::Packet => Source::Packet,
+        RawEventSource::Ebpf => Source::Ebpf,
     };
     let provider = match raw.source {
         RawEventSource::Audit => "dns_sensor/unknown",
@@ -356,6 +428,7 @@ fn normalize_dns_event(raw: DnsEventRaw, host: &HostRef, boot_id: &str) -> Canon
         RawEventSource::Procfs => "dns_sensor/unknown",
         RawEventSource::ContainerApi => "dns_sensor/unknown",
         RawEventSource::Packet => "dns_sensor/af_packet",
+        RawEventSource::Ebpf => "dns_sensor/unknown",
     };
     let process = provisional_process(raw.pid, &raw.exe_path, host.host_id, boot_id);
     CanonicalEvent {
@@ -449,6 +522,7 @@ fn identity_provider(source: RawEventSource) -> &'static str {
         // codebase; handled for match exhaustiveness only.
         RawEventSource::ContainerApi => "identity_sensor/container_api",
         RawEventSource::Packet => "identity_sensor/packet",
+        RawEventSource::Ebpf => "identity_sensor/ebpf",
     }
 }
 
@@ -459,6 +533,7 @@ fn schema_source(source: RawEventSource) -> Source {
         RawEventSource::Procfs => Source::Procfs,
         RawEventSource::ContainerApi => Source::ContainerApi,
         RawEventSource::Packet => Source::Packet,
+        RawEventSource::Ebpf => Source::Ebpf,
     }
 }
 
@@ -917,6 +992,70 @@ mod tests {
             kernel_version: "0.0.0".to_string(),
             cloud: None,
         }
+    }
+
+    #[test]
+    fn ebpf_exec_provider() {
+        let raw = RawEvent::ProcessExec(ProcessExecRaw {
+            pid: 1,
+            ppid: 0,
+            uid: 0,
+            exe_path: "/bin/true".to_string(),
+            comm: "true".to_string(),
+            cmdline: vec![],
+            timestamp_ns: 1,
+            start_time_mono: 2,
+            source: RawEventSource::Ebpf,
+        });
+        let event = normalize(raw, &sample_host(), "boot-1");
+        assert_eq!(event.provider, "process_exec_sensor/ebpf");
+        assert_eq!(event.source, Source::Ebpf);
+    }
+
+    #[test]
+    fn normalize_process_exit_carries_key_and_exit_data() {
+        let host = sample_host();
+        let exec = normalize(
+            RawEvent::ProcessExec(ProcessExecRaw {
+                pid: 4242,
+                ppid: 100,
+                uid: 1000,
+                exe_path: "/usr/bin/curl".to_string(),
+                comm: "curl".to_string(),
+                cmdline: vec![],
+                timestamp_ns: 10,
+                start_time_mono: 777,
+                source: RawEventSource::Ebpf,
+            }),
+            &host,
+            "boot-1",
+        );
+        let exit = normalize(
+            RawEvent::ProcessExit(ProcessExitRaw {
+                pid: 4242,
+                ppid: 100,
+                uid: 1000,
+                comm: "curl".to_string(),
+                exe_path: "/usr/bin/curl".to_string(),
+                exit_code: Some(7),
+                signal: None,
+                timestamp_ns: 20,
+                start_time_mono: 777,
+                source: RawEventSource::Ebpf,
+            }),
+            &host,
+            "boot-1",
+        );
+        assert_eq!(exit.event_type, EventType::ProcessExit);
+        assert_eq!(exit.category, Category::Process);
+        assert_eq!(exit.source, Source::Ebpf);
+        assert_eq!(exit.provider, "process_exec_sensor/ebpf");
+        assert_eq!(
+            exit.process.as_ref().unwrap().process_key,
+            exec.process.as_ref().unwrap().process_key
+        );
+        assert_eq!(exit.event_data["exit_code"], 7);
+        assert!(exit.event_data["signal"].is_null());
     }
 
     #[test]

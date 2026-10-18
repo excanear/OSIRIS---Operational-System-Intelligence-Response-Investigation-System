@@ -26,6 +26,12 @@ impl ProcessResolver {
         self.by_pid.insert(pid, (process_key, ppid));
     }
 
+    /// Evicts `pid` on `PROCESS_EXIT`. Called by Enrich only after the exit
+    /// event has been enriched, so it still carries process/parent identity.
+    pub fn forget(&mut self, pid: u32) {
+        self.by_pid.remove(&pid);
+    }
+
     /// Resolves the parent's process_key by looking up this process's own
     /// recorded ppid. Returns None if the parent was never observed (e.g.
     /// it exec'd before the Agent started) — the caller leaves

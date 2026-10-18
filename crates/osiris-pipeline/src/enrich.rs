@@ -46,6 +46,16 @@ pub fn enrich(
         _ => {}
     }
 
+    // Per-pid eviction runs last: the exit event above was fully attributed
+    // (process, parent, session) before its pid's state is dropped, so a
+    // later exec reusing the pid starts clean.
+    if event.event_type == EventType::ProcessExit {
+        if let Some(pid) = event.process.as_ref().map(|p| p.pid) {
+            resolver.forget(pid);
+            sessions.forget_pid(pid);
+        }
+    }
+
     event
 }
 
@@ -1532,5 +1542,54 @@ mod tests {
             "/normalize-set-this-path",
             "Normalize's own cgroup must survive, not be clobbered by the resolver"
         );
+    }
+
+    #[test]
+    fn exit_event_keeps_session_then_evicts() {
+        let host_id = Uuid::new_v4();
+        let mut resolver = ProcessResolver::new();
+        let mut sessions = SessionResolver::new();
+        let mut ns_cgroup = NsCgroupResolver::new("/nonexistent-test-proc-root");
+        sessions.record_login(
+            100,
+            SessionRecord {
+                session_id: "3".to_string(),
+                uid: 0,
+                username: Some("alice".to_string()),
+                tty: None,
+                remote_addr: None,
+                auth_method: None,
+            },
+        );
+        let exec = enrich(
+            bare_event(host_id, 200, 100),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+            &mut ns_cgroup,
+        );
+        assert_eq!(exec.session.as_ref().unwrap().session_id, "3");
+
+        let mut exit = bare_event(host_id, 200, 100);
+        exit.event_type = EventType::ProcessExit;
+        let exit = enrich(exit, "boot-1", &mut resolver, &mut sessions, &mut ns_cgroup);
+        // The exit event itself still carries session and process identity.
+        assert_eq!(exit.session.as_ref().unwrap().session_id, "3");
+        assert_eq!(
+            exit.process.as_ref().unwrap().process_key,
+            exec.process.as_ref().unwrap().process_key
+        );
+        // The pid is evicted from both resolvers afterwards.
+        assert_eq!(resolver.resolve(200), None);
+
+        // pid reuse under a parent outside the session does not inherit it.
+        let reused = enrich(
+            bare_event(host_id, 200, 1),
+            "boot-1",
+            &mut resolver,
+            &mut sessions,
+            &mut ns_cgroup,
+        );
+        assert!(reused.session.is_none());
     }
 }
