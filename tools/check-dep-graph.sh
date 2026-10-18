@@ -98,6 +98,7 @@ check_forbidden osiris-sensors-identity osiris-server osiris-api
 check_forbidden osiris-sensors-systemd osiris-server osiris-api
 check_forbidden osiris-sensors-persistence osiris-server osiris-api
 check_forbidden osiris-sensors-container osiris-server osiris-api
+check_forbidden osiris-ebpf osiris-storage osiris-pipeline osiris-detect osiris-api osiris-server osiris-sensor-api
 # Phase 10: dev tooling must never be reachable from shipped binaries.
 check_forbidden osiris-server osiris-real-linux-tests osiris-bench
 check_forbidden osiris-agent osiris-real-linux-tests osiris-bench

@@ -1534,6 +1534,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-ebpf"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "osiris-evidence"
 version = "0.1.0"
 dependencies = [

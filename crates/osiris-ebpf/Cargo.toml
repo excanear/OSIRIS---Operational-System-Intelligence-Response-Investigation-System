@@ -1,0 +1,9 @@
+[package]
+name = "osiris-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
