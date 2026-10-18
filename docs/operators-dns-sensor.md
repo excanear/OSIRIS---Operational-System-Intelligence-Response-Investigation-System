@@ -27,3 +27,13 @@ configured (see `operators-fleet-policy.md`).
 - DNS over TCP, DoT, DoH and mDNS are not captured.
 - On systemd-resolved hosts one lookup yields events for the app (via 127.0.0.53) and for
   systemd-resolved upstream; see `VALIDATION.md`, "DNS sensor (Phase 11a)".
+- Forwarded and NATed traffic (Docker hosts, routers) is seen twice:
+  - First on the veth or bridge as an incoming packet. It is not local, so it is not attributed.
+  - Again on egress as `PACKET_OUTGOING`. The sensor treats that copy as sent by the host, so it
+    yields a second `DNS_QUERY` event, attributed by its post-masquerade source port.
+
+  If that port collides with a host socket on the same port (exact or wildcard-bound), the second
+  event is attributed to an unrelated host process. Processes in other network namespaces are
+  never attributed, because the sensor reads the agent's own `/proc/net/udp`.
+- The engine counters (packets, parse errors, duplicates, timeouts and so on) and the kernel's
+  drop counter are not exported yet. Packet loss on a busy host is therefore silent.

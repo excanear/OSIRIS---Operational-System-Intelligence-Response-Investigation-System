@@ -182,16 +182,19 @@ run 39087535939 (commit `bf85f37`, branch `real-linux/t11a-1`), green on `ubuntu
 `<marker>.xyz` produced a `DNS_QUERY` event attributed to curl and a
 `dns_query_to_suspicious_tld` alert citing it. The DNS crate's unit tests, including the
 Linux-only cBPF, loopback and symlink attribution tests, also passed on the runner (65 unit tests
-plus the replay test on 24.04). A real capture (24.04, SLL2 header stripped) is kept as the replay
-fixture `crates/osiris-sensors/dns/tests/fixtures/ubuntu2404-curl-xyz.hex`.
+plus the replay test on 24.04). That run's replay test covered only the synthetic fixtures. A real
+capture from the same run (24.04, SLL2 header stripped) was added afterwards, in commit `d7566b5`,
+as the replay fixture `crates/osiris-sensors/dns/tests/fixtures/ubuntu2404-curl-xyz.hex`. It is
+replayed by the host test suite (`cargo test` on Windows and in CI), not in run 39087535939.
 
 ### Observed behaviour (documented, not fixed)
 
 - On `lo` the kernel delivers every packet twice (outgoing and incoming). The sensor skips the
   outgoing loopback copy, so no duplicate event is produced.
 - On the Azure runner systemd-resolved sends each upstream query on two interfaces. The copies are
-  merged into one transaction (no duplicate event), but the `duplicates` counter rises by one per
-  upstream query. Health is unaffected (only parse errors and overflow evictions degrade it).
+  merged into one transaction (no duplicate event), but the engine's internal `duplicates` counter
+  rises by one per upstream query. This was seen by replaying the fixture: the engine counters are
+  not exported yet (see the Phase 11 debts in `ROADMAP-REMAINING.md`). Health is unaffected (only parse errors and overflow evictions degrade it).
 - One `curl` lookup of a `.xyz` name yields 4 `DNS_QUERY` events: A and AAAA from curl through the
   127.0.0.53 stub (these alert), and A and AAAA from systemd-resolved upstream (no alert, its exe
   is not in the rule). glibc search-domain variants add more events that do not end in `.xyz`.

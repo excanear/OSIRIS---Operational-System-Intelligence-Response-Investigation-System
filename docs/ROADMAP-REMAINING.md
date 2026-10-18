@@ -84,6 +84,17 @@ revisão final independente → merge → push.
   (run 39087535939, Ubuntu 22.04 e 24.04). Ver `docs/VALIDATION.md` e `docs/operators-dns-sensor.md`.
   Dívida: backend eBPF uprobe (11b); pontos cegos DNS sobre TCP, DoT, DoH e mDNS; o sensor não
   tenta reabrir o socket se o `initialize` falhar.
+  Dívidas da revisão final da 11a:
+  - Os contadores `EngineMetrics` (spec §10: pacotes, erros de parse, divergências de direção,
+    timeouts, respostas sem par, despejos por overflow, duplicatas, atribuídos e não atribuídos)
+    só podem ser lidos por `DnsSensor::engine_metrics()`, que nada chama. Não são exportados:
+    falta uma mudança em sensor-api ou em selftelemetry.
+  - O contador de descartes do kernel (`PACKET_STATISTICS`, `tp_drops`) nunca é lido. A perda
+    por estouro do buffer de recepção em host ocupado passa em silêncio.
+  - Tráfego encaminhado ou com NAT (Docker, roteador): a cópia de egresso (`PACKET_OUTGOING`)
+    conta como local e gera um segundo evento. Se a porta colidir, esse evento pode ser atribuído
+    a um processo do host sem relação. Correção futura: comparar o IP de origem com os endereços
+    locais.
 - **eBPF/CO-RE** (§5): loader libbpf-rs, programas para exec/fork/exit, file, net; capability probe;
   fallbacks atuais (audit/procfs) mantidos. Hoje: nenhum código eBPF.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
