@@ -101,7 +101,7 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
         "process_exec" => config
             .audit_log_path
             .clone()
-            .map(|p| Box::new(ProcessExecSensor::new(p)) as Box<dyn Sensor>),
+            .map(|p| Box::new(ProcessExecSensor::new(Some(p.into()), None)) as Box<dyn Sensor>),
         "filesystem" => config
             .fs_audit_log_path
             .clone()

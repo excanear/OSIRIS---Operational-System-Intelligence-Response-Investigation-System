@@ -9,6 +9,10 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 osiris-sensor-api = { path = "../../osiris-sensor-api" }
 osiris-fileutil = { path = "../../osiris-fileutil" }
+osiris-ebpf = { path = "../../osiris-ebpf" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1909,6 +1909,8 @@ name = "osiris-sensors-process"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
+ "osiris-ebpf",
  "osiris-fileutil",
  "osiris-sensor-api",
  "tempfile",
