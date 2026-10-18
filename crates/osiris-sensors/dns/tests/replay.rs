@@ -3,10 +3,13 @@
 //!
 //! Fixture format: one hex-encoded L3 packet per line (blank lines and `#`
 //! comments ignored); expected JSON: `{"query", "qtype", "response_ips"}` for
-//! the single event the packets must produce.
+//! the single event the packets must produce, or an array of such objects
+//! for the events they must produce, in emit order.
 //!
 //! A `# local_origin=true|false` comment line sets the `local_origin` flag
-//! passed for the file's packets (default true).
+//! passed for the packets that follow it (default true), so a capture that
+//! mixes sent and received packets can be replayed as the sensor saw it.
+//! No process attribution in replay (empty proc root), so it is not compared.
 
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +39,10 @@ fn replays_fixture_files() {
         let expected_path = path.with_extension("expected.json");
         let expected: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&expected_path).unwrap()).unwrap();
+        let expected = match expected {
+            serde_json::Value::Array(all) => all,
+            one => vec![one],
+        };
 
         let proc_root = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(
@@ -57,30 +64,51 @@ fn replays_fixture_files() {
             }
             events.extend(engine.on_packet(&unhex(line), local_origin, 1, now));
         }
-        assert_eq!(events.len(), 1, "{}: {events:?}", path.display());
-        let RawEvent::Dns(d) = &events[0] else {
-            panic!("{}: not a dns event", path.display());
-        };
         assert_eq!(
-            d.query,
-            expected["query"].as_str().unwrap(),
-            "{}",
+            events.len(),
+            expected.len(),
+            "{}: {events:?}",
+            path.display()
+        );
+        for (i, (event, want)) in events.iter().zip(&expected).enumerate() {
+            let RawEvent::Dns(d) = event else {
+                panic!("{} #{i}: not a dns event", path.display());
+            };
+            assert_eq!(
+                d.query,
+                want["query"].as_str().unwrap(),
+                "{} #{i}",
+                path.display()
+            );
+            assert_eq!(
+                d.qtype,
+                want["qtype"].as_str().unwrap(),
+                "{} #{i}",
+                path.display()
+            );
+            let ips: Vec<String> = want["response_ips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(d.response_ips, ips, "{} #{i}", path.display());
+        }
+        let m = engine.metrics();
+        assert_eq!(m.parse_errors, 0, "{}: parse errors", path.display());
+        assert_eq!(
+            m.direction_mismatches,
+            0,
+            "{}: direction mismatches",
             path.display()
         );
         assert_eq!(
-            d.qtype,
-            expected["qtype"].as_str().unwrap(),
-            "{}",
+            m.tracker.unmatched_responses,
+            0,
+            "{}: unmatched responses",
             path.display()
         );
-        let want: Vec<String> = expected["response_ips"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(d.response_ips, want, "{}", path.display());
         count += 1;
     }
-    assert!(count >= 3, "expected at least 3 fixtures, found {count}");
+    assert!(count >= 4, "expected at least 4 fixtures, found {count}");
 }

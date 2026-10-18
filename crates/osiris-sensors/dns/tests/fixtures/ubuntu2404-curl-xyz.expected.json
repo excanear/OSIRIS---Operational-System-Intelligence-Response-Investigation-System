@@ -1,0 +1,22 @@
+[
+  {
+    "query": "osirisp1069febaf363544229b0a5d482f7ccd4f8.xyz",
+    "qtype": "AAAA",
+    "response_ips": []
+  },
+  {
+    "query": "osirisp1069febaf363544229b0a5d482f7ccd4f8.xyz",
+    "qtype": "AAAA",
+    "response_ips": []
+  },
+  {
+    "query": "osirisp1069febaf363544229b0a5d482f7ccd4f8.xyz",
+    "qtype": "A",
+    "response_ips": []
+  },
+  {
+    "query": "osirisp1069febaf363544229b0a5d482f7ccd4f8.xyz",
+    "qtype": "A",
+    "response_ips": []
+  }
+]
