@@ -79,7 +79,8 @@ today's audit backend.
      layout is one C header mirrored by a `#[repr(C)]` Rust struct whose size and field offsets
      are pinned by unit tests *(call — §5.4 asks for build-time codegen from one source; a
      layout test catches the same mismatch with no codegen toolchain. Record this in the ADR)*.
-   - Ring buffer size **256 KiB** *(call)*.
+   - Ring buffer size **1 MiB** *(call: exec records are fixed-size, ~4.5 KiB, so this holds
+     ~230 in-flight execs)*.
 5. **Process sensor gains an eBPF backend.** The sensor keeps its name `process_exec` and its
    audit backend. Backend selection at `initialize`:
    - Agent config has no `ebpf` section → audit backend, exactly as today (no behaviour change
@@ -104,8 +105,11 @@ today's audit backend.
    processes)*.
 7. **Exit events — new raw type.** Add `RawEvent::ProcessExit(ProcessExitRaw)` to
    `osiris-sensor-api` (`pid`, `ppid`, `uid`, `comm`, `exe_path` (best-effort, may be empty),
-   `exit_code`, `timestamp_ns`, `start_time_mono`, `source`), normalize it to the existing
-   `EventType::ProcessExit` with the same `process_key` derivation as exec, and make the session
+   `exit_code: Option<i32>`, `signal: Option<u32>` — decoded from the kernel wait status: normal
+   exit sets `exit_code`, death by signal sets `signal` — `timestamp_ns`, `start_time_mono`,
+   `source`), normalize it to the existing `EventType::ProcessExit` with the same `process_key`
+   derivation as exec and `event_data` `{"exit_code": <n|null>, "signal": <n|null>}` (no schema
+   struct change) *(call)*, and make the session
    resolver forget the exiting process (the "no sensor emits PROCESS_EXIT yet" comment goes away).
    The audit backend does not emit exits (unchanged). `PROCESS_EXIT`'s telemetry level stays as
    `crates/osiris-policy` already defines it.
