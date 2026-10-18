@@ -183,6 +183,16 @@ mod tests {
         assert_eq!(load_overlay(&path), None);
     }
 
+    #[test]
+    fn an_overlay_naming_the_dns_sensor_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        let mut p = sample();
+        p.sensors.insert("dns".into(), false);
+        save_overlay(&path, &p).unwrap();
+        assert_eq!(load_overlay(&path), Some(p));
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_overlay_is_private() {

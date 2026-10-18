@@ -252,6 +252,11 @@ mod tests {
         let mut unknown = PolicyPayload::from_effective(&Default::default());
         unknown.sensors = vec![("bogus".into(), true)];
         assert_eq!(unknown.to_effective().unwrap_err(), "unknown sensor: bogus");
+        let mut with_dns = osiris_policy::EffectivePolicy::default();
+        with_dns.sensors.insert("dns".into(), false);
+        assert!(PolicyPayload::from_effective(&with_dns)
+            .to_effective()
+            .is_ok());
     }
     #[test]
     fn canonical_bytes_start_with_domain_tag_and_are_stable() {

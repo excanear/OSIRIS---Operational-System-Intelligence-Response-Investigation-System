@@ -798,6 +798,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_policy_naming_the_dns_sensor_is_accepted() {
+        let f = fx(true);
+        let g = f
+            .state
+            .groups
+            .create(&GroupScope::Platform, None, "g")
+            .unwrap();
+        let _ = put(
+            &f,
+            &ctx(None),
+            g.group_id,
+            json!({"sensors": {"dns": false}}),
+        )
+        .await
+        .expect("dns is a known sensor");
+    }
+
+    #[tokio::test]
     async fn an_invalid_policy_on_another_tenants_group_is_404_not_400() {
         let f = fx(true);
         let a = f.state.tenants.create_tenant("a").unwrap().tenant_id;

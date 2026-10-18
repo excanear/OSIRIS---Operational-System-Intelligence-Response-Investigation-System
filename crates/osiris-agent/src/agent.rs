@@ -126,6 +126,7 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
         "container" => (!config.container_cgroup_roots.is_empty()).then(|| {
             Box::new(ContainerSensor::new(config.container_cgroup_roots.clone())) as Box<dyn Sensor>
         }),
+        // Reuses `config.proc_root` (same /proc root as the resolver) for /proc/net/udp attribution.
         "dns" => config.dns_capture.as_ref().map(|c| {
             let proc_root = config.proc_root.as_deref().unwrap_or("/proc");
             Box::new(DnsSensor::new(
