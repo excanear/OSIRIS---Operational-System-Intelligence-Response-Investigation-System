@@ -26,6 +26,9 @@ pub struct StackOptions {
 pub struct AgentOptions {
     pub audit_log: PathBuf,
     pub persistence_dirs: Vec<PathBuf>,
+    /// Pre-built BPF object dir; `Some` runs the process sensor on eBPF
+    /// (see `render::bpf_dir_from_env`), `None` keeps it on audit.
+    pub ebpf_object_dir: Option<PathBuf>,
 }
 
 pub struct Stack {
@@ -35,6 +38,8 @@ pub struct Stack {
     admin_password: String,
     host_id: Option<Uuid>,
     agent_port: u16,
+    /// The agent's local status endpoint port (agent mode only).
+    status_port: Option<u16>,
     server: Child,
     agent: Option<Child>,
     http: reqwest::blocking::Client,
@@ -138,6 +143,7 @@ impl Stack {
             admin_password: bootstrap.password,
             host_id,
             agent_port,
+            status_port: None,
             server,
             agent: None,
             http: reqwest::blocking::Client::builder()
@@ -169,6 +175,8 @@ impl Stack {
         );
 
         if let Some(a) = opts.agent {
+            let status_port = free_port();
+            stack.status_port = Some(status_port);
             let agent_yaml = AgentYaml {
                 dir: d.clone(),
                 agent_port,
@@ -176,6 +184,8 @@ impl Stack {
                 audit_log: Some(a.audit_log),
                 persistence_dirs: a.persistence_dirs,
                 health_interval_secs: 5,
+                status_port,
+                ebpf_object_dir: a.ebpf_object_dir,
             };
             std::fs::write(d.join("agent.yaml"), agent_yaml.render()).unwrap();
             // Owned by the Stack before the wait so a panic there still reaps it in Drop.
@@ -259,6 +269,43 @@ impl Stack {
             .filter(|r| r.status().is_success())
             .and_then(|r| r.json().ok())
             .unwrap_or(Value::Null)
+    }
+
+    /// The agent's local `GET /status`: per-sensor `SensorHealth` with the
+    /// `capability_flags` and `last_error` that AGENT_HEALTH does not carry.
+    /// `Value::Null` when unreachable or when the stack has no agent.
+    pub fn agent_status(&self) -> Value {
+        let Some(port) = self.status_port else {
+            return Value::Null;
+        };
+        self.http
+            .get(format!("http://127.0.0.1:{port}/status"))
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.json().ok())
+            .unwrap_or(Value::Null)
+    }
+
+    /// Bounded poll of the agent's status until `done`; panics with the last
+    /// body + logs.
+    pub fn wait_agent_status(&self, deadline: Duration, done: impl Fn(&Value) -> bool) -> Value {
+        let end = Instant::now() + deadline;
+        loop {
+            let body = self.agent_status();
+            if done(&body) {
+                return body;
+            }
+            if Instant::now() >= end {
+                let mut s = body.to_string();
+                s.truncate(4000);
+                panic!(
+                    "agent /status never matched within {deadline:?}\nlast body: {s}\n{}",
+                    self.logs_tail()
+                );
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     /// Bounded poll of `path` until `done`; panics with the last body + logs.

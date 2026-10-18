@@ -21,8 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Prepare auditd and watch dirs
-        run: sudo tools/real-linux/setup.sh
+      - name: Choose the BPF object dir
+        # Phase 11b-1: setup.sh builds the BPF object here and every stack's
+        # agent loads it (render::bpf_dir_from_env).
+        run: echo "OSIRIS_BPF_DIR=$RUNNER_TEMP/osiris-bpf" >> "$GITHUB_ENV"
+      - name: Prepare auditd, watch dirs and the BPF object
+        # A BPF build failure is annotated by setup.sh (annotate.sh tail).
+        run: sudo "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" tools/real-linux/setup.sh
       - name: Start DNS packet capture
         # Diagnostic only (Phase 11a): every UDP/53 packet during the suite,
         # for post-mortems and the replay fixture. A capture failure warns
@@ -35,17 +40,28 @@ jobs:
           sleep 2
           pgrep -x tcpdump >/dev/null || echo "::warning::tcpdump is not running: $(cat "$RUNNER_TEMP/artifacts/tcpdump.log")"
       - name: Run the real-Linux suite as root
+        id: suite
         # Build ~5 min + suite ~2 min; a hang fails here, not at the job cap.
         timeout-minutes: 25
         # Root needs the runner's toolchain: keep PATH and cargo/rustup homes.
         # TMPDIR makes the harness's kept stack dirs findable for the artifact.
+        # --nocapture keeps the eBPF scenarios' `osiris-ebpf:` status lines.
         run: |
           mkdir -p "$RUNNER_TEMP/osiris-kept"
           sudo chmod 1777 "$RUNNER_TEMP/osiris-kept"
           sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
             "TMPDIR=$RUNNER_TEMP/osiris-kept" CARGO_TARGET_DIR=/root/osiris-target \
-            tools/real-linux/run.sh 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
+            "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" \
+            tools/real-linux/run.sh --nocapture 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
           exit "${PIPESTATUS[0]}"
+      - name: Annotate suite failures
+        # Annotations are public; job logs and artifacts need GitHub auth.
+        if: always() && steps.suite.outcome == 'failure'
+        run: tools/real-linux/annotate.sh failures "real-Linux suite failed" "$RUNNER_TEMP/real-linux-output.txt"
+      - name: Annotate the eBPF backend status
+        # Kept stack dirs are root-only, hence sudo.
+        if: always() && steps.suite.outcome != 'skipped'
+        run: sudo tools/real-linux/annotate.sh ebpf "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/osiris-kept"
       - name: Stop DNS packet capture
         if: always()
         # SIGINT lets tcpdump finish the pcap; bounded wait for it to exit.
@@ -54,6 +70,7 @@ jobs:
           for _ in $(seq 1 20); do pgrep -x tcpdump >/dev/null || break; sleep 0.5; done
           sudo pkill -KILL -x tcpdump || true
       - name: Run the DNS sensor's unit tests on Linux
+        id: dns_unit
         # The Linux-only tests (cBPF program, AF_PACKET dispositions, the
         # /proc symlink attribution cases) can only run here. No root needed.
         if: always()
@@ -61,6 +78,23 @@ jobs:
         run: |
           cargo test -p osiris-sensors-dns -- --include-ignored 2>&1 | tee "$RUNNER_TEMP/dns-unit-tests.txt"
           exit "${PIPESTATUS[0]}"
+      - name: Annotate DNS unit test failures
+        if: always() && steps.dns_unit.outcome == 'failure'
+        run: tools/real-linux/annotate.sh failures "DNS unit tests failed" "$RUNNER_TEMP/dns-unit-tests.txt"
+      - name: Run the process sensor's and eBPF engine's unit tests on Linux
+        id: ebpf_unit
+        # Phase 11b-1: the Linux-only tests (e.g. the /proc/<pid>/exe symlink
+        # case resolved_proc_exe_wins_over_the_filename, the loader and
+        # probe tests) can only run here. No root needed.
+        if: always()
+        timeout-minutes: 15
+        run: |
+          cargo test -p osiris-sensors-process -p osiris-ebpf -- --include-ignored 2>&1 \
+            | tee "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
+          exit "${PIPESTATUS[0]}"
+      - name: Annotate process/eBPF unit test failures
+        if: always() && steps.ebpf_unit.outcome == 'failure'
+        run: tools/real-linux/annotate.sh failures "process/eBPF unit tests failed" "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
       - name: Collect audit log
         if: always()
         run: |
@@ -69,6 +103,8 @@ jobs:
           sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
           cp "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/artifacts/" || true
           cp "$RUNNER_TEMP/dns-unit-tests.txt" "$RUNNER_TEMP/artifacts/" || true
+          cp "$RUNNER_TEMP/process-ebpf-unit-tests.txt" "$RUNNER_TEMP/artifacts/" || true
+          sudo cp -r "$OSIRIS_BPF_DIR" "$RUNNER_TEMP/artifacts/bpf" || true
           sudo cp -r "$RUNNER_TEMP/osiris-kept" "$RUNNER_TEMP/artifacts/kept-stack-dirs" || true
           sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
       - uses: actions/upload-artifact@v4

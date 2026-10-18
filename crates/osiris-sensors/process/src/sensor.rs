@@ -394,9 +394,25 @@ impl Sensor for ProcessExecSensor {
             let started = load_ebpf(&settings).and_then(|prog| {
                 self.start_ebpf(prog, ctx.output.clone(), ctx.cancellation.clone())
             });
+            // Logged as well as health-visible: the backend choice is the
+            // first thing a post-mortem of a real host needs.
             match started {
-                Ok(()) => return Ok(()),
-                Err(reason) => fallback_reason = Some(reason),
+                Ok(()) => {
+                    tracing::info!(
+                        sensor = "process_exec",
+                        object_dir = %settings.object_dir.display(),
+                        "eBPF process backend active"
+                    );
+                    return Ok(());
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        sensor = "process_exec",
+                        reason = %reason,
+                        "eBPF process backend unavailable; trying the audit fallback"
+                    );
+                    fallback_reason = Some(reason);
+                }
             }
         }
 

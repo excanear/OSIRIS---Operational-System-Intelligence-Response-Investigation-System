@@ -7,8 +7,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use osiris_real_linux_tests::json::{contains_str, has_kv, ids_containing, objects_with};
+use osiris_real_linux_tests::render::bpf_dir_from_env;
 use osiris_real_linux_tests::stack::{AgentOptions, Stack, StackOptions};
-use serde_json::json;
+use serde_json::{json, Value};
 
 const DEADLINE: Duration = Duration::from_secs(45);
 const WATCH_ROOT: &str = "/tmp/osiris-p10";
@@ -41,13 +42,19 @@ fn sh(script: &str) {
 }
 
 /// One stack per test: agent on the real audit log, persistence watch on a
-/// per-test dir under WATCH_ROOT.
+/// per-test dir under WATCH_ROOT, and the process sensor on eBPF whenever
+/// `$OSIRIS_BPF_DIR` names a built object dir (the workflow always sets it).
 fn stack(persist: &Path) -> Stack {
+    stack_with_bpf(persist, bpf_dir_from_env())
+}
+
+fn stack_with_bpf(persist: &Path, ebpf_object_dir: Option<PathBuf>) -> Stack {
     std::fs::create_dir_all(persist).unwrap();
     Stack::start(StackOptions {
         agent: Some(AgentOptions {
             audit_log: PathBuf::from("/var/log/audit/audit.log"),
             persistence_dirs: vec![persist.to_path_buf()],
+            ebpf_object_dir,
         }),
         ..Default::default()
     })
@@ -286,4 +293,198 @@ fn dns_query_is_observed_and_alerts() {
         DEADLINE,
         |v| ids.iter().any(|id| contains_str(v, id)),
     );
+}
+
+// ---- Phase 11b-1: the eBPF process backend ----
+
+const EBPF_PROVIDER: &str = "process_exec_sensor/ebpf";
+
+/// The built object dir the eBPF scenarios need (`setup.sh` builds it when
+/// `OSIRIS_BPF_DIR` is set; the real-Linux workflow always sets it).
+fn required_bpf_dir() -> PathBuf {
+    bpf_dir_from_env().expect(
+        "OSIRIS_BPF_DIR is unset: run tools/real-linux/setup.sh with OSIRIS_BPF_DIR \
+         to build the BPF object, and run the suite with it set",
+    )
+}
+
+/// eBPF timestamps are boot time plus a wall-clock offset computed once at
+/// sensor start; query from a little before `t0` so a few ms of offset skew
+/// can never hide an event (markers and pids keep the match exact).
+fn since_before(t0: u128) -> u128 {
+    t0.saturating_sub(5_000_000_000)
+}
+
+/// Waits until AGENT_HEALTH reports the process sensor in `state`, and
+/// returns every `process_exec` entry seen.
+fn process_health_reaches(s: &Stack, state: &str) -> Vec<Value> {
+    let health = events(s, "AGENT_HEALTH", 0, |v| {
+        objects_with(v, "sensor_name", &json!("process_exec"))
+            .iter()
+            .any(|h| h["state"]["state"] == json!(state))
+    });
+    objects_with(&health, "sensor_name", &json!("process_exec"))
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// The agent's full `process_exec` health (capability flags, last error),
+/// from its local status endpoint, once it has left STARTING. Echoed with
+/// an `osiris-ebpf:` prefix so the workflow can surface it as an annotation.
+fn process_status(s: &Stack) -> Value {
+    let pick = |v: &Value| -> Option<Value> {
+        v["sensors"]
+            .as_array()?
+            .iter()
+            .find(|h| h["name"] == json!("process_exec") && h["state"] != json!("STARTING"))
+            .cloned()
+    };
+    let status = s.wait_agent_status(DEADLINE, |v| pick(v).is_some());
+    let entry = pick(&status).unwrap();
+    eprintln!("osiris-ebpf: process_exec status: {entry}");
+    entry
+}
+
+fn has_flag(health: &Value, flag: &str) -> bool {
+    health["capability_flags"]
+        .as_array()
+        .is_some_and(|a| a.contains(&json!(flag)))
+}
+
+/// With a built object on a BTF kernel, the process sensor runs on eBPF:
+/// HEALTHY in the heartbeat, capability flag `ebpf` on the agent.
+#[test]
+#[ignore]
+fn process_sensor_uses_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let health = process_health_reaches(&s, "HEALTHY");
+    assert!(
+        !health
+            .iter()
+            .any(|h| h["state"]["state"] != json!("HEALTHY")),
+        "process_exec not steadily HEALTHY in AGENT_HEALTH: {health:?}"
+    );
+    let status = process_status(&s);
+    assert_eq!(status["state"], json!("HEALTHY"), "status: {status}");
+    assert!(
+        has_flag(&status, "ebpf"),
+        "no `ebpf` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "audit_fallback"),
+        "eBPF active yet `audit_fallback` set: {status}"
+    );
+}
+
+/// `sh -c 'exit 7' <marker>` spawned by this test: its exec arrives from the
+/// eBPF backend with the marker in argv, this process as parent and uid 0;
+/// its exit joins the same process_key and carries exit code 7.
+#[test]
+#[ignore]
+fn exec_and_exit_are_observed_via_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let t0 = now_ns();
+    // The marker is `$0` of the -c script, so it sits in argv.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 7", &m])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    // `exit 7` is a builtin: the shell ends at once, so this wait is bounded.
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(7), "sh exit status: {status}");
+
+    let since = since_before(t0);
+    let execs_of = |v: &Value| -> Vec<Value> {
+        objects_with(v, "event_type", &json!("PROCESS_EXEC"))
+            .into_iter()
+            .filter(|e| e["provider"] == json!(EBPF_PROVIDER))
+            .filter(|e| e["process"]["pid"] == json!(pid))
+            .filter(|e| contains_str(&e["process"]["cmdline"], &m))
+            .cloned()
+            .collect()
+    };
+    let execs = events(&s, "PROCESS_EXEC", since, |v| !execs_of(v).is_empty());
+    let exec = execs_of(&execs).remove(0);
+    assert_eq!(exec["source"], json!("EBPF"), "exec: {exec}");
+    assert_eq!(
+        exec["event_data"]["ppid"],
+        json!(std::process::id()),
+        "ppid is not the spawning test process: {exec}"
+    );
+    assert_eq!(exec["event_data"]["uid"], json!(0), "uid: {exec}");
+    let key = exec["process"]["process_key"].clone();
+    assert!(key.is_string(), "exec has no process_key: {exec}");
+
+    let exits_of = |v: &Value| -> Vec<Value> {
+        objects_with(v, "event_type", &json!("PROCESS_EXIT"))
+            .into_iter()
+            .filter(|e| e["process"]["process_key"] == key)
+            .cloned()
+            .collect()
+    };
+    let exits = events(&s, "PROCESS_EXIT", since, |v| !exits_of(v).is_empty());
+    let exit = exits_of(&exits).remove(0);
+    assert_eq!(exit["provider"], json!(EBPF_PROVIDER), "exit: {exit}");
+    assert_eq!(exit["event_data"]["exit_code"], json!(7), "exit: {exit}");
+    assert_eq!(exit["process"]["pid"], json!(pid), "exit: {exit}");
+}
+
+/// A copy of the object dir whose sidecar digest is altered fails the
+/// integrity check: the sensor falls back to audit (DEGRADED with the
+/// reason, capability flag `audit_fallback`) and audit-backed execs still
+/// arrive.
+#[test]
+#[ignore]
+fn corrupted_object_falls_back_to_audit() {
+    let m = marker();
+    let good = required_bpf_dir();
+    // Declared before the stack so it outlives the agent reading it.
+    let bad = tempfile::Builder::new()
+        .prefix("osiris-bpf-corrupt-")
+        .tempdir()
+        .unwrap();
+    std::fs::copy(good.join("process.bpf.o"), bad.path().join("process.bpf.o")).unwrap();
+    std::fs::write(
+        bad.path().join("process.bpf.o.sha256"),
+        format!("{}  process.bpf.o\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let s = stack_with_bpf(
+        &Path::new(WATCH_ROOT).join(&m),
+        Some(bad.path().to_path_buf()),
+    );
+
+    let health = process_health_reaches(&s, "DEGRADED");
+    let degraded: Vec<&Value> = health
+        .iter()
+        .filter(|h| h["state"]["state"] == json!("DEGRADED"))
+        .collect();
+    assert!(
+        degraded.iter().all(|h| h["state"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("integrity"))),
+        "DEGRADED without the integrity reason: {health:?}"
+    );
+    let status = process_status(&s);
+    assert_eq!(status["state"], json!("DEGRADED"), "status: {status}");
+    assert!(
+        has_flag(&status, "audit_fallback"),
+        "no `audit_fallback` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "ebpf"),
+        "fell back yet `ebpf` set: {status}"
+    );
+
+    let t0 = now_ns();
+    sh(&format!("/bin/sh -c 'true {m}'"));
+    events(&s, "PROCESS_EXEC", t0, |v| {
+        objects_with(v, "event_type", &json!("PROCESS_EXEC"))
+            .iter()
+            .any(|e| e["provider"] == json!("process_exec_sensor/audit") && contains_str(e, &m))
+    });
 }
