@@ -3,7 +3,7 @@
 The `process_exec` sensor can use an eBPF backend (tracepoints `sched_process_exec` and
 `sched_process_exit`) instead of the Linux audit log. It reports provider
 `process_exec_sensor/ebpf`, source `EBPF`, and also emits `PROCESS_EXIT` events. Decision record:
-`docs/adr/0001-ebpf-loader-aya.md`.
+`docs/adr/ADR-010-ebpf-loader-aya.md`.
 
 ## Building the object
 
@@ -36,7 +36,7 @@ ebpf:
 
 ## Requirements
 
-- Linux kernel 5.8 or newer (ring buffer maps) with BTF (`/sys/kernel/btf/vmlinux`).
+- Validated kernels: 5.15 (Ubuntu 22.04) and 6.x (Ubuntu 24.04). Theoretical minimum: 5.8 (ring buffer maps) with BTF (`/sys/kernel/btf/vmlinux`); other kernels are untested.
 - Privileges: `CAP_BPF` and `CAP_PERFMON`, or `CAP_SYS_ADMIN` (root).
 - The build host needs clang and libbpf-dev. The run host needs neither.
 
@@ -54,6 +54,6 @@ ebpf:
 - When a non-leader thread calls `execve`, the old thread-group leader's exit is reported as a
   `PROCESS_EXIT` with signal 9 for a process that keeps running, followed by an `EXEC` under the
   same pid.
-- `PROCESS_FORK` is not emitted. Event volume is roughly double audit-only (exits are new).
+- `PROCESS_FORK` is not emitted. Event volume is expected to be roughly double audit-only because exits are new (an unmeasured estimate).
 - Benchmarks: `osiris-bench` runs the agent on the eBPF backend when `OSIRIS_BPF_DIR` is set to a
   built object directory.

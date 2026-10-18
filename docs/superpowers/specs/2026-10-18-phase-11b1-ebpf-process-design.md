@@ -37,7 +37,7 @@ today's audit backend.
    zlib) that cannot be built or even type-checked from this Windows dev host and adds a C
    toolchain to every Linux build; `aya` keeps all cargo builds pure Rust and lets the Linux-only
    code be cross-checked here with `--target x86_64-unknown-linux-gnu`. This is the "revisit via
-   ADR" path §5.2 itself allows: record it as `docs/adr/0001-ebpf-loader-aya.md` (ARCHITECTURE §28
+   ADR" path §5.2 itself allows: record it as `docs/adr/ADR-010-ebpf-loader-aya.md` (ARCHITECTURE §28
    ADR location) and update §5.1/§5.2 to point at it. `aya` (and its dependencies) is the only new
    third-party crate, and only under `[target.'cfg(target_os = "linux")'.dependencies]`.
 2. **The BPF object is not built by cargo** *(call)*: sources live in `bpf/` (e.g.

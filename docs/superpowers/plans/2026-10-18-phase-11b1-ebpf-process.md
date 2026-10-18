@@ -157,6 +157,6 @@ pub fn split_argv(bytes: &[u8]) -> Vec<String>;
 
 ### Task 8: Docs and final gates
 
-**Files:** Create `docs/adr/0001-ebpf-loader-aya.md` (context, decision: aya loader + clang C CO-RE programs, layout-test instead of codegen, consequences, revisit triggers); `docs/operators-ebpf.md` (build the object, `ebpf` key, privileges, fallback, drop counter). Modify `ARCHITECTURE.md` §5.1/§5.2 (point to the ADR, loader = aya) and §4 Process row status note; `docs/VALIDATION.md` (eBPF section with the GH run id and kernels); `docs/ROADMAP-REMAINING.md` (11b-1 done; 11b-2 network, 11b-3 filesystem, 11b-4 DNS uprobe pending; debts found).
+**Files:** Create `docs/adr/ADR-010-ebpf-loader-aya.md` (context, decision: aya loader + clang C CO-RE programs, layout-test instead of codegen, consequences, revisit triggers); `docs/operators-ebpf.md` (build the object, `ebpf` key, privileges, fallback, drop counter). Modify `ARCHITECTURE.md` §5.1/§5.2 (point to the ADR, loader = aya) and §4 Process row status note; `docs/VALIDATION.md` (eBPF section with the GH run id and kernels); `docs/ROADMAP-REMAINING.md` (11b-1 done; 11b-2 network, 11b-3 filesystem, 11b-4 DNS uprobe pending; debts found).
 
 - [ ] **Step 1:** Write docs. **Step 2:** Run every gate in Global Constraint #14 → PASS. **Step 3:** Commit `docs(11b-1): eBPF engine and process backend validated`.

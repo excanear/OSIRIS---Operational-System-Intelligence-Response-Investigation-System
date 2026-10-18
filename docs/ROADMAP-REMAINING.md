@@ -97,7 +97,7 @@ revisão final independente → merge → push.
     locais.
 - **Fase 11b-1 (feita)**: motor eBPF (`crates/osiris-ebpf`, loader aya, programas C CO-RE com clang) e
   backend eBPF de exec/exit do sensor `process_exec`, com fallback para audit. Validado em Linux real
-  (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/0001-ebpf-loader-aya.md`,
+  (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/ADR-010-ebpf-loader-aya.md`,
   `docs/operators-ebpf.md` e `docs/VALIDATION.md`.
   Próximos (cada um com seu brainstorming/spec/plano): **11b-2** rede (connect/accept/close),
   **11b-3** filesystem, **11b-4** uprobe de DNS em bibliotecas de resolução.

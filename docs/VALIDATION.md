@@ -206,7 +206,7 @@ replayed by the host test suite (`cargo test` on Windows and in CI), not in run 
 - If the AF_PACKET socket cannot be opened at initialize (no `CAP_NET_RAW`, unknown interface),
   the sensor is reported unsupported or failed and is not retried. Socket errors after start are
   retried with backoff.
-- DNS over TCP, DoT, DoH and mDNS are not captured. The eBPF resolver uprobe is Phase 11b.
+- DNS over TCP, DoT, DoH and mDNS are not captured. The eBPF resolver uprobe is Phase 11b-4.
 
 ## eBPF process backend (Phase 11b-1)
 

@@ -1,4 +1,4 @@
-# ADR 0001: eBPF user-space loader is aya; kernel programs stay clang-built C CO-RE
+# ADR-010: eBPF user-space loader is aya; kernel programs stay clang-built C CO-RE
 
 Status: accepted, 2026-10-18 (Phase 11b-1). Supersedes the loader choice in ARCHITECTURE.md
 §5.2 (libbpf-rs). Spec: `docs/superpowers/specs/2026-10-18-phase-11b1-ebpf-process-design.md`.

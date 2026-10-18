@@ -253,7 +253,7 @@ Sensors do not import each other. Cross-sensor relationships (e.g., "this networ
 | Security (LSM/capabilities) | eBPF LSM hooks where kernel supports `CONFIG_BPF_LSM`; audit for capability use | audit only | DETAILED |
 | Module/generic Security | see above | — | DETAILED |
 
-**Process/Exec status (Phase 11b-1).** The eBPF backend is implemented (`crates/osiris-ebpf`, `bpf/process.bpf.c`, `crates/osiris-sensors/process`): tracepoints `sched_process_exec` and `sched_process_exit`, provider `process_exec_sensor/ebpf`, source `EBPF`, with audit as the fallback (DEGRADED, flag `audit_fallback`). `sched_process_fork` is not used and `PROCESS_FORK` is not emitted. Validated on Ubuntu 22.04 and 24.04 (GitHub Actions run 39139529617). See `docs/operators-ebpf.md`, `docs/adr/0001-ebpf-loader-aya.md` and `docs/VALIDATION.md`.
+**Process/Exec status (Phase 11b-1).** The eBPF backend is implemented (`crates/osiris-ebpf`, `bpf/process.bpf.c`, `crates/osiris-sensors/process`): tracepoints `sched_process_exec` and `sched_process_exit`, provider `process_exec_sensor/ebpf`, source `EBPF`, with audit as the fallback (DEGRADED, flag `audit_fallback`). `sched_process_fork` is not used and `PROCESS_FORK` is not emitted. Validated on Ubuntu 22.04 and 24.04 (GitHub Actions run 39139529617). See `docs/operators-ebpf.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` and `docs/VALIDATION.md`.
 
 **DNS sensor status (Phase 11a).** The AF_PACKET backend is implemented (`crates/osiris-sensors/dns`, source `PACKET`, provider `dns_sensor/af_packet`, UDP port 53 over IPv4/IPv6, cBPF-filtered). The eBPF uprobe backend is pending Phase 11b-4. Level discrepancy: the table lists DNS as DETAILED, but the shipped telemetry levels emit `DnsQuery` from STANDARD upward (see `docs/operators-fleet-policy.md`); the code is the source of truth. Blind spots: DNS over TCP, DoT, DoH and mDNS. See `docs/operators-dns-sensor.md` and `docs/VALIDATION.md`.
 
@@ -270,7 +270,7 @@ eBPF is a **sensor backend technology**, not the sensor itself and not the only 
 ```text
 osiris-ebpf (crate)
 │
-├── Loader             — aya based (ADR 0001, `docs/adr/0001-ebpf-loader-aya.md`); loads compiled BPF object (CO-RE),
+├── Loader             — aya based (ADR-010, `docs/adr/ADR-010-ebpf-loader-aya.md`); loads compiled BPF object (CO-RE),
 │                          verifies, attaches, manages program lifecycle
 ├── Skeleton Registry   — one .bpf.c source + generated skeleton per program,
 │                          versioned (§5.4)
@@ -286,7 +286,7 @@ osiris-ebpf (crate)
 
 ### 5.2 Technology choice: CO-RE + libbpf, Aya considered and rejected for v1
 
-> **Update (Phase 11b-1):** the user-space loader is **aya**, not libbpf-rs; kernel programs remain clang-built C with CO-RE, as below. The record layout is mirrored by hand with layout tests and a schema-version check instead of the build-time codegen of §5.4. See `docs/adr/0001-ebpf-loader-aya.md` for the rationale, costs and revisit triggers. The text below is the original v1 reasoning, kept for history.
+> **Update (Phase 11b-1):** the user-space loader is **aya**, not libbpf-rs; kernel programs remain clang-built C with CO-RE, as below. The record layout is mirrored by hand with layout tests and a schema-version check instead of the build-time codegen of §5.4. See `docs/adr/ADR-010-ebpf-loader-aya.md` for the rationale, costs and revisit triggers. The text below is the original v1 reasoning, kept for history.
 
 Two realistic Rust-ecosystem paths exist: **Aya** (pure-Rust eBPF, no libbpf/clang dependency at runtime) and **libbpf-rs + C-based BPF programs compiled with clang, loaded CO-RE style**.
 
@@ -1006,7 +1006,7 @@ osiris/
 | Decision | Choice | Alternatives considered | Why |
 |---|---|---|---|
 | Systems language | Rust | C/C++, Go | Memory safety without GC pauses (relevant for Agent hot path), strong async ecosystem (Tokio), one language across Agent/Core/CLI reduces cross-language FFI risk. Mandated by master prompt §78 as well. |
-| eBPF toolchain | libbpf-rs + CO-RE (C kernel-space) | Aya (pure Rust) | CO-RE is the portability mechanism the ecosystem converged on for multi-kernel support (§5.2); Aya reconsidered once its LSM/complex-map coverage matures — tracked as ADR follow-up. |
+| eBPF toolchain | aya loader (user space) + clang C CO-RE (kernel space); ADR-010 supersedes the original libbpf-rs choice | libbpf-rs (original v1 choice, see ADR-003) | CO-RE is the portability mechanism the ecosystem converged on for multi-kernel support (§5.2); Aya reconsidered once its LSM/complex-map coverage matures — tracked as ADR follow-up. |
 | Web API framework | axum | actix-web, warp | Shares Tokio runtime/tower middleware with the rest of the stack; tower layering matches the authn→authz→audit pipeline needed. |
 | Console framework | React + TypeScript | Svelte, Vue | Largest ecosystem of mature data-table/graph/timeline primitives for a data-dense DFIR UI; TypeScript for type-safe API consumption. |
 | MVP telemetry store | SQLite (WAL) | PostgreSQL, ClickHouse from day one | Zero operational dependency for v1 (§96 ordering: correctness before scale); matches expected MVP write volume; swappable via `Storage` trait. |
@@ -1167,7 +1167,8 @@ Hard rule enforced in CI (§26): `osiris-sensors/*` and `osiris-ebpf`/`osiris-ke
 ```text
 ADR-001  Event Schema v1 design (envelope+payload split, process_key identity)
 ADR-002  Rust as the systems language across Agent/Core/CLI
-ADR-003  eBPF via libbpf-rs+CO-RE, not Aya, for v1 (revisit trigger documented)
+ADR-003  eBPF via libbpf-rs+CO-RE, not Aya, for v1 (revisit trigger documented).
+         User-space loader SUPERSEDED by ADR-010 (aya); kernel programs stay clang C CO-RE
 ADR-004  Event Bus: bounded, priority-lane, in-process design; spill-not-drop
          policy for CRITICAL
 ADR-005  Storage: SQLite MVP → ClickHouse fleet-scale, two-store split
@@ -1177,6 +1178,8 @@ ADR-007  Query Language (OQL) grammar and planner design
 ADR-008  Agent/Server process split and privilege boundary enforcement
 ADR-009  Response Engine: dispatch-to-agent execution model, v1 scope limited
          to non-destructive actions
+ADR-010  eBPF user-space loader is aya; kernel programs stay clang-built C CO-RE
+         (docs/adr/ADR-010-ebpf-loader-aya.md; supersedes ADR-003 for the loader)
 ```
 
 Each ADR follows the master prompt's required structure: Context, Decision, Alternatives, Consequences. These are written at implementation time for each area as it is built, using this ARCHITECTURE.md as the pre-agreed context — they should not re-litigate decisions already justified here, only record any refinement made during implementation.
