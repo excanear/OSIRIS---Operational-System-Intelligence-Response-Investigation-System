@@ -15,7 +15,7 @@ pub mod reader;
 pub mod record;
 
 pub use integrity::{verify_object, IntegrityError};
-pub use loader::{object_schema_version, LoadError, ProcessProgram};
+pub use loader::{object_schema_version, DropCounter, LoadError, ProcessProgram};
 pub use probe::{caps_allow_bpf, parse_kernel_release, probe, ProbeReport};
 pub use reader::{spawn_reader, ReaderError};
 pub use record::{

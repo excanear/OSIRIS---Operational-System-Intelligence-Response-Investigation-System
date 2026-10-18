@@ -62,9 +62,7 @@ impl ProcessProgram {
     /// `handle_exit`.
     pub fn load(object_dir: &Path, self_tgid: u32) -> Result<Self, LoadError> {
         let object_path = object_dir.join(OBJECT_FILE);
-        if !object_path.is_file() {
-            return Err(LoadError::MissingObject(object_path));
-        }
+        check_regular_file(&object_path)?;
         #[cfg(target_os = "linux")]
         {
             let bytes = read_verified(object_dir, &object_path)?;
@@ -82,9 +80,17 @@ impl ProcessProgram {
     /// Ring-buffer reservations the BPF side failed (sum over CPUs of
     /// `DROPS[0]`). Returns 0 if the map cannot be read.
     pub fn drops(&self) -> u64 {
+        self.drop_counter().get()
+    }
+
+    /// A shareable handle on the `DROPS` map that stays usable after the
+    /// program has been moved into [`crate::spawn_reader`].
+    pub fn drop_counter(&self) -> DropCounter {
         #[cfg(target_os = "linux")]
         {
-            self.inner.drops()
+            DropCounter {
+                map: std::sync::Arc::clone(&self.inner.drops),
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -93,15 +99,73 @@ impl ProcessProgram {
     }
 }
 
+/// Cloneable, thread-safe reader of the BPF-side drop counter (`DROPS[0]`).
+#[derive(Clone)]
+pub struct DropCounter {
+    #[cfg(target_os = "linux")]
+    map: std::sync::Arc<aya::maps::PerCpuArray<aya::maps::MapData, u64>>,
+}
+
+impl DropCounter {
+    /// Sum over CPUs of `DROPS[0]` (saturating); 0 if the map cannot be read.
+    /// Off Linux there is no map and it is always 0.
+    pub fn get(&self) -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            self.map
+                .get(&0, 0)
+                .map(|per_cpu| per_cpu.iter().fold(0u64, |acc, v| acc.saturating_add(*v)))
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
+    }
+}
+
+impl std::fmt::Debug for DropCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DropCounter").finish_non_exhaustive()
+    }
+}
+
+/// Map an I/O error on `path`: only `NotFound` means the file is missing;
+/// anything else (permission denied, is a directory, …) names the cause.
+fn io_error(path: &Path, err: std::io::Error) -> LoadError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        LoadError::MissingObject(path.to_path_buf())
+    } else {
+        LoadError::Load(format!("cannot read {}: {err}", path.display()))
+    }
+}
+
+/// `path` must exist and be a regular file (checked before touching aya).
+fn check_regular_file(path: &Path) -> Result<(), LoadError> {
+    let meta = std::fs::metadata(path).map_err(|e| io_error(path, e))?;
+    if meta.is_file() {
+        Ok(())
+    } else {
+        Err(LoadError::Load(format!(
+            "cannot read {}: not a regular file",
+            path.display()
+        )))
+    }
+}
+
 /// Read the object and sidecar, verify the digest and the schema version,
 /// and return the verified object bytes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_verified(object_dir: &Path, object_path: &Path) -> Result<Vec<u8>, LoadError> {
-    let bytes = std::fs::read(object_path)
-        .map_err(|_| LoadError::MissingObject(object_path.to_path_buf()))?;
+    let bytes = std::fs::read(object_path).map_err(|e| io_error(object_path, e))?;
     let sidecar_path = object_dir.join(SIDECAR_FILE);
-    let sidecar = std::fs::read_to_string(&sidecar_path)
-        .map_err(|_| LoadError::MissingObject(sidecar_path))?;
+    let sidecar = std::fs::read(&sidecar_path).map_err(|e| io_error(&sidecar_path, e))?;
+    let sidecar = String::from_utf8(sidecar).map_err(|_| {
+        LoadError::Load(format!(
+            "cannot read {}: not valid UTF-8",
+            sidecar_path.display()
+        ))
+    })?;
     verify_object(&bytes, &sidecar)?;
     check_schema(&bytes)?;
     Ok(bytes)
@@ -249,6 +313,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::sync::Arc;
+
     use aya::maps::{Array, MapData, PerCpuArray, RingBuf};
     use aya::programs::TracePoint;
     use aya::{Ebpf, EbpfLoader};
@@ -258,7 +324,7 @@ mod linux {
     /// Programs (with their attach links) and the two maps the reader needs.
     pub(crate) struct Inner {
         pub(crate) events: RingBuf<MapData>,
-        drops: PerCpuArray<MapData, u64>,
+        pub(crate) drops: Arc<PerCpuArray<MapData, u64>>,
         /// Owns the programs and links; kept alive for the attachment's life.
         _ebpf: Ebpf,
     }
@@ -306,16 +372,9 @@ mod linux {
 
             Ok(Self {
                 events,
-                drops,
+                drops: Arc::new(drops),
                 _ebpf: ebpf,
             })
-        }
-
-        pub(crate) fn drops(&self) -> u64 {
-            self.drops
-                .get(&0, 0)
-                .map(|per_cpu| per_cpu.iter().fold(0u64, |acc, v| acc.saturating_add(*v)))
-                .unwrap_or(0)
         }
     }
 }
@@ -331,6 +390,55 @@ mod tests {
             .err()
             .expect("load must fail");
         assert!(matches!(err, LoadError::MissingObject(_)), "{err:?}");
+    }
+
+    #[test]
+    fn drop_counter_is_shareable() {
+        fn assert_shareable<T: Clone + Send + Sync + 'static>() {}
+        assert_shareable::<DropCounter>();
+    }
+
+    #[test]
+    fn only_not_found_is_missing_object() {
+        // Object path is a directory: a distinct error naming the cause.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(OBJECT_FILE)).unwrap();
+        let err = ProcessProgram::load(dir.path(), 1)
+            .err()
+            .expect("load must fail");
+        assert!(
+            matches!(&err, LoadError::Load(m) if m.contains(OBJECT_FILE) && m.contains("not a regular file")),
+            "{err:?}"
+        );
+
+        // Missing sidecar: NotFound, so MissingObject naming the sidecar.
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join(OBJECT_FILE);
+        std::fs::write(&obj, b"obj").unwrap();
+        let err = read_verified(dir.path(), &obj).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::MissingObject(p) if p.ends_with(SIDECAR_FILE)),
+            "{err:?}"
+        );
+
+        // Non-UTF-8 sidecar: distinct error naming the sidecar.
+        std::fs::write(dir.path().join(SIDECAR_FILE), [0xff, 0xfe, 0x00]).unwrap();
+        let err = read_verified(dir.path(), &obj).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::Load(m) if m.contains(SIDECAR_FILE) && m.contains("UTF-8")),
+            "{err:?}"
+        );
+
+        // Sidecar is a directory: not reported as missing.
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join(OBJECT_FILE);
+        std::fs::write(&obj, b"obj").unwrap();
+        std::fs::create_dir(dir.path().join(SIDECAR_FILE)).unwrap();
+        let err = read_verified(dir.path(), &obj).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::Load(m) if m.contains(SIDECAR_FILE)),
+            "{err:?}"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

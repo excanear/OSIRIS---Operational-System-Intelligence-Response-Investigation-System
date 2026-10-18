@@ -17,24 +17,34 @@ use crate::record::{DecodeError, Record};
 /// Upper bound on one `poll(2)` wait (Global Constraint #5: ≤ 500 ms).
 pub const POLL_TIMEOUT_MS: i32 = 500;
 
-/// Why the reader thread stopped other than by cancellation.
+/// While draining, cancellation is checked after this many records, so a
+/// flood of events cannot hold off shutdown.
+pub const CANCEL_CHECK_EVERY: u32 = 256;
+
+/// Why the reader thread failed to start or stopped other than by
+/// cancellation.
 #[derive(Debug, thiserror::Error)]
 pub enum ReaderError {
     /// `poll(2)` on the ring-buffer fd failed.
     #[error("ring buffer poll failed: {0}")]
     Poll(std::io::Error),
+    /// The reader thread could not be started.
+    #[error("cannot spawn eBPF reader thread: {0}")]
+    Spawn(std::io::Error),
 }
 
-/// Start the reader thread. It returns `Ok(())` once `cancel` is cancelled.
+/// Start the reader thread. The thread returns `Ok(())` once `cancel` is
+/// cancelled. Failing to start it is [`ReaderError::Spawn`]; the program is
+/// then dropped, detaching both tracepoints.
 pub fn spawn_reader(
     prog: ProcessProgram,
     cancel: CancellationToken,
     on_record: impl FnMut(Result<Record, DecodeError>) + Send + 'static,
-) -> JoinHandle<Result<(), ReaderError>> {
+) -> Result<JoinHandle<Result<(), ReaderError>>, ReaderError> {
     std::thread::Builder::new()
         .name("osiris-ebpf-reader".to_string())
         .spawn(move || run(prog, cancel, on_record))
-        .expect("spawn eBPF ring-buffer reader thread")
+        .map_err(ReaderError::Spawn)
 }
 
 #[cfg(target_os = "linux")]
@@ -50,9 +60,16 @@ fn run(
     let events = &mut prog.inner.events;
     let fd = events.as_raw_fd();
     loop {
-        // Drain everything already published before sleeping.
+        // Drain everything already published before sleeping, checking
+        // cancellation every CANCEL_CHECK_EVERY records.
+        let mut drained: u32 = 0;
         while let Some(item) = events.next() {
             on_record(decode(&item));
+            drop(item);
+            drained = drained.wrapping_add(1);
+            if drained.is_multiple_of(CANCEL_CHECK_EVERY) && cancel.is_cancelled() {
+                return Ok(());
+            }
         }
         if cancel.is_cancelled() {
             return Ok(());
