@@ -1916,6 +1916,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

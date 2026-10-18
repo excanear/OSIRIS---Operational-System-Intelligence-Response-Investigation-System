@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,9 @@ struct HealthState {
     last_error: Option<String>,
     last_event_at: Option<u64>,
     capability_flags: Vec<String>,
+    /// Why eBPF is off while running on the audit fallback; kept so a later
+    /// audit tail error is reported next to it, never instead of it.
+    fallback_reason: Option<String>,
 }
 
 impl Default for HealthState {
@@ -50,6 +53,7 @@ impl Default for HealthState {
             last_error: None,
             last_event_at: None,
             capability_flags: vec![],
+            fallback_reason: None,
         }
     }
 }
@@ -203,7 +207,11 @@ impl ProcessExecSensor {
                     Err(e) => {
                         let mut h = lock_health(&health);
                         h.state = SensorState::Degraded;
-                        h.last_error = Some(e.to_string());
+                        // Never let a tail error hide why eBPF is off.
+                        h.last_error = Some(match &h.fallback_reason {
+                            Some(reason) => format!("{reason}; audit: {e}"),
+                            None => e.to_string(),
+                        });
                     }
                 }
                 tokio::select! {
@@ -228,15 +236,33 @@ impl ProcessExecSensor {
 fn load_ebpf(settings: &EbpfSettings) -> Result<ProcessProgram, String> {
     let mut reasons = vec![];
     let object = settings.object_dir.join(osiris_ebpf::loader::OBJECT_FILE);
-    if !object.is_file() {
-        reasons.push(format!("bpf object file missing: {}", object.display()));
-    }
+    reasons.extend(object_problem(&object));
     reasons.extend(probe().reasons);
     if !reasons.is_empty() {
         return Err(format!("eBPF unavailable: {}", reasons.join("; ")));
     }
     ProcessProgram::load(&settings.object_dir, settings.self_tgid)
         .map_err(|e| format!("eBPF unavailable: {e}"))
+}
+
+/// What is wrong with the BPF object path, truthfully: absent, present but
+/// not a regular file, or not even stat-able (e.g. EACCES on the
+/// directory). `None` when it is a regular file.
+fn object_problem(object: &Path) -> Option<String> {
+    match std::fs::metadata(object) {
+        Ok(m) if m.is_file() => None,
+        Ok(_) => Some(format!(
+            "bpf object is not a regular file: {}",
+            object.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("bpf object file missing: {}", object.display()))
+        }
+        Err(e) => Some(format!(
+            "cannot access bpf object {}: {e}",
+            object.display()
+        )),
+    }
 }
 
 /// realtime − monotonic, in ns: added to a `bpf_ktime_get_ns()` value
@@ -257,6 +283,11 @@ fn boot_wall_offset_ns() -> i128 {
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "clock_gettime(CLOCK_MONOTONIC) failed; eBPF event timestamps will be \
+             monotonic, not wall-clock"
+        );
         return 0;
     }
     wall - (i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec))
@@ -347,7 +378,15 @@ impl Sensor for ProcessExecSensor {
 
     async fn initialize(&mut self, ctx: SensorContext) -> Result<(), SensorError> {
         self.cancellation = Some(ctx.cancellation.clone());
-        lock_health(&self.health).state = SensorState::Starting;
+        {
+            // A re-initialize starts from a clean backend selection.
+            let mut h = lock_health(&self.health);
+            h.state = SensorState::Starting;
+            h.running_state = SensorState::Healthy;
+            h.last_error = None;
+            h.fallback_reason = None;
+            h.capability_flags = vec![];
+        }
         self.drop_counter = None;
 
         let mut fallback_reason = None;
@@ -390,7 +429,8 @@ impl Sensor for ProcessExecSensor {
         if let Some(reason) = fallback_reason {
             let mut h = lock_health(&self.health);
             h.running_state = SensorState::Degraded;
-            h.last_error = Some(reason);
+            h.last_error = Some(reason.clone());
+            h.fallback_reason = Some(reason);
             h.capability_flags = vec!["audit_fallback".to_string()];
         }
         self.start_audit(path, ctx);
@@ -671,5 +711,106 @@ mod tests {
             "reason must be reported: {:?}",
             health.last_error
         );
+    }
+
+    /// A tail error on the fallback path is reported next to the eBPF
+    /// reason, never instead of it.
+    #[tokio::test]
+    async fn a_tail_error_keeps_the_fallback_reason_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, "").unwrap();
+        let mut sensor =
+            ProcessExecSensor::new(Some(path.clone()), Some(ebpf_settings(objects.path())))
+                .with_poll_interval(Duration::from_millis(20));
+        let (tx, _rx) = mpsc::channel(16);
+        sensor
+            .initialize(SensorContext::new(tx, CancellationToken::new()))
+            .await
+            .unwrap();
+        sensor.start().await.unwrap();
+
+        // A directory where the log was makes every poll fail (open on
+        // Windows, read on Linux) with something other than NotFound.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let last_error = loop {
+            let e = sensor.health().last_error.unwrap_or_default();
+            if e.contains("audit:") || Instant::now() > deadline {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        sensor.stop().await.unwrap();
+        assert!(last_error.contains("audit:"), "{last_error}");
+        assert!(last_error.contains("process.bpf.o"), "{last_error}");
+    }
+
+    #[test]
+    fn object_problem_names_the_real_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("process.bpf.o");
+        let missing = object_problem(&object).unwrap();
+        assert!(missing.contains("missing"), "{missing}");
+
+        std::fs::create_dir(&object).unwrap();
+        let not_file = object_problem(&object).unwrap();
+        assert!(not_file.contains("not a regular file"), "{not_file}");
+        assert!(!not_file.contains("missing"), "{not_file}");
+
+        std::fs::remove_dir(&object).unwrap();
+        std::fs::write(&object, b"\x7fELF").unwrap();
+        assert_eq!(object_problem(&object), None);
+    }
+
+    fn exec_record() -> Record {
+        Record::Exec(osiris_ebpf::ExecEvent {
+            pid: u32::MAX,
+            ppid: 1,
+            uid: 0,
+            ktime_ns: 100,
+            start_boottime_ns: 10_000_000,
+            comm: "true".to_string(),
+            filename: "/bin/true".to_string(),
+            args: b"true\0".to_vec(),
+            args_truncated: false,
+        })
+    }
+
+    #[test]
+    fn on_record_emits_and_sets_the_running_state() {
+        let health = Mutex::new(HealthState {
+            running_state: SensorState::Degraded,
+            ..HealthState::default()
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        on_record(Ok(exec_record()), 1_000, &tx, &health);
+        match rx.try_recv() {
+            Ok(RawEvent::ProcessExec(raw)) => {
+                assert_eq!(raw.timestamp_ns, 1_100);
+                assert_eq!(raw.source, osiris_sensor_api::RawEventSource::Ebpf);
+            }
+            other => panic!("expected a ProcessExec event, got {other:?}"),
+        }
+        let h = lock_health(&health);
+        assert_eq!(h.events_emitted_total, 1);
+        assert_eq!(h.events_dropped_total, 0);
+        assert_eq!(h.last_event_at, Some(1_100));
+        assert_eq!(h.state, SensorState::Degraded);
+    }
+
+    #[test]
+    fn on_record_counts_decode_errors_and_closed_channels_as_dropped() {
+        let health = Mutex::new(HealthState::default());
+        let (tx, rx) = mpsc::channel(4);
+        on_record(Err(DecodeError::ShorterThanHeader(3)), 0, &tx, &health);
+        drop(rx);
+        on_record(Ok(exec_record()), 0, &tx, &health);
+        let h = lock_health(&health);
+        assert_eq!(h.events_dropped_total, 2);
+        assert_eq!(h.events_emitted_total, 0);
+        assert_eq!(h.state, SensorState::Starting);
     }
 }

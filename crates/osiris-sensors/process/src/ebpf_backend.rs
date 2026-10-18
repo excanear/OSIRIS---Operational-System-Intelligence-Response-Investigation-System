@@ -14,6 +14,8 @@
 //! backend's caps ([`MAX_ARGS`], [`MAX_ARGV_BYTES`]) and keep-a-prefix rule
 //! so downstream sees identical shapes from either backend.
 
+use std::path::Path;
+
 use osiris_ebpf::{decode_wait_status, ExecEvent, ExitEvent};
 use osiris_sensor_api::{ProcessExecRaw, ProcessExitRaw, RawEventSource};
 
@@ -58,22 +60,30 @@ fn wall_clock_ns(ktime_ns: u64, boot_wall_offset_ns: i128) -> u64 {
     wall.clamp(0, i128::from(u64::MAX)) as u64
 }
 
-/// `/proc/<pid>/exe`'s target, when the process (and the link) still exist.
-fn proc_exe(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+/// The real procfs root used outside tests.
+const PROC_ROOT: &str = "/proc";
+
+/// `<proc_root>/<pid>/exe`'s target, when the process (and the link) still
+/// exist.
+fn proc_exe(proc_root: &Path, pid: u32) -> Option<String> {
+    std::fs::read_link(proc_root.join(pid.to_string()).join("exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// An exec record as the existing `ProcessExecRaw`. `exe_path` is the
-/// exec'd filename when absolute, else `/proc/<pid>/exe`'s target when
-/// readable, else the filename as given.
+/// The exec'd binary as the audit backend's `exe=` reports it: the
+/// resolved `<proc_root>/<pid>/exe` link (symlinks such as `/bin/sh` →
+/// `dash` followed; a script shows its interpreter) when readable, else
+/// the execve filename as given. Detection rules key on `exe_path`, so
+/// both backends must agree.
+pub fn resolve_exe_path(proc_root: &Path, pid: u32, filename: &str) -> String {
+    proc_exe(proc_root, pid).unwrap_or_else(|| filename.to_string())
+}
+
+/// An exec record as the existing `ProcessExecRaw`; `exe_path` per
+/// [`resolve_exe_path`] against `/proc`.
 pub fn exec_to_raw(e: &ExecEvent, boot_wall_offset_ns: i128) -> ProcessExecRaw {
-    let exe_path = if e.filename.starts_with('/') {
-        e.filename.clone()
-    } else {
-        proc_exe(e.pid).unwrap_or_else(|| e.filename.clone())
-    };
+    let exe_path = resolve_exe_path(Path::new(PROC_ROOT), e.pid, &e.filename);
     ProcessExecRaw {
         pid: e.pid,
         ppid: e.ppid,
@@ -97,7 +107,7 @@ pub fn exit_to_raw(e: &ExitEvent, boot_wall_offset_ns: i128) -> ProcessExitRaw {
         ppid: e.ppid,
         uid: e.uid,
         comm: e.comm.clone(),
-        exe_path: proc_exe(e.pid).unwrap_or_default(),
+        exe_path: proc_exe(Path::new(PROC_ROOT), e.pid).unwrap_or_default(),
         exit_code,
         signal,
         timestamp_ns: wall_clock_ns(e.ktime_ns, boot_wall_offset_ns),
@@ -136,7 +146,8 @@ mod tests {
 
     fn exec_event() -> ExecEvent {
         ExecEvent {
-            pid: 4242,
+            // No such pid, so /proc/<pid>/exe is unreadable on any host.
+            pid: u32::MAX,
             ppid: 1,
             uid: 1000,
             ktime_ns: 5_000_000_000,
@@ -154,7 +165,7 @@ mod tests {
         assert_eq!(raw.start_time_mono, 1234);
         assert_eq!(raw.timestamp_ns, 1_700_000_005_000_000_000);
         assert_eq!(raw.source, RawEventSource::Ebpf);
-        assert_eq!(raw.pid, 4242);
+        assert_eq!(raw.pid, u32::MAX);
         assert_eq!(raw.ppid, 1);
         assert_eq!(raw.uid, 1000);
         assert_eq!(raw.comm, "ls");
@@ -168,6 +179,44 @@ mod tests {
         e.pid = u32::MAX; // no such process
         e.filename = "./run.sh".to_string();
         assert_eq!(exec_to_raw(&e, 0).exe_path, "./run.sh");
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    /// Like audit's `exe=`, a readable `/proc/<pid>/exe` wins over the
+    /// execve filename (even an absolute one: `/bin/sh` → `dash`).
+    #[test]
+    fn resolved_proc_exe_wins_over_the_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("dash");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::create_dir(root.path().join("77")).unwrap();
+        if let Err(e) = symlink(&target, &root.path().join("77").join("exe")) {
+            eprintln!(
+                "SKIPPED resolved_proc_exe_wins_over_the_filename: \
+                 cannot create a symlink on this host ({e})"
+            );
+            return;
+        }
+        assert_eq!(
+            resolve_exe_path(root.path(), 77, "/bin/sh"),
+            target.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn filename_is_used_when_proc_exe_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_exe_path(root.path(), 77, "/bin/sh"), "/bin/sh");
+        assert_eq!(resolve_exe_path(root.path(), 77, "./run.sh"), "./run.sh");
     }
 
     #[test]
