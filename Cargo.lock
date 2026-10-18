@@ -1283,6 +1283,7 @@ dependencies = [
  "osiris-selftelemetry",
  "osiris-sensor-api",
  "osiris-sensors-container",
+ "osiris-sensors-dns",
  "osiris-sensors-fs",
  "osiris-sensors-identity",
  "osiris-sensors-net",

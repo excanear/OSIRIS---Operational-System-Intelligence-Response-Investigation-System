@@ -35,6 +35,7 @@ osiris-sensors-identity = { path = "../osiris-sensors/identity" }
 osiris-sensors-systemd = { path = "../osiris-sensors/systemd" }
 osiris-sensors-persistence = { path = "../osiris-sensors/persistence" }
 osiris-sensors-container = { path = "../osiris-sensors/container" }
+osiris-sensors-dns = { path = "../osiris-sensors/dns" }
 osiris-generator = { path = "../../generator" }
 osiris-command = { path = "../osiris-command" }
 osiris-policy = { path = "../osiris-policy" }

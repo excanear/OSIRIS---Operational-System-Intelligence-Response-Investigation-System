@@ -250,8 +250,8 @@ mod tests {
             "sensors must be sorted by name and unique"
         );
         let mut unknown = PolicyPayload::from_effective(&Default::default());
-        unknown.sensors = vec![("dns".into(), true)];
-        assert_eq!(unknown.to_effective().unwrap_err(), "unknown sensor: dns");
+        unknown.sensors = vec![("bogus".into(), true)];
+        assert_eq!(unknown.to_effective().unwrap_err(), "unknown sensor: bogus");
     }
     #[test]
     fn canonical_bytes_start_with_domain_tag_and_are_stable() {

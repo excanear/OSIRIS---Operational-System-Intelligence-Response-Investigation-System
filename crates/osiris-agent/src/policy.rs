@@ -179,7 +179,7 @@ mod tests {
         let path = dir.path().join("p.json");
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_overlay(&path), None);
-        std::fs::write(&path, r#"{"sensors":{"dns":true}}"#).unwrap();
+        std::fs::write(&path, r#"{"sensors":{"bogus":true}}"#).unwrap();
         assert_eq!(load_overlay(&path), None);
     }
 

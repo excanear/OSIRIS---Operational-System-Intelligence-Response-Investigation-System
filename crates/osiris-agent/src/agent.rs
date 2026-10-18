@@ -15,6 +15,7 @@ use osiris_schema::HostRef;
 use osiris_selftelemetry::MetricsRegistry;
 use osiris_sensor_api::{RawEvent, Sensor, SensorContext, SensorHealth};
 use osiris_sensors_container::ContainerSensor;
+use osiris_sensors_dns::sensor::DnsSensor;
 use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_identity::IdentitySensor;
 use osiris_sensors_net::NetworkSensor;
@@ -73,7 +74,7 @@ const DISABLED_BY_POLICY: &str = "disabled by policy";
 
 /// Startup order of the policy-controllable sensors (the synthetic sensor
 /// follows and is not policy-controlled).
-const STARTUP_ORDER: [&str; 7] = [
+const STARTUP_ORDER: [&str; 8] = [
     "process_exec",
     "filesystem",
     "network",
@@ -81,6 +82,7 @@ const STARTUP_ORDER: [&str; 7] = [
     "systemd",
     "persistence",
     "container",
+    "dns",
 ];
 
 /// Outcome of switching one sensor.
@@ -123,6 +125,13 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
         }),
         "container" => (!config.container_cgroup_roots.is_empty()).then(|| {
             Box::new(ContainerSensor::new(config.container_cgroup_roots.clone())) as Box<dyn Sensor>
+        }),
+        "dns" => config.dns_capture.as_ref().map(|c| {
+            let proc_root = config.proc_root.as_deref().unwrap_or("/proc");
+            Box::new(DnsSensor::new(
+                PathBuf::from(proc_root),
+                c.interface.clone(),
+            )) as Box<dyn Sensor>
         }),
         _ => None,
     }
@@ -563,6 +572,7 @@ pub(crate) mod tests {
             systemd_audit_log_path: None,
             persistence_watch_paths: vec![],
             container_cgroup_roots: vec![],
+            dns_capture: None,
             proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
@@ -582,6 +592,21 @@ pub(crate) mod tests {
                 .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         }
+    }
+
+    #[test]
+    fn build_sensor_dns_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_sensor(&base_config(&dir), "dns").is_none());
+    }
+
+    #[test]
+    fn build_sensor_dns_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.dns_capture = Some(crate::config::DnsCaptureConfig { interface: None });
+        let sensor = build_sensor(&config, "dns").expect("dns sensor built");
+        assert_eq!(sensor.name(), "dns");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ and `control:` in `agent.yaml`). Without it nothing is sent.
 | Field | Meaning |
 |---|---|
 | `telemetry_level` | `MINIMAL`, `STANDARD`, `DETAILED` or `FORENSIC`. Events outside the level are dropped on the Agent before they reach the bus (counted in `events_dropped_by_policy`). Unset = no filtering (today's behaviour). |
-| `sensors` | Map of sensor name to `true`/`false`. `false` stops the sensor; `true` (re)starts it. Known names: `container`, `filesystem`, `identity`, `network`, `persistence`, `process_exec`, `systemd`. An unknown name is rejected (`unknown sensor: <name>`). |
+| `sensors` | Map of sensor name to `true`/`false`. `false` stops the sensor; `true` (re)starts it. Known names: `container`, `dns`, `filesystem`, `identity`, `network`, `persistence`, `process_exec`, `systemd`. An unknown name is rejected (`unknown sensor: <name>`). |
 | `heartbeat_interval_secs` | Interval of the Agent's `AGENT_HEALTH` heartbeat, `10..=3600`. Unset = `fleet.health_interval_secs` from `agent.yaml`. |
 | `priority` | Integer, default 0. Higher wins when groups conflict (see precedence). |
 

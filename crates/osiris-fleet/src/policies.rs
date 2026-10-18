@@ -357,10 +357,10 @@ mod tests {
         let reg = open(&dir);
         let g = reg.create(&P, None, "g").unwrap();
         let mut bad = GroupPolicy::default();
-        bad.sensors.insert("dns".into(), true);
+        bad.sensors.insert("bogus".into(), true);
         assert_eq!(
             reg.set_policy(&P, g.group_id, &bad, "u"),
-            Err(GroupError::InvalidPolicy("unknown sensor: dns".into()))
+            Err(GroupError::InvalidPolicy("unknown sensor: bogus".into()))
         );
     }
 

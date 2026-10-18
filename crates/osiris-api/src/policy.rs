@@ -575,11 +575,11 @@ mod tests {
                 &f,
                 &ctx(None),
                 g.group_id,
-                json!({"sensors": {"dns": true}})
+                json!({"sensors": {"bogus": true}})
             )
             .await
             .unwrap_err(),
-            (StatusCode::BAD_REQUEST, "unknown sensor: dns".to_string())
+            (StatusCode::BAD_REQUEST, "unknown sensor: bogus".to_string())
         );
         assert_eq!(
             put(
@@ -808,7 +808,7 @@ mod tests {
             .create(&GroupScope::Tenant(a), None, "g")
             .unwrap();
         let nf = (StatusCode::NOT_FOUND, "group not found".to_string());
-        let bad = json!({"sensors": {"dns": true}});
+        let bad = json!({"sensors": {"bogus": true}});
         assert_eq!(
             put(&f, &ctx(Some(b)), g.group_id, bad.clone())
                 .await

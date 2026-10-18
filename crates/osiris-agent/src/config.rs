@@ -149,6 +149,15 @@ pub struct ControlConfig {
     pub vault_dir: String,
 }
 
+/// Phase 11a: the passive DNS sensor. Absent = the sensor is not built;
+/// present (even as `{}`) enables it. `interface: None` captures on all
+/// interfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DnsCaptureConfig {
+    #[serde(default)]
+    pub interface: Option<String>,
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
@@ -227,6 +236,9 @@ pub struct AgentConfig {
     /// existing sensor.
     #[serde(default)]
     pub proc_root: Option<String>,
+    /// Passive DNS capture (Phase 11a); `None` = sensor not configured.
+    #[serde(default)]
+    pub dns_capture: Option<DnsCaptureConfig>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
@@ -403,6 +415,33 @@ mod tests {
         assert_eq!(
             config.container_cgroup_roots[0].path,
             "/sys/fs/cgroup/system.slice"
+        );
+    }
+
+    #[test]
+    fn config_without_dns_capture_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: true\nspool_path: /tmp/spool.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        assert!(AgentConfig::load(&path).unwrap().dns_capture.is_none());
+    }
+
+    #[test]
+    fn config_with_empty_dns_capture_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/spool.ndjson\nstatus_addr: 127.0.0.1:9200\ndns_capture: {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::load(&path).unwrap().dns_capture,
+            Some(DnsCaptureConfig { interface: None })
         );
     }
 

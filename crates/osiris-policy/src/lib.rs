@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const KNOWN_SENSORS: [&str; 7] = [
+pub const KNOWN_SENSORS: [&str; 8] = [
     "container",
+    "dns",
     "filesystem",
     "identity",
     "network",
@@ -361,13 +362,23 @@ mod tests {
     }
 
     #[test]
+    fn policy_accepts_dns_sensor() {
+        let mut p = GroupPolicy::default();
+        p.sensors.insert("dns".into(), false);
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
     fn validation_rejects_unknown_sensors_and_bad_heartbeats() {
         let mut p = GroupPolicy::default();
-        p.sensors.insert("dns".into(), true);
-        assert_eq!(p.validate(), Err(PolicyError::UnknownSensor("dns".into())));
+        p.sensors.insert("bogus".into(), true);
         assert_eq!(
-            PolicyError::UnknownSensor("dns".into()).to_string(),
-            "unknown sensor: dns"
+            p.validate(),
+            Err(PolicyError::UnknownSensor("bogus".into()))
+        );
+        assert_eq!(
+            PolicyError::UnknownSensor("bogus".into()).to_string(),
+            "unknown sensor: bogus"
         );
         let mut p = GroupPolicy::default();
         p.heartbeat_interval_secs = Some(9);
@@ -508,7 +519,7 @@ mod tests {
     /// encoding needs a new domain tag. Derived independently of this crate
     /// (SHA-256 over the §3.5 bytes, built by hand).
     #[test]
-    fn hash_matches_the_golden_vectors() {
+    fn policy_golden_hashes_unchanged() {
         assert_eq!(
             empty_policy_hash_hex(),
             "82bc62e7947525f434da5a10e137d23fd6e4b9191d71d5005ee42aa1875f3d15"
