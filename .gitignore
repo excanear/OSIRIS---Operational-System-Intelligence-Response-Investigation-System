@@ -5,3 +5,7 @@
 console/test-results/
 console/playwright-report/
 console/e2e/.stack.json
+
+# BPF build outputs (tools/ebpf/build.sh); never committed
+*.bpf.o
+*.bpf.o.sha256
