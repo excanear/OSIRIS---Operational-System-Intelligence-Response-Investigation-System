@@ -20,7 +20,7 @@ use osiris_sensors_fs::FilesystemSensor;
 use osiris_sensors_identity::IdentitySensor;
 use osiris_sensors_net::NetworkSensor;
 use osiris_sensors_persistence::PersistenceSensor;
-use osiris_sensors_process::ProcessExecSensor;
+use osiris_sensors_process::{EbpfSettings, ProcessExecSensor};
 use osiris_sensors_systemd::SystemdSensor;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -98,10 +98,15 @@ pub enum SensorChange {
 /// Builds one sensor by name; `None` when agent.yaml does not configure it.
 fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
     match name {
-        "process_exec" => config
-            .audit_log_path
-            .clone()
-            .map(|p| Box::new(ProcessExecSensor::new(Some(p.into()), None)) as Box<dyn Sensor>),
+        "process_exec" => {
+            let audit = config.audit_log_path.clone().map(PathBuf::from);
+            let ebpf = config.ebpf.as_ref().map(|c| EbpfSettings {
+                object_dir: c.object_dir.clone(),
+                self_tgid: std::process::id(),
+            });
+            (audit.is_some() || ebpf.is_some())
+                .then(|| Box::new(ProcessExecSensor::new(audit, ebpf)) as Box<dyn Sensor>)
+        }
         "filesystem" => config
             .fs_audit_log_path
             .clone()
@@ -578,6 +583,7 @@ pub(crate) mod tests {
             persistence_watch_paths: vec![],
             container_cgroup_roots: vec![],
             dns_capture: None,
+            ebpf: None,
             proc_root: None,
             enable_synthetic: false,
             synthetic_scenario: None,
@@ -597,6 +603,18 @@ pub(crate) mod tests {
                 .to_string(),
             status_addr: "127.0.0.1:0".to_string(),
         }
+    }
+
+    #[test]
+    fn build_sensor_process_with_ebpf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        assert!(build_sensor(&config, "process_exec").is_none());
+        config.ebpf = Some(crate::config::EbpfConfig {
+            object_dir: dir.path().to_path_buf(),
+        });
+        let sensor = build_sensor(&config, "process_exec").expect("process sensor built");
+        assert_eq!(sensor.name(), "process_exec");
     }
 
     #[test]

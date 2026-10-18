@@ -208,6 +208,7 @@ async fn a_group_policy_reaches_a_real_agent_and_reports_in_sync() {
         },
         fleet: osiris_agent::FleetConfig::default(),
         dns_capture: None,
+        ebpf: None,
         audit_log_path: None,
         fs_audit_log_path: None,
         network_proc_root: None,

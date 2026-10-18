@@ -158,6 +158,19 @@ pub struct DnsCaptureConfig {
     pub interface: Option<String>,
 }
 
+/// Phase 11b-1: the eBPF process backend. Absent = audit-only behaviour;
+/// present (even as `{}`) enables the eBPF backend with the default object dir.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EbpfConfig {
+    /// Directory holding the pre-built BPF objects.
+    #[serde(default = "default_object_dir")]
+    pub object_dir: PathBuf,
+}
+
+fn default_object_dir() -> PathBuf {
+    PathBuf::from("/usr/lib/osiris/bpf")
+}
+
 /// Minimal agent.yaml shape for Phase 1 (ARCHITECTURE.md §3.1 point 2's
 /// full ConfigManager — schema validation, inotify hot-reload — is
 /// deferred per plan Global Constraints #6; this loads once at startup).
@@ -239,6 +252,9 @@ pub struct AgentConfig {
     /// Passive DNS capture (Phase 11a); `None` = sensor not configured.
     #[serde(default)]
     pub dns_capture: Option<DnsCaptureConfig>,
+    /// eBPF process backend (Phase 11b-1); `None` = audit-only.
+    #[serde(default)]
+    pub ebpf: Option<EbpfConfig>,
     /// Enables the synthetic/generator sensor (always available).
     #[serde(default)]
     pub enable_synthetic: bool,
@@ -442,6 +458,41 @@ mod tests {
         assert_eq!(
             AgentConfig::load(&path).unwrap().dns_capture,
             Some(DnsCaptureConfig { interface: None })
+        );
+    }
+
+    #[test]
+    fn config_without_ebpf_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "enable_synthetic: true
+spool_path: /tmp/spool.ndjson
+status_addr: 127.0.0.1:9200
+",
+        )
+        .unwrap();
+        assert!(AgentConfig::load(&path).unwrap().ebpf.is_none());
+    }
+
+    #[test]
+    fn config_with_empty_ebpf_defaults_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/spool.ndjson
+status_addr: 127.0.0.1:9200
+ebpf: {}
+",
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::load(&path).unwrap().ebpf,
+            Some(EbpfConfig {
+                object_dir: PathBuf::from("/usr/lib/osiris/bpf")
+            })
         );
     }
 
