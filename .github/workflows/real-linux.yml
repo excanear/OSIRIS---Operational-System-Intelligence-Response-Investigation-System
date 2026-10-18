@@ -23,6 +23,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Prepare auditd and watch dirs
         run: sudo tools/real-linux/setup.sh
+      - name: Start DNS packet capture
+        # Diagnostic only (Phase 11a): every UDP/53 packet during the suite,
+        # for post-mortems and the replay fixture. A capture failure warns
+        # and never blocks the suite. -U flushes per packet; -Z root keeps
+        # write access to the runner-owned artifacts dir.
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          sudo nohup tcpdump -Z root -U -i any -w "$RUNNER_TEMP/artifacts/dns.pcap" udp port 53 \
+            > "$RUNNER_TEMP/artifacts/tcpdump.log" 2>&1 &
+          sleep 2
+          pgrep -x tcpdump >/dev/null || echo "::warning::tcpdump is not running: $(cat "$RUNNER_TEMP/artifacts/tcpdump.log")"
       - name: Run the real-Linux suite as root
         # Build ~5 min + suite ~2 min; a hang fails here, not at the job cap.
         timeout-minutes: 25
@@ -35,6 +46,21 @@ jobs:
             "TMPDIR=$RUNNER_TEMP/osiris-kept" CARGO_TARGET_DIR=/root/osiris-target \
             tools/real-linux/run.sh 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
           exit "${PIPESTATUS[0]}"
+      - name: Stop DNS packet capture
+        if: always()
+        # SIGINT lets tcpdump finish the pcap; bounded wait for it to exit.
+        run: |
+          sudo pkill -INT -x tcpdump || true
+          for _ in $(seq 1 20); do pgrep -x tcpdump >/dev/null || break; sleep 0.5; done
+          sudo pkill -KILL -x tcpdump || true
+      - name: Run the DNS sensor's unit tests on Linux
+        # The Linux-only tests (cBPF program, AF_PACKET dispositions, the
+        # /proc symlink attribution cases) can only run here. No root needed.
+        if: always()
+        timeout-minutes: 15
+        run: |
+          cargo test -p osiris-sensors-dns -- --include-ignored 2>&1 | tee "$RUNNER_TEMP/dns-unit-tests.txt"
+          exit "${PIPESTATUS[0]}"
       - name: Collect audit log
         if: always()
         run: |
@@ -42,6 +68,7 @@ jobs:
           sudo cp /var/log/audit/audit.log "$RUNNER_TEMP/artifacts/audit.log" || true
           sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
           cp "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/artifacts/" || true
+          cp "$RUNNER_TEMP/dns-unit-tests.txt" "$RUNNER_TEMP/artifacts/" || true
           sudo cp -r "$RUNNER_TEMP/osiris-kept" "$RUNNER_TEMP/artifacts/kept-stack-dirs" || true
           sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
       - uses: actions/upload-artifact@v4

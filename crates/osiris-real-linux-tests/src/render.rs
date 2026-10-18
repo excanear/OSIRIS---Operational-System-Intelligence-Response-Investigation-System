@@ -72,6 +72,7 @@ impl AgentYaml {
         let mut s = format!(
             "spool_path: {spool}\nstatus_addr: '127.0.0.1:0'\nenable_synthetic: false\n\
              proc_root: '/proc'\nnetwork_proc_root: '/proc'\n\
+             dns_capture: {{}}\n\
              cloud_metadata:\n  enabled: false\n\
              fleet:\n  health_interval_secs: {hb}\n\
              forward:\n  server_addr: '127.0.0.1:{agent}'\n  server_name: 'localhost'\n  ca: {ca}\n  cert: {acert}\n  key: {akey}\n\
@@ -164,6 +165,8 @@ mod tests {
         assert_eq!(cfg.persistence_watch_paths.len(), 1);
         assert_eq!(cfg.fleet.health_interval_secs, 5);
         assert!(!cfg.enable_synthetic);
+        // The real-Linux agent captures DNS, on all interfaces.
+        assert!(cfg.dns_capture.unwrap().interface.is_none());
         assert_eq!(cfg.forward.unwrap().server_addr, "127.0.0.1:18081");
     }
 

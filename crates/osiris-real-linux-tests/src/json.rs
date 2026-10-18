@@ -29,6 +29,29 @@ pub fn ids_containing(v: &Value, id_key: &str, needle: &str) -> Vec<String> {
     out
 }
 
+/// Every object (at any depth) whose `key` equals `want`, whole -- e.g. the
+/// `{"sensor_name": "dns", ...}` entry of an AGENT_HEALTH event, or each
+/// event of an events response -- so a scenario can check several fields
+/// of one object together.
+pub fn objects_with<'a>(v: &'a Value, key: &str, want: &Value) -> Vec<&'a Value> {
+    let mut out = vec![];
+    collect_objects(v, key, want, &mut out);
+    out
+}
+
+fn collect_objects<'a>(v: &'a Value, key: &str, want: &Value, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| collect_objects(x, key, want, out)),
+        Value::Object(o) => {
+            if o.get(key) == Some(want) {
+                out.push(v);
+            }
+            o.values().for_each(|x| collect_objects(x, key, want, out));
+        }
+        _ => {}
+    }
+}
+
 fn collect_ids(v: &Value, id_key: &str, needle: &str, out: &mut Vec<String>) {
     match v {
         Value::Array(a) => a.iter().for_each(|x| collect_ids(x, id_key, needle, out)),
@@ -58,6 +81,18 @@ mod tests {
         assert!(has_kv(&v, "dst_port", &json!(4242)));
         assert!(!has_kv(&v, "dst_port", &json!(4243)));
         assert!(has_kv(&v, "proto", &json!("tcp")));
+    }
+
+    #[test]
+    fn objects_with_returns_each_matching_object_whole() {
+        let health = json!([{"event_data": {"health": {"sensors": [
+            {"sensor_name": "network", "state": {"state": "HEALTHY"}},
+            {"sensor_name": "dns", "state": {"state": "HEALTHY"}}
+        ]}}}]);
+        let dns = objects_with(&health, "sensor_name", &json!("dns"));
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0]["state"]["state"], json!("HEALTHY"));
+        assert!(objects_with(&health, "sensor_name", &json!("bogus")).is_empty());
     }
 
     /// Real-Linux finding (Phase 10, GH run 38073738001): an alert carries

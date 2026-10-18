@@ -5,7 +5,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq auditd curl sudo build-essential pkg-config libssl-dev >/dev/null
+apt-get install -y -qq auditd curl sudo tcpdump build-essential pkg-config libssl-dev >/dev/null
 mkdir -p /tmp/osiris-p10 /var/www /etc/osiris
 install -m 0640 "$here/osiris.rules" /etc/audit/rules.d/osiris.rules
 systemctl enable --now auditd >/dev/null || {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use osiris_real_linux_tests::json::{contains_str, has_kv, ids_containing};
+use osiris_real_linux_tests::json::{contains_str, has_kv, ids_containing, objects_with};
 use osiris_real_linux_tests::stack::{AgentOptions, Stack, StackOptions};
 use serde_json::json;
 
@@ -232,5 +232,58 @@ fn agent_reports_real_host_facts_and_healthy_sensors() {
     assert!(
         !contains_str(&health, "FAILED"),
         "a sensor reports FAILED: {health}"
+    );
+}
+
+/// Phase 11a: a curl lookup of a unique `.xyz` name is seen by the passive
+/// DNS sensor (AF_PACKET), attributed to curl, and raises the suspicious-TLD
+/// alert. The query goes to the host resolver (systemd-resolved's stub on
+/// Ubuntu); the name never resolves, which is fine — the query is the event.
+#[test]
+#[ignore]
+fn dns_query_is_observed_and_alerts() {
+    let m = marker();
+    let s = stack(&Path::new(WATCH_ROOT).join(&m));
+    // The sensor reports itself in the AGENT_HEALTH heartbeat (5s cadence):
+    // an unprivileged or broken capture shows up here, not as silence.
+    let health = events(&s, "AGENT_HEALTH", 0, |v| {
+        !objects_with(v, "sensor_name", &json!("dns")).is_empty()
+    });
+    let dns_health = objects_with(&health, "sensor_name", &json!("dns"));
+    assert!(
+        dns_health
+            .iter()
+            .any(|h| h["state"]["state"] == json!("HEALTHY")),
+        "dns sensor never HEALTHY in AGENT_HEALTH: {health}"
+    );
+    assert!(
+        !dns_health
+            .iter()
+            .any(|h| h["state"]["state"] == json!("FAILED")),
+        "dns sensor reports FAILED: {health}"
+    );
+
+    let name = format!("{m}.xyz");
+    let t0 = now_ns();
+    sh(&format!("curl -s -m 5 http://{name}/ || true"));
+    let by_curl = |v: &serde_json::Value| -> Vec<String> {
+        objects_with(v, "event_type", &json!("DNS_QUERY"))
+            .into_iter()
+            .filter(|e| e["dns"]["query"] == json!(name))
+            .filter(|e| {
+                e["process"]["exe_path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("curl"))
+            })
+            .filter_map(|e| e["event_id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let queries = events(&s, "DNS_QUERY", t0, |v| !by_curl(v).is_empty());
+    let ids = by_curl(&queries);
+    // Alerts cite events by id only (see web_root_drop_raises_an_alert).
+    s.wait_for(
+        &format!("/api/v1/alerts?rule_id=dns_query_to_suspicious_tld&since={t0}"),
+        DEADLINE,
+        |v| ids.iter().any(|id| contains_str(v, id)),
     );
 }
