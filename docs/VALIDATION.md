@@ -208,6 +208,36 @@ replayed by the host test suite (`cargo test` on Windows and in CI), not in run 
   retried with backoff.
 - DNS over TCP, DoT, DoH and mDNS are not captured. The eBPF resolver uprobe is Phase 11b.
 
+## eBPF process backend (Phase 11b-1)
+
+The eBPF engine (`crates/osiris-ebpf`) and the eBPF exec/exit backend of `process_exec` were
+validated on GitHub Actions run 39139529617 (commit `e5becff`, branch `real-linux/t11b1-1`),
+green on `ubuntu-22.04` (kernel 5.15) and `ubuntu-24.04` (6.x) on the first run. The object was
+built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
+
+- `process_exec` reported `HEALTHY` with capability flag `ebpf`.
+- `exec_and_exit_are_observed_via_ebpf` passed: provider `process_exec_sensor/ebpf`, the argv
+  marker, ppid and uid 0 on the `PROCESS_EXEC`, and a `PROCESS_EXIT` with the same `process_key`
+  and `exit_code` 7.
+- `corrupted_object_falls_back_to_audit` passed: with a corrupted object the sensor was
+  `DEGRADED`, flag `audit_fallback`, `last_error` "eBPF unavailable: bpf object integrity check
+  failed: bpf object digest mismatch ...".
+- All pre-existing real-Linux scenarios stayed green with the eBPF backend active.
+- The process and osiris-ebpf crates' unit tests ran on the runner.
+
+### Known limitations
+
+- Not covered: kernels other than 5.15 and 6.x, RHEL-like distributions, a kernel-version VM
+  matrix (ARCHITECTURE §26).
+- When a non-leader thread calls `execve`, the old thread-group leader's exit is reported as a
+  `PROCESS_EXIT` with signal 9 for a process that keeps running, then an `EXEC` under the same pid.
+- Exit `exe_path` is often empty (the process is already gone). argv can be empty when the page is
+  not resident at read time.
+- A ring-buffer reservation failure increments the drop counter, reported as
+  `events_dropped_total`. Not provoked in validation.
+- With `ebpf` configured but no `audit_log_path`, an eBPF failure makes the sensor `FAILED`.
+- `PROCESS_FORK` is not emitted. See `docs/operators-ebpf.md`.
+
 ## Findings
 
 | Finding | Distro | Fix commit |
@@ -316,4 +346,4 @@ was not repeated on the final binaries.
 - DNS over TCP, DoT, DoH and mDNS are not captured (see "DNS sensor (Phase 11a)").
 - No container or Kubernetes scenarios.
 - RHEL-like distributions (auditd paths, SELinux) are not covered.
-- eBPF is out of scope.
+- eBPF covers only process exec/exit (Phase 11b-1); network, filesystem and the DNS uprobe are pending (11b-2..4).

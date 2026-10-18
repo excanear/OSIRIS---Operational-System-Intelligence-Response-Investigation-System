@@ -95,8 +95,20 @@ revisão final independente → merge → push.
     conta como local e gera um segundo evento. Se a porta colidir, esse evento pode ser atribuído
     a um processo do host sem relação. Correção futura: comparar o IP de origem com os endereços
     locais.
-- **eBPF/CO-RE** (§5): loader libbpf-rs, programas para exec/fork/exit, file, net; capability probe;
-  fallbacks atuais (audit/procfs) mantidos. Hoje: nenhum código eBPF.
+- **Fase 11b-1 (feita)**: motor eBPF (`crates/osiris-ebpf`, loader aya, programas C CO-RE com clang) e
+  backend eBPF de exec/exit do sensor `process_exec`, com fallback para audit. Validado em Linux real
+  (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/0001-ebpf-loader-aya.md`,
+  `docs/operators-ebpf.md` e `docs/VALIDATION.md`.
+  Próximos (cada um com seu brainstorming/spec/plano): **11b-2** rede (connect/accept/close),
+  **11b-3** filesystem, **11b-4** uprobe de DNS em bibliotecas de resolução.
+  Dívidas da 11b-1:
+  - `PROCESS_FORK` não é emitido (só exec e exit).
+  - Níveis de telemetria por entidade em mapas no kernel (§6): ainda não.
+  - Matriz de kernels em VMs (§5.4/§26): validado só nos 2 kernels dos runners.
+  - Redução de privilégios do agente a um conjunto mínimo de capabilities (§15).
+  - Empacotamento do objeto BPF (.deb/.rpm, unit systemd): Fase 13.
+  - Saída de thread não-líder após `execve` gera um `PROCESS_EXIT` (signal 9) para processo vivo.
+  - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com 11b-2/3.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)

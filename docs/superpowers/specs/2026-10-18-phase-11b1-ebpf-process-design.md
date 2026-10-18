@@ -94,8 +94,8 @@ today's audit backend.
      (ARCHITECTURE §4.2: DEGRADED = "eBPF program failed to load, fell back to audit"). Never a
      silent no-op.
 6. **Exec events** from eBPF become the existing `RawEvent::ProcessExec(ProcessExecRaw)`:
-   `exe_path` from the exec'd filename (resolved to an absolute path in user space when
-   relative, using the process's `/proc/<pid>/exe` link when still available), `cmdline` from the
+   `exe_path` is the `/proc/<pid>/exe` link target when readable, else the exec'd filename
+   from the tracepoint (parity with the audit backend's resolved `exe=`), `cmdline` from the
    argv bytes split on NUL (same bounds and truncation rules as the audit backend's `execve.rs`,
    so downstream sees identical shapes), `comm`, `uid`, `ppid`, `pid`, `timestamp_ns` (wall clock).
    `start_time_mono` must equal what the audit backend computes for the same process
@@ -108,8 +108,8 @@ today's audit backend.
    `exit_code: Option<i32>`, `signal: Option<u32>` — decoded from the kernel wait status: normal
    exit sets `exit_code`, death by signal sets `signal` — `timestamp_ns`, `start_time_mono`,
    `source`), normalize it to the existing `EventType::ProcessExit` with the same `process_key`
-   derivation as exec and `event_data` `{"exit_code": <n|null>, "signal": <n|null>}` (no schema
-   struct change) *(call)*, and make the session
+   derivation as exec and `event_data` carrying at least `exit_code` and `signal` (each `<n|null>`), plus `comm`,
+   `ppid` and `uid` (enrichment needs `ppid`; no schema struct change) *(call)*, and make the session
    resolver forget the exiting process (the "no sensor emits PROCESS_EXIT yet" comment goes away).
    The audit backend does not emit exits (unchanged). `PROCESS_EXIT`'s telemetry level stays as
    `crates/osiris-policy` already defines it.
@@ -164,7 +164,7 @@ today's audit backend.
 
 ## 5. Known behaviour to document (not fix)
 
-- `exe_path` is the path passed to `execve` as resolved by the kernel for the tracepoint; for
+- `exe_path` is the `/proc/<pid>/exe` target when readable, else the `execve` filename; for
   scripts it is the script path, the interpreter appears in argv — same as the audit backend.
 - argv is read after exec from the new process's memory; a process that rewrites its argv before
   the read (rare, racy) shows the rewritten text.
