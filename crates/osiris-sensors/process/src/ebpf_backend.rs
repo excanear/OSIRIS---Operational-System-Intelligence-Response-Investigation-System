@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use osiris_ebpf::{decode_wait_status, ExecEvent, ExitEvent};
+use osiris_ebpf::{decode_wait_status, resolve_exe, ExeIdentity, ExecEvent, ExitEvent};
 use osiris_sensor_api::{ProcessExecRaw, ProcessExitRaw, RawEventSource};
 
 use crate::execve::{MAX_ARGS, MAX_ARGV_BYTES};
@@ -72,62 +72,26 @@ fn proc_exe(proc_root: &Path, pid: u32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// `<proc_root>/<pid>/comm` without its trailing newline, when readable.
-fn proc_comm(proc_root: &Path, pid: u32) -> Option<Vec<u8>> {
-    let mut comm = std::fs::read(proc_root.join(pid.to_string()).join("comm")).ok()?;
-    if comm.last() == Some(&b'\n') {
-        comm.pop();
-    }
-    Some(comm)
-}
-
-/// The kernel keeps at most `TASK_COMM_LEN - 1` = 15 bytes of a comm.
-const COMM_MAX_BYTES: usize = 15;
-
-/// Whether `/proc/<pid>/comm`'s bytes name the same task comm as the
-/// record's (decoded like the record: at most 15 bytes, lossy UTF-8).
-fn same_comm(proc_comm: &[u8], record_comm: &str) -> bool {
-    let proc_comm = &proc_comm[..proc_comm.len().min(COMM_MAX_BYTES)];
-    String::from_utf8_lossy(proc_comm) == record_comm
-}
-
-/// Pick `exe_path` from what user space read for one exec record: the
-/// `/proc/<pid>/exe` link is trusted only if `/proc/<pid>/comm`, read
-/// *after* the link, still equals the comm the kernel captured at exec
-/// time. A mismatch means the pid has exec'd again (`sh -c 'cmd'`,
-/// `system()`, wrappers) or was reused since the record was written, so
-/// the link names a later image; the execve filename is used instead. A
-/// process that renamed itself (`PR_SET_NAME`) only degrades to the
-/// filename, it is never mislabeled.
-pub fn choose_exe_path(
-    link: Option<String>,
-    proc_comm: Option<&[u8]>,
+/// The exec'd binary as the audit backend's `exe=` reports it: the
+/// resolved `<proc_root>/<pid>/exe` link (symlinks such as `/bin/sh` →
+/// `dash` followed; a script shows its interpreter) when it can be tied to
+/// the record — by the kernel's exe identity, else by comm (see
+/// [`osiris_ebpf::resolve_exe`]) — else the execve filename as given.
+/// Detection rules key on `exe_path`, so both backends must agree.
+pub fn resolve_exe_path(
+    proc_root: &Path,
+    pid: u32,
+    exe: Option<ExeIdentity>,
     record_comm: &str,
     filename: &str,
 ) -> String {
-    match (link, proc_comm) {
-        (Some(link), Some(comm)) if same_comm(comm, record_comm) => link,
-        _ => filename.to_string(),
-    }
-}
-
-/// The exec'd binary as the audit backend's `exe=` reports it: the
-/// resolved `<proc_root>/<pid>/exe` link (symlinks such as `/bin/sh` →
-/// `dash` followed; a script shows its interpreter) when readable and
-/// still the same image (see [`choose_exe_path`]), else the execve
-/// filename as given. Detection rules key on `exe_path`, so both backends
-/// must agree. Order matters: the link is read first, then comm, so an
-/// exec between the two reads changes comm and is rejected.
-pub fn resolve_exe_path(proc_root: &Path, pid: u32, record_comm: &str, filename: &str) -> String {
-    let link = proc_exe(proc_root, pid);
-    let comm = proc_comm(proc_root, pid);
-    choose_exe_path(link, comm.as_deref(), record_comm, filename)
+    resolve_exe(proc_root, pid, exe, record_comm).unwrap_or_else(|| filename.to_string())
 }
 
 /// An exec record as the existing `ProcessExecRaw`; `exe_path` per
 /// [`resolve_exe_path`] against `/proc`.
 pub fn exec_to_raw(e: &ExecEvent, boot_wall_offset_ns: i128) -> ProcessExecRaw {
-    let exe_path = resolve_exe_path(Path::new(PROC_ROOT), e.pid, &e.comm, &e.filename);
+    let exe_path = resolve_exe_path(Path::new(PROC_ROOT), e.pid, e.exe, &e.comm, &e.filename);
     ProcessExecRaw {
         pid: e.pid,
         ppid: e.ppid,
@@ -200,6 +164,7 @@ mod tests {
             filename: "/usr/bin/ls".to_string(),
             args: b"ls\0-la\0".to_vec(),
             args_truncated: false,
+            exe: None,
         }
     }
 
@@ -259,7 +224,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
+            resolve_exe_path(root.path(), 77, None, "sh", "/bin/sh"),
             target.to_string_lossy()
         );
     }
@@ -273,7 +238,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
+            resolve_exe_path(root.path(), 77, None, "sh", "/bin/sh"),
             "/bin/sh"
         );
     }
@@ -282,64 +247,13 @@ mod tests {
     fn filename_is_used_when_proc_exe_is_unreadable() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
+            resolve_exe_path(root.path(), 77, None, "sh", "/bin/sh"),
             "/bin/sh"
         );
         assert_eq!(
-            resolve_exe_path(root.path(), 77, "run.sh", "./run.sh"),
+            resolve_exe_path(root.path(), 77, None, "run.sh", "./run.sh"),
             "./run.sh"
         );
-    }
-
-    #[test]
-    fn exe_link_is_accepted_only_with_a_matching_comm() {
-        let link = || Some("/usr/bin/dash".to_string());
-        // Match (trailing newline already stripped by proc_comm).
-        assert_eq!(
-            choose_exe_path(link(), Some(b"sh"), "sh", "/bin/sh"),
-            "/usr/bin/dash"
-        );
-        // A later exec or a reused pid: different comm.
-        assert_eq!(
-            choose_exe_path(link(), Some(b"curl"), "sh", "/bin/sh"),
-            "/bin/sh"
-        );
-        // comm unreadable (the process exited between the two reads).
-        assert_eq!(choose_exe_path(link(), None, "sh", "/bin/sh"), "/bin/sh");
-        // Link unreadable.
-        assert_eq!(
-            choose_exe_path(None, Some(b"sh"), "sh", "/bin/sh"),
-            "/bin/sh"
-        );
-        // comm is truncated to 15 bytes on both sides.
-        assert_eq!(
-            choose_exe_path(
-                link(),
-                Some(b"a-very-long-name"),
-                "a-very-long-nam",
-                "/opt/a-very-long-name"
-            ),
-            "/usr/bin/dash"
-        );
-        // Non-UTF-8 comm bytes compare like the record decodes them.
-        assert_eq!(
-            choose_exe_path(link(), Some(b"x\xffy"), "x\u{FFFD}y", "/x"),
-            "/usr/bin/dash"
-        );
-        // A prefix is not a match.
-        assert_eq!(
-            choose_exe_path(link(), Some(b"s"), "sh", "/bin/sh"),
-            "/bin/sh"
-        );
-    }
-
-    #[test]
-    fn proc_comm_drops_only_the_trailing_newline() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("77")).unwrap();
-        std::fs::write(root.path().join("77").join("comm"), b"sh\n").unwrap();
-        assert_eq!(proc_comm(root.path(), 77).as_deref(), Some(&b"sh"[..]));
-        assert_eq!(proc_comm(root.path(), 78), None);
     }
 
     #[test]

@@ -754,6 +754,7 @@ mod tests {
             filename: "/bin/true".to_string(),
             args: b"true\0".to_vec(),
             args_truncated: false,
+            exe: None,
         })
     }
 

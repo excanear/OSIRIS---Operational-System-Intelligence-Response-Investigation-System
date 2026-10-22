@@ -43,19 +43,59 @@ typedef __u64 u64;
 typedef __s64 s64;
 
 typedef int pid_t;
+/* Kernel-internal dev_t: MAJOR = dev >> 20, MINOR = dev & 0xfffff. */
+typedef __u32 dev_t;
+
+/* include/linux/types.h; the kernel's BTF has the same anonymous struct. */
+typedef struct {
+	int counter;
+} __attribute__((preserve_access_index)) atomic_t;
 
 /* Subset of enum bpf_map_type (include/uapi/linux/bpf.h); values are ABI. */
 enum bpf_map_type {
 	BPF_MAP_TYPE_ARRAY = 2,
 	BPF_MAP_TYPE_PERCPU_ARRAY = 6,
+	BPF_MAP_TYPE_LRU_HASH = 9,
 	BPF_MAP_TYPE_RINGBUF = 27,
 };
+
+/* bpf_map_update_elem() flags (include/uapi/linux/bpf.h); values are ABI. */
+enum {
+	BPF_ANY = 0,
+	BPF_NOEXIST = 1,
+	BPF_EXIST = 2,
+};
+
+struct super_block {
+	dev_t s_dev;
+} __attribute__((preserve_access_index));
+
+struct inode {
+	unsigned long i_ino;
+	struct super_block *i_sb;
+} __attribute__((preserve_access_index));
+
+struct file {
+	struct inode *f_inode;
+} __attribute__((preserve_access_index));
 
 /* mm->arg_start/arg_end live in an anonymous struct inside mm_struct;
  * CO-RE field matching descends into anonymous members by name. */
 struct mm_struct {
 	unsigned long arg_start;
 	unsigned long arg_end;
+	/* The executable mapped by the last exec (an __rcu pointer). */
+	struct file *exe_file;
+} __attribute__((preserve_access_index));
+
+/* Shared by every thread of a thread group (include/linux/sched/signal.h). */
+struct signal_struct {
+	/* Threads that have not yet passed do_exit()'s group_dead test. */
+	atomic_t live;
+	/* SIGNAL_* flags; SIGNAL_GROUP_EXIT is defined in process.bpf.c. */
+	unsigned int flags;
+	/* Wait status of a group exit (exit_group(), fatal signal). */
+	int group_exit_code;
 } __attribute__((preserve_access_index));
 
 struct task_struct {
@@ -63,7 +103,10 @@ struct task_struct {
 	pid_t tgid;
 	int exit_code;
 	struct task_struct *real_parent;
+	struct task_struct *group_leader;
 	struct mm_struct *mm;
+	struct signal_struct *signal;
+	char comm[16];
 	/* Boot-based start time in ns; present since Linux 5.5. */
 	u64 start_boottime;
 } __attribute__((preserve_access_index));

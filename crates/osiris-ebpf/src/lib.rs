@@ -9,6 +9,7 @@
 //! depend on `osiris-sensor-api`.
 
 pub mod clock;
+pub mod exe;
 pub mod integrity;
 pub mod loader;
 pub mod probe;
@@ -16,6 +17,7 @@ pub mod reader;
 pub mod record;
 
 pub use clock::boot_wall_offset_ns;
+pub use exe::{dev_to_user, resolve_exe, ExeIdentity};
 pub use integrity::{verify_object, IntegrityError};
 pub use loader::{
     object_schema_version, sidecar_name, DropCounter, EbpfSettings, LoadError, LoadedObject,

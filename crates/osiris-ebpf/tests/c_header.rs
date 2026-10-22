@@ -39,6 +39,14 @@ fn c_header_matches_rust_constants() {
             offset_of!(ExecRecord, comm)
         ),
         format!(
+            "_Static_assert(__builtin_offsetof(struct exec_record, exe_dev) == {},",
+            offset_of!(ExecRecord, exe_dev)
+        ),
+        format!(
+            "_Static_assert(__builtin_offsetof(struct exec_record, exe_ino) == {},",
+            offset_of!(ExecRecord, exe_ino)
+        ),
+        format!(
             "_Static_assert(__builtin_offsetof(struct exec_record, filename) == {},",
             offset_of!(ExecRecord, filename)
         ),
@@ -55,6 +63,11 @@ fn c_header_matches_rust_constants() {
         assert!(h.contains(line.as_str()), "bpf/process.h lacks `{line}`");
     }
     // Pinned values from the brief, independent of the Rust constants.
-    assert!(h.contains("_Static_assert(sizeof(struct exec_record) == 4424,"));
+    assert!(h.contains("#define SCHEMA_VERSION 2"));
+    assert!(h.contains("_Static_assert(sizeof(struct exec_record) == 4432,"));
+    assert!(h.contains("_Static_assert(__builtin_offsetof(struct exec_record, exe_dev) == 68,"));
+    assert!(h.contains("_Static_assert(__builtin_offsetof(struct exec_record, exe_ino) == 72,"));
+    assert!(h.contains("_Static_assert(__builtin_offsetof(struct exec_record, filename) == 80,"));
+    assert!(h.contains("_Static_assert(__builtin_offsetof(struct exec_record, args) == 336,"));
     assert!(h.contains("_Static_assert(sizeof(struct exit_record) == 56,"));
 }

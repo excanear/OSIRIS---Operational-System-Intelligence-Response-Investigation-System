@@ -7,7 +7,9 @@
 
 use std::mem::size_of;
 
-pub const PROCESS_SCHEMA_VERSION: u32 = 1;
+use crate::exe::{dev_to_user, ExeIdentity};
+
+pub const PROCESS_SCHEMA_VERSION: u32 = 2;
 pub const KIND_EXEC: u32 = 1;
 pub const KIND_EXIT: u32 = 2;
 pub const ARGS_MAX: usize = 4096;
@@ -35,7 +37,11 @@ pub struct ExecRecord {
     pub filename_len: u32,
     pub args_len: u32,
     pub args_truncated: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
+    /// Kernel-internal `dev_t` of `mm->exe_file`'s superblock (0 = unknown).
+    pub exe_dev: u32,
+    /// `mm->exe_file`'s inode number (0 = unknown).
+    pub exe_ino: u64,
     pub filename: [u8; FILENAME_MAX],
     pub args: [u8; ARGS_MAX],
 }
@@ -66,6 +72,9 @@ pub struct ExecEvent {
     /// Raw argv bytes (NUL-separated), clamped to [`ARGS_MAX`].
     pub args: Vec<u8>,
     pub args_truncated: bool,
+    /// The exec'd image's identity as the kernel saw it; `None` when the
+    /// record carries inode 0 (no `mm`/`exe_file`, or the read failed).
+    pub exe: Option<ExeIdentity>,
 }
 
 /// Decoded exit record (owned). `exit_status` is the raw wait status.
@@ -132,6 +141,10 @@ pub fn decode(bytes: &[u8]) -> Result<Record, DecodeError> {
             filename: c_string(&r.filename, (r.filename_len as usize).min(FILENAME_MAX)),
             args: r.args[..args_len].to_vec(),
             args_truncated: r.args_truncated != 0,
+            exe: (r.exe_ino != 0).then(|| ExeIdentity {
+                dev: dev_to_user(r.exe_dev),
+                ino: r.exe_ino,
+            }),
         }))
     } else {
         let r: ExitRecord = read(bytes);
@@ -222,12 +235,63 @@ mod tests {
 
     #[test]
     fn layout_is_pinned() {
-        assert_eq!(size_of::<ExecRecord>(), 4424);
+        assert_eq!(PROCESS_SCHEMA_VERSION, 2);
+        assert_eq!(size_of::<ExecRecord>(), 4432);
         assert_eq!(size_of::<ExitRecord>(), 56);
+        assert_eq!(offset_of!(ExecRecord, pid), 8);
+        assert_eq!(offset_of!(ExecRecord, ppid), 12);
+        assert_eq!(offset_of!(ExecRecord, uid), 16);
+        assert_eq!(offset_of!(ExecRecord, gid), 20);
+        assert_eq!(offset_of!(ExecRecord, ktime_ns), 24);
+        assert_eq!(offset_of!(ExecRecord, start_boottime_ns), 32);
         assert_eq!(offset_of!(ExecRecord, comm), 40);
-        assert_eq!(offset_of!(ExecRecord, filename), 72);
-        assert_eq!(offset_of!(ExecRecord, args), 328);
+        assert_eq!(offset_of!(ExecRecord, filename_len), 56);
+        assert_eq!(offset_of!(ExecRecord, args_len), 60);
+        assert_eq!(offset_of!(ExecRecord, args_truncated), 64);
+        assert_eq!(offset_of!(ExecRecord, _pad), 65);
+        assert_eq!(offset_of!(ExecRecord, exe_dev), 68);
+        assert_eq!(offset_of!(ExecRecord, exe_ino), 72);
+        assert_eq!(offset_of!(ExecRecord, filename), 80);
+        assert_eq!(offset_of!(ExecRecord, args), 336);
+        assert_eq!(offset_of!(ExitRecord, exit_status), 20);
         assert_eq!(offset_of!(ExitRecord, comm), 40);
+    }
+
+    #[test]
+    fn decode_exec_v2_carries_exe_identity() {
+        match decode(&as_bytes(&exec())).unwrap() {
+            Record::Exec(e) => assert_eq!(e.exe, None),
+            other => panic!("{other:?}"),
+        }
+        let mut r = exec();
+        r.exe_dev = (8 << 20) | 1;
+        r.exe_ino = 42;
+        match decode(&as_bytes(&r)).unwrap() {
+            Record::Exec(e) => assert_eq!(e.exe, Some(ExeIdentity { dev: 2049, ino: 42 })),
+            other => panic!("{other:?}"),
+        }
+        // A zero inode means "no identity", whatever the device says.
+        r.exe_ino = 0;
+        match decode(&as_bytes(&r)).unwrap() {
+            Record::Exec(e) => assert_eq!(e.exe, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_v1_records() {
+        let mut r = exec();
+        r.hdr.schema_version = 1;
+        assert_eq!(
+            decode(&as_bytes(&r)),
+            Err(DecodeError::UnsupportedVersion(1))
+        );
+        let mut r = exit();
+        r.hdr.schema_version = 1;
+        assert_eq!(
+            decode(&as_bytes(&r)),
+            Err(DecodeError::UnsupportedVersion(1))
+        );
     }
 
     #[test]
@@ -273,10 +337,10 @@ mod tests {
             Err(DecodeError::Truncated { kind: 2, .. })
         ));
         let mut r = exit();
-        r.hdr.schema_version = 2;
+        r.hdr.schema_version = 3;
         assert_eq!(
             decode(&as_bytes(&r)),
-            Err(DecodeError::UnsupportedVersion(2))
+            Err(DecodeError::UnsupportedVersion(3))
         );
         let mut r = exit();
         r.hdr.kind = 9;
