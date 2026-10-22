@@ -4,7 +4,8 @@
 //! two clocks: `ktime_ns` is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC) and
 //! `start_boottime_ns` is the task's boot-time start. Wall-clock
 //! `timestamp_ns` is `ktime_ns` plus a realtime − monotonic offset the
-//! sensor samples once when its reader starts; `start_time_mono` is the
+//! sensor resamples for every record (so a wall-clock step or a suspend is
+//! followed from the next record on); `start_time_mono` is the
 //! boot-time start in clock ticks (USER_HZ 100), i.e. exactly what the
 //! audit backend reads from `/proc/<pid>/stat` field 22, so both backends
 //! derive the same `process_key` for one process.
@@ -71,19 +72,62 @@ fn proc_exe(proc_root: &Path, pid: u32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// `<proc_root>/<pid>/comm` without its trailing newline, when readable.
+fn proc_comm(proc_root: &Path, pid: u32) -> Option<Vec<u8>> {
+    let mut comm = std::fs::read(proc_root.join(pid.to_string()).join("comm")).ok()?;
+    if comm.last() == Some(&b'\n') {
+        comm.pop();
+    }
+    Some(comm)
+}
+
+/// The kernel keeps at most `TASK_COMM_LEN - 1` = 15 bytes of a comm.
+const COMM_MAX_BYTES: usize = 15;
+
+/// Whether `/proc/<pid>/comm`'s bytes name the same task comm as the
+/// record's (decoded like the record: at most 15 bytes, lossy UTF-8).
+fn same_comm(proc_comm: &[u8], record_comm: &str) -> bool {
+    let proc_comm = &proc_comm[..proc_comm.len().min(COMM_MAX_BYTES)];
+    String::from_utf8_lossy(proc_comm) == record_comm
+}
+
+/// Pick `exe_path` from what user space read for one exec record: the
+/// `/proc/<pid>/exe` link is trusted only if `/proc/<pid>/comm`, read
+/// *after* the link, still equals the comm the kernel captured at exec
+/// time. A mismatch means the pid has exec'd again (`sh -c 'cmd'`,
+/// `system()`, wrappers) or was reused since the record was written, so
+/// the link names a later image; the execve filename is used instead. A
+/// process that renamed itself (`PR_SET_NAME`) only degrades to the
+/// filename, it is never mislabeled.
+pub fn choose_exe_path(
+    link: Option<String>,
+    proc_comm: Option<&[u8]>,
+    record_comm: &str,
+    filename: &str,
+) -> String {
+    match (link, proc_comm) {
+        (Some(link), Some(comm)) if same_comm(comm, record_comm) => link,
+        _ => filename.to_string(),
+    }
+}
+
 /// The exec'd binary as the audit backend's `exe=` reports it: the
 /// resolved `<proc_root>/<pid>/exe` link (symlinks such as `/bin/sh` →
-/// `dash` followed; a script shows its interpreter) when readable, else
-/// the execve filename as given. Detection rules key on `exe_path`, so
-/// both backends must agree.
-pub fn resolve_exe_path(proc_root: &Path, pid: u32, filename: &str) -> String {
-    proc_exe(proc_root, pid).unwrap_or_else(|| filename.to_string())
+/// `dash` followed; a script shows its interpreter) when readable and
+/// still the same image (see [`choose_exe_path`]), else the execve
+/// filename as given. Detection rules key on `exe_path`, so both backends
+/// must agree. Order matters: the link is read first, then comm, so an
+/// exec between the two reads changes comm and is rejected.
+pub fn resolve_exe_path(proc_root: &Path, pid: u32, record_comm: &str, filename: &str) -> String {
+    let link = proc_exe(proc_root, pid);
+    let comm = proc_comm(proc_root, pid);
+    choose_exe_path(link, comm.as_deref(), record_comm, filename)
 }
 
 /// An exec record as the existing `ProcessExecRaw`; `exe_path` per
 /// [`resolve_exe_path`] against `/proc`.
 pub fn exec_to_raw(e: &ExecEvent, boot_wall_offset_ns: i128) -> ProcessExecRaw {
-    let exe_path = resolve_exe_path(Path::new(PROC_ROOT), e.pid, &e.filename);
+    let exe_path = resolve_exe_path(Path::new(PROC_ROOT), e.pid, &e.comm, &e.filename);
     ProcessExecRaw {
         pid: e.pid,
         ppid: e.ppid,
@@ -191,32 +235,111 @@ mod tests {
         std::os::windows::fs::symlink_file(target, link)
     }
 
-    /// Like audit's `exe=`, a readable `/proc/<pid>/exe` wins over the
-    /// execve filename (even an absolute one: `/bin/sh` → `dash`).
-    #[test]
-    fn resolved_proc_exe_wins_over_the_filename() {
+    /// A fake `<root>/77/` with `exe` → `<root>/dash` and the given `comm`
+    /// file contents; `None` (test skipped) when symlinks are unavailable.
+    fn fake_proc(comm: &[u8]) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("dash");
         std::fs::write(&target, b"").unwrap();
         std::fs::create_dir(root.path().join("77")).unwrap();
+        std::fs::write(root.path().join("77").join("comm"), comm).unwrap();
         if let Err(e) = symlink(&target, &root.path().join("77").join("exe")) {
-            eprintln!(
-                "SKIPPED resolved_proc_exe_wins_over_the_filename: \
-                 cannot create a symlink on this host ({e})"
-            );
-            return;
+            eprintln!("SKIPPED: cannot create a symlink on this host ({e})");
+            return None;
         }
+        Some((root, target))
+    }
+
+    /// Like audit's `exe=`, a readable `/proc/<pid>/exe` wins over the
+    /// execve filename (even an absolute one: `/bin/sh` → `dash`) while
+    /// `/proc/<pid>/comm` still matches the record's comm.
+    #[test]
+    fn resolved_proc_exe_wins_over_the_filename() {
+        let Some((root, target)) = fake_proc(b"sh\n") else {
+            return;
+        };
         assert_eq!(
-            resolve_exe_path(root.path(), 77, "/bin/sh"),
+            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
             target.to_string_lossy()
+        );
+    }
+
+    /// `sh -c 'curl …'` execs curl in place before the `/bin/sh` record is
+    /// consumed: the link now names curl's image and comm says `curl`, so
+    /// the `/bin/sh` event keeps its own execve filename.
+    #[test]
+    fn a_later_exec_is_detected_by_comm_and_the_filename_is_kept() {
+        let Some((root, _target)) = fake_proc(b"curl\n") else {
+            return;
+        };
+        assert_eq!(
+            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
+            "/bin/sh"
         );
     }
 
     #[test]
     fn filename_is_used_when_proc_exe_is_unreadable() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(resolve_exe_path(root.path(), 77, "/bin/sh"), "/bin/sh");
-        assert_eq!(resolve_exe_path(root.path(), 77, "./run.sh"), "./run.sh");
+        assert_eq!(
+            resolve_exe_path(root.path(), 77, "sh", "/bin/sh"),
+            "/bin/sh"
+        );
+        assert_eq!(
+            resolve_exe_path(root.path(), 77, "run.sh", "./run.sh"),
+            "./run.sh"
+        );
+    }
+
+    #[test]
+    fn exe_link_is_accepted_only_with_a_matching_comm() {
+        let link = || Some("/usr/bin/dash".to_string());
+        // Match (trailing newline already stripped by proc_comm).
+        assert_eq!(
+            choose_exe_path(link(), Some(b"sh"), "sh", "/bin/sh"),
+            "/usr/bin/dash"
+        );
+        // A later exec or a reused pid: different comm.
+        assert_eq!(
+            choose_exe_path(link(), Some(b"curl"), "sh", "/bin/sh"),
+            "/bin/sh"
+        );
+        // comm unreadable (the process exited between the two reads).
+        assert_eq!(choose_exe_path(link(), None, "sh", "/bin/sh"), "/bin/sh");
+        // Link unreadable.
+        assert_eq!(
+            choose_exe_path(None, Some(b"sh"), "sh", "/bin/sh"),
+            "/bin/sh"
+        );
+        // comm is truncated to 15 bytes on both sides.
+        assert_eq!(
+            choose_exe_path(
+                link(),
+                Some(b"a-very-long-name"),
+                "a-very-long-nam",
+                "/opt/a-very-long-name"
+            ),
+            "/usr/bin/dash"
+        );
+        // Non-UTF-8 comm bytes compare like the record decodes them.
+        assert_eq!(
+            choose_exe_path(link(), Some(b"x\xffy"), "x\u{FFFD}y", "/x"),
+            "/usr/bin/dash"
+        );
+        // A prefix is not a match.
+        assert_eq!(
+            choose_exe_path(link(), Some(b"s"), "sh", "/bin/sh"),
+            "/bin/sh"
+        );
+    }
+
+    #[test]
+    fn proc_comm_drops_only_the_trailing_newline() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("77")).unwrap();
+        std::fs::write(root.path().join("77").join("comm"), b"sh\n").unwrap();
+        assert_eq!(proc_comm(root.path(), 77).as_deref(), Some(&b"sh"[..]));
+        assert_eq!(proc_comm(root.path(), 78), None);
     }
 
     #[test]

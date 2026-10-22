@@ -94,8 +94,8 @@ today's audit backend.
      (ARCHITECTURE §4.2: DEGRADED = "eBPF program failed to load, fell back to audit"). Never a
      silent no-op.
 6. **Exec events** from eBPF become the existing `RawEvent::ProcessExec(ProcessExecRaw)`:
-   `exe_path` is the `/proc/<pid>/exe` link target when readable, else the exec'd filename
-   from the tracepoint (parity with the audit backend's resolved `exe=`), `cmdline` from the
+   `exe_path` is the `/proc/<pid>/exe` link target when readable and `/proc/<pid>/comm` still
+   matches the record's comm (§5), else the exec'd filename from the tracepoint (parity with the audit backend's resolved `exe=`), `cmdline` from the
    argv bytes split on NUL (same bounds and truncation rules as the audit backend's `execve.rs`,
    so downstream sees identical shapes), `comm`, `uid`, `ppid`, `pid`, `timestamp_ns` (wall clock).
    `start_time_mono` must equal what the audit backend computes for the same process
@@ -164,10 +164,24 @@ today's audit backend.
 
 ## 5. Known behaviour to document (not fix)
 
-- `exe_path` is the `/proc/<pid>/exe` target when readable, else the `execve` filename; for
-  scripts it is the script path, the interpreter appears in argv — same as the audit backend.
+- `exe_path` is the `/proc/<pid>/exe` target when readable and `/proc/<pid>/comm` (read after
+  the link) still equals the record's kernel-captured comm, else the `execve` filename; for a
+  script the link names its interpreter, as audit's `exe=` does. (Amended by the final review:
+  this line previously said the script path.)
+- `/proc/<pid>/exe` is read when user space consumes the record, not at exec time: by then the pid
+  may have exec'd again (`sh -c 'cmd'`, `system()`, `popen()`, wrappers) or been reused, and the
+  link would name the later image. The comm check rejects that case and keeps the filename; a later
+  image with the same 15-byte comm is not detected, and a self-renamed process (`PR_SET_NAME`)
+  degrades to the filename. Kernel-side exe identity (schema v2) is deferred to 11b-2.
+- Exit is gated on the thread-group leader. Besides the non-leader `execve` case (a spurious exit
+  with signal 9), a leader that calls `pthread_exit` while other threads run produces a
+  `PROCESS_EXIT` for a live process, and the real end of the process is never reported. Fix
+  deferred to 11b-2 (emit when `signal->live` reaches 0, start time from `group_leader`).
 - argv is read after exec from the new process's memory; a process that rewrites its argv before
-  the read (rare, racy) shows the rewritten text.
+  the read (rare, racy) shows the rewritten text. argv is empty when the read fails or when
+  `arg_end <= arg_start`.
+- The agent must run in the host pid namespace (self-filter and `/proc` lookups use root-namespace
+  pids) and the root time namespace (`/proc/<pid>/stat` starttime parity for `process_key`).
 - Exit events for very short-lived processes may have an empty `exe_path` when user space cannot
   resolve it anymore; `comm` is always present.
 - Event volume roughly doubles versus audit-only (exits are new).

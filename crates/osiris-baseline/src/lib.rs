@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use osiris_schema::CanonicalEvent;
+use osiris_schema::{CanonicalEvent, EventType};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// The frequency dimensions the Baseline Engine tracks (ARCHITECTURE.md
@@ -213,7 +213,13 @@ impl BaselineEngine {
     ) -> Result<Vec<Observation>, BaselineError> {
         let mut observations = Vec::new();
 
-        if let (Some(parent), Some(process)) = (&event.parent_process, &event.process) {
+        // A process exit carries the same parent and process as its exec:
+        // counting it would double-count the pair (or count an empty child
+        // `exe_path` when the binary was no longer readable at exit).
+        let is_exit = event.event_type == EventType::ProcessExit;
+        if let (Some(parent), Some(process), false) =
+            (&event.parent_process, &event.process, is_exit)
+        {
             let key = format!("{}\u{1}{}", parent.exe_path, process.exe_path);
             observations.push(self.upsert(
                 conn,
@@ -375,6 +381,24 @@ mod tests {
         assert_eq!(observations[0].kind, FrequencyKind::ParentChildExec);
         assert_eq!(observations[0].rarity, Rarity::New);
         assert_eq!(observations[0].count, 1);
+    }
+
+    #[test]
+    fn process_exit_does_not_feed_parent_child_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = BaselineEngine::open(dir.path().join("baseline.db")).unwrap();
+        let mut exec = base_event();
+        exec.parent_process = Some(process_ref("/bin/bash", exec.host_id));
+        exec.process = Some(process_ref("/usr/bin/curl", exec.host_id));
+        let mut exit = exec.clone();
+        exit.event_type = EventType::ProcessExit;
+
+        assert!(engine.observe(&exit).unwrap().is_empty());
+        let first = engine.observe(&exec).unwrap();
+        assert_eq!(first[0].kind, FrequencyKind::ParentChildExec);
+        assert_eq!(first[0].count, 1, "the exit was not counted");
+        assert!(engine.observe(&exit).unwrap().is_empty());
+        assert_eq!(engine.observe(&exec).unwrap()[0].count, 2);
     }
 
     #[test]

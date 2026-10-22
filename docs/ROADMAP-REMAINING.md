@@ -108,6 +108,10 @@ revisão final independente → merge → push.
   - Redução de privilégios do agente a um conjunto mínimo de capabilities (§15).
   - Empacotamento do objeto BPF (.deb/.rpm, unit systemd): Fase 13.
   - Saída de thread não-líder após `execve` gera um `PROCESS_EXIT` (signal 9) para processo vivo.
+  - Líder que chama `pthread_exit` com outras threads vivas gera um `PROCESS_EXIT` para processo
+    vivo, e o fim real nunca é emitido. Correção (11b-2): emitir quando `signal->live` chega a 0.
+  - `exe_path` lido de `/proc/<pid>/exe` em user space (mitigado com checagem de `comm`):
+    capturar a identidade do executável no kernel (schema v2) na 11b-2.
   - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com 11b-2/3.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 

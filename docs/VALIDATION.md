@@ -231,8 +231,14 @@ built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
   matrix (ARCHITECTURE §26).
 - When a non-leader thread calls `execve`, the old thread-group leader's exit is reported as a
   `PROCESS_EXIT` with signal 9 for a process that keeps running, then an `EXEC` under the same pid.
-- Exit `exe_path` is often empty (the process is already gone). argv can be empty when the page is
-  not resident at read time.
+- When the thread-group leader calls `pthread_exit` while other threads run, a `PROCESS_EXIT` is
+  reported for a live process and its real end is never reported. Not provoked in validation.
+- Exec `exe_path` comes from `/proc/<pid>/exe` read in user space, accepted only while
+  `/proc/<pid>/comm` matches the record's comm; otherwise the `execve` filename. The comm check
+  (against a later exec or pid reuse) is unit-tested; on a real kernel only the plain
+  `/bin/sh` case is asserted, from the next `real-linux/*` run on.
+- Exit `exe_path` is often empty (the process is already gone). argv is empty when the kernel read
+  fails or when `arg_end <= arg_start`.
 - A ring-buffer reservation failure increments the drop counter, reported as
   `events_dropped_total`. Not provoked in validation.
 - With `ebpf` configured but no `audit_log_path`, an eBPF failure makes the sensor `FAILED`.

@@ -205,12 +205,13 @@ pub fn object_schema_version(elf: &[u8]) -> Option<u32> {
             return None;
         }
         let base = shoff.checked_add(i.checked_mul(shentsize)?)?;
+        let at = |field: usize| base.checked_add(field);
         Some(Section {
             name: rd.u32(base)?,
-            kind: rd.u32(base + 4)?,
-            offset: usize::try_from(rd.u64(base + 24)?).ok()?,
-            size: usize::try_from(rd.u64(base + 32)?).ok()?,
-            link: usize::try_from(rd.u32(base + 40)?).ok()?,
+            kind: rd.u32(at(4)?)?,
+            offset: usize::try_from(rd.u64(at(24)?)?).ok()?,
+            size: usize::try_from(rd.u64(at(32)?)?).ok()?,
+            link: usize::try_from(rd.u32(at(40)?)?).ok()?,
         })
     };
     let shstr = section(shstrndx)?;
@@ -545,6 +546,21 @@ mod tests {
         let good = elf(true, ".rodata", "schema_version", 1);
         for len in 0..good.len() {
             let _ = object_schema_version(&good[..len]);
+        }
+    }
+
+    /// A section-header offset near the top of the address space must be
+    /// rejected, never overflow (debug builds would panic on `base + n`).
+    #[test]
+    fn huge_section_header_offset_is_rejected_without_panicking() {
+        let good = elf(true, ".rodata", "schema_version", 1);
+        for shoff in [u64::MAX, u64::MAX - 3, u64::MAX - 39, u64::MAX - 63] {
+            for shstrndx in [0u16, 4] {
+                let mut bad = good.clone();
+                bad[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());
+                bad[0x3e..0x40].copy_from_slice(&shstrndx.to_le_bytes());
+                assert_eq!(object_schema_version(&bad), None, "shoff {shoff:#x}");
+            }
         }
     }
 

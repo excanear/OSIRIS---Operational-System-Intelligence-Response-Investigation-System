@@ -379,8 +379,9 @@ fn process_sensor_uses_ebpf() {
 }
 
 /// `sh -c 'exit 7' <marker>` spawned by this test: its exec arrives from the
-/// eBPF backend with the marker in argv, this process as parent and uid 0;
-/// its exit joins the same process_key and carries exit code 7.
+/// eBPF backend with the marker in argv, this process as parent, uid 0 and
+/// `/bin/sh` (or its resolved target) as exe; its exit joins the same
+/// process_key and carries exit code 7.
 #[test]
 #[ignore]
 fn exec_and_exit_are_observed_via_ebpf() {
@@ -416,6 +417,20 @@ fn exec_and_exit_are_observed_via_ebpf() {
         "ppid is not the spawning test process: {exec}"
     );
     assert_eq!(exec["event_data"]["uid"], json!(0), "uid: {exec}");
+    // The right exe: the resolved `/proc/<pid>/exe` (the target of the
+    // `/bin/sh` symlink chain) when the reader saw the process alive with
+    // the same comm, else the execve filename itself.
+    let sh_target = std::fs::canonicalize("/bin/sh").unwrap();
+    let allowed = [
+        "/bin/sh".to_string(),
+        sh_target.to_string_lossy().into_owned(),
+    ];
+    assert!(
+        allowed
+            .iter()
+            .any(|a| exec["process"]["exe_path"] == json!(a)),
+        "exe_path is not one of {allowed:?}: {exec}"
+    );
     let key = exec["process"]["process_key"].clone();
     assert!(key.is_string(), "exec has no process_key: {exec}");
 

@@ -137,10 +137,9 @@ impl ProcessExecSensor {
         cancellation: CancellationToken,
     ) -> Result<(), String> {
         let drop_counter = prog.drop_counter();
-        let offset = boot_wall_offset_ns();
         let health = self.health.clone();
         let reader = osiris_ebpf::spawn_reader(prog, cancellation, move |record| {
-            on_record(record, offset, &output, &health)
+            on_record(record, &boot_wall_offset_ns, &output, &health)
         })
         .map_err(|e| format!("eBPF unavailable: {e}"))?;
         {
@@ -266,11 +265,13 @@ fn object_problem(object: &Path) -> Option<String> {
 }
 
 /// realtime − monotonic, in ns: added to a `bpf_ktime_get_ns()` value
-/// (CLOCK_MONOTONIC) it gives wall-clock time. Sampled once per reader
-/// start, so a later wall-clock step is not followed (as with any
-/// monotonic-based timestamp).
+/// (CLOCK_MONOTONIC) it gives wall-clock time. Resampled for every record
+/// (two vDSO clock reads), because CLOCK_MONOTONIC does not follow a
+/// wall-clock step and stops during suspend: an offset sampled once would
+/// misstamp every later event by the step.
 #[cfg(target_os = "linux")]
 fn boot_wall_offset_ns() -> i128 {
+    static CLOCK_WARNING: std::sync::Once = std::sync::Once::new();
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -283,11 +284,15 @@ fn boot_wall_offset_ns() -> i128 {
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     if rc != 0 {
-        tracing::warn!(
-            error = %std::io::Error::last_os_error(),
-            "clock_gettime(CLOCK_MONOTONIC) failed; eBPF event timestamps will be \
-             monotonic, not wall-clock"
-        );
+        let error = std::io::Error::last_os_error();
+        // Called per record: warn once, not once per event.
+        CLOCK_WARNING.call_once(|| {
+            tracing::warn!(
+                error = %error,
+                "clock_gettime(CLOCK_MONOTONIC) failed; eBPF event timestamps will be \
+                 monotonic, not wall-clock"
+            );
+        });
         return 0;
     }
     wall - (i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec))
@@ -300,23 +305,24 @@ fn boot_wall_offset_ns() -> i128 {
 }
 
 /// Reader-thread callback: convert and forward one record. A record that
-/// does not decode is counted as dropped. Runs on the reader's own
-/// `std::thread`, so blocking on a full channel is backpressure, not a
-/// stalled async worker.
+/// does not decode is counted as dropped. `boot_wall_offset_ns` is called
+/// once per decoded record, so the realtime − monotonic offset is current
+/// for each event. Runs on the reader's own `std::thread`, so blocking on
+/// a full channel is backpressure, not a stalled async worker.
 fn on_record(
     record: Result<Record, DecodeError>,
-    boot_wall_offset_ns: i128,
+    boot_wall_offset_ns: &dyn Fn() -> i128,
     output: &mpsc::Sender<RawEvent>,
     health: &Mutex<HealthState>,
 ) {
     let (event, ts) = match record {
         Ok(Record::Exec(e)) => {
-            let raw = exec_to_raw(&e, boot_wall_offset_ns);
+            let raw = exec_to_raw(&e, boot_wall_offset_ns());
             let ts = raw.timestamp_ns;
             (RawEvent::ProcessExec(raw), ts)
         }
         Ok(Record::Exit(e)) => {
-            let raw = exit_to_raw(&e, boot_wall_offset_ns);
+            let raw = exit_to_raw(&e, boot_wall_offset_ns());
             let ts = raw.timestamp_ns;
             (RawEvent::ProcessExit(raw), ts)
         }
@@ -802,7 +808,7 @@ mod tests {
             ..HealthState::default()
         });
         let (tx, mut rx) = mpsc::channel(4);
-        on_record(Ok(exec_record()), 1_000, &tx, &health);
+        on_record(Ok(exec_record()), &|| 1_000, &tx, &health);
         match rx.try_recv() {
             Ok(RawEvent::ProcessExec(raw)) => {
                 assert_eq!(raw.timestamp_ns, 1_100);
@@ -821,12 +827,55 @@ mod tests {
     fn on_record_counts_decode_errors_and_closed_channels_as_dropped() {
         let health = Mutex::new(HealthState::default());
         let (tx, rx) = mpsc::channel(4);
-        on_record(Err(DecodeError::ShorterThanHeader(3)), 0, &tx, &health);
+        on_record(Err(DecodeError::ShorterThanHeader(3)), &|| 0, &tx, &health);
         drop(rx);
-        on_record(Ok(exec_record()), 0, &tx, &health);
+        on_record(Ok(exec_record()), &|| 0, &tx, &health);
         let h = lock_health(&health);
         assert_eq!(h.events_dropped_total, 2);
         assert_eq!(h.events_emitted_total, 0);
         assert_eq!(h.state, SensorState::Starting);
+    }
+
+    /// Final-review I1: the realtime − monotonic offset is resampled for
+    /// every record, so a wall-clock step (or a resume from suspend) after
+    /// the reader started moves the next event's timestamp with it.
+    #[test]
+    fn on_record_resamples_the_wall_clock_offset_per_record() {
+        let health = Mutex::new(HealthState::default());
+        let (tx, mut rx) = mpsc::channel(4);
+        let offset = std::cell::Cell::new(1_000i128);
+        let sample = || {
+            let now = offset.get();
+            offset.set(now + 5_000); // the clock steps between records
+            now
+        };
+        on_record(Ok(exec_record()), &sample, &tx, &health);
+        on_record(Ok(exec_record()), &sample, &tx, &health);
+        on_record(
+            Err(DecodeError::ShorterThanHeader(3)),
+            &sample,
+            &tx,
+            &health,
+        );
+        let mut stamps = Vec::new();
+        while let Ok(RawEvent::ProcessExec(raw)) = rx.try_recv() {
+            stamps.push(raw.timestamp_ns);
+        }
+        // ktime_ns 100 + offset 1_000, then + offset 6_000.
+        assert_eq!(stamps, [1_100, 6_100]);
+        // A record that does not decode is not stamped, so not sampled.
+        assert_eq!(offset.get(), 11_000);
+    }
+
+    /// The real offset is realtime − monotonic: positive on any host whose
+    /// clock is past the epoch by more than its uptime, and stable between
+    /// two back-to-back samples when no step happens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_wall_offset_is_realtime_minus_monotonic() {
+        let a = boot_wall_offset_ns();
+        let b = boot_wall_offset_ns();
+        assert!(a > 0, "offset {a}");
+        assert!((a - b).abs() < 1_000_000_000, "offsets {a} and {b}");
     }
 }
