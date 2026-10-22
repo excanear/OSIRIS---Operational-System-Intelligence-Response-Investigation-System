@@ -1,18 +1,18 @@
-//! Ring-buffer reader thread for a loaded [`ProcessProgram`].
+//! Ring-buffer reader thread for a [`LoadedObject`].
 //!
 //! Runs on a dedicated `std::thread` (never an async worker): it drains every
-//! available record, decodes each with [`decode`] and hands the result to the
-//! callback, then `poll(2)`s the ring-buffer fd for at most
-//! [`POLL_TIMEOUT_MS`] so cancellation is observed within that bound. The
-//! program (and so both tracepoint attachments) is dropped when the thread
-//! ends.
+//! available record, decodes each with the caller's `decode` function and
+//! hands the result to the callback, then `poll(2)`s the ring-buffer fd for
+//! at most [`POLL_TIMEOUT_MS`] so cancellation is observed within that bound.
+//! The object (and so every tracepoint attachment) is dropped when the
+//! thread ends.
 
 use std::thread::JoinHandle;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::loader::ProcessProgram;
-use crate::record::{DecodeError, Record};
+use crate::loader::LoadedObject;
+use crate::record::DecodeError;
 
 /// Upper bound on one `poll(2)` wait (Global Constraint #5: ≤ 500 ms).
 pub const POLL_TIMEOUT_MS: i32 = 500;
@@ -33,31 +33,33 @@ pub enum ReaderError {
     Spawn(std::io::Error),
 }
 
-/// Start the reader thread. The thread returns `Ok(())` once `cancel` is
-/// cancelled. Failing to start it is [`ReaderError::Spawn`]; the program is
-/// then dropped, detaching both tracepoints.
-pub fn spawn_reader(
-    prog: ProcessProgram,
+/// Start the reader thread for `obj`'s `EVENTS` ring buffer; every record
+/// is passed through `decode` and the result to `on_record`. The thread
+/// returns `Ok(())` once `cancel` is cancelled. Failing to start it is
+/// [`ReaderError::Spawn`]; the object is then dropped, detaching every
+/// tracepoint.
+pub fn spawn_reader<T: Send + 'static>(
+    obj: LoadedObject,
+    decode: fn(&[u8]) -> Result<T, DecodeError>,
     cancel: CancellationToken,
-    on_record: impl FnMut(Result<Record, DecodeError>) + Send + 'static,
+    on_record: impl FnMut(Result<T, DecodeError>) + Send + 'static,
 ) -> Result<JoinHandle<Result<(), ReaderError>>, ReaderError> {
     std::thread::Builder::new()
         .name("osiris-ebpf-reader".to_string())
-        .spawn(move || run(prog, cancel, on_record))
+        .spawn(move || run(obj, decode, cancel, on_record))
         .map_err(ReaderError::Spawn)
 }
 
 #[cfg(target_os = "linux")]
-fn run(
-    mut prog: ProcessProgram,
+fn run<T>(
+    mut obj: LoadedObject,
+    decode: fn(&[u8]) -> Result<T, DecodeError>,
     cancel: CancellationToken,
-    mut on_record: impl FnMut(Result<Record, DecodeError>),
+    mut on_record: impl FnMut(Result<T, DecodeError>),
 ) -> Result<(), ReaderError> {
     use std::os::fd::AsRawFd;
 
-    use crate::record::decode;
-
-    let events = &mut prog.inner.events;
+    let events = &mut obj.inner.events;
     let fd = events.as_raw_fd();
     loop {
         // Drain everything already published before sleeping, checking
@@ -80,7 +82,7 @@ fn run(
             revents: 0,
         };
         // SAFETY: `pfd` is a valid, initialised pollfd for the duration of
-        // the call and nfds is 1; `fd` stays open because `prog` owns it.
+        // the call and nfds is 1; `fd` stays open because `obj` owns it.
         let rc = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
@@ -92,10 +94,11 @@ fn run(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(
-    prog: ProcessProgram,
+fn run<T>(
+    obj: LoadedObject,
+    _decode: fn(&[u8]) -> Result<T, DecodeError>,
     _cancel: CancellationToken,
-    _on_record: impl FnMut(Result<Record, DecodeError>),
+    _on_record: impl FnMut(Result<T, DecodeError>),
 ) -> Result<(), ReaderError> {
-    match prog.never {}
+    match obj.never {}
 }

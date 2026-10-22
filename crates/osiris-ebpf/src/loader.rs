@@ -1,12 +1,17 @@
-//! Loader for the process BPF object (`<object_dir>/process.bpf.o`).
+//! Spec-driven loader for one BPF object (`<object_dir>/<spec.object_file>`).
 //!
-//! [`ProcessProgram::load`] reads the object and its `.sha256` sidecar once,
-//! checks the digest ([`verify_object`]), reads the object's
-//! `schema_version` global out of the ELF before anything reaches the kernel,
-//! and only then hands the *same verified bytes* to `aya` — the file is never
-//! re-read, so it cannot be swapped between check and load. `SELF_TGID[0]` is
-//! set before either tracepoint is attached, so the agent never sees its own
-//! exec/exit events.
+//! An [`ObjectSpec`] names the object file, the record schema version it
+//! must carry and the tracepoints to attach. [`LoadedObject::load`] reads
+//! the object and its `.sha256` sidecar ([`sidecar_name`]) once, checks the
+//! digest ([`verify_object`]), reads the object's `schema_version` global
+//! out of the ELF and compares it with `spec.expected_schema` before
+//! anything reaches the kernel, and only then hands the *same verified
+//! bytes* to `aya` — the file is never re-read, so it cannot be swapped
+//! between check and load. `SELF_TGID[0]` is set before any tracepoint is
+//! attached, so the agent never sees its own events.
+//!
+//! Every object uses the same map names: `EVENTS` (ring buffer), `DROPS`
+//! (per-CPU reservation-failure counter) and `SELF_TGID` (one-entry array).
 //!
 //! The schema read is a small bounds-checked ELF64 symbol lookup
 //! ([`object_schema_version`]), OS-neutral and unit-tested. `aya` does not
@@ -16,58 +21,99 @@
 use std::path::{Path, PathBuf};
 
 use crate::integrity::{verify_object, IntegrityError};
-use crate::record::SCHEMA_VERSION;
+use crate::record::PROCESS_SCHEMA_VERSION;
 
-/// Object file name inside the configured object directory.
-pub const OBJECT_FILE: &str = "process.bpf.o";
-/// Integrity sidecar file name (lowercase hex SHA-256 of [`OBJECT_FILE`]).
-pub const SIDECAR_FILE: &str = "process.bpf.o.sha256";
 /// Name of the `.rodata` global carrying the object's record schema version.
 pub const SCHEMA_SYMBOL: &str = "schema_version";
 
-/// Why the process program could not be loaded.
+/// What one BPF object is: its file, its record schema and its programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectSpec {
+    /// File name inside the configured object directory.
+    pub object_file: &'static str,
+    /// The `schema_version` global the object must carry.
+    pub expected_schema: u32,
+    /// (program name, tracepoint category, tracepoint name)
+    pub tracepoints: &'static [(&'static str, &'static str, &'static str)],
+}
+
+/// The process exec/exit object.
+pub const PROCESS_OBJECT: ObjectSpec = ObjectSpec {
+    object_file: "process.bpf.o",
+    expected_schema: PROCESS_SCHEMA_VERSION,
+    tracepoints: &[
+        ("handle_exec", "sched", "sched_process_exec"),
+        ("handle_exit", "sched", "sched_process_exit"),
+    ],
+};
+
+/// Integrity sidecar file name for `object_file`: `<object_file>.sha256`
+/// (lowercase hex SHA-256 of the object, first token).
+pub fn sidecar_name(object_file: &str) -> String {
+    format!("{object_file}.sha256")
+}
+
+/// Where to find the BPF objects, and which tgid (the agent's own) the
+/// in-kernel self-filter drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfSettings {
+    pub object_dir: PathBuf,
+    pub self_tgid: u32,
+}
+
+/// Why a BPF object could not be loaded. Every message names the object
+/// file it concerns.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    /// The object or its sidecar is absent (or unreadable).
+    /// The object or its sidecar is absent (the full path is shown).
     #[error("bpf object file missing: {}", .0.display())]
     MissingObject(PathBuf),
     /// The object does not match its sidecar digest.
-    #[error("bpf object integrity check failed: {0}")]
-    Integrity(#[from] IntegrityError),
+    #[error("bpf object {file} integrity check failed: {source}")]
+    Integrity {
+        file: String,
+        source: IntegrityError,
+    },
     /// The object was built for a different record schema.
-    #[error("bpf object schema version {object} does not match expected {expected}")]
-    SchemaMismatch { object: u32, expected: u32 },
-    /// Parsing, verifying or loading the object failed.
+    #[error("bpf object {file} schema version {object} does not match expected {expected}")]
+    SchemaMismatch {
+        file: String,
+        object: u32,
+        expected: u32,
+    },
+    /// Parsing, verifying or loading the object failed (the message starts
+    /// with, or contains, the object file name).
     #[error("bpf load failed: {0}")]
     Load(String),
-    /// Attaching a program failed.
+    /// Attaching a program failed: `<object_file>: <prog>: <err>`.
     #[error("bpf attach failed: {0}")]
     Attach(String),
 }
 
-/// The loaded and attached process exec/exit programs plus their maps.
+/// One loaded BPF object: its attached programs plus the `EVENTS` ring
+/// buffer and `DROPS` counter.
 ///
-/// Dropping it detaches both tracepoints and closes every map.
-pub struct ProcessProgram {
+/// Dropping it detaches every tracepoint and closes every map.
+pub struct LoadedObject {
     #[cfg(target_os = "linux")]
     pub(crate) inner: linux::Inner,
-    /// Off Linux a program can never be loaded, so the type is uninhabited.
+    /// Off Linux an object can never be loaded, so the type is uninhabited.
     #[cfg(not(target_os = "linux"))]
     pub(crate) never: std::convert::Infallible,
 }
 
-impl ProcessProgram {
-    /// Verify, schema-check and load `<object_dir>/process.bpf.o`, set
-    /// `SELF_TGID[0] = self_tgid`, then attach `handle_exec` and
-    /// `handle_exit`.
-    pub fn load(object_dir: &Path, self_tgid: u32) -> Result<Self, LoadError> {
-        let object_path = object_dir.join(OBJECT_FILE);
+impl LoadedObject {
+    /// Verify, schema-check (against `spec.expected_schema`) and load
+    /// `<object_dir>/<spec.object_file>`, set `SELF_TGID[0] = self_tgid`,
+    /// then attach every tracepoint in `spec.tracepoints`, in order.
+    pub fn load(object_dir: &Path, spec: &ObjectSpec, self_tgid: u32) -> Result<Self, LoadError> {
+        let object_path = object_dir.join(spec.object_file);
         check_regular_file(&object_path)?;
         #[cfg(target_os = "linux")]
         {
-            let bytes = read_verified(object_dir, &object_path)?;
+            let bytes = read_verified(object_dir, spec)?;
             Ok(Self {
-                inner: linux::Inner::load(&bytes, self_tgid)?,
+                inner: linux::Inner::load(&bytes, spec, self_tgid)?,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -77,14 +123,8 @@ impl ProcessProgram {
         }
     }
 
-    /// Ring-buffer reservations the BPF side failed (sum over CPUs of
-    /// `DROPS[0]`). Returns 0 if the map cannot be read.
-    pub fn drops(&self) -> u64 {
-        self.drop_counter().get()
-    }
-
     /// A shareable handle on the `DROPS` map that stays usable after the
-    /// program has been moved into [`crate::spawn_reader`].
+    /// object has been moved into [`crate::spawn_reader`].
     pub fn drop_counter(&self) -> DropCounter {
         #[cfg(target_os = "linux")]
         {
@@ -153,12 +193,13 @@ fn check_regular_file(path: &Path) -> Result<(), LoadError> {
     }
 }
 
-/// Read the object and sidecar, verify the digest and the schema version,
-/// and return the verified object bytes.
+/// Read the object and its sidecar, verify the digest and the schema
+/// version, and return the verified object bytes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn read_verified(object_dir: &Path, object_path: &Path) -> Result<Vec<u8>, LoadError> {
-    let bytes = std::fs::read(object_path).map_err(|e| io_error(object_path, e))?;
-    let sidecar_path = object_dir.join(SIDECAR_FILE);
+fn read_verified(object_dir: &Path, spec: &ObjectSpec) -> Result<Vec<u8>, LoadError> {
+    let object_path = object_dir.join(spec.object_file);
+    let bytes = std::fs::read(&object_path).map_err(|e| io_error(&object_path, e))?;
+    let sidecar_path = object_dir.join(sidecar_name(spec.object_file));
     let sidecar = std::fs::read(&sidecar_path).map_err(|e| io_error(&sidecar_path, e))?;
     let sidecar = String::from_utf8(sidecar).map_err(|_| {
         LoadError::Load(format!(
@@ -166,22 +207,28 @@ fn read_verified(object_dir: &Path, object_path: &Path) -> Result<Vec<u8>, LoadE
             sidecar_path.display()
         ))
     })?;
-    verify_object(&bytes, &sidecar)?;
-    check_schema(&bytes)?;
+    verify_object(&bytes, &sidecar).map_err(|source| LoadError::Integrity {
+        file: spec.object_file.to_string(),
+        source,
+    })?;
+    check_schema(&bytes, spec)?;
     Ok(bytes)
 }
 
-/// Compare the object's `schema_version` global with [`SCHEMA_VERSION`].
-fn check_schema(object: &[u8]) -> Result<(), LoadError> {
+/// Compare the object's `schema_version` global with
+/// `spec.expected_schema`.
+fn check_schema(object: &[u8], spec: &ObjectSpec) -> Result<(), LoadError> {
     let found = object_schema_version(object).ok_or_else(|| {
         LoadError::Load(format!(
-            "bpf object has no readable `{SCHEMA_SYMBOL}` global"
+            "bpf object {} has no readable `{SCHEMA_SYMBOL}` global",
+            spec.object_file
         ))
     })?;
-    if found != SCHEMA_VERSION {
+    if found != spec.expected_schema {
         return Err(LoadError::SchemaMismatch {
+            file: spec.object_file.to_string(),
             object: found,
-            expected: SCHEMA_VERSION,
+            expected: spec.expected_schema,
         });
     }
     Ok(())
@@ -320,7 +367,7 @@ mod linux {
     use aya::programs::TracePoint;
     use aya::{Ebpf, EbpfLoader};
 
-    use super::LoadError;
+    use super::{LoadError, ObjectSpec};
 
     /// Programs (with their attach links) and the two maps the reader needs.
     pub(crate) struct Inner {
@@ -331,45 +378,48 @@ mod linux {
     }
 
     impl Inner {
-        pub(crate) fn load(bytes: &[u8], self_tgid: u32) -> Result<Self, LoadError> {
+        pub(crate) fn load(
+            bytes: &[u8],
+            spec: &ObjectSpec,
+            self_tgid: u32,
+        ) -> Result<Self, LoadError> {
+            let file = spec.object_file;
+            let load_err = |what: &str| LoadError::Load(format!("{file}: {what}"));
             let mut ebpf = EbpfLoader::new()
                 .load(bytes)
-                .map_err(|e| LoadError::Load(e.to_string()))?;
+                .map_err(|e| load_err(&e.to_string()))?;
 
             let self_map = ebpf
                 .map_mut("SELF_TGID")
-                .ok_or_else(|| LoadError::Load("map SELF_TGID not found".to_string()))?;
-            let mut self_tgid_map: Array<_, u32> = Array::try_from(self_map)
-                .map_err(|e| LoadError::Load(format!("SELF_TGID: {e}")))?;
+                .ok_or_else(|| load_err("map SELF_TGID not found"))?;
+            let mut self_tgid_map: Array<_, u32> =
+                Array::try_from(self_map).map_err(|e| load_err(&format!("SELF_TGID: {e}")))?;
             self_tgid_map
                 .set(0, self_tgid, 0)
-                .map_err(|e| LoadError::Load(format!("SELF_TGID: {e}")))?;
+                .map_err(|e| load_err(&format!("SELF_TGID: {e}")))?;
 
-            for (prog, event) in [
-                ("handle_exec", "sched_process_exec"),
-                ("handle_exit", "sched_process_exit"),
-            ] {
+            for &(prog, category, name) in spec.tracepoints {
                 let tp: &mut TracePoint = ebpf
                     .program_mut(prog)
-                    .ok_or_else(|| LoadError::Load(format!("program {prog} not found")))?
+                    .ok_or_else(|| load_err(&format!("program {prog} not found")))?
                     .try_into()
-                    .map_err(|e| LoadError::Load(format!("{prog}: {e}")))?;
-                tp.load()
-                    .map_err(|e| LoadError::Load(format!("{prog}: {e}")))?;
-                tp.attach("sched", event)
-                    .map_err(|e| LoadError::Attach(format!("{prog} -> sched/{event}: {e}")))?;
+                    .map_err(|e| load_err(&format!("{prog}: {e}")))?;
+                tp.load().map_err(|e| load_err(&format!("{prog}: {e}")))?;
+                tp.attach(category, name).map_err(|e| {
+                    LoadError::Attach(format!("{file}: {prog}: {category}/{name}: {e}"))
+                })?;
             }
 
             let events = ebpf
                 .take_map("EVENTS")
-                .ok_or_else(|| LoadError::Load("map EVENTS not found".to_string()))?;
+                .ok_or_else(|| load_err("map EVENTS not found"))?;
             let events =
-                RingBuf::try_from(events).map_err(|e| LoadError::Load(format!("EVENTS: {e}")))?;
+                RingBuf::try_from(events).map_err(|e| load_err(&format!("EVENTS: {e}")))?;
             let drops = ebpf
                 .take_map("DROPS")
-                .ok_or_else(|| LoadError::Load("map DROPS not found".to_string()))?;
+                .ok_or_else(|| load_err("map DROPS not found"))?;
             let drops =
-                PerCpuArray::try_from(drops).map_err(|e| LoadError::Load(format!("DROPS: {e}")))?;
+                PerCpuArray::try_from(drops).map_err(|e| load_err(&format!("DROPS: {e}")))?;
 
             Ok(Self {
                 events,
@@ -384,10 +434,84 @@ mod linux {
 mod tests {
     use super::*;
 
+    const TEST_OBJECT: ObjectSpec = ObjectSpec {
+        object_file: "x.bpf.o",
+        expected_schema: 99,
+        tracepoints: &[("handle_x", "sched", "sched_process_exec")],
+    };
+
+    /// The process object's sidecar, as 11b-1 named it.
+    const PROCESS_SIDECAR: &str = "process.bpf.o.sha256";
+
+    #[test]
+    fn sidecar_name_appends_sha256() {
+        assert_eq!(sidecar_name("net.bpf.o"), "net.bpf.o.sha256");
+        assert_eq!(sidecar_name(PROCESS_OBJECT.object_file), PROCESS_SIDECAR);
+    }
+
+    /// The process object keeps 11b-1's file and its two tracepoints.
+    #[test]
+    fn process_object_spec_is_11b1s() {
+        assert_eq!(PROCESS_OBJECT.object_file, "process.bpf.o");
+        assert_eq!(PROCESS_OBJECT.expected_schema, PROCESS_SCHEMA_VERSION);
+        assert_eq!(
+            PROCESS_OBJECT.tracepoints,
+            [
+                ("handle_exec", "sched", "sched_process_exec"),
+                ("handle_exit", "sched", "sched_process_exit"),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_reports_missing_object_with_its_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = LoadedObject::load(dir.path(), &TEST_OBJECT, 1)
+            .err()
+            .expect("load must fail");
+        assert!(
+            matches!(&err, LoadError::MissingObject(p) if p.ends_with("x.bpf.o")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_schema_mismatch_against_spec() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let object = elf(true, ".rodata", "schema_version", 9);
+        std::fs::write(dir.path().join("x.bpf.o"), &object).unwrap();
+        std::fs::write(
+            dir.path().join("x.bpf.o.sha256"),
+            format!("{}  x.bpf.o\n", hex::encode(Sha256::digest(&object))),
+        )
+        .unwrap();
+        let err = LoadedObject::load(dir.path(), &TEST_OBJECT, 1)
+            .err()
+            .expect("load must fail");
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(
+                &err,
+                LoadError::SchemaMismatch {
+                    object: 9,
+                    expected: 99,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            matches!(&err, LoadError::Load(m) if m.contains("eBPF requires Linux")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn load_reports_missing_object() {
         let dir = tempfile::tempdir().unwrap();
-        let err = ProcessProgram::load(dir.path(), 1)
+        let err = LoadedObject::load(dir.path(), &PROCESS_OBJECT, 1)
             .err()
             .expect("load must fail");
         assert!(matches!(err, LoadError::MissingObject(_)), "{err:?}");
@@ -403,41 +527,41 @@ mod tests {
     fn only_not_found_is_missing_object() {
         // Object path is a directory: a distinct error naming the cause.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(OBJECT_FILE)).unwrap();
-        let err = ProcessProgram::load(dir.path(), 1)
+        std::fs::create_dir(dir.path().join(PROCESS_OBJECT.object_file)).unwrap();
+        let err = LoadedObject::load(dir.path(), &PROCESS_OBJECT, 1)
             .err()
             .expect("load must fail");
         assert!(
-            matches!(&err, LoadError::Load(m) if m.contains(OBJECT_FILE) && m.contains("not a regular file")),
+            matches!(&err, LoadError::Load(m) if m.contains(PROCESS_OBJECT.object_file) && m.contains("not a regular file")),
             "{err:?}"
         );
 
         // Missing sidecar: NotFound, so MissingObject naming the sidecar.
         let dir = tempfile::tempdir().unwrap();
-        let obj = dir.path().join(OBJECT_FILE);
+        let obj = dir.path().join(PROCESS_OBJECT.object_file);
         std::fs::write(&obj, b"obj").unwrap();
-        let err = read_verified(dir.path(), &obj).unwrap_err();
+        let err = read_verified(dir.path(), &PROCESS_OBJECT).unwrap_err();
         assert!(
-            matches!(&err, LoadError::MissingObject(p) if p.ends_with(SIDECAR_FILE)),
+            matches!(&err, LoadError::MissingObject(p) if p.ends_with(PROCESS_SIDECAR)),
             "{err:?}"
         );
 
         // Non-UTF-8 sidecar: distinct error naming the sidecar.
-        std::fs::write(dir.path().join(SIDECAR_FILE), [0xff, 0xfe, 0x00]).unwrap();
-        let err = read_verified(dir.path(), &obj).unwrap_err();
+        std::fs::write(dir.path().join(PROCESS_SIDECAR), [0xff, 0xfe, 0x00]).unwrap();
+        let err = read_verified(dir.path(), &PROCESS_OBJECT).unwrap_err();
         assert!(
-            matches!(&err, LoadError::Load(m) if m.contains(SIDECAR_FILE) && m.contains("UTF-8")),
+            matches!(&err, LoadError::Load(m) if m.contains(PROCESS_SIDECAR) && m.contains("UTF-8")),
             "{err:?}"
         );
 
         // Sidecar is a directory: not reported as missing.
         let dir = tempfile::tempdir().unwrap();
-        let obj = dir.path().join(OBJECT_FILE);
+        let obj = dir.path().join(PROCESS_OBJECT.object_file);
         std::fs::write(&obj, b"obj").unwrap();
-        std::fs::create_dir(dir.path().join(SIDECAR_FILE)).unwrap();
-        let err = read_verified(dir.path(), &obj).unwrap_err();
+        std::fs::create_dir(dir.path().join(PROCESS_SIDECAR)).unwrap();
+        let err = read_verified(dir.path(), &PROCESS_OBJECT).unwrap_err();
         assert!(
-            matches!(&err, LoadError::Load(m) if m.contains(SIDECAR_FILE)),
+            matches!(&err, LoadError::Load(m) if m.contains(PROCESS_SIDECAR)),
             "{err:?}"
         );
     }
@@ -446,8 +570,8 @@ mod tests {
     #[test]
     fn load_off_linux_reports_linux_required() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(OBJECT_FILE), b"x").unwrap();
-        let err = ProcessProgram::load(dir.path(), 1)
+        std::fs::write(dir.path().join(PROCESS_OBJECT.object_file), b"x").unwrap();
+        let err = LoadedObject::load(dir.path(), &PROCESS_OBJECT, 1)
             .err()
             .expect("load must fail");
         assert!(
@@ -565,15 +689,40 @@ mod tests {
     }
 
     #[test]
+    fn integrity_error_names_the_object() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("process.bpf.o"), b"obj").unwrap();
+        std::fs::write(dir.path().join(PROCESS_SIDECAR), "00".repeat(32)).unwrap();
+        let err = read_verified(dir.path(), &PROCESS_OBJECT).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::Integrity { file, .. } if file == "process.bpf.o"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("process.bpf.o"), "{err}");
+    }
+
+    #[test]
     fn schema_check_reports_mismatch() {
-        assert!(check_schema(&elf(true, ".rodata", "schema_version", SCHEMA_VERSION)).is_ok());
-        assert!(matches!(
-            check_schema(&elf(true, ".rodata", "schema_version", 9)),
-            Err(LoadError::SchemaMismatch {
-                object: 9,
-                expected: SCHEMA_VERSION
-            })
-        ));
-        assert!(matches!(check_schema(b"junk"), Err(LoadError::Load(_))));
+        let current = elf(true, ".rodata", "schema_version", PROCESS_SCHEMA_VERSION);
+        assert!(check_schema(&current, &PROCESS_OBJECT).is_ok());
+        let err =
+            check_schema(&elf(true, ".rodata", "schema_version", 9), &PROCESS_OBJECT).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                LoadError::SchemaMismatch {
+                    file,
+                    object: 9,
+                    expected: PROCESS_SCHEMA_VERSION
+                } if file == "process.bpf.o"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("process.bpf.o"), "{err}");
+        let err = check_schema(b"junk", &PROCESS_OBJECT).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::Load(m) if m.contains("process.bpf.o")),
+            "{err:?}"
+        );
     }
 }

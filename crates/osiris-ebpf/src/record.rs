@@ -7,7 +7,7 @@
 
 use std::mem::size_of;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const PROCESS_SCHEMA_VERSION: u32 = 1;
 pub const KIND_EXEC: u32 = 1;
 pub const KIND_EXIT: u32 = 2;
 pub const ARGS_MAX: usize = 4096;
@@ -104,7 +104,7 @@ pub fn decode(bytes: &[u8]) -> Result<Record, DecodeError> {
         return Err(DecodeError::ShorterThanHeader(bytes.len()));
     }
     let hdr: RecordHeader = read(bytes);
-    if hdr.schema_version != SCHEMA_VERSION {
+    if hdr.schema_version != PROCESS_SCHEMA_VERSION {
         return Err(DecodeError::UnsupportedVersion(hdr.schema_version));
     }
     let need = match hdr.kind {
@@ -186,7 +186,7 @@ mod tests {
         // SAFETY: all-zero is a valid ExecRecord.
         let mut r: ExecRecord = unsafe { zeroed() };
         r.hdr = RecordHeader {
-            schema_version: SCHEMA_VERSION,
+            schema_version: PROCESS_SCHEMA_VERSION,
             kind: KIND_EXEC,
         };
         r.pid = 10;
@@ -207,7 +207,7 @@ mod tests {
         // SAFETY: all-zero is a valid ExitRecord.
         let mut r: ExitRecord = unsafe { zeroed() };
         r.hdr = RecordHeader {
-            schema_version: SCHEMA_VERSION,
+            schema_version: PROCESS_SCHEMA_VERSION,
             kind: KIND_EXIT,
         };
         r.pid = 10;

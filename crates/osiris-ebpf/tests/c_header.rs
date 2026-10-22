@@ -7,7 +7,8 @@ use std::mem::{offset_of, size_of};
 use std::path::Path;
 
 use osiris_ebpf::{
-    ExecRecord, ExitRecord, ARGS_MAX, COMM_LEN, FILENAME_MAX, KIND_EXEC, KIND_EXIT, SCHEMA_VERSION,
+    ExecRecord, ExitRecord, ARGS_MAX, COMM_LEN, FILENAME_MAX, KIND_EXEC, KIND_EXIT,
+    PROCESS_SCHEMA_VERSION,
 };
 
 fn header() -> String {
@@ -19,7 +20,7 @@ fn header() -> String {
 fn c_header_matches_rust_constants() {
     let h = header();
     let expected = [
-        format!("#define SCHEMA_VERSION {SCHEMA_VERSION}"),
+        format!("#define SCHEMA_VERSION {PROCESS_SCHEMA_VERSION}"),
         format!("#define KIND_EXEC {KIND_EXEC}"),
         format!("#define KIND_EXIT {KIND_EXIT}"),
         format!("#define ARGS_MAX {ARGS_MAX}"),

@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use osiris_ebpf::{probe, DecodeError, DropCounter, ProcessProgram, Record};
+use osiris_ebpf::{
+    boot_wall_offset_ns, probe, DecodeError, DropCounter, EbpfSettings, LoadedObject, Record,
+    PROCESS_OBJECT,
+};
 use osiris_sensor_api::{
     ProcessExecRaw, RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth,
     SensorMetrics, SensorState,
@@ -18,14 +21,6 @@ use osiris_fileutil::LineTailer;
 
 /// How often the eBPF supervisor checks whether the reader thread ended.
 const READER_SUPERVISE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Where to find the process BPF object, and which tgid (the agent's own)
-/// the in-kernel self-filter drops.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EbpfSettings {
-    pub object_dir: PathBuf,
-    pub self_tgid: u32,
-}
 
 struct HealthState {
     state: SensorState,
@@ -132,16 +127,17 @@ impl ProcessExecSensor {
     /// started; the program is dropped and detached) means fall back.
     fn start_ebpf(
         &mut self,
-        prog: ProcessProgram,
+        prog: LoadedObject,
         output: mpsc::Sender<RawEvent>,
         cancellation: CancellationToken,
     ) -> Result<(), String> {
         let drop_counter = prog.drop_counter();
         let health = self.health.clone();
-        let reader = osiris_ebpf::spawn_reader(prog, cancellation, move |record| {
-            on_record(record, &boot_wall_offset_ns, &output, &health)
-        })
-        .map_err(|e| format!("eBPF unavailable: {e}"))?;
+        let reader =
+            osiris_ebpf::spawn_reader(prog, osiris_ebpf::decode, cancellation, move |record| {
+                on_record(record, &boot_wall_offset_ns, &output, &health)
+            })
+            .map_err(|e| format!("eBPF unavailable: {e}"))?;
         {
             let mut h = lock_health(&self.health);
             h.running_state = SensorState::Healthy;
@@ -232,15 +228,15 @@ impl ProcessExecSensor {
 /// Probe the host and load the program; `Err` carries every reason found
 /// (a missing object is named even when the probe also fails, so the
 /// operator sees the configuration problem as well as the host one).
-fn load_ebpf(settings: &EbpfSettings) -> Result<ProcessProgram, String> {
+fn load_ebpf(settings: &EbpfSettings) -> Result<LoadedObject, String> {
     let mut reasons = vec![];
-    let object = settings.object_dir.join(osiris_ebpf::loader::OBJECT_FILE);
+    let object = settings.object_dir.join(PROCESS_OBJECT.object_file);
     reasons.extend(object_problem(&object));
     reasons.extend(probe().reasons);
     if !reasons.is_empty() {
         return Err(format!("eBPF unavailable: {}", reasons.join("; ")));
     }
-    ProcessProgram::load(&settings.object_dir, settings.self_tgid)
+    LoadedObject::load(&settings.object_dir, &PROCESS_OBJECT, settings.self_tgid)
         .map_err(|e| format!("eBPF unavailable: {e}"))
 }
 
@@ -262,46 +258,6 @@ fn object_problem(object: &Path) -> Option<String> {
             object.display()
         )),
     }
-}
-
-/// realtime − monotonic, in ns: added to a `bpf_ktime_get_ns()` value
-/// (CLOCK_MONOTONIC) it gives wall-clock time. Resampled for every record
-/// (two vDSO clock reads), because CLOCK_MONOTONIC does not follow a
-/// wall-clock step and stops during suspend: an offset sampled once would
-/// misstamp every later event by the step.
-#[cfg(target_os = "linux")]
-fn boot_wall_offset_ns() -> i128 {
-    static CLOCK_WARNING: std::sync::Once = std::sync::Once::new();
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid, writable timespec for the duration of the
-    // call; CLOCK_MONOTONIC is always supported on Linux.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let wall = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        // Called per record: warn once, not once per event.
-        CLOCK_WARNING.call_once(|| {
-            tracing::warn!(
-                error = %error,
-                "clock_gettime(CLOCK_MONOTONIC) failed; eBPF event timestamps will be \
-                 monotonic, not wall-clock"
-            );
-        });
-        return 0;
-    }
-    wall - (i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec))
-}
-
-/// Off Linux a program never loads, so the offset is never used.
-#[cfg(not(target_os = "linux"))]
-fn boot_wall_offset_ns() -> i128 {
-    0
 }
 
 /// Reader-thread callback: convert and forward one record. A record that
@@ -865,17 +821,5 @@ mod tests {
         assert_eq!(stamps, [1_100, 6_100]);
         // A record that does not decode is not stamped, so not sampled.
         assert_eq!(offset.get(), 11_000);
-    }
-
-    /// The real offset is realtime − monotonic: positive on any host whose
-    /// clock is past the epoch by more than its uptime, and stable between
-    /// two back-to-back samples when no step happens.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn boot_wall_offset_is_realtime_minus_monotonic() {
-        let a = boot_wall_offset_ns();
-        let b = boot_wall_offset_ns();
-        assert!(a > 0, "offset {a}");
-        assert!((a - b).abs() < 1_000_000_000, "offsets {a} and {b}");
     }
 }
