@@ -77,6 +77,60 @@ struct inode {
 
 struct file {
 	struct inode *f_inode;
+	/* For a socket file: its struct socket (net/socket.c sock_alloc_file). */
+	void *private_data;
+} __attribute__((preserve_access_index));
+
+/* include/linux/fdtable.h. Both pointers below are __rcu in the kernel. */
+struct fdtable {
+	unsigned int max_fds;
+	struct file **fd;
+} __attribute__((preserve_access_index));
+
+struct files_struct {
+	struct fdtable *fdt;
+} __attribute__((preserve_access_index));
+
+/* include/uapi/linux/in6.h */
+struct in6_addr {
+	union {
+		__u8 u6_addr8[16];
+		__be16 u6_addr16[8];
+		__be32 u6_addr32[4];
+	} in6_u;
+} __attribute__((preserve_access_index));
+
+/*
+ * include/net/sock.h. In the kernel skc_daddr/skc_rcv_saddr and
+ * skc_dport/skc_num sit in anonymous structs inside unions; CO-RE matching
+ * descends into anonymous members by name, so they are declared flat here.
+ * The two v6 addresses exist only with CONFIG_IPV6 (net.bpf.c checks them
+ * with bpf_core_field_exists before use).
+ */
+struct sock_common {
+	__be32 skc_daddr;
+	__be32 skc_rcv_saddr;
+	__be16 skc_dport;
+	__u16 skc_num;
+	unsigned short skc_family;
+	/* volatile in the kernel; CO-RE ignores qualifiers. */
+	unsigned char skc_state;
+	struct in6_addr skc_v6_daddr;
+	struct in6_addr skc_v6_rcv_saddr;
+} __attribute__((preserve_access_index));
+
+struct socket;
+
+struct sock {
+	struct sock_common __sk_common;
+	/* A plain u16 since Linux 5.6 (an 8-bit bitfield before). */
+	u16 sk_protocol;
+	struct socket *sk_socket;
+} __attribute__((preserve_access_index));
+
+/* include/linux/net.h */
+struct socket {
+	struct sock *sk;
 } __attribute__((preserve_access_index));
 
 /* mm->arg_start/arg_end live in an anonymous struct inside mm_struct;
@@ -106,6 +160,7 @@ struct task_struct {
 	struct task_struct *group_leader;
 	struct mm_struct *mm;
 	struct signal_struct *signal;
+	struct files_struct *files;
 	char comm[16];
 	/* Boot-based start time in ns; present since Linux 5.5. */
 	u64 start_boottime;
@@ -129,6 +184,41 @@ struct trace_event_raw_sched_process_exec {
 	u32 __data_loc_filename;
 	pid_t pid;
 	pid_t old_pid;
+	char __data[0];
+} __attribute__((preserve_access_index));
+
+/*
+ * sock:inet_sock_set_state record (include/trace/events/sock.h; protocol
+ * is __u16 since Linux 5.6). Ports are host order (the tracepoint applies
+ * ntohs); saddr/daddr are inet_saddr/inet_daddr and the v6 arrays the v6
+ * addresses (IPv4-mapped for AF_INET sockets).
+ */
+struct trace_event_raw_inet_sock_set_state {
+	struct trace_entry ent;
+	const void *skaddr;
+	int oldstate;
+	int newstate;
+	__u16 sport;
+	__u16 dport;
+	__u16 family;
+	__u16 protocol;
+	__u8 saddr[4];
+	__u8 daddr[4];
+	__u8 saddr_v6[16];
+	__u8 daddr_v6[16];
+	char __data[0];
+} __attribute__((preserve_access_index));
+
+/*
+ * raw_syscalls:sys_exit record. A syscalls:sys_exit_<name> record is
+ * struct syscall_trace_exit { ent; int nr; long ret; } (kernel/trace/
+ * trace.h), whose ret sits at the same offset (16 on 64-bit) as this
+ * struct's, so this BTF type serves both (the libbpf-tools convention).
+ */
+struct trace_event_raw_sys_exit {
+	struct trace_entry ent;
+	long id;
+	long ret;
 	char __data[0];
 } __attribute__((preserve_access_index));
 

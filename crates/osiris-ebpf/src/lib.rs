@@ -1,17 +1,19 @@
 //! Shared eBPF engine for OSIRIS sensors.
 //!
-//! OS-neutral pieces: the `#[repr(C)]` record ABI shared with the C BPF
-//! programs (`record`), BPF object integrity checking (`integrity`), the
-//! capability probe's parsing (`probe`), the object specs and schema lookup
-//! (`loader`) and the kernel-clock offset (`clock`). Loading, attaching and
-//! ring-buffer reading use `aya` and are Linux-only; off Linux `probe`
-//! reports unsupported and [`LoadedObject::load`] always fails. It must not
-//! depend on `osiris-sensor-api`.
+//! OS-neutral pieces: the `#[repr(C)]` record ABIs shared with the C BPF
+//! programs (`record` for process, `net_record` for TCP), BPF object
+//! integrity checking (`integrity`), the kernel exe identity and `exe_path`
+//! resolver (`exe`), the capability probe's parsing (`probe`), the object
+//! specs and schema lookup (`loader`) and the kernel-clock offset (`clock`).
+//! Loading, attaching and ring-buffer reading use `aya` and are Linux-only;
+//! off Linux `probe` reports unsupported and [`LoadedObject::load`] always
+//! fails. It must not depend on `osiris-sensor-api`.
 
 pub mod clock;
 pub mod exe;
 pub mod integrity;
 pub mod loader;
+pub mod net_record;
 pub mod probe;
 pub mod reader;
 pub mod record;
@@ -21,7 +23,11 @@ pub use exe::{dev_to_user, resolve_exe, ExeIdentity};
 pub use integrity::{verify_object, IntegrityError};
 pub use loader::{
     object_schema_version, sidecar_name, DropCounter, EbpfSettings, LoadError, LoadedObject,
-    ObjectSpec, PROCESS_OBJECT,
+    ObjectSpec, NET_OBJECT, PROCESS_OBJECT,
+};
+pub use net_record::{
+    decode_net, NetEvent, NetKind, NetRecord, AF_INET, AF_INET6, DIR_INBOUND, DIR_OUTBOUND,
+    KIND_NET_ACCEPT, KIND_NET_CLOSE, KIND_NET_CONNECT, NET_SCHEMA_VERSION,
 };
 pub use probe::{caps_allow_bpf, parse_kernel_release, probe, ProbeReport};
 pub use reader::{spawn_reader, ReaderError};

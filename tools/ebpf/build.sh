@@ -3,9 +3,10 @@
 #
 #   tools/ebpf/build.sh <out_dir>
 #
-# Writes <out_dir>/process.bpf.o and <out_dir>/process.bpf.o.sha256 (the
-# sidecar the agent's loader verifies). Needs clang and libbpf-dev
-# (/usr/include/bpf/bpf_helpers.h). Works from any working directory.
+# Writes, for each object (process.bpf.o, net.bpf.o), <out_dir>/<object>
+# and <out_dir>/<object>.sha256 (the sidecar the agent's loader verifies).
+# Needs clang and libbpf-dev (/usr/include/bpf/bpf_helpers.h). Works from
+# any working directory.
 set -euo pipefail
 
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
@@ -28,12 +29,14 @@ fi
 
 mkdir -p "$out_dir"
 
-clang -target bpf -D__TARGET_ARCH_x86 -g -O2 \
-    -I "$bpf_dir" \
-    -c "$bpf_dir/process.bpf.c" \
-    -o "$out_dir/process.bpf.o"
+for prog in process net; do
+    clang -target bpf -D__TARGET_ARCH_x86 -g -O2 \
+        -I "$bpf_dir" \
+        -c "$bpf_dir/$prog.bpf.c" \
+        -o "$out_dir/$prog.bpf.o"
 
-(cd "$out_dir" && sha256sum process.bpf.o > process.bpf.o.sha256)
+    (cd "$out_dir" && sha256sum "$prog.bpf.o" > "$prog.bpf.o.sha256")
 
-echo "built $out_dir/process.bpf.o"
-cat "$out_dir/process.bpf.o.sha256"
+    echo "built $out_dir/$prog.bpf.o"
+    cat "$out_dir/$prog.bpf.o.sha256"
+done

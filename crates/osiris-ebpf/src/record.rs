@@ -105,6 +105,12 @@ pub enum DecodeError {
     UnknownKind(u32),
     #[error("record truncated for kind {kind}: {got} < {need} bytes")]
     Truncated { kind: u32, got: usize, need: usize },
+    /// A net record whose address family is neither `AF_INET` nor `AF_INET6`.
+    #[error("unknown address family {0}")]
+    UnknownFamily(u16),
+    /// A net record whose direction is neither outbound nor inbound.
+    #[error("unknown direction {0}")]
+    UnknownDirection(u8),
 }
 
 /// Decode one ring-buffer record. Never panics on arbitrary input.
@@ -162,14 +168,14 @@ pub fn decode(bytes: &[u8]) -> Result<Record, DecodeError> {
 
 /// Read a `T` from the front of `bytes`; callers check the length first.
 /// `T` must be valid for any bit pattern (plain integers and byte arrays).
-fn read<T: Copy>(bytes: &[u8]) -> T {
+pub(crate) fn read<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     // SAFETY: length asserted above; read_unaligned needs no alignment.
     unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 /// NUL-terminated string from at most `len` bytes of `bytes`, lossy UTF-8.
-fn c_string(bytes: &[u8], len: usize) -> String {
+pub(crate) fn c_string(bytes: &[u8], len: usize) -> String {
     let b = &bytes[..len.min(bytes.len())];
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..end]).into_owned()

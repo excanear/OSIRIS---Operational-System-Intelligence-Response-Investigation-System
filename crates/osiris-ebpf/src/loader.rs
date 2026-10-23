@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::integrity::{verify_object, IntegrityError};
+use crate::net_record::NET_SCHEMA_VERSION;
 use crate::record::PROCESS_SCHEMA_VERSION;
 
 /// Name of the `.rodata` global carrying the object's record schema version.
@@ -44,6 +45,17 @@ pub const PROCESS_OBJECT: ObjectSpec = ObjectSpec {
     tracepoints: &[
         ("handle_exec", "sched", "sched_process_exec"),
         ("handle_exit", "sched", "sched_process_exit"),
+    ],
+};
+
+/// The TCP connect/accept/close object.
+pub const NET_OBJECT: ObjectSpec = ObjectSpec {
+    object_file: "net.bpf.o",
+    expected_schema: NET_SCHEMA_VERSION,
+    tracepoints: &[
+        ("handle_state", "sock", "inet_sock_set_state"),
+        ("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
+        ("handle_accept_exit", "syscalls", "sys_exit_accept"),
     ],
 };
 
@@ -459,6 +471,21 @@ mod tests {
             [
                 ("handle_exec", "sched", "sched_process_exec"),
                 ("handle_exit", "sched", "sched_process_exit"),
+            ]
+        );
+    }
+
+    /// The net object: its own file, schema 1 and the three hooks.
+    #[test]
+    fn net_object_spec_names() {
+        assert_eq!(NET_OBJECT.object_file, "net.bpf.o");
+        assert_eq!(NET_OBJECT.expected_schema, 1);
+        assert_eq!(
+            NET_OBJECT.tracepoints,
+            [
+                ("handle_state", "sock", "inet_sock_set_state"),
+                ("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
+                ("handle_accept_exit", "syscalls", "sys_exit_accept"),
             ]
         );
     }
