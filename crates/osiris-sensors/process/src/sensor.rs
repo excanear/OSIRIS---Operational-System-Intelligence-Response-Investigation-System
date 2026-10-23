@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::assembler::ExecAssembler;
 use crate::ebpf_backend::{exec_to_raw, exit_to_raw};
+use crate::exe_cache::{ExeCache, EXE_CACHE_CAPACITY};
 use crate::proc_stat::read_process_start_time;
 use osiris_fileutil::LineTailer;
 
@@ -133,9 +134,16 @@ impl ProcessExecSensor {
     ) -> Result<(), String> {
         let drop_counter = prog.drop_counter();
         let health = self.health.clone();
+        let mut exe_cache = ExeCache::new(EXE_CACHE_CAPACITY);
         let reader =
             osiris_ebpf::spawn_reader(prog, osiris_ebpf::decode, cancellation, move |record| {
-                on_record(record, &boot_wall_offset_ns, &output, &health)
+                on_record(
+                    record,
+                    &boot_wall_offset_ns,
+                    &mut exe_cache,
+                    &output,
+                    &health,
+                )
             })
             .map_err(|e| format!("eBPF unavailable: {e}"))?;
         {
@@ -268,17 +276,22 @@ fn object_problem(object: &Path) -> Option<String> {
 fn on_record(
     record: Result<Record, DecodeError>,
     boot_wall_offset_ns: &dyn Fn() -> i128,
+    exe_cache: &mut ExeCache,
     output: &mpsc::Sender<RawEvent>,
     health: &Mutex<HealthState>,
 ) {
     let (event, ts) = match record {
         Ok(Record::Exec(e)) => {
             let raw = exec_to_raw(&e, boot_wall_offset_ns());
+            exe_cache.insert(e.pid, e.start_boottime_ns, raw.exe_path.clone());
             let ts = raw.timestamp_ns;
             (RawEvent::ProcessExec(raw), ts)
         }
         Ok(Record::Exit(e)) => {
-            let raw = exit_to_raw(&e, boot_wall_offset_ns());
+            let exe_path = exe_cache
+                .take(e.pid, e.start_boottime_ns)
+                .unwrap_or_default();
+            let raw = exit_to_raw(&e, boot_wall_offset_ns(), exe_path);
             let ts = raw.timestamp_ns;
             (RawEvent::ProcessExit(raw), ts)
         }
@@ -765,7 +778,13 @@ mod tests {
             ..HealthState::default()
         });
         let (tx, mut rx) = mpsc::channel(4);
-        on_record(Ok(exec_record()), &|| 1_000, &tx, &health);
+        on_record(
+            Ok(exec_record()),
+            &|| 1_000,
+            &mut ExeCache::new(4),
+            &tx,
+            &health,
+        );
         match rx.try_recv() {
             Ok(RawEvent::ProcessExec(raw)) => {
                 assert_eq!(raw.timestamp_ns, 1_100);
@@ -784,9 +803,21 @@ mod tests {
     fn on_record_counts_decode_errors_and_closed_channels_as_dropped() {
         let health = Mutex::new(HealthState::default());
         let (tx, rx) = mpsc::channel(4);
-        on_record(Err(DecodeError::ShorterThanHeader(3)), &|| 0, &tx, &health);
+        on_record(
+            Err(DecodeError::ShorterThanHeader(3)),
+            &|| 0,
+            &mut ExeCache::new(4),
+            &tx,
+            &health,
+        );
         drop(rx);
-        on_record(Ok(exec_record()), &|| 0, &tx, &health);
+        on_record(
+            Ok(exec_record()),
+            &|| 0,
+            &mut ExeCache::new(4),
+            &tx,
+            &health,
+        );
         let h = lock_health(&health);
         assert_eq!(h.events_dropped_total, 2);
         assert_eq!(h.events_emitted_total, 0);
@@ -806,11 +837,24 @@ mod tests {
             offset.set(now + 5_000); // the clock steps between records
             now
         };
-        on_record(Ok(exec_record()), &sample, &tx, &health);
-        on_record(Ok(exec_record()), &sample, &tx, &health);
+        on_record(
+            Ok(exec_record()),
+            &sample,
+            &mut ExeCache::new(4),
+            &tx,
+            &health,
+        );
+        on_record(
+            Ok(exec_record()),
+            &sample,
+            &mut ExeCache::new(4),
+            &tx,
+            &health,
+        );
         on_record(
             Err(DecodeError::ShorterThanHeader(3)),
             &sample,
+            &mut ExeCache::new(4),
             &tx,
             &health,
         );
@@ -822,5 +866,60 @@ mod tests {
         assert_eq!(stamps, [1_100, 6_100]);
         // A record that does not decode is not stamped, so not sampled.
         assert_eq!(offset.get(), 11_000);
+    }
+
+    fn exit_record(pid: u32, start_boottime_ns: u64) -> Record {
+        Record::Exit(osiris_ebpf::ExitEvent {
+            pid,
+            ppid: 1,
+            uid: 0,
+            exit_status: 0,
+            ktime_ns: 200,
+            start_boottime_ns,
+            comm: "true".to_string(),
+        })
+    }
+
+    /// The exit record's `exe_path` is what the same process's exec record
+    /// resolved to; a different start time (recycled pid) or a second exit
+    /// finds nothing and reports an empty path.
+    #[test]
+    fn exit_takes_exe_path_from_exec() {
+        let health = Mutex::new(HealthState::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut cache = ExeCache::new(4);
+        on_record(Ok(exec_record()), &|| 0, &mut cache, &tx, &health);
+        on_record(
+            Ok(exit_record(u32::MAX, 10_000_000)),
+            &|| 0,
+            &mut cache,
+            &tx,
+            &health,
+        );
+        on_record(
+            Ok(exit_record(u32::MAX, 10_000_001)),
+            &|| 0,
+            &mut cache,
+            &tx,
+            &health,
+        );
+        on_record(
+            Ok(exit_record(u32::MAX, 10_000_000)),
+            &|| 0,
+            &mut cache,
+            &tx,
+            &health,
+        );
+        let mut exits = Vec::new();
+        let mut exec_path = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                RawEvent::ProcessExec(raw) => exec_path = Some(raw.exe_path),
+                RawEvent::ProcessExit(raw) => exits.push(raw.exe_path),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(exec_path.as_deref(), Some("/bin/true"));
+        assert_eq!(exits, ["/bin/true", "", ""]);
     }
 }

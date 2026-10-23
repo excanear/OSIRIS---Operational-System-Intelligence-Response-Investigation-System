@@ -1,6 +1,7 @@
 pub mod assembler;
 pub mod audit_line;
 pub mod ebpf_backend;
+pub mod exe_cache;
 pub mod execve;
 pub mod proc_stat;
 pub mod sensor;
@@ -8,6 +9,7 @@ pub mod sensor;
 pub use assembler::ExecAssembler;
 pub use audit_line::parse_audit_line;
 pub use ebpf_backend::{exec_to_raw, exit_to_raw, split_argv};
+pub use exe_cache::{ExeCache, EXE_CACHE_CAPACITY};
 /// Lives in `osiris-ebpf` (shared with the network sensor); re-exported so
 /// callers keep `osiris_sensors_process::EbpfSettings`.
 pub use osiris_ebpf::EbpfSettings;

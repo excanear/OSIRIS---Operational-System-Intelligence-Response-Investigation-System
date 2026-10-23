@@ -64,14 +64,6 @@ fn wall_clock_ns(ktime_ns: u64, boot_wall_offset_ns: i128) -> u64 {
 /// The real procfs root used outside tests.
 const PROC_ROOT: &str = "/proc";
 
-/// `<proc_root>/<pid>/exe`'s target, when the process (and the link) still
-/// exist.
-fn proc_exe(proc_root: &Path, pid: u32) -> Option<String> {
-    std::fs::read_link(proc_root.join(pid.to_string()).join("exe"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
 /// The exec'd binary as the audit backend's `exe=` reports it: the
 /// resolved `<proc_root>/<pid>/exe` link (symlinks such as `/bin/sh` →
 /// `dash` followed; a script shows its interpreter) when it can be tied to
@@ -106,16 +98,17 @@ pub fn exec_to_raw(e: &ExecEvent, boot_wall_offset_ns: i128) -> ProcessExecRaw {
 }
 
 /// An exit record as `ProcessExitRaw`; the wait status becomes
-/// `exit_code` (normal exit) or `signal` (killed). `exe_path` is
-/// best-effort: `/proc/<pid>/exe` if still readable, else empty.
-pub fn exit_to_raw(e: &ExitEvent, boot_wall_offset_ns: i128) -> ProcessExitRaw {
+/// `exit_code` (normal exit) or `signal` (killed). The process is already
+/// gone, so `exe_path` comes from the caller's exec-fed
+/// [`crate::exe_cache::ExeCache`] (empty on a miss); `/proc` is not read.
+pub fn exit_to_raw(e: &ExitEvent, boot_wall_offset_ns: i128, exe_path: String) -> ProcessExitRaw {
     let (exit_code, signal) = decode_wait_status(e.exit_status);
     ProcessExitRaw {
         pid: e.pid,
         ppid: e.ppid,
         uid: e.uid,
         comm: e.comm.clone(),
-        exe_path: proc_exe(Path::new(PROC_ROOT), e.pid).unwrap_or_default(),
+        exe_path,
         exit_code,
         signal,
         timestamp_ns: wall_clock_ns(e.ktime_ns, boot_wall_offset_ns),
@@ -267,7 +260,7 @@ mod tests {
             start_boottime_ns: 12_340_000_000,
             comm: "sleep".to_string(),
         };
-        let raw = exit_to_raw(&e, -5);
+        let raw = exit_to_raw(&e, -5, String::new());
         assert_eq!(raw.signal, Some(9));
         assert_eq!(raw.exit_code, None);
         assert_eq!(raw.timestamp_ns, 5);
@@ -281,8 +274,10 @@ mod tests {
                 ..e
             },
             0,
+            "/bin/sleep".to_string(),
         );
         assert_eq!(normal.exit_code, Some(7));
         assert_eq!(normal.signal, None);
+        assert_eq!(normal.exe_path, "/bin/sleep");
     }
 }
