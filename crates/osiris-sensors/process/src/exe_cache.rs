@@ -101,6 +101,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacity_cache_stores_nothing() {
+        let mut c = ExeCache::new(0);
+        c.insert(1, 1, "/a".into());
+        assert!(c.is_empty());
+        assert_eq!(c.take(1, 1), None);
+    }
+
+    #[test]
     fn reinsert_updates_without_duplicates_and_queue_stays_bounded() {
         let mut c = ExeCache::new(2);
         c.insert(1, 1, "/old".into());
