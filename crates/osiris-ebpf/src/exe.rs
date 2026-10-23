@@ -203,6 +203,22 @@ mod tests {
 
     #[test]
     fn resolve_exe_fallback_chain() {
+        // Missing link: nothing to resolve, whatever the identity and comm
+        // say. Runs everywhere (no symlink needed).
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir(empty.path().join("77")).unwrap();
+        std::fs::write(empty.path().join("77").join("comm"), b"curl\n").unwrap();
+        assert_eq!(resolve_exe(empty.path(), 77, None, "curl"), None);
+        assert_eq!(
+            resolve_exe(
+                empty.path(),
+                77,
+                Some(ExeIdentity { dev: 1, ino: 1 }),
+                "curl"
+            ),
+            None
+        );
+
         let Some((root, target)) = fake_proc(b"curl\n") else {
             return;
         };
