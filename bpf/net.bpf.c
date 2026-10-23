@@ -23,7 +23,8 @@
  *   any      -> CLOSE        tracked: emit CLOSE, then forget it
  * accept()/accept4() returning fd >= 0: resolve the fd to its sock, emit
  * ACCEPT and track it (inbound). Sockets of the tgid in SELF_TGID[0] (the
- * agent; 0 = unset) are never tracked, so none of their events is emitted.
+ * agent; 0 = unset) are never tracked, so none of their events is emitted;
+ * their connect/accept also removes any stale entry left at that address.
  * A failed ring-buffer reservation increments DROPS[0].
  *
  * Verifier notes (target: Linux 5.15+, privileged load):
@@ -82,9 +83,10 @@ struct sock_owner {
 };
 
 /*
- * Tracked sockets, keyed by the struct sock pointer. LRU: when more than
- * 65 536 sockets are open at once the least recently used entry is
- * evicted and only that connection's CLOSE is lost.
+ * Tracked sockets, keyed by the struct sock pointer. LRU: when the map
+ * fills, a least recently used entry is evicted and only that
+ * connection's CLOSE is lost. The kernel's LRU keeps per-CPU free lists,
+ * so eviction can start somewhat before 65 536 entries are live.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -147,7 +149,8 @@ static __always_inline void owner_from_current(struct sock_owner *o, __u32 tgid,
 }
 
 /*
- * Reserve a record and fill everything but the tuple; the addresses are
+ * Reserve a record and fill everything but family and the tuple (the
+ * caller sets those); the addresses are
  * zeroed (ring-buffer memory is not), so an IPv4 tuple only writes the
  * first 4 bytes of each. NULL (and a counted drop) when the buffer is full.
  */
@@ -219,8 +222,13 @@ int handle_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	if (oldstate == TCP_CLOSE && newstate == TCP_SYN_SENT) {
 		/* tcp_v4_connect()/tcp_v6_connect(): the connecting task. */
 		tgid = bpf_get_current_pid_tgid() >> 32;
-		if (is_self(tgid))
+		if (is_self(tgid)) {
+			/* The agent's own connect: drop any entry left over for
+			 * a previous sock at this address, so the agent's
+			 * CONNECT/CLOSE are never emitted under a stale owner. */
+			bpf_map_delete_elem(&SOCKS, &key);
 			return 0;
+		}
 		owner_from_current(&owner, tgid, DIR_OUTBOUND);
 		/* BPF_ANY: a stale entry for a reused sock address is replaced. */
 		bpf_map_update_elem(&SOCKS, &key, &owner, BPF_ANY);
@@ -272,8 +280,6 @@ static __always_inline int on_accept_exit(long ret)
 	if (ret < 0)
 		return 0;
 	tgid = bpf_get_current_pid_tgid() >> 32;
-	if (is_self(tgid))
-		return 0;
 
 	task = (struct task_struct *)bpf_get_current_task();
 	fdt = BPF_CORE_READ(task, files, fdt);
@@ -297,6 +303,14 @@ static __always_inline int on_accept_exit(long ret)
 	if (family != AF_INET && family != AF_INET6)
 		return 0;
 
+	key = (__u64)(unsigned long)sk;
+	if (is_self(tgid)) {
+		/* The agent's own accept: as for its connects, drop any entry
+		 * left over for a previous sock at this address. */
+		bpf_map_delete_elem(&SOCKS, &key);
+		return 0;
+	}
+
 	owner_from_current(&owner, tgid, DIR_INBOUND);
 	rec = reserve(KIND_NET_ACCEPT, &owner);
 	if (rec) {
@@ -315,14 +329,17 @@ static __always_inline int on_accept_exit(long ret)
 
 	/*
 	 * Tracked even when the record was dropped, so the CLOSE is still
-	 * seen. A connection the peer already tore down (state CLOSE) will
-	 * see no further transition, so it is not tracked: its entry would
-	 * only linger until LRU eviction.
+	 * seen. Insert first, then re-read the state: a close on another CPU
+	 * before the insert found no entry and will see no further
+	 * transition, so the entry is removed again rather than left to
+	 * attribute a later sock at this address to this owner. A close after
+	 * the insert emits CLOSE and deletes it in handle_state (the delete
+	 * below is then a no-op). Only CLOSE is tested: a TCP Fast Open child
+	 * can be accepted while still SYN_RECV and must stay tracked.
 	 */
-	if (BPF_CORE_READ(sk, __sk_common.skc_state) != TCP_CLOSE) {
-		key = (__u64)(unsigned long)sk;
-		bpf_map_update_elem(&SOCKS, &key, &owner, BPF_ANY);
-	}
+	bpf_map_update_elem(&SOCKS, &key, &owner, BPF_ANY);
+	if (BPF_CORE_READ(sk, __sk_common.skc_state) == TCP_CLOSE)
+		bpf_map_delete_elem(&SOCKS, &key);
 	return 0;
 }
 
