@@ -59,3 +59,24 @@ and the BPF programs to see kernel structs through a generated `vmlinux.h`.
 | Hand-mirrored record + layout tests + schema check | Medium: a mismatch that tests miss is a memory-safety bug in decoding. Mitigated by static asserts, offset tests and the version check. | The number of record types grows (11b-2 network, 11b-3 filesystem) enough that hand-mirroring becomes error-prone: add codegen from one source as §5.4 asks. |
 | Minimal CO-RE structs instead of `vmlinux.h` | Low: a field missing from the minimal header is a compile error, not a runtime one. | Programs need many more kernel structs (network, filesystem), at which point a generated BTF header may be cheaper. |
 | Kernel-version coverage = the two runner kernels | Medium: untested on RHEL-like or older kernels (the ring buffer needs >= 5.8). | Before claiming support for other distros: add the VM matrix of §26. |
+
+## Update (Phase 11b-2): one object per sensor
+
+Phase 11b-2 generalises the loader and adds a second object, so there is now one BPF object per
+sensor: `process.bpf.o` (schema 2) and `net.bpf.o` (schema 1), each with its own `.sha256`
+sidecar and `.rodata` `schema_version`, both in `ebpf.object_dir`. The record layouts are still
+mirrored by hand (C header, `#[repr(C)]` struct, offset tests, version check); the net record
+makes the count of hand-mirrored records three, and the codegen revisit trigger above stays open.
+Process record v2 adds the exec'd image identity (`exe_dev`, `exe_ino`) in what was padding.
+`aya` stays at 0.14.0. Kernel-side details worth recording:
+
+- `process.bpf.c` keeps an `EXITED` dedup map (`LRU_HASH`, 4096 entries, key
+  `{start_boottime, tgid}`), so two threads that both see `signal->live == 0` emit one group exit.
+- When all threads call `pthread_exit`, the reported exit status is that of the first thread to
+  observe `live == 0`, not necessarily the leader's.
+- The net socket-owner map (`SOCKS`) is an LRU of 65 536 entries whose per-CPU free lists can evict
+  before it is full. The accept-time insert versus peer-close race is not fenced: at worst one
+  stale entry stays until overwritten or evicted.
+- Validation: GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`)
+  passed on ubuntu-22.04 and ubuntu-24.04 on the first push. Both runners boot 6.x kernels, so the
+  5.15 floor is reasoned (CO-RE), not run.

@@ -244,6 +244,43 @@ built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
 - With `ebpf` configured but no `audit_log_path`, an eBPF failure makes the sensor `FAILED`.
 - `PROCESS_FORK` is not emitted. See `docs/operators-ebpf.md`.
 
+## eBPF network backend and process record v2 (Phase 11b-2)
+
+The eBPF TCP backend of `network_sensor` (`bpf/net.bpf.c`, `crates/osiris-sensors/net`) and
+process record v2 (exe identity captured in the kernel, one exit per thread group) were validated
+on GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`), green on
+`ubuntu-22.04` (job 120708485081) and `ubuntu-24.04` (job 120708485394) on the first push. Both
+objects were built on the runner by `tools/ebpf/build.sh`.
+
+Scenarios that passed on both runners:
+
+- `network_sensor_uses_ebpf`: `network_sensor` `HEALTHY` with capability flag `ebpf`.
+- `short_tcp_connection_is_observed_via_ebpf_v4` and `_v6`: a short-lived `bash` connection to a
+  listener in the test process produced CONNECT and CLOSE (OUTBOUND, owner the child pid, comm
+  `bash`) and ACCEPT and CLOSE (INBOUND, owner the test process), provider `network_sensor/ebpf`;
+  the v6 run also checked the `::1` addresses.
+- `group_exit_reports_once_with_code`: a worker thread calls `os._exit(7)` while the main
+  thread sleeps; exactly one `PROCESS_EXIT` arrived for the pid, exit code 7, non-empty `exe_path`
+  (from the exec cache).
+- `corrupted_net_object_falls_back_to_procfs`: with a corrupted `net.bpf.o` the sensor was
+  `DEGRADED`, flag `procfs_fallback`, `last_error` naming `net.bpf.o`.
+
+Kernel coverage: both runners boot 6.x kernels, so 5.15 was not run in 11b-2 (11b-1 had reported
+5.15 for the 22.04 runner). The 5.15 floor is reasoned from CO-RE and ring-buffer support, not
+exercised.
+
+### Known limitations
+
+- Not covered: kernels other than the two runner kernels, RHEL-like distributions, a kernel-version
+  VM matrix (ARCHITECTURE §26).
+- Network: TCP only; connections open at agent start, failed connects, io_uring accepts and
+  LRU-evicted closes are not reported; a CLOSE can arrive without a CONNECT; connects by kernel
+  threads (NFS/CIFS/iSCSI, MPTCP extra subflows) are attributed to the kernel worker; the exe
+  identity check cannot match on btrfs or overlayfs. See `docs/operators-ebpf.md`.
+- Ring-buffer drops and LRU eviction were not provoked in validation.
+- On a real kernel only the worker-thread group exit is asserted; the leader `pthread_exit` and
+  non-leader `execve` cases were not provoked.
+
 ## Findings
 
 | Finding | Distro | Fix commit |
@@ -352,4 +389,4 @@ was not repeated on the final binaries.
 - DNS over TCP, DoT, DoH and mDNS are not captured (see "DNS sensor (Phase 11a)").
 - No container or Kubernetes scenarios.
 - RHEL-like distributions (auditd paths, SELinux) are not covered.
-- eBPF covers only process exec/exit (Phase 11b-1); network, filesystem and the DNS uprobe are pending (11b-2..4).
+- eBPF covers process exec/exit (11b-1) and TCP network (11b-2); filesystem and the DNS uprobe are pending (11b-3, 11b-4).

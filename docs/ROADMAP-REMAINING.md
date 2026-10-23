@@ -99,20 +99,32 @@ revisão final independente → merge → push.
   backend eBPF de exec/exit do sensor `process_exec`, com fallback para audit. Validado em Linux real
   (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/ADR-010-ebpf-loader-aya.md`,
   `docs/operators-ebpf.md` e `docs/VALIDATION.md`.
-  Próximos (cada um com seu brainstorming/spec/plano): **11b-2** rede (connect/accept/close),
-  **11b-3** filesystem, **11b-4** uprobe de DNS em bibliotecas de resolução.
+  Próximos (cada um com seu brainstorming/spec/plano): **11b-3** filesystem, **11b-4** uprobe de DNS
+  em bibliotecas de resolução.
   Dívidas da 11b-1:
   - `PROCESS_FORK` não é emitido (só exec e exit).
   - Níveis de telemetria por entidade em mapas no kernel (§6): ainda não.
   - Matriz de kernels em VMs (§5.4/§26): validado só nos 2 kernels dos runners.
   - Redução de privilégios do agente a um conjunto mínimo de capabilities (§15).
   - Empacotamento do objeto BPF (.deb/.rpm, unit systemd): Fase 13.
-  - Saída de thread não-líder após `execve` gera um `PROCESS_EXIT` (signal 9) para processo vivo.
-  - Líder que chama `pthread_exit` com outras threads vivas gera um `PROCESS_EXIT` para processo
-    vivo, e o fim real nunca é emitido. Correção (11b-2): emitir quando `signal->live` chega a 0.
-  - `exe_path` lido de `/proc/<pid>/exe` em user space (mitigado com checagem de `comm`):
-    capturar a identidade do executável no kernel (schema v2) na 11b-2.
-  - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com 11b-2/3.
+  - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com a 11b-3
+    (agora são três registros espelhados).
+- **Fase 11b-2 (feita)**: backend eBPF TCP do sensor de rede (`bpf/net.bpf.c`: connect/accept/close,
+  IPv4 e IPv6, fallback para procfs) e registro de processo v2 (identidade do executável capturada no
+  kernel, uma saída por grupo de threads; resolve as saídas de thread não-líder/`pthread_exit` e a
+  leitura tardia de `/proc/<pid>/exe` da 11b-1). Validado em Linux real (run 40039969622, Ubuntu 22.04
+  e 24.04, kernels 6.x). Ver `docs/operators-ebpf.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
+  `docs/VALIDATION.md`.
+  Dívidas da 11b-2:
+  - UDP não é coberto.
+  - Conexões que falham (sem conexão estabelecida) não são reportadas.
+  - Accepts via io_uring não são vistos.
+  - Conexões já existentes quando o agente inicia não são reportadas (nem o CLOSE delas).
+  - CLOSE de conexão despejada do LRU (mais de 65 536 sockets) é perdido.
+  - A checagem de identidade do executável não casa em btrfs/overlayfs (cai no resultado com `comm`).
+  - O piso de kernel 5.15 é raciocinado (CO-RE), não executado: os runners atuais sobem kernels 6.x.
+  - O sensor `process_exec` mostra `events_emitted_total` 0 e `last_event_at` nulo em `/status` com o
+    backend eBPF (o caminho eBPF de rede conta corretamente); herdado da 11b-1.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)
