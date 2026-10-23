@@ -48,7 +48,7 @@ and the BPF programs to see kernel structs through a generated `vmlinux.h`.
   Adding a field means editing the C header, the Rust mirror and the version constant together;
   forgetting one fails the layout tests or the load, not the kernel read.
 - Validation: GitHub Actions run 39139529617 (commit `e5becff`, branch `real-linux/t11b1-1`)
-  passed on ubuntu-22.04 (kernel 5.15) and ubuntu-24.04 (6.x) on the first run.
+  passed on ubuntu-22.04 and ubuntu-24.04 on the first run (kernel versions as reported then: 5.15 and 6.x; not recorded by the run).
 
 ## Cost if wrong, and revisit triggers
 
@@ -78,5 +78,5 @@ Process record v2 adds the exec'd image identity (`exe_dev`, `exe_ino`) in what 
   before it is full. The accept-time insert versus peer-close race is not fenced: at worst one
   stale entry stays until overwritten or evicted.
 - Validation: GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`)
-  passed on ubuntu-22.04 and ubuntu-24.04 on the first push. Both runners boot 6.x kernels, so the
-  5.15 floor is reasoned (CO-RE), not run.
+  passed on ubuntu-22.04 and ubuntu-24.04 on the first push. The run did not record `uname -r` (runners
+  presumed 6.x), so the 5.15 floor is reasoned (CO-RE), not run.

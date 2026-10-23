@@ -42,7 +42,7 @@ ebpf:
 
 ## Requirements
 
-- Validated kernels: the 6.x kernels of the ubuntu-22.04 and ubuntu-24.04 GitHub runners (the 11b-2 run). 11b-1 reported 5.15 for the 22.04 runner, but the runners now boot 6.x kernels, so 5.15 was not exercised by the 11b-2 run. The 5.15 floor is reasoned (CO-RE relocations and ring buffers, >= 5.8, with BTF at `/sys/kernel/btf/vmlinux`), not run. Other kernels are untested.
+- Validated on the ubuntu-22.04 and ubuntu-24.04 GitHub runners. The run did not record `uname -r`, so the kernel versions are not known; GitHub-hosted runners are presumed to run 6.x (11b-1 had reported 5.15 for the 22.04 runner). 5.15 is therefore not confirmed as exercised. The 5.15 floor is reasoned (CO-RE relocations and ring buffers, >= 5.8, with BTF at `/sys/kernel/btf/vmlinux`), not run. Other kernels are untested.
 - The net program also needs `CONFIG_FTRACE_SYSCALLS` (syscall tracepoints), which mainstream distro kernels enable.
 - Privileges: `CAP_BPF` and `CAP_PERFMON`, or `CAP_SYS_ADMIN` (root).
 - The build host needs clang and libbpf-dev. The run host needs neither.
@@ -120,7 +120,7 @@ falls back as above.
 
 - Connections that already existed when the agent started are not reported, and neither is their
   CLOSE (they are untracked). The procfs backend's startup burst does not occur.
-- A passive connection that the peer closes before the server calls `accept()` produces no events.
+- A passive connection that the peer closes before the server calls `accept()` still produces an ACCEPT when `accept()` returns, but its CLOSE may be missing (the socket was already closed when the owner entry was inserted).
 - After LRU eviction (more than 65 536 tracked sockets) an evicted connection's CLOSE is lost. The
   map is an LRU whose per-CPU free lists can evict before it is full. The race between the
   accept-time insert and a peer close is not fenced; at worst one stale entry remains until it is

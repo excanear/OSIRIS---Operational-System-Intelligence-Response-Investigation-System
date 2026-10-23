@@ -212,7 +212,7 @@ replayed by the host test suite (`cargo test` on Windows and in CI), not in run 
 
 The eBPF engine (`crates/osiris-ebpf`) and the eBPF exec/exit backend of `process_exec` were
 validated on GitHub Actions run 39139529617 (commit `e5becff`, branch `real-linux/t11b1-1`),
-green on `ubuntu-22.04` (kernel 5.15) and `ubuntu-24.04` (6.x) on the first run. The object was
+green on `ubuntu-22.04` and `ubuntu-24.04` on the first run (kernel versions as reported at the time: 5.15 and 6.x; later runs did not record `uname -r`, so treat them as unconfirmed). The object was
 built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
 
 - `process_exec` reported `HEALTHY` with capability flag `ebpf`.
@@ -227,7 +227,7 @@ built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
 
 ### Known limitations
 
-- Not covered: kernels other than 5.15 and 6.x, RHEL-like distributions, a kernel-version VM
+- Not covered: kernels other than the runners' (versions not recorded), RHEL-like distributions, a kernel-version VM
   matrix (ARCHITECTURE §26).
 - When a non-leader thread calls `execve`, the old thread-group leader's exit is reported as a
   `PROCESS_EXIT` with signal 9 for a process that keeps running, then an `EXEC` under the same pid.
@@ -265,8 +265,8 @@ Scenarios that passed on both runners:
 - `corrupted_net_object_falls_back_to_procfs`: with a corrupted `net.bpf.o` the sensor was
   `DEGRADED`, flag `procfs_fallback`, `last_error` naming `net.bpf.o`.
 
-Kernel coverage: both runners boot 6.x kernels, so 5.15 was not run in 11b-2 (11b-1 had reported
-5.15 for the 22.04 runner). The 5.15 floor is reasoned from CO-RE and ring-buffer support, not
+Kernel coverage: the run did not record `uname -r`, so the runner kernel versions are not known
+(GitHub-hosted runners are presumed to run 6.x; 11b-1 had reported 5.15 for the 22.04 runner). The 5.15 floor is reasoned from CO-RE and ring-buffer support, not
 exercised.
 
 ### Known limitations

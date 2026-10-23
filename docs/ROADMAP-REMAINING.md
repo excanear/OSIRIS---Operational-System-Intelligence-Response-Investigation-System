@@ -113,7 +113,7 @@ revisão final independente → merge → push.
   IPv4 e IPv6, fallback para procfs) e registro de processo v2 (identidade do executável capturada no
   kernel, uma saída por grupo de threads; resolve as saídas de thread não-líder/`pthread_exit` e a
   leitura tardia de `/proc/<pid>/exe` da 11b-1). Validado em Linux real (run 40039969622, Ubuntu 22.04
-  e 24.04, kernels 6.x). Ver `docs/operators-ebpf.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
+  e 24.04; versões de kernel dos runners não registradas, presumidas 6.x). Ver `docs/operators-ebpf.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
   `docs/VALIDATION.md`.
   Dívidas da 11b-2:
   - UDP não é coberto.
@@ -122,7 +122,8 @@ revisão final independente → merge → push.
   - Conexões já existentes quando o agente inicia não são reportadas (nem o CLOSE delas).
   - CLOSE de conexão despejada do LRU (mais de 65 536 sockets) é perdido.
   - A checagem de identidade do executável não casa em btrfs/overlayfs (cai no resultado com `comm`).
-  - O piso de kernel 5.15 é raciocinado (CO-RE), não executado: os runners atuais sobem kernels 6.x.
+  - O piso de kernel 5.15 é raciocinado (CO-RE), não executado: as versões de kernel dos runners não foram registradas (presumidas 6.x).
+  - O workflow real-linux deve imprimir `uname -r` por job.
   - O sensor `process_exec` mostra `events_emitted_total` 0 e `last_event_at` nulo em `/status` com o
     backend eBPF (o caminho eBPF de rede conta corretamente); herdado da 11b-1.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
