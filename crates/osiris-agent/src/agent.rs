@@ -95,15 +95,20 @@ pub enum SensorChange {
     Failed(String),
 }
 
+/// The eBPF settings shared by the process and network sensors; `None` without an `ebpf` key.
+fn ebpf_settings(config: &AgentConfig) -> Option<EbpfSettings> {
+    config.ebpf.as_ref().map(|c| EbpfSettings {
+        object_dir: c.object_dir.clone(),
+        self_tgid: std::process::id(),
+    })
+}
+
 /// Builds one sensor by name; `None` when agent.yaml does not configure it.
 fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
     match name {
         "process_exec" => {
             let audit = config.audit_log_path.clone().map(PathBuf::from);
-            let ebpf = config.ebpf.as_ref().map(|c| EbpfSettings {
-                object_dir: c.object_dir.clone(),
-                self_tgid: std::process::id(),
-            });
+            let ebpf = ebpf_settings(config);
             (audit.is_some() || ebpf.is_some())
                 .then(|| Box::new(ProcessExecSensor::new(audit, ebpf)) as Box<dyn Sensor>)
         }
@@ -111,10 +116,12 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
             .fs_audit_log_path
             .clone()
             .map(|p| Box::new(FilesystemSensor::new(p)) as Box<dyn Sensor>),
-        "network" => config
-            .network_proc_root
-            .clone()
-            .map(|p| Box::new(NetworkSensor::new(Some(PathBuf::from(p)), None)) as Box<dyn Sensor>),
+        "network" => {
+            let proc_root = config.network_proc_root.clone().map(PathBuf::from);
+            let ebpf = ebpf_settings(config);
+            (proc_root.is_some() || ebpf.is_some())
+                .then(|| Box::new(NetworkSensor::new(proc_root, ebpf)) as Box<dyn Sensor>)
+        }
         "identity" => config
             .identity_audit_log_path
             .clone()
@@ -615,6 +622,37 @@ pub(crate) mod tests {
         });
         let sensor = build_sensor(&config, "process_exec").expect("process sensor built");
         assert_eq!(sensor.name(), "process_exec");
+    }
+
+    #[test]
+    fn network_sensor_built_from_ebpf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root = None;
+        config.ebpf = Some(crate::config::EbpfConfig {
+            object_dir: dir.path().to_path_buf(),
+        });
+        let sensor = build_sensor(&config, "network").expect("network sensor built");
+        assert_eq!(sensor.name(), "network");
+    }
+
+    #[test]
+    fn network_sensor_absent_without_either_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root = None;
+        config.ebpf = None;
+        assert!(build_sensor(&config, "network").is_none());
+    }
+
+    #[test]
+    fn network_sensor_built_from_proc_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.network_proc_root = Some(dir.path().to_string_lossy().to_string());
+        config.ebpf = None;
+        let sensor = build_sensor(&config, "network").expect("network sensor built");
+        assert_eq!(sensor.name(), "network");
     }
 
     #[test]
