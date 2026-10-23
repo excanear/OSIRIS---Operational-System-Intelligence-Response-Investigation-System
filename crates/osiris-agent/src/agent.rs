@@ -114,7 +114,7 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
         "network" => config
             .network_proc_root
             .clone()
-            .map(|p| Box::new(NetworkSensor::new(p)) as Box<dyn Sensor>),
+            .map(|p| Box::new(NetworkSensor::new(Some(PathBuf::from(p)), None)) as Box<dyn Sensor>),
         "identity" => config
             .identity_audit_log_path
             .clone()

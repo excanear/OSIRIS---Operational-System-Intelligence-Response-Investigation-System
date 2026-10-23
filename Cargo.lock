@@ -1886,10 +1886,12 @@ name = "osiris-sensors-net"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "osiris-ebpf",
  "osiris-sensor-api",
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

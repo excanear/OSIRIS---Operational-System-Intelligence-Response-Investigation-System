@@ -143,46 +143,59 @@ pub enum NetworkOperation {
     Close,
 }
 
-/// Which side of the connection this host is. Derived from a documented
-/// port-range heuristic, not ground truth (Phase 3 plan Global Constraints
-/// #4) — `/proc/net/tcp` alone does not report which side initiated a
-/// connection.
+/// Which side of the connection this host is. From the eBPF backend
+/// (`source == Ebpf`) it is exact: connect is Outbound, accept is Inbound
+/// and close repeats the direction recorded at open time. From the procfs
+/// backend it is a documented port-range heuristic, not ground truth
+/// (Phase 3 plan Global Constraints #4) — `/proc/net/tcp` alone does not
+/// report which side initiated a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkDirection {
     Inbound,
     Outbound,
 }
 
-/// A TCP connection lifecycle record, assembled from a `/proc/net/tcp`
-/// snapshot diff plus a best-effort `/proc/<pid>/fd` inode scan for process
-/// attribution (Phase 3 plan Global Constraints #1/#5).
+/// A TCP connection lifecycle record, from one of two backends: the eBPF
+/// net program's connect/accept/close records (`source == Ebpf`), or a
+/// `/proc/net/tcp` snapshot diff plus a best-effort `/proc/<pid>/fd` inode
+/// scan for process attribution (`source == Procfs`, Phase 3 plan Global
+/// Constraints #1/#5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkEventRaw {
     pub operation: NetworkOperation,
+    /// Address text: dotted IPv4, or IPv6 as `std::net` renders it (eBPF
+    /// only; an IPv4-mapped IPv6 address is rendered as IPv4). The procfs
+    /// backend reads `/proc/net/tcp` only, so it reports IPv4 alone.
     pub local_addr: String,
     pub local_port: u16,
+    /// Same rendering as `local_addr`.
     pub remote_addr: String,
     pub remote_port: u16,
-    /// Always `"tcp"` this phase (IPv4-only, Global Constraints #1/#2) —
-    /// kept as a string rather than an enum so a later UDP/IPv6 backend
-    /// extends this field's value set without a breaking type change.
+    /// Always `"tcp"` this phase (both backends cover TCP only) — kept as a
+    /// string rather than an enum so a later UDP backend extends this
+    /// field's value set without a breaking type change.
     pub proto: String,
     pub direction: NetworkDirection,
     /// `None` when the sensor could not attribute this connection to a
     /// process (Global Constraint #5) — the pipeline then emits no
-    /// `process` and no `CONNECTED_TO` edge, rather than guessing.
+    /// `process` and no `CONNECTED_TO` edge, rather than guessing. Always
+    /// `Some` (the owning tgid) from the eBPF backend.
     pub pid: Option<u32>,
-    /// Always populated directly from the `/proc/net/tcp` row's `uid`
-    /// column, independent of whether pid attribution succeeded.
+    /// From the eBPF record (the owning task's uid), or, on the procfs
+    /// backend, directly from the `/proc/net/tcp` row's `uid` column,
+    /// independent of whether pid attribution succeeded.
     pub uid: u32,
     /// Empty when `pid` is `None`, or when `pid` resolved but
     /// `/proc/<pid>/exe`/`/proc/<pid>/comm` could not be read (the process
-    /// may have exited between the fd-scan and the read).
+    /// may have exited between the fd-scan and the read). On the eBPF
+    /// backend, empty whenever the `/proc/<pid>/exe` link cannot be tied to
+    /// the record (often: the process exited before user space read it).
     pub exe_path: String,
     pub comm: String,
-    /// Wall-clock nanoseconds, UTC, from the sensor's own clock at the poll
-    /// tick this connection's state change was observed (`/proc/net/tcp`
-    /// carries no per-connection timestamp of its own).
+    /// Wall-clock nanoseconds, UTC. eBPF: the kernel's record time,
+    /// converted from CLOCK_MONOTONIC. Procfs: the sensor's own clock at
+    /// the poll tick this connection's state change was observed
+    /// (`/proc/net/tcp` carries no per-connection timestamp of its own).
     pub timestamp_ns: u64,
     pub source: RawEventSource,
 }
