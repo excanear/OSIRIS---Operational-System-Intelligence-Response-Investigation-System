@@ -2,9 +2,10 @@
 //! on a host prepared by `tools/real-linux/setup.sh`.
 #![cfg(target_os = "linux")]
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use osiris_real_linux_tests::json::{contains_str, has_kv, ids_containing, objects_with};
 use osiris_real_linux_tests::render::bpf_dir_from_env;
@@ -315,35 +316,43 @@ fn since_before(t0: u128) -> u128 {
     t0.saturating_sub(5_000_000_000)
 }
 
-/// Waits until AGENT_HEALTH reports the process sensor in `state`, and
-/// returns every `process_exec` entry seen.
-fn process_health_reaches(s: &Stack, state: &str) -> Vec<Value> {
+/// Waits until AGENT_HEALTH reports `sensor` (its `Sensor::name()`) in
+/// `state`, and returns every entry of that sensor seen.
+fn sensor_health_reaches(s: &Stack, sensor: &str, state: &str) -> Vec<Value> {
     let health = events(s, "AGENT_HEALTH", 0, |v| {
-        objects_with(v, "sensor_name", &json!("process_exec"))
+        objects_with(v, "sensor_name", &json!(sensor))
             .iter()
             .any(|h| h["state"]["state"] == json!(state))
     });
-    objects_with(&health, "sensor_name", &json!("process_exec"))
+    objects_with(&health, "sensor_name", &json!(sensor))
         .into_iter()
         .cloned()
         .collect()
 }
 
-/// The agent's full `process_exec` health (capability flags, last error),
+fn process_health_reaches(s: &Stack, state: &str) -> Vec<Value> {
+    sensor_health_reaches(s, "process_exec", state)
+}
+
+/// The agent's full health of `sensor` (capability flags, last error),
 /// from its local status endpoint, once it has left STARTING. Echoed with
 /// an `osiris-ebpf:` prefix so the workflow can surface it as an annotation.
-fn process_status(s: &Stack) -> Value {
+fn sensor_status(s: &Stack, sensor: &str) -> Value {
     let pick = |v: &Value| -> Option<Value> {
         v["sensors"]
             .as_array()?
             .iter()
-            .find(|h| h["name"] == json!("process_exec") && h["state"] != json!("STARTING"))
+            .find(|h| h["name"] == json!(sensor) && h["state"] != json!("STARTING"))
             .cloned()
     };
     let status = s.wait_agent_status(DEADLINE, |v| pick(v).is_some());
     let entry = pick(&status).unwrap();
-    eprintln!("osiris-ebpf: process_exec status: {entry}");
+    eprintln!("osiris-ebpf: {sensor} status: {entry}");
     entry
+}
+
+fn process_status(s: &Stack) -> Value {
+    sensor_status(s, "process_exec")
 }
 
 fn has_flag(health: &Value, flag: &str) -> bool {
@@ -502,4 +511,291 @@ fn corrupted_object_falls_back_to_audit() {
             .iter()
             .any(|e| e["provider"] == json!("process_exec_sensor/audit") && contains_str(e, &m))
     });
+}
+
+// ---- Phase 11b-2: the eBPF network backend and group exit ----
+
+const NET_EBPF_PROVIDER: &str = "network_sensor/ebpf";
+
+/// Bounded wait for a spawned child (Global Constraint #11): killed and
+/// reaped, then a panic, when it outlives `limit`.
+fn wait_child(child: &mut Child, limit: Duration) -> ExitStatus {
+    let end = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child {} still running after {limit:?}", child.id());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Accepts one connection on `listener` from a thread of this process and
+/// drops it at once; the accept is polled, so the thread ends (with a
+/// panic) within DEADLINE even if nobody connects.
+fn accept_one_and_drop(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let end = Instant::now() + DEADLINE;
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    drop(conn);
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < end, "no connection within {DEADLINE:?}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        }
+    })
+}
+
+/// Every stored event of `event_type` from the eBPF network backend that
+/// satisfies `pred`.
+fn ebpf_net_events(v: &Value, event_type: &str, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+    objects_with(v, "event_type", &json!(event_type))
+        .into_iter()
+        .filter(|e| e["provider"] == json!(NET_EBPF_PROVIDER))
+        .filter(|e| pred(e))
+        .cloned()
+        .collect()
+}
+
+/// With both objects built, the network sensor runs on eBPF: HEALTHY in the
+/// heartbeat, capability flag `ebpf` on the agent, and a connection it
+/// observes is stored with provider `network_sensor/ebpf`.
+#[test]
+#[ignore]
+fn network_sensor_uses_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let health = sensor_health_reaches(&s, "network", "HEALTHY");
+    assert!(
+        !health
+            .iter()
+            .any(|h| h["state"]["state"] != json!("HEALTHY")),
+        "network not steadily HEALTHY in AGENT_HEALTH: {health:?}"
+    );
+    let status = sensor_status(&s, "network");
+    assert_eq!(status["state"], json!("HEALTHY"), "status: {status}");
+    assert!(
+        has_flag(&status, "ebpf"),
+        "no `ebpf` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "procfs_fallback"),
+        "eBPF active yet `procfs_fallback` set: {status}"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accept = accept_one_and_drop(listener);
+    let t0 = now_ns();
+    sh(&format!("exec 3<>/dev/tcp/127.0.0.1/{port}; : {m}"));
+    accept.join().unwrap();
+    events(&s, "NETWORK_CONNECT", since_before(t0), |v| {
+        !ebpf_net_events(v, "NETWORK_CONNECT", |e| {
+            e["network"]["dst_port"] == json!(port)
+        })
+        .is_empty()
+    });
+}
+
+/// A connection that lives for microseconds (no /proc/net/tcp poll could
+/// see it): `bash` opens it and exits, a thread of this test accepts it
+/// and drops it at once. Both ends arrive from eBPF with exact owners and
+/// directions (the child's CONNECT/CLOSE outbound, this process's
+/// ACCEPT/CLOSE inbound) and, for IPv6, the `::1` addresses.
+fn short_tcp_connection_is_observed_via_ebpf(bind: &str, host: &str, v6: bool) {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    sensor_health_reaches(&s, "network", "HEALTHY");
+
+    let listener = TcpListener::bind(bind).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accept = accept_one_and_drop(listener);
+    let t0 = now_ns();
+    let mut child = Command::new("bash")
+        .args(["-c", &format!("exec 3<>/dev/tcp/{host}/{port}; : {m}")])
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    let status = wait_child(&mut child, DEADLINE);
+    assert!(status.success(), "bash connect failed: {status}");
+    accept.join().unwrap();
+    let me = std::process::id();
+    let since = since_before(t0);
+
+    let loopback_ok = |e: &Value| {
+        !v6 || (e["network"]["src_ip"] == json!("::1") && e["network"]["dst_ip"] == json!("::1"))
+    };
+    let outbound = |e: &Value| {
+        e["process"]["pid"] == json!(child_pid)
+            && e["event_data"]["comm"] == json!("bash")
+            && e["network"]["direction"] == json!("OUTBOUND")
+            && e["network"]["dst_port"] == json!(port)
+            && loopback_ok(e)
+    };
+    // Inbound: the peer is the source, this host's listener the destination.
+    let inbound = |e: &Value| {
+        e["process"]["pid"] == json!(me)
+            && e["network"]["direction"] == json!("INBOUND")
+            && e["network"]["dst_port"] == json!(port)
+            && loopback_ok(e)
+    };
+    type Pred<'a> = &'a dyn Fn(&Value) -> bool;
+    let checks: [(&str, Pred, &str); 4] = [
+        ("NETWORK_CONNECT", &outbound, "child outbound"),
+        ("NETWORK_CLOSE", &outbound, "child outbound"),
+        ("NETWORK_ACCEPT", &inbound, "test inbound"),
+        ("NETWORK_CLOSE", &inbound, "test inbound"),
+    ];
+    for (event_type, pred, side) in checks {
+        let got = events(&s, event_type, since, |v| {
+            !ebpf_net_events(v, event_type, pred).is_empty()
+        });
+        let e = ebpf_net_events(&got, event_type, pred).remove(0);
+        eprintln!("osiris-ebpf: {event_type} ({side}): {e}");
+    }
+}
+
+#[test]
+#[ignore]
+fn short_tcp_connection_is_observed_via_ebpf_v4() {
+    short_tcp_connection_is_observed_via_ebpf("127.0.0.1:0", "127.0.0.1", false);
+}
+
+#[test]
+#[ignore]
+fn short_tcp_connection_is_observed_via_ebpf_v6() {
+    short_tcp_connection_is_observed_via_ebpf("[::1]:0", "::1", true);
+}
+
+/// A worker thread calls `os._exit(7)` while the main thread sleeps: the
+/// whole group exits once, so exactly one PROCESS_EXIT arrives for the pid,
+/// with the group's exit code 7 and the exe path the exec fed the cache.
+#[test]
+#[ignore]
+fn group_exit_reports_once_with_code() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    process_health_reaches(&s, "HEALTHY");
+    let script = "import os, threading, time\n\
+                  threading.Thread(target=lambda: (time.sleep(0.5), os._exit(7))).start()\n\
+                  time.sleep(30)\n";
+    let t0 = now_ns();
+    // The marker is sys.argv[1], so it sits in the exec's cmdline.
+    let mut child = Command::new("python3")
+        .args(["-c", script, &m])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let status = wait_child(&mut child, Duration::from_secs(20));
+    assert_eq!(status.code(), Some(7), "python3 exit status: {status}");
+
+    let since = since_before(t0);
+    let execs_of = |v: &Value| -> Vec<Value> {
+        objects_with(v, "event_type", &json!("PROCESS_EXEC"))
+            .into_iter()
+            .filter(|e| e["provider"] == json!(EBPF_PROVIDER))
+            .filter(|e| e["process"]["pid"] == json!(pid))
+            .filter(|e| contains_str(&e["process"]["cmdline"], &m))
+            .cloned()
+            .collect()
+    };
+    events(&s, "PROCESS_EXEC", since, |v| !execs_of(v).is_empty());
+
+    let exits_of = |v: &Value| -> Vec<Value> {
+        objects_with(v, "event_type", &json!("PROCESS_EXIT"))
+            .into_iter()
+            .filter(|e| e["provider"] == json!(EBPF_PROVIDER))
+            .filter(|e| e["process"]["pid"] == json!(pid))
+            .cloned()
+            .collect()
+    };
+    events(&s, "PROCESS_EXIT", since, |v| !exits_of(v).is_empty());
+    // A duplicate from a second exiting thread would follow within ms;
+    // give it a few seconds to reach the store before counting.
+    std::thread::sleep(Duration::from_secs(5));
+    let all = s.api_get(&format!(
+        "/api/v1/events?event_type=PROCESS_EXIT&since={since}&limit=1000"
+    ));
+    let exits = exits_of(&all);
+    assert_eq!(
+        exits.len(),
+        1,
+        "expected one PROCESS_EXIT for {pid}: {exits:?}"
+    );
+    let exit = &exits[0];
+    assert_eq!(exit["event_data"]["exit_code"], json!(7), "exit: {exit}");
+    assert!(
+        exit["process"]["exe_path"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty()),
+        "exit without exe_path: {exit}"
+    );
+    eprintln!("osiris-ebpf: group exit: {exit}");
+}
+
+/// An object dir whose `net.bpf.o` sidecar digest is altered (the process
+/// object intact): only the network sensor falls back, to the procfs
+/// poller (DEGRADED with a reason naming `net.bpf.o`, flag
+/// `procfs_fallback`), while the process sensor stays HEALTHY on eBPF.
+#[test]
+#[ignore]
+fn corrupted_net_object_falls_back_to_procfs() {
+    let m = marker();
+    let good = required_bpf_dir();
+    // Declared before the stack so it outlives the agent reading it.
+    let bad = tempfile::Builder::new()
+        .prefix("osiris-bpf-corrupt-net-")
+        .tempdir()
+        .unwrap();
+    for f in ["process.bpf.o", "process.bpf.o.sha256", "net.bpf.o"] {
+        std::fs::copy(good.join(f), bad.path().join(f)).unwrap();
+    }
+    std::fs::write(
+        bad.path().join("net.bpf.o.sha256"),
+        format!("{}  net.bpf.o\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let s = stack_with_bpf(
+        &Path::new(WATCH_ROOT).join(&m),
+        Some(bad.path().to_path_buf()),
+    );
+
+    let health = sensor_health_reaches(&s, "network", "DEGRADED");
+    assert!(
+        health
+            .iter()
+            .filter(|h| h["state"]["state"] == json!("DEGRADED"))
+            .all(|h| h["state"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("net.bpf.o"))),
+        "DEGRADED without a reason naming net.bpf.o: {health:?}"
+    );
+    let status = sensor_status(&s, "network");
+    assert_eq!(status["state"], json!("DEGRADED"), "status: {status}");
+    assert!(
+        has_flag(&status, "procfs_fallback"),
+        "no `procfs_fallback` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "ebpf"),
+        "fell back yet `ebpf` set: {status}"
+    );
+
+    let process = process_status(&s);
+    assert_eq!(process["state"], json!("HEALTHY"), "process: {process}");
+    assert!(
+        has_flag(&process, "ebpf"),
+        "process sensor left eBPF: {process}"
+    );
 }

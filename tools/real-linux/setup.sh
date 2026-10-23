@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prepares a WSL/VM Linux host for the OSIRIS real-Linux suite. Idempotent.
-# With OSIRIS_BPF_DIR set, also builds the BPF object (and its sha256
-# sidecar) there for the eBPF process backend; the log is <dir>/build.log.
+# With OSIRIS_BPF_DIR set, also builds the BPF objects (and their sha256
+# sidecars) there for the eBPF process and network backends; the log is
+# <dir>/build.log.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "setup.sh must run as root (auditd, /etc/osiris)"; exit 1; }
 here="$(cd "$(dirname "$0")" && pwd)"

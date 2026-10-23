@@ -22,10 +22,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Choose the BPF object dir
-        # Phase 11b-1: setup.sh builds the BPF object here and every stack's
-        # agent loads it (render::bpf_dir_from_env).
+        # setup.sh builds the BPF objects here (process.bpf.o since 11b-1,
+        # net.bpf.o since 11b-2) and every stack's agent loads them
+        # (render::bpf_dir_from_env).
         run: echo "OSIRIS_BPF_DIR=$RUNNER_TEMP/osiris-bpf" >> "$GITHUB_ENV"
-      - name: Prepare auditd, watch dirs and the BPF object
+      - name: Prepare auditd, watch dirs and the BPF objects
         # A BPF build failure is annotated by setup.sh (annotate.sh tail).
         run: sudo "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" tools/real-linux/setup.sh
       - name: Start DNS packet capture
@@ -58,7 +59,7 @@ jobs:
         # Annotations are public; job logs and artifacts need GitHub auth.
         if: always() && steps.suite.outcome == 'failure'
         run: tools/real-linux/annotate.sh failures "real-Linux suite failed" "$RUNNER_TEMP/real-linux-output.txt"
-      - name: Annotate the eBPF backend status
+      - name: Annotate the eBPF backends' status (process and network)
         # Kept stack dirs are root-only, hence sudo.
         if: always() && steps.suite.outcome != 'skipped'
         run: sudo tools/real-linux/annotate.sh ebpf "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/osiris-kept"
@@ -81,20 +82,21 @@ jobs:
       - name: Annotate DNS unit test failures
         if: always() && steps.dns_unit.outcome == 'failure'
         run: tools/real-linux/annotate.sh failures "DNS unit tests failed" "$RUNNER_TEMP/dns-unit-tests.txt"
-      - name: Run the process sensor's and eBPF engine's unit tests on Linux
+      - name: Run the process and network sensors' and eBPF engine's unit tests on Linux
         id: ebpf_unit
         # Phase 11b-1: the Linux-only tests (e.g. the /proc/<pid>/exe symlink
         # case resolved_proc_exe_wins_over_the_filename, the loader and
-        # probe tests) can only run here. No root needed.
+        # probe tests; since 11b-2 the network sensor's eBPF wiring and the
+        # exe-identity symlink cases) can only run here. No root needed.
         if: always()
         timeout-minutes: 15
         run: |
-          cargo test -p osiris-sensors-process -p osiris-ebpf -- --include-ignored 2>&1 \
+          cargo test -p osiris-sensors-process -p osiris-sensors-net -p osiris-ebpf -- --include-ignored 2>&1 \
             | tee "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
           exit "${PIPESTATUS[0]}"
-      - name: Annotate process/eBPF unit test failures
+      - name: Annotate process/network/eBPF unit test failures
         if: always() && steps.ebpf_unit.outcome == 'failure'
-        run: tools/real-linux/annotate.sh failures "process/eBPF unit tests failed" "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
+        run: tools/real-linux/annotate.sh failures "process/network/eBPF unit tests failed" "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
       - name: Collect audit log
         if: always()
         run: |

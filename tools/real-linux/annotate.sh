@@ -10,7 +10,7 @@
 #       (or the output's tail when none match, e.g. a compile error)
 #   annotate.sh ebpf     <test-output> [kept-stack-dirs]
 #       ::warning:: with the eBPF backend status lines the scenarios echo and
-#       the agent log lines naming the eBPF load or its fallback reason
+#       the agent log lines naming the eBPF loads or their fallback reasons
 set -uo pipefail
 
 max_lines=20
@@ -57,9 +57,9 @@ ebpf)
     {
         [ -f "$out" ] && grep -h 'osiris-ebpf:' "$out"
         if [ -n "$kept" ] && [ -d "$kept" ]; then
-            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback' {} +
+            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback|procfs fallback' {} +
         fi
-    } | head -n "$max_lines" | emit warning "eBPF process backend"
+    } | head -n "$max_lines" | emit warning "eBPF process and network backends"
     ;;
 *)
     echo "usage: $0 tail|failures|ebpf ..." >&2
