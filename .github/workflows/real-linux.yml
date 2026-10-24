@@ -20,6 +20,12 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
+      - name: Record the runner kernel
+        # The BPF objects are proven only on the kernels these runs use; the
+        # notice annotation is public, so the version is recorded per run.
+        run: |
+          uname -a
+          echo "::notice title=runner kernel (${{ matrix.os }})::$(uname -r)"
       - uses: dtolnay/rust-toolchain@stable
       - name: Choose the BPF object dir
         # setup.sh builds the BPF objects here (process.bpf.o since 11b-1,

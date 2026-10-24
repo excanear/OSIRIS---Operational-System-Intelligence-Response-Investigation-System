@@ -119,6 +119,8 @@ revisão final independente → merge → push.
   - UDP não é coberto.
   - Conexões que falham (sem conexão estabelecida) não são reportadas.
   - Accepts via io_uring não são vistos.
+  - Accepts de processos 32-bit (compat ia32) em x86_64 não são vistos: tracepoints de syscall não
+    disparam para syscalls compat (nem o CLOSE desses sockets).
   - Conexões já existentes quando o agente inicia não são reportadas (nem o CLOSE delas).
   - CLOSE de conexão despejada do LRU (mais de 65 536 sockets) é perdido.
   - A checagem de identidade do executável não casa em btrfs/overlayfs (cai no resultado com `comm`).

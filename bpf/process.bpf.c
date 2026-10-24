@@ -220,19 +220,17 @@ int handle_exit(void *ctx)
 	 * The process ends when its thread group dies, not when the leader
 	 * exits: a leader's pthread_exit() leaves the group running, and a
 	 * non-leader's execve() kills the old leader (de_thread) while the
-	 * process lives on. do_exit() on 5.15 and 6.x runs, in order:
-	 *
-	 *   group_dead = atomic_dec_and_test(&tsk->signal->live);
-	 *   ... tsk->exit_code = code; ... exit_mm(); ...
-	 *   trace_sched_process_exit(tsk);
-	 *
-	 * so every exiting thread has already decremented signal->live here
-	 * and a non-zero value means other threads are still running. More
-	 * than one thread can read 0 (A decrements to 1, B to 0, then both
-	 * reach the tracepoint), so EXITED lets only the first emit.
-	 * signal_struct is freed only after the last thread is released, so
-	 * it is valid here. exit_mm() has cleared current->mm, which is why
-	 * exit records carry no exe identity.
+	 * process lives on. The gate relies on one ordering in do_exit():
+	 * the exiting thread's atomic_dec_and_test(&tsk->signal->live) runs
+	 * before trace_sched_process_exit(tsk). So every exiting thread has
+	 * already decremented signal->live here, and a non-zero value means
+	 * other threads are still running. More than one thread can read 0
+	 * (A decrements to 1, B to 0, then both reach the tracepoint), so
+	 * EXITED lets only the first emit. signal_struct is freed only after
+	 * the last thread is released, so it is valid here. Exit records
+	 * carry no exe identity and do not read current->mm, which exit_mm()
+	 * may already have cleared (its order relative to the tracepoint is
+	 * not relied on); user space takes exe_path from the exec cache.
 	 */
 	if (BPF_CORE_READ(sig, live.counter) != 0)
 		return 0;

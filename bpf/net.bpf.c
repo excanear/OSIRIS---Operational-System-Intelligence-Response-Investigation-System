@@ -128,7 +128,10 @@ static __always_inline __u16 port_from_be(__be16 v)
  * The calling task as a socket owner. Called only from process context
  * (connect() via CLOSE->SYN_SENT, the accept syscalls' exit). The exe
  * identity is mm->exe_file's inode, as in process.bpf.c; a kernel thread
- * (no mm) or a failed read leaves 0 = unknown.
+ * (no mm) or a failed read leaves 0 = unknown. The comm is the thread-group
+ * leader's (what /proc/<pid>/comm shows and what exec/exit records carry),
+ * not the calling thread's: connect() and accept() often run on named
+ * worker threads. A failed read leaves it zero-filled.
  */
 static __always_inline void owner_from_current(struct sock_owner *o, __u32 tgid,
 					       __u8 direction)
@@ -139,7 +142,7 @@ static __always_inline void owner_from_current(struct sock_owner *o, __u32 tgid,
 	__builtin_memset(o, 0, sizeof(*o));
 	o->pid = tgid;
 	o->uid = (__u32)bpf_get_current_uid_gid();
-	bpf_get_current_comm(o->comm, sizeof(o->comm));
+	BPF_CORE_READ_STR_INTO(&o->comm, task, group_leader, comm);
 	o->direction = direction;
 	exe_inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
 	if (exe_inode) {

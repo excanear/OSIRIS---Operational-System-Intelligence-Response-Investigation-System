@@ -29,7 +29,10 @@ ebpf:
   object_dir: /usr/lib/osiris/bpf
 ```
 
-- `ebpf` absent: audit backend only, exactly as before.
+- `ebpf` absent: the process sensor uses the audit backend only and the network sensor the procfs
+  poller only, exactly as before.
+- `ebpf` present: both the process sensor and the network sensor try eBPF, so `object_dir` must
+  hold `process.bpf.o` and `net.bpf.o` with their sidecars.
 - `ebpf: {}`: `object_dir` defaults to `/usr/lib/osiris/bpf`.
 - Backend choice at start: probe OK and load OK gives the eBPF backend (health `HEALTHY`,
   capability flag `ebpf`). Otherwise, if `audit_log_path` is configured, the sensor falls back to
@@ -39,6 +42,18 @@ ebpf:
   fallback).
 - Capability flags and `last_error` are visible through the agent's local `GET /status`, not in
   `AGENT_HEALTH`.
+
+### Upgrading from 11b-1
+
+Rebuild both objects on upgrade (`tools/ebpf/build.sh <object_dir>`). Two things change for an
+install that already has an `ebpf` key:
+
+- A `process.bpf.o` built for 11b-1 (record schema 1) is now refused, because the agent expects
+  schema 2. The process sensor then falls back to the audit backend (`DEGRADED`,
+  `audit_fallback`), or is `FAILED` without `audit_log_path`.
+- The `ebpf` key now also starts the network sensor's eBPF backend, which needs `net.bpf.o` in
+  `object_dir`. Without it the network sensor is `DEGRADED` on the procfs poller (when
+  `network_proc_root` is set) or is skipped as unsupported.
 
 ## Requirements
 
@@ -123,8 +138,12 @@ falls back as above.
 - A passive connection that the peer closes before the server calls `accept()` still produces an ACCEPT when `accept()` returns, but its CLOSE may be missing (the socket was already closed when the owner entry was inserted).
 - After LRU eviction (more than 65 536 tracked sockets) an evicted connection's CLOSE is lost. The
   map is an LRU whose per-CPU free lists can evict before it is full. The race between the
-  accept-time insert and a peer close is not fenced; at worst one stale entry remains until it is
-  overwritten or evicted.
+  accept-time insert and a peer close is not fenced, so a stale entry can remain. It is replaced
+  only when the next socket at the same kernel address goes through `connect()` or `accept()`.
+  A socket that reaches CLOSE without either (a passive child reset before `accept()`, an
+  io_uring or in-kernel accept) is reported under the stale owner: at worst one later CLOSE at a
+  reused socket address may be attributed to the wrong pid. The window is tiny (the address must
+  be reused while the entry survives), but such a CLOSE's owner is not proof.
 - A CLOSE can arrive without a prior CONNECT (simultaneous open, or a ring-buffer drop).
   Consumers must not assume CONNECT/CLOSE pairing.
 - The owner is the process that called `connect()` or `accept()`. CLOSE reports that tgid even if
@@ -133,6 +152,12 @@ falls back as above.
 - Connects made by kernel threads (NFS, CIFS, iSCSI, MPTCP extra subflows) are attributed to the
   kernel worker, with an unknown exe.
 - Accepts through io_uring, or any path that bypasses `accept`/`accept4`, are not reported.
+- Accepts by 32-bit (ia32 compat) processes on x86_64 are not reported: syscall tracepoints do
+  not fire for compat syscalls, so their `accept`/`accept4`/`socketcall` produces no ACCEPT, and
+  the socket is untracked (no CLOSE either). Their outbound connects are still seen, because
+  CONNECT comes from the socket-state tracepoint.
+- `comm` is the owner process's comm (the thread-group leader's, as `/proc/<pid>/comm` and the
+  procfs backend report it), not the name of the thread that called `connect()` or `accept()`.
 - Only TCP is covered: no UDP, and failed connects (no established connection) are not reported.
 - `exe_path` follows the same chain as exec, ending in `""` for network events. It is resolved
   against `network_proc_root` when set, else `/proc`, and is usually `""` when the process exits

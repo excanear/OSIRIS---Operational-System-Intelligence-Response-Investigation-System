@@ -534,12 +534,17 @@ fn wait_child(child: &mut Child, limit: Duration) -> ExitStatus {
     }
 }
 
-/// Accepts one connection on `listener` from a thread of this process and
-/// drops it at once; the accept is polled, so the thread ends (with a
+/// The thread name [`accept_one_and_drop`] gives its thread: unlike the
+/// process (group-leader) comm, so a net record that carried the calling
+/// thread's comm would not match the inbound predicate.
+const ACCEPT_THREAD_NAME: &str = "osiris-acceptor";
+
+/// Accepts one connection on `listener` from a named thread of this process
+/// and drops it at once; the accept is polled, so the thread ends (with a
 /// panic) within DEADLINE even if nobody connects.
 fn accept_one_and_drop(listener: TcpListener) -> std::thread::JoinHandle<()> {
     listener.set_nonblocking(true).unwrap();
-    std::thread::spawn(move || {
+    let body = move || {
         let end = Instant::now() + DEADLINE;
         loop {
             match listener.accept() {
@@ -554,7 +559,11 @@ fn accept_one_and_drop(listener: TcpListener) -> std::thread::JoinHandle<()> {
                 Err(e) => panic!("accept failed: {e}"),
             }
         }
-    })
+    };
+    std::thread::Builder::new()
+        .name(ACCEPT_THREAD_NAME.into())
+        .spawn(body)
+        .unwrap()
 }
 
 /// Every stored event of `event_type` from the eBPF network backend that
@@ -612,7 +621,9 @@ fn network_sensor_uses_ebpf() {
 /// see it): `bash` opens it and exits, a thread of this test accepts it
 /// and drops it at once. Both ends arrive from eBPF with exact owners and
 /// directions (the child's CONNECT/CLOSE outbound, this process's
-/// ACCEPT/CLOSE inbound) and, for IPv6, the `::1` addresses.
+/// ACCEPT/CLOSE inbound), with each owner's process comm (for the inbound
+/// side the group leader's, not the named accept thread's) and, for IPv6,
+/// the `::1` addresses.
 fn short_tcp_connection_is_observed_via_ebpf(bind: &str, host: &str, v6: bool) {
     let m = marker();
     let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
@@ -631,6 +642,16 @@ fn short_tcp_connection_is_observed_via_ebpf(bind: &str, host: &str, v6: bool) {
     assert!(status.success(), "bash connect failed: {status}");
     accept.join().unwrap();
     let me = std::process::id();
+    // The process comm (/proc/<tgid>/comm is the group leader's), which the
+    // net record must carry rather than the accepting thread's name.
+    let my_comm = std::fs::read_to_string("/proc/self/comm")
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    assert_ne!(
+        my_comm, ACCEPT_THREAD_NAME,
+        "leader comm equals the accept thread's name; the comm check proves nothing"
+    );
     let since = since_before(t0);
 
     let loopback_ok = |e: &Value| {
@@ -646,6 +667,7 @@ fn short_tcp_connection_is_observed_via_ebpf(bind: &str, host: &str, v6: bool) {
     // Inbound: the peer is the source, this host's listener the destination.
     let inbound = |e: &Value| {
         e["process"]["pid"] == json!(me)
+            && e["event_data"]["comm"] == json!(my_comm)
             && e["network"]["direction"] == json!("INBOUND")
             && e["network"]["dst_port"] == json!(port)
             && loopback_ok(e)

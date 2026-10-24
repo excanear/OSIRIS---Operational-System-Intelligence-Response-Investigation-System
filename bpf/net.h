@@ -39,7 +39,7 @@ struct net_record {
 	__u32 pid;                  /*  8: owner tgid */
 	__u32 uid;                  /* 12: owner uid */
 	__u64 ktime_ns;             /* 16: bpf_ktime_get_ns() at emit */
-	char comm[COMM_LEN];        /* 24: owner comm */
+	char comm[COMM_LEN];        /* 24: owner's group-leader comm */
 	__u16 family;               /* 40: AF_INET or AF_INET6 */
 	__u16 lport;                /* 42 */
 	__u16 rport;                /* 44 */

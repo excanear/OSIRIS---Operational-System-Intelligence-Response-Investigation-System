@@ -35,6 +35,8 @@ pub struct NetRecord {
     pub uid: u32,
     /// `bpf_ktime_get_ns()` when the record was emitted.
     pub ktime_ns: u64,
+    /// The owner's thread-group leader comm (as `/proc/<pid>/comm` shows
+    /// it), not that of the thread that called `connect()`/`accept()`.
     pub comm: [u8; COMM_LEN],
     pub family: u16,
     pub lport: u16,
@@ -65,6 +67,7 @@ pub struct NetEvent {
     pub pid: u32,
     pub uid: u32,
     pub ktime_ns: u64,
+    /// The owner's thread-group leader comm.
     pub comm: String,
     /// [`AF_INET`] or [`AF_INET6`].
     pub family: u16,

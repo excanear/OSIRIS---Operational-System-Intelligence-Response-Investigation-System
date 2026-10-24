@@ -75,8 +75,13 @@ Process record v2 adds the exec'd image identity (`exe_dev`, `exe_ino`) in what 
 - When all threads call `pthread_exit`, the reported exit status is that of the first thread to
   observe `live == 0`, not necessarily the leader's.
 - The net socket-owner map (`SOCKS`) is an LRU of 65 536 entries whose per-CPU free lists can evict
-  before it is full. The accept-time insert versus peer-close race is not fenced: at worst one
-  stale entry stays until overwritten or evicted.
+  before it is full. The accept-time insert versus peer-close race is not fenced, so a stale
+  entry can stay until the next connect/accept at that socket address overwrites it or it is
+  evicted. A socket that reaches CLOSE without a connect/accept (a passive child reset before
+  `accept()`, an io_uring or in-kernel accept) meanwhile is reported under the stale owner: at
+  worst one later CLOSE at a reused socket address may be attributed to the wrong pid.
+- Net records carry the owner's thread-group leader comm (as `/proc/<pid>/comm` and the exit
+  record do), not the calling thread's.
 - Validation: GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`)
   passed on ubuntu-22.04 and ubuntu-24.04 on the first push. The run did not record `uname -r` (runners
   presumed 6.x), so the 5.15 floor is reasoned (CO-RE), not run.

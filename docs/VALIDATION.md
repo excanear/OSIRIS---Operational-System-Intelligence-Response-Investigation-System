@@ -273,8 +273,8 @@ exercised.
 
 - Not covered: kernels other than the two runner kernels, RHEL-like distributions, a kernel-version
   VM matrix (ARCHITECTURE §26).
-- Network: TCP only; connections open at agent start, failed connects, io_uring accepts and
-  LRU-evicted closes are not reported; a CLOSE can arrive without a CONNECT; connects by kernel
+- Network: TCP only; connections open at agent start, failed connects, io_uring accepts,
+  accepts by 32-bit compat processes and LRU-evicted closes are not reported; a CLOSE can arrive without a CONNECT; connects by kernel
   threads (NFS/CIFS/iSCSI, MPTCP extra subflows) are attributed to the kernel worker; the exe
   identity check cannot match on btrfs or overlayfs. See `docs/operators-ebpf.md`.
 - Ring-buffer drops and LRU eviction were not provoked in validation.
