@@ -57,7 +57,7 @@ install that already has an `ebpf` key:
 
 ## Requirements
 
-- Validated on the ubuntu-22.04 and ubuntu-24.04 GitHub runners. The run did not record `uname -r`, so the kernel versions are not known; GitHub-hosted runners are presumed to run 6.x (11b-1 had reported 5.15 for the 22.04 runner). 5.15 is therefore not confirmed as exercised. The 5.15 floor is reasoned (CO-RE relocations and ring buffers, >= 5.8, with BTF at `/sys/kernel/btf/vmlinux`), not run. Other kernels are untested.
+- Validated on the ubuntu-22.04 and ubuntu-24.04 GitHub runners. Run 40043542332 recorded their kernels: `6.8.0-1064-azure` (ubuntu-22.04) and `6.17.0-1022-azure` (ubuntu-24.04). No 5.15 kernel was exercised. The 5.15 floor is reasoned (CO-RE relocations and ring buffers, >= 5.8, with BTF at `/sys/kernel/btf/vmlinux`), not run. Other kernels are untested.
 - The net program also needs `CONFIG_FTRACE_SYSCALLS` (syscall tracepoints), which mainstream distro kernels enable.
 - Privileges: `CAP_BPF` and `CAP_PERFMON`, or `CAP_SYS_ADMIN` (root).
 - The build host needs clang and libbpf-dev. The run host needs neither.

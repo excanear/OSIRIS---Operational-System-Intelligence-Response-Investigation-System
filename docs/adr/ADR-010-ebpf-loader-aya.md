@@ -83,5 +83,6 @@ Process record v2 adds the exec'd image identity (`exe_dev`, `exe_ino`) in what 
 - Net records carry the owner's thread-group leader comm (as `/proc/<pid>/comm` and the exit
   record do), not the calling thread's.
 - Validation: GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`)
-  passed on ubuntu-22.04 and ubuntu-24.04 on the first push. The run did not record `uname -r` (runners
-  presumed 6.x), so the 5.15 floor is reasoned (CO-RE), not run.
+  passed on ubuntu-22.04 and ubuntu-24.04 on the first push. The post-review re-run 40043542332
+  (commit `6140b74`) passed on kernels `6.8.0-1064-azure` (ubuntu-22.04) and `6.17.0-1022-azure`
+  (ubuntu-24.04). No 5.15 kernel was run, so the 5.15 floor is reasoned (CO-RE).

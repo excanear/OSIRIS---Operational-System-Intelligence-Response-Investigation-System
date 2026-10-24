@@ -252,12 +252,19 @@ on GitHub Actions run 40039969622 (commit `8e4d8d6`, branch `real-linux/t11b2-1`
 `ubuntu-22.04` (job 120708485081) and `ubuntu-24.04` (job 120708485394) on the first push. Both
 objects were built on the runner by `tools/ebpf/build.sh`.
 
+After the final review, the net owner `comm` was changed to the thread-group leader's, and the
+inbound check now asserts it. The suite was re-run as GitHub Actions run 40043542332 (commit
+`6140b74`, branch `real-linux/t11b2-2`), green on `ubuntu-22.04` (job 120719901813, kernel
+`6.8.0-1064-azure`) and `ubuntu-24.04` (job 120719901404, kernel `6.17.0-1022-azure`). The
+workflow now records `uname -r` per job as a notice annotation.
+
 Scenarios that passed on both runners:
 
 - `network_sensor_uses_ebpf`: `network_sensor` `HEALTHY` with capability flag `ebpf`.
 - `short_tcp_connection_is_observed_via_ebpf_v4` and `_v6`: a short-lived `bash` connection to a
   listener in the test process produced CONNECT and CLOSE (OUTBOUND, owner the child pid, comm
-  `bash`) and ACCEPT and CLOSE (INBOUND, owner the test process), provider `network_sensor/ebpf`;
+  `bash`) and ACCEPT and CLOSE (INBOUND, owner the test process, comm its `/proc/self/comm`,
+  not the name of the accepting thread; asserted since run 40043542332), provider `network_sensor/ebpf`;
   the v6 run also checked the `::1` addresses.
 - `group_exit_reports_once_with_code`: a worker thread calls `os._exit(7)` while the main
   thread sleeps; exactly one `PROCESS_EXIT` arrived for the pid, exit code 7, non-empty `exe_path`
@@ -265,9 +272,9 @@ Scenarios that passed on both runners:
 - `corrupted_net_object_falls_back_to_procfs`: with a corrupted `net.bpf.o` the sensor was
   `DEGRADED`, flag `procfs_fallback`, `last_error` naming `net.bpf.o`.
 
-Kernel coverage: the run did not record `uname -r`, so the runner kernel versions are not known
-(GitHub-hosted runners are presumed to run 6.x; 11b-1 had reported 5.15 for the 22.04 runner). The 5.15 floor is reasoned from CO-RE and ring-buffer support, not
-exercised.
+Kernel coverage: run 40043542332 recorded `6.8.0-1064-azure` (ubuntu-22.04) and
+`6.17.0-1022-azure` (ubuntu-24.04). Run 40039969622 did not record `uname -r`. No 5.15 kernel was
+exercised: the 5.15 floor is reasoned from CO-RE and ring-buffer support, not run.
 
 ### Known limitations
 
