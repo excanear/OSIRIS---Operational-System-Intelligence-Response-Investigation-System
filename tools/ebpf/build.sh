@@ -3,7 +3,7 @@
 #
 #   tools/ebpf/build.sh <out_dir>
 #
-# Writes, for each object (process.bpf.o, net.bpf.o), <out_dir>/<object>
+# Writes, for each object (process.bpf.o, net.bpf.o, fs.bpf.o), <out_dir>/<object>
 # and <out_dir>/<object>.sha256 (the sidecar the agent's loader verifies).
 # Needs clang and libbpf-dev (/usr/include/bpf/bpf_helpers.h). Works from
 # any working directory.
@@ -29,7 +29,7 @@ fi
 
 mkdir -p "$out_dir"
 
-for prog in process net; do
+for prog in process net fs; do
     clang -target bpf -D__TARGET_ARCH_x86 -g -O2 \
         -I "$bpf_dir" \
         -c "$bpf_dir/$prog.bpf.c" \

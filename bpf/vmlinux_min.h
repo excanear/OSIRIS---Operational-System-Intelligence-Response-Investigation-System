@@ -43,6 +43,10 @@ typedef __u64 u64;
 typedef __s64 s64;
 
 typedef int pid_t;
+typedef __u32 uid_t;
+typedef __u32 gid_t;
+typedef unsigned short umode_t;
+typedef unsigned int fmode_t;
 /* Kernel-internal dev_t: MAJOR = dev >> 20, MINOR = dev & 0xfffff. */
 typedef __u32 dev_t;
 
@@ -51,8 +55,18 @@ typedef struct {
 	int counter;
 } __attribute__((preserve_access_index)) atomic_t;
 
+/* include/linux/uidgid.h: kernel-global (init_user_ns) ids. */
+typedef struct {
+	uid_t val;
+} __attribute__((preserve_access_index)) kuid_t;
+
+typedef struct {
+	gid_t val;
+} __attribute__((preserve_access_index)) kgid_t;
+
 /* Subset of enum bpf_map_type (include/uapi/linux/bpf.h); values are ABI. */
 enum bpf_map_type {
+	BPF_MAP_TYPE_HASH = 1,
 	BPF_MAP_TYPE_ARRAY = 2,
 	BPF_MAP_TYPE_PERCPU_ARRAY = 6,
 	BPF_MAP_TYPE_LRU_HASH = 9,
@@ -66,16 +80,69 @@ enum {
 	BPF_EXIST = 2,
 };
 
+/* Map creation flag (include/uapi/linux/bpf.h); value is ABI. */
+#define BPF_F_NO_PREALLOC (1U << 0)
+
 struct super_block {
 	dev_t s_dev;
 } __attribute__((preserve_access_index));
 
 struct inode {
+	umode_t i_mode;
+	kuid_t i_uid;
+	kgid_t i_gid;
 	unsigned long i_ino;
 	struct super_block *i_sb;
 } __attribute__((preserve_access_index));
 
+/*
+ * include/linux/dcache.h. In the kernel `len` sits in an anonymous struct
+ * inside a union with hash_len; CO-RE matching descends into anonymous
+ * members by name, so it is declared flat here.
+ */
+struct qstr {
+	u32 len;
+	const unsigned char *name;
+} __attribute__((preserve_access_index));
+
+struct dentry {
+	struct dentry *d_parent;
+	struct qstr d_name;
+	/* NULL for a negative dentry (e.g. the target of a create). */
+	struct inode *d_inode;
+} __attribute__((preserve_access_index));
+
+/* include/linux/mount.h: the public part of a mount. */
+struct vfsmount {
+	struct dentry *mnt_root;
+} __attribute__((preserve_access_index));
+
+/*
+ * fs/mount.h (kernel-internal, but in BTF): `mnt` is embedded, so
+ * container_of(vfsmount, struct mount, mnt) gives the struct mount. The
+ * root of a mount tree (or a detached mount) has mnt_parent == itself.
+ */
+struct mount {
+	struct mount *mnt_parent;
+	struct dentry *mnt_mountpoint;
+	struct vfsmount mnt;
+} __attribute__((preserve_access_index));
+
+/* include/linux/path.h */
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+} __attribute__((preserve_access_index));
+
+/* include/linux/fs_struct.h */
+struct fs_struct {
+	struct path root;
+} __attribute__((preserve_access_index));
+
 struct file {
+	/* FMODE_* bits; the values are #defines in include/linux/fs.h. */
+	fmode_t f_mode;
+	struct path f_path;
 	struct inode *f_inode;
 	/* For a socket file: its struct socket (net/socket.c sock_alloc_file). */
 	void *private_data;
@@ -161,9 +228,40 @@ struct task_struct {
 	struct mm_struct *mm;
 	struct signal_struct *signal;
 	struct files_struct *files;
+	/* The task's root and cwd; NULL once exit_fs() has run. */
+	struct fs_struct *fs;
 	char comm[16];
 	/* Boot-based start time in ns; present since Linux 5.5. */
 	u64 start_boottime;
+} __attribute__((preserve_access_index));
+
+/*
+ * arch/x86/include/asm/ptrace.h, x86_64 (the fs object is x86_64-only).
+ * <bpf/bpf_tracing.h> reads kprobe arguments from di, si, dx, cx, r8 when
+ * __VMLINUX_H__ is defined (fs.bpf.c defines it). cs and ss (unions since
+ * FRED, 6.9) are never read and are omitted; with preserve_access_index
+ * the fields that are read are relocated by name.
+ */
+struct pt_regs {
+	unsigned long r15;
+	unsigned long r14;
+	unsigned long r13;
+	unsigned long r12;
+	unsigned long bp;
+	unsigned long bx;
+	unsigned long r11;
+	unsigned long r10;
+	unsigned long r9;
+	unsigned long r8;
+	unsigned long ax;
+	unsigned long cx;
+	unsigned long dx;
+	unsigned long si;
+	unsigned long di;
+	unsigned long orig_ax;
+	unsigned long ip;
+	unsigned long flags;
+	unsigned long sp;
 } __attribute__((preserve_access_index));
 
 /* Common tracepoint record header (include/linux/trace_events.h). */

@@ -96,13 +96,40 @@ jobs:
         # exe-identity symlink cases) can only run here. No root needed.
         if: always()
         timeout-minutes: 15
+        # fs_object_loads_and_attaches (tests/load_fs.rs) needs root: skipped
+        # here, run by the next step.
         run: |
-          cargo test -p osiris-sensors-process -p osiris-sensors-net -p osiris-ebpf -- --include-ignored 2>&1 \
+          cargo test -p osiris-sensors-process -p osiris-sensors-net -p osiris-ebpf -- --include-ignored \
+            --skip fs_object_loads_and_attaches 2>&1 \
             | tee "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
           exit "${PIPESTATUS[0]}"
       - name: Annotate process/network/eBPF unit test failures
         if: always() && steps.ebpf_unit.outcome == 'failure'
         run: tools/real-linux/annotate.sh failures "process/network/eBPF unit tests failed" "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
+      - name: Load the fs BPF object as root
+        id: fs_load
+        # Phase 11b-3: proves the verifier accepts fs.bpf.o on this kernel,
+        # that its programs attach, and that one watched create is emitted.
+        # Root's own target dir, as in the suite step. --nocapture keeps the
+        # skipped attach points line.
+        if: always()
+        timeout-minutes: 15
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+            CARGO_TARGET_DIR=/root/osiris-target "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" \
+            cargo test -p osiris-ebpf --test load_fs -- --include-ignored --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/fs-load-test.txt"
+          status="${PIPESTATUS[0]}"
+          # Public notice: the skipped attach points and the event seen.
+          grep -h 'osiris-ebpf: fs' "$RUNNER_TEMP/fs-load-test.txt" | cut -c1-900 \
+            | while IFS= read -r line; do echo "::notice title=fs load (${{ matrix.os }})::$line"; done
+          exit "$status"
+      - name: Annotate fs load test failures
+        # The tail carries the end of a verifier log.
+        if: always() && steps.fs_load.outcome == 'failure'
+        run: |
+          tools/real-linux/annotate.sh failures "fs BPF load test failed" "$RUNNER_TEMP/fs-load-test.txt"
+          tools/real-linux/annotate.sh tail error "fs BPF load test output (tail)" "$RUNNER_TEMP/fs-load-test.txt" 60
       - name: Collect audit log
         if: always()
         run: |
@@ -112,6 +139,7 @@ jobs:
           cp "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/artifacts/" || true
           cp "$RUNNER_TEMP/dns-unit-tests.txt" "$RUNNER_TEMP/artifacts/" || true
           cp "$RUNNER_TEMP/process-ebpf-unit-tests.txt" "$RUNNER_TEMP/artifacts/" || true
+          cp "$RUNNER_TEMP/fs-load-test.txt" "$RUNNER_TEMP/artifacts/" || true
           sudo cp -r "$OSIRIS_BPF_DIR" "$RUNNER_TEMP/artifacts/bpf" || true
           sudo cp -r "$RUNNER_TEMP/osiris-kept" "$RUNNER_TEMP/artifacts/kept-stack-dirs" || true
           sudo chmod -R a+rX "$RUNNER_TEMP/artifacts" || true
