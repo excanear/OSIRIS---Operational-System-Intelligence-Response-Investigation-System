@@ -98,6 +98,54 @@ pub fn caps_allow_bpf(cap_eff_hex: &str) -> bool {
     has(CAP_SYS_ADMIN) || (has(CAP_BPF) && has(CAP_PERFMON))
 }
 
+/// The wanted kernel symbols that `available` does not list. `available` is
+/// the text of `available_filter_functions` (`name` or `name [module]`
+/// per line) or `/proc/kallsyms` (`addr type name [module]`). Only exact
+/// names count, so `foo.cold` does not satisfy `foo`.
+pub fn missing_kernel_symbols(available: &str, wanted: &[&str]) -> Vec<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in available.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        let looks_like_addr = first.len() >= 8 && first.bytes().all(|b| b.is_ascii_hexdigit());
+        let second = tokens.next();
+        match (looks_like_addr, second, tokens.next()) {
+            // kallsyms: `<addr> <type letter> <name> [module]`
+            (true, Some(kind), Some(name)) if kind.len() == 1 => {
+                names.insert(name);
+            }
+            _ => {
+                names.insert(first);
+            }
+        }
+    }
+    wanted
+        .iter()
+        .filter(|w| !names.contains(*w))
+        .map(|w| (*w).to_string())
+        .collect()
+}
+
+/// Text listing the kernel's symbols: tracefs `available_filter_functions`
+/// (only attachable functions), else `/proc/kallsyms`. `None` off Linux or
+/// when nothing is readable.
+pub fn kernel_symbols_text() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        [
+            "/sys/kernel/tracing/available_filter_functions",
+            "/sys/kernel/debug/tracing/available_filter_functions",
+            "/proc/kallsyms",
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +195,27 @@ mod tests {
         let no_caps = evaluate("6.1", true, "Name:\tx\n");
         assert!(!no_caps.supported);
         assert!(no_caps.reasons[0].contains("CapEff"));
+    }
+
+    #[test]
+    fn missing_kernel_symbols_parses_both_formats() {
+        let wanted = [
+            "security_path_mknod",
+            "security_file_open",
+            "security_path_rename",
+        ];
+        let filter = "security_path_mknod\nsecurity_file_open [kernel]\n";
+        assert_eq!(
+            missing_kernel_symbols(filter, &wanted),
+            vec!["security_path_rename".to_string()]
+        );
+        let kallsyms = "ffffffff81234560 T security_path_mknod\n";
+        assert!(missing_kernel_symbols(kallsyms, &["security_path_mknod"]).is_empty());
+        // A `.cold` split is a different symbol.
+        assert_eq!(
+            missing_kernel_symbols("security_path_mknod.cold\n", &["security_path_mknod"]),
+            vec!["security_path_mknod".to_string()]
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

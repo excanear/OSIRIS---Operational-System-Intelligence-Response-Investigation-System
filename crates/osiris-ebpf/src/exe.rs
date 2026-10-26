@@ -31,6 +31,15 @@ pub fn dev_to_user(kernel_dev: u32) -> u64 {
         | (minor & 0xff)
 }
 
+/// Inverse of [`dev_to_user`]: a user-space `st_dev` (glibc `makedev`
+/// encoding) → the kernel-internal `dev_t` (`MAJOR << 20 | MINOR`).
+pub fn dev_from_user(st_dev: u64) -> u32 {
+    let major = ((st_dev >> 8) & 0xfff) | ((st_dev >> 32) & 0xffff_f000);
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & 0xffff_ff00);
+    // Kernel dev_t has 12 major bits and 20 minor bits; truncate the rest.
+    (((major & 0xfff) << 20) | (minor & 0xf_ffff)) as u32
+}
+
 /// `exe_path` for a record of `pid` taken from `<proc_root>/<pid>/exe`,
 /// or `None` when the link cannot be tied to the record (the caller then
 /// falls back to the exec filename, or `""` for network records):
@@ -128,6 +137,14 @@ mod tests {
         assert_eq!(dev_to_user((8 << 20) | 1), 2049);
         assert_eq!(dev_to_user((259 << 20) | 0x12345), 0x1231_0345);
         assert_eq!(dev_to_user(0), 0);
+    }
+
+    #[test]
+    fn dev_from_user_round_trips() {
+        for (major, minor) in [(8u32, 1u32), (259, 3), (0, 47), (4095, 1_048_575)] {
+            let k = (major << 20) | minor;
+            assert_eq!(dev_from_user(dev_to_user(k)), k, "({major},{minor})");
+        }
     }
 
     #[test]

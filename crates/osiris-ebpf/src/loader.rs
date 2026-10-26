@@ -27,6 +27,38 @@ use crate::record::PROCESS_SCHEMA_VERSION;
 /// Name of the `.rodata` global carrying the object's record schema version.
 pub const SCHEMA_SYMBOL: &str = "schema_version";
 
+/// Where one BPF program attaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachKind {
+    /// A kernel tracepoint `<category>/<name>`.
+    TracePoint {
+        category: &'static str,
+        name: &'static str,
+    },
+    /// A kprobe on a kernel function, at offset 0.
+    KProbe { symbol: &'static str },
+}
+
+/// One program and its attach target. A missing or rejected `required`
+/// point fails the load; an optional one is skipped and reported by
+/// [`LoadedObject::skipped_attach_points`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachPoint {
+    pub program: &'static str,
+    pub kind: AttachKind,
+    pub required: bool,
+}
+
+impl AttachPoint {
+    /// `category/name` or the kprobe symbol, for messages.
+    pub fn target(&self) -> String {
+        match self.kind {
+            AttachKind::TracePoint { category, name } => format!("{category}/{name}"),
+            AttachKind::KProbe { symbol } => symbol.to_string(),
+        }
+    }
+}
+
 /// What one BPF object is: its file, its record schema and its programs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectSpec {
@@ -34,17 +66,29 @@ pub struct ObjectSpec {
     pub object_file: &'static str,
     /// The `schema_version` global the object must carry.
     pub expected_schema: u32,
-    /// (program name, tracepoint category, tracepoint name)
-    pub tracepoints: &'static [(&'static str, &'static str, &'static str)],
+    /// Programs and where they attach, in attach order.
+    pub attach: &'static [AttachPoint],
+}
+
+const fn required_tp(
+    program: &'static str,
+    category: &'static str,
+    name: &'static str,
+) -> AttachPoint {
+    AttachPoint {
+        program,
+        kind: AttachKind::TracePoint { category, name },
+        required: true,
+    }
 }
 
 /// The process exec/exit object.
 pub const PROCESS_OBJECT: ObjectSpec = ObjectSpec {
     object_file: "process.bpf.o",
     expected_schema: PROCESS_SCHEMA_VERSION,
-    tracepoints: &[
-        ("handle_exec", "sched", "sched_process_exec"),
-        ("handle_exit", "sched", "sched_process_exit"),
+    attach: &[
+        required_tp("handle_exec", "sched", "sched_process_exec"),
+        required_tp("handle_exit", "sched", "sched_process_exit"),
     ],
 };
 
@@ -52,12 +96,35 @@ pub const PROCESS_OBJECT: ObjectSpec = ObjectSpec {
 pub const NET_OBJECT: ObjectSpec = ObjectSpec {
     object_file: "net.bpf.o",
     expected_schema: NET_SCHEMA_VERSION,
-    tracepoints: &[
-        ("handle_state", "sock", "inet_sock_set_state"),
-        ("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
-        ("handle_accept_exit", "syscalls", "sys_exit_accept"),
+    attach: &[
+        required_tp("handle_state", "sock", "inet_sock_set_state"),
+        required_tp("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
+        required_tp("handle_accept_exit", "syscalls", "sys_exit_accept"),
     ],
 };
+
+/// Choose which of `points` to attach. `exists` says whether a point's
+/// program and target are present; a missing optional point is dropped, a
+/// missing required one is an `Err` naming its program and target.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn plan_attach(
+    points: &[AttachPoint],
+    exists: impl Fn(&AttachPoint) -> bool,
+) -> Result<Vec<&AttachPoint>, String> {
+    let mut plan = Vec::new();
+    for point in points {
+        if exists(point) {
+            plan.push(point);
+        } else if point.required {
+            return Err(format!(
+                "{}: {}: required attach point not available",
+                point.program,
+                point.target()
+            ));
+        }
+    }
+    Ok(plan)
+}
 
 /// Integrity sidecar file name for `object_file`: `<object_file>.sha256`
 /// (lowercase hex SHA-256 of the object, first token).
@@ -117,7 +184,7 @@ pub struct LoadedObject {
 impl LoadedObject {
     /// Verify, schema-check (against `spec.expected_schema`) and load
     /// `<object_dir>/<spec.object_file>`, set `SELF_TGID[0] = self_tgid`,
-    /// then attach every tracepoint in `spec.tracepoints`, in order.
+    /// then attach every point in `spec.attach`, in order.
     pub fn load(object_dir: &Path, spec: &ObjectSpec, self_tgid: u32) -> Result<Self, LoadError> {
         let object_path = object_dir.join(spec.object_file);
         check_regular_file(&object_path)?;
@@ -132,6 +199,46 @@ impl LoadedObject {
         {
             let _ = self_tgid;
             Err(LoadError::Load("eBPF requires Linux".to_string()))
+        }
+    }
+
+    /// `"<program>: <target>: <reason>"` for every optional attach point
+    /// that was skipped (absent, or rejected by the kernel).
+    pub fn skipped_attach_points(&self) -> &[String] {
+        #[cfg(target_os = "linux")]
+        {
+            &self.inner.skipped
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// Add `(dev, ino)` to the `WATCH` map (`dev` is a kernel `dev_t`).
+    /// Fails when the object has no `WATCH` map.
+    pub fn insert_watch(&mut self, dev: u32, ino: u64) -> Result<(), LoadError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.insert_watch(dev, ino)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dev, ino);
+            match self.never {}
+        }
+    }
+
+    /// Write `WATCH_FLAGS[0]`. Fails when the object has no such map.
+    pub fn set_watch_flags(&mut self, flags: u32) -> Result<(), LoadError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.set_watch_flags(flags)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = flags;
+            match self.never {}
         }
     }
 
@@ -375,18 +482,68 @@ impl<'a> Reader<'a> {
 mod linux {
     use std::sync::Arc;
 
-    use aya::maps::{Array, MapData, PerCpuArray, RingBuf};
-    use aya::programs::TracePoint;
+    use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+    use aya::programs::{KProbe, TracePoint};
     use aya::{Ebpf, EbpfLoader};
 
-    use super::{LoadError, ObjectSpec};
+    use super::{plan_attach, AttachKind, AttachPoint, LoadError, ObjectSpec};
 
-    /// Programs (with their attach links) and the two maps the reader needs.
+    /// Key of the `WATCH` map: `{u32 dev; u32 _pad; u64 ino}`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct WatchKey {
+        dev: u32,
+        _pad: u32,
+        ino: u64,
+    }
+
+    // SAFETY: `#[repr(C)]`, only integer fields, and the explicit pad field
+    // leaves no implicit padding bytes.
+    unsafe impl aya::Pod for WatchKey {}
+
+    /// Programs (with their attach links) and the maps the reader needs.
     pub(crate) struct Inner {
         pub(crate) events: RingBuf<MapData>,
         pub(crate) drops: Arc<PerCpuArray<MapData, u64>>,
+        watch: Option<HashMap<MapData, WatchKey, u8>>,
+        watch_flags: Option<Array<MapData, u32>>,
+        pub(crate) skipped: Vec<String>,
         /// Owns the programs and links; kept alive for the attachment's life.
         _ebpf: Ebpf,
+    }
+
+    fn tracepoint_exists(category: &str, name: &str) -> bool {
+        [
+            "/sys/kernel/tracing/events",
+            "/sys/kernel/debug/tracing/events",
+        ]
+        .iter()
+        .any(|root| {
+            std::path::Path::new(root)
+                .join(category)
+                .join(name)
+                .exists()
+        })
+    }
+
+    fn attach_one(ebpf: &mut Ebpf, point: &AttachPoint) -> Result<(), String> {
+        let program = ebpf
+            .program_mut(point.program)
+            .ok_or_else(|| "program not found".to_string())?;
+        match point.kind {
+            AttachKind::TracePoint { category, name } => {
+                let tp: &mut TracePoint = program.try_into().map_err(|e| format!("{e}"))?;
+                tp.load().map_err(|e| format!("load: {e}"))?;
+                tp.attach(category, name)
+                    .map_err(|e| format!("attach: {e}"))?;
+            }
+            AttachKind::KProbe { symbol } => {
+                let kp: &mut KProbe = program.try_into().map_err(|e| format!("{e}"))?;
+                kp.load().map_err(|e| format!("load: {e}"))?;
+                kp.attach(symbol, 0).map_err(|e| format!("attach: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     impl Inner {
@@ -410,16 +567,39 @@ mod linux {
                 .set(0, self_tgid, 0)
                 .map_err(|e| load_err(&format!("SELF_TGID: {e}")))?;
 
-            for &(prog, category, name) in spec.tracepoints {
-                let tp: &mut TracePoint = ebpf
-                    .program_mut(prog)
-                    .ok_or_else(|| load_err(&format!("program {prog} not found")))?
-                    .try_into()
-                    .map_err(|e| load_err(&format!("{prog}: {e}")))?;
-                tp.load().map_err(|e| load_err(&format!("{prog}: {e}")))?;
-                tp.attach(category, name).map_err(|e| {
-                    LoadError::Attach(format!("{file}: {prog}: {category}/{name}: {e}"))
-                })?;
+            // A required tracepoint that is absent surfaces from the attach
+            // call itself with the kernel's error; only optional ones are
+            // pre-checked against tracefs.
+            let plan = plan_attach(spec.attach, |p| {
+                if ebpf.program(p.program).is_none() {
+                    return false;
+                }
+                match p.kind {
+                    AttachKind::TracePoint { category, name } if !p.required => {
+                        tracepoint_exists(category, name)
+                    }
+                    _ => true,
+                }
+            })
+            .map_err(|e| LoadError::Attach(format!("{file}: {e}")))?;
+
+            let mut skipped: Vec<String> = spec
+                .attach
+                .iter()
+                .filter(|point| !plan.iter().any(|p| std::ptr::eq(*p, *point)))
+                .map(|point| format!("{}: {}: not present", point.program, point.target()))
+                .collect();
+            for point in plan {
+                if let Err(reason) = attach_one(&mut ebpf, point) {
+                    if point.required {
+                        return Err(LoadError::Attach(format!(
+                            "{file}: {}: {}: {reason}",
+                            point.program,
+                            point.target()
+                        )));
+                    }
+                    skipped.push(format!("{}: {}: {reason}", point.program, point.target()));
+                }
             }
 
             let events = ebpf
@@ -432,12 +612,41 @@ mod linux {
                 .ok_or_else(|| load_err("map DROPS not found"))?;
             let drops =
                 PerCpuArray::try_from(drops).map_err(|e| load_err(&format!("DROPS: {e}")))?;
+            let watch = ebpf
+                .take_map("WATCH")
+                .map(|m| HashMap::try_from(m).map_err(|e| load_err(&format!("WATCH: {e}"))))
+                .transpose()?;
+            let watch_flags = ebpf
+                .take_map("WATCH_FLAGS")
+                .map(|m| Array::try_from(m).map_err(|e| load_err(&format!("WATCH_FLAGS: {e}"))))
+                .transpose()?;
 
             Ok(Self {
                 events,
                 drops: Arc::new(drops),
+                watch,
+                watch_flags,
+                skipped,
                 _ebpf: ebpf,
             })
+        }
+
+        pub(crate) fn insert_watch(&mut self, dev: u32, ino: u64) -> Result<(), LoadError> {
+            let map = self
+                .watch
+                .as_mut()
+                .ok_or_else(|| LoadError::Load("object has no WATCH map".to_string()))?;
+            map.insert(WatchKey { dev, _pad: 0, ino }, 1u8, 0)
+                .map_err(|e| LoadError::Load(format!("WATCH: {e}")))
+        }
+
+        pub(crate) fn set_watch_flags(&mut self, flags: u32) -> Result<(), LoadError> {
+            let map = self
+                .watch_flags
+                .as_mut()
+                .ok_or_else(|| LoadError::Load("object has no WATCH_FLAGS map".to_string()))?;
+            map.set(0, flags, 0)
+                .map_err(|e| LoadError::Load(format!("WATCH_FLAGS: {e}")))
         }
     }
 }
@@ -449,8 +658,72 @@ mod tests {
     const TEST_OBJECT: ObjectSpec = ObjectSpec {
         object_file: "x.bpf.o",
         expected_schema: 99,
-        tracepoints: &[("handle_x", "sched", "sched_process_exec")],
+        attach: &[AttachPoint {
+            program: "handle_x",
+            kind: AttachKind::TracePoint {
+                category: "sched",
+                name: "sched_process_exec",
+            },
+            required: true,
+        }],
     };
+
+    fn tp(program: &'static str, category: &'static str, name: &'static str) -> AttachPoint {
+        AttachPoint {
+            program,
+            kind: AttachKind::TracePoint { category, name },
+            required: true,
+        }
+    }
+
+    /// (program, category, name) triples of a spec made only of required
+    /// tracepoints.
+    fn triples(spec: &ObjectSpec) -> Vec<(&'static str, &'static str, &'static str)> {
+        spec.attach
+            .iter()
+            .map(|a| {
+                assert!(a.required, "{}", a.program);
+                match a.kind {
+                    AttachKind::TracePoint { category, name } => (a.program, category, name),
+                    AttachKind::KProbe { .. } => panic!("unexpected kprobe {}", a.program),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn object_specs_keep_their_programs() {
+        assert_eq!(
+            triples(&PROCESS_OBJECT),
+            [
+                ("handle_exec", "sched", "sched_process_exec"),
+                ("handle_exit", "sched", "sched_process_exit"),
+            ]
+        );
+        assert_eq!(
+            triples(&NET_OBJECT),
+            [
+                ("handle_state", "sock", "inet_sock_set_state"),
+                ("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
+                ("handle_accept_exit", "syscalls", "sys_exit_accept"),
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_attach_points_are_skipped_required_fail() {
+        let req = tp("req_prog", "sched", "a");
+        let mut opt = tp("opt_prog", "sched", "b");
+        opt.required = false;
+        let points = [req, opt];
+        let all = plan_attach(&points, |_| true).unwrap();
+        assert_eq!(all.len(), 2);
+        let only_req = plan_attach(&points, |p| p.program == "req_prog").unwrap();
+        assert_eq!(only_req.len(), 1);
+        assert_eq!(only_req[0].program, "req_prog");
+        let err = plan_attach(&points, |p| p.program == "opt_prog").unwrap_err();
+        assert!(err.contains("req_prog"), "{err}");
+    }
 
     /// The process object's sidecar, as 11b-1 named it.
     const PROCESS_SIDECAR: &str = "process.bpf.o.sha256";
@@ -459,35 +732,6 @@ mod tests {
     fn sidecar_name_appends_sha256() {
         assert_eq!(sidecar_name("net.bpf.o"), "net.bpf.o.sha256");
         assert_eq!(sidecar_name(PROCESS_OBJECT.object_file), PROCESS_SIDECAR);
-    }
-
-    /// The process object keeps 11b-1's file and its two tracepoints.
-    #[test]
-    fn process_object_spec_is_11b1s() {
-        assert_eq!(PROCESS_OBJECT.object_file, "process.bpf.o");
-        assert_eq!(PROCESS_OBJECT.expected_schema, PROCESS_SCHEMA_VERSION);
-        assert_eq!(
-            PROCESS_OBJECT.tracepoints,
-            [
-                ("handle_exec", "sched", "sched_process_exec"),
-                ("handle_exit", "sched", "sched_process_exit"),
-            ]
-        );
-    }
-
-    /// The net object: its own file, schema 1 and the three hooks.
-    #[test]
-    fn net_object_spec_names() {
-        assert_eq!(NET_OBJECT.object_file, "net.bpf.o");
-        assert_eq!(NET_OBJECT.expected_schema, 1);
-        assert_eq!(
-            NET_OBJECT.tracepoints,
-            [
-                ("handle_state", "sock", "inet_sock_set_state"),
-                ("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
-                ("handle_accept_exit", "syscalls", "sys_exit_accept"),
-            ]
-        );
     }
 
     #[test]
