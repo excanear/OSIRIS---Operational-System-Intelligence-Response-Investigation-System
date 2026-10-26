@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::fs_record::FS_SCHEMA_VERSION;
 use crate::integrity::{verify_object, IntegrityError};
 use crate::net_record::NET_SCHEMA_VERSION;
 use crate::record::PROCESS_SCHEMA_VERSION;
@@ -101,6 +102,93 @@ pub const NET_OBJECT: ObjectSpec = ObjectSpec {
         required_tp("handle_accept4_exit", "syscalls", "sys_exit_accept4"),
         required_tp("handle_accept_exit", "syscalls", "sys_exit_accept"),
     ],
+};
+
+const fn kprobe(program: &'static str, symbol: &'static str, required: bool) -> AttachPoint {
+    AttachPoint {
+        program,
+        kind: AttachKind::KProbe { symbol },
+        required,
+    }
+}
+
+const fn sys_tp(program: &'static str, name: &'static str, required: bool) -> AttachPoint {
+    AttachPoint {
+        program,
+        kind: AttachKind::TracePoint {
+            category: "syscalls",
+            name,
+        },
+        required,
+    }
+}
+
+/// Enter and exit tracepoint points of one syscall.
+macro_rules! sys_pair {
+    ($sc:literal, $req:literal) => {
+        [
+            sys_tp(concat!("tp_enter_", $sc), concat!("sys_enter_", $sc), $req),
+            sys_tp(concat!("tp_exit_", $sc), concat!("sys_exit_", $sc), $req),
+        ]
+    };
+}
+
+/// 8 kprobes, 16 syscalls x (enter, exit), and the task-exit cleanup.
+const FS_ATTACH_LEN: usize = 8 + 16 * 2 + 1;
+
+const fn fs_attach_points() -> [AttachPoint; FS_ATTACH_LEN] {
+    let kps = [
+        kprobe("kp_path_mknod", "security_path_mknod", true),
+        kprobe("kp_path_mkdir", "security_path_mkdir", true),
+        kprobe("kp_path_unlink", "security_path_unlink", true),
+        kprobe("kp_path_rmdir", "security_path_rmdir", true),
+        kprobe("kp_path_rename", "security_path_rename", true),
+        kprobe("kp_file_open", "security_file_open", true),
+        kprobe("kp_path_truncate", "security_path_truncate", true),
+        kprobe("kp_file_truncate", "security_file_truncate", false),
+    ];
+    let syscalls = [
+        sys_pair!("open", false),
+        sys_pair!("openat", true),
+        sys_pair!("openat2", false),
+        sys_pair!("creat", false),
+        sys_pair!("truncate", true),
+        sys_pair!("ftruncate", true),
+        sys_pair!("mknod", false),
+        sys_pair!("mknodat", true),
+        sys_pair!("mkdir", false),
+        sys_pair!("mkdirat", true),
+        sys_pair!("unlink", false),
+        sys_pair!("unlinkat", true),
+        sys_pair!("rmdir", false),
+        sys_pair!("rename", false),
+        sys_pair!("renameat", true),
+        sys_pair!("renameat2", true),
+    ];
+    let mut out = [kps[0]; FS_ATTACH_LEN];
+    let mut n = 0;
+    while n < kps.len() {
+        out[n] = kps[n];
+        n += 1;
+    }
+    let mut s = 0;
+    while s < syscalls.len() {
+        out[n] = syscalls[s][0];
+        out[n + 1] = syscalls[s][1];
+        n += 2;
+        s += 1;
+    }
+    out[n] = required_tp("tp_task_exit", "sched", "sched_process_exit");
+    out
+}
+
+static FS_ATTACH: [AttachPoint; FS_ATTACH_LEN] = fs_attach_points();
+
+/// The filesystem create/write/delete/rename object (x86_64 only).
+pub const FS_OBJECT: ObjectSpec = ObjectSpec {
+    object_file: "fs.bpf.o",
+    expected_schema: FS_SCHEMA_VERSION,
+    attach: &FS_ATTACH,
 };
 
 /// Choose which of `points` to attach. `exists` says whether a point's

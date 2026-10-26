@@ -13,6 +13,7 @@
 
 pub mod clock;
 pub mod exe;
+pub mod fs_record;
 pub mod integrity;
 pub mod loader;
 pub mod net_record;
@@ -22,10 +23,14 @@ pub mod record;
 
 pub use clock::boot_wall_offset_ns;
 pub use exe::{dev_from_user, dev_to_user, resolve_exe, ExeIdentity};
+pub use fs_record::{
+    decode_fs, FsEvent, FsInode, FsKind, FsRecord, FS_SCHEMA_VERSION, KIND_FS_CREATE,
+    KIND_FS_DELETE, KIND_FS_RENAME, KIND_FS_WRITE, PATH_CAP,
+};
 pub use integrity::{verify_object, IntegrityError};
 pub use loader::{
     object_schema_version, sidecar_name, AttachKind, AttachPoint, DropCounter, EbpfSettings,
-    LoadError, LoadedObject, ObjectSpec, NET_OBJECT, PROCESS_OBJECT,
+    LoadError, LoadedObject, ObjectSpec, FS_OBJECT, NET_OBJECT, PROCESS_OBJECT,
 };
 pub use net_record::{
     decode_net, NetEvent, NetKind, NetRecord, AF_INET, AF_INET6, DIR_INBOUND, DIR_OUTBOUND,

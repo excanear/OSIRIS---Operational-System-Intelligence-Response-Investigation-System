@@ -111,6 +111,9 @@ pub enum DecodeError {
     /// A net record whose direction is neither outbound nor inbound.
     #[error("unknown direction {0}")]
     UnknownDirection(u8),
+    /// An fs record whose path length exceeds the path buffer.
+    #[error("{field} length {len} exceeds the path buffer")]
+    PathTooLong { field: &'static str, len: u16 },
 }
 
 /// Decode one ring-buffer record. Never panics on arbitrary input.
