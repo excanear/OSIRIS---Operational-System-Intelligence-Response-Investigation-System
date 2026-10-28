@@ -18,8 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Prepare auditd and watch dirs
-        run: sudo tools/real-linux/setup.sh
+      - name: Choose the BPF object dir
+        # The agent runs its eBPF sensors (process, network, filesystem) in the bench.
+        run: echo "OSIRIS_BPF_DIR=$RUNNER_TEMP/osiris-bpf" >> "$GITHUB_ENV"
+      - name: Prepare auditd, watch dirs and the BPF objects
+        run: sudo "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" tools/real-linux/setup.sh
       - name: Record runner facts
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
@@ -34,11 +37,11 @@ jobs:
             lscpu
           } > "$RUNNER_TEMP/artifacts/runner-facts.txt"
       - name: Run the agent benchmark as root
-        # Build ~5 min + 3 x 30 s runs; a hang fails here, not at the job cap.
+        # Build ~5 min + 3 x 30 s runs + the 10 000-iteration fs loop; a hang fails here, not at the job cap.
         timeout-minutes: 25
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
-            CARGO_TARGET_DIR=/root/osiris-target \
+            "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" CARGO_TARGET_DIR=/root/osiris-target \
             tools/real-linux/bench.sh --agent-only "$RUNNER_TEMP/artifacts/bench-agent.jsonl" 2>&1 \
             | tee "$RUNNER_TEMP/artifacts/bench-output.txt"
           exit "${PIPESTATUS[0]}"

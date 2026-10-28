@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod agent;
+mod fsloop;
 mod ingest;
 mod pipeline;
 mod query;
@@ -35,6 +36,11 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         duration: u64,
     },
+    /// Create/write/delete loop in a watched and an unwatched dir, with and without the agent.
+    FsLoop {
+        #[arg(long, default_value_t = 10_000)]
+        iterations: u64,
+    },
     /// The full matrix. Agent benches need real auditd, so they can be split off.
     All {
         /// Everything except the agent bench (hosts without auditd, e.g. WSL2).
@@ -52,6 +58,7 @@ fn main() {
         Cmd::Query { events } => vec![query::run(events)],
         Cmd::Ingest { rate, duration } => vec![ingest::run(rate, duration)],
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
+        Cmd::FsLoop { iterations } => vec![fsloop::run(iterations)],
         Cmd::All {
             skip_agent,
             agent_only,
@@ -70,6 +77,7 @@ fn main() {
                 for r in [0, 1_000, 10_000] {
                     v.push(agent::run(r, 30));
                 }
+                v.push(fsloop::run(10_000));
             }
             v
         }
