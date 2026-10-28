@@ -65,7 +65,7 @@ jobs:
         # Annotations are public; job logs and artifacts need GitHub auth.
         if: always() && steps.suite.outcome == 'failure'
         run: tools/real-linux/annotate.sh failures "real-Linux suite failed" "$RUNNER_TEMP/real-linux-output.txt"
-      - name: Annotate the eBPF backends' status (process and network)
+      - name: Annotate the eBPF backends' status (process, network and filesystem)
         # Kept stack dirs are root-only, hence sudo.
         if: always() && steps.suite.outcome != 'skipped'
         run: sudo tools/real-linux/annotate.sh ebpf "$RUNNER_TEMP/real-linux-output.txt" "$RUNNER_TEMP/osiris-kept"

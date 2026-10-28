@@ -1106,7 +1106,7 @@ fn fs_failed_ops_after_hook_are_silent() {
     let _c = Cleanup(vec![format!("chattr -i {imm}"), format!("rm -rf {d}")]);
     let marker_path = format!("{d}/marker.txt");
     let script = "import os, subprocess, sys\n\
-                  full, imm, mk = sys.argv[1], sys.argv[2], sys.argv[3]\n\
+                  full, imm, mk, okdir, okfile = sys.argv[1:6]\n\
                   os.mkdir(full)\n\
                   open(full + '/f', 'w').close()\n\
                   try:\n\
@@ -1121,9 +1121,14 @@ fn fs_failed_ops_after_hook_are_silent() {
                   \x20   sys.exit('unlink of an immutable file succeeded')\n\
                   except OSError:\n\
                   \x20   pass\n\
+                  os.mkdir(okdir)\n\
+                  os.rmdir(okdir)\n\
+                  open(okfile, 'w').close()\n\
+                  os.unlink(okfile)\n\
                   open(mk, 'w').close()\n";
+    let (okdir, okfile) = (format!("{d}/okdir"), format!("{d}/okfile"));
     let t0 = now_ns();
-    let pid = run_actor(script, &[&full, &imm, &marker_path]);
+    let pid = run_actor(script, &[&full, &imm, &marker_path, &okdir, &okfile]);
     let since = since_before(t0);
     wait_ebpf_fs(&s, "FILE_CREATE", since, by_actor(pid, &marker_path));
     std::thread::sleep(SETTLE);
@@ -1135,6 +1140,14 @@ fn fs_failed_ops_after_hook_are_silent() {
             .cloned()
             .collect();
         assert!(got.is_empty(), "failed op on {path} was reported: {got:?}");
+    }
+    // Positive control, same actor and run: the successful rmdir/unlink just
+    // before the marker are each reported once, so the silence above is not
+    // a sensor that saw nothing.
+    for path in [&okdir, &okfile] {
+        let got = ebpf_fs_events(&deletes, "FILE_DELETE", by_actor(pid, path));
+        assert_eq!(got.len(), 1, "expected one FILE_DELETE for {path}: {got:?}");
+        assert_eq!(got[0]["source"], json!("EBPF"), "source: {}", got[0]);
     }
 }
 
