@@ -29,7 +29,14 @@ pub struct AgentOptions {
     /// Pre-built BPF object dir; `Some` runs the process sensor on eBPF
     /// (see `render::bpf_dir_from_env`), `None` keeps it on audit.
     pub ebpf_object_dir: Option<PathBuf>,
+    /// Watched trees beyond `BASE_FS_WATCH`; created before the agent starts.
+    pub extra_fs_watch: Vec<PathBuf>,
 }
+
+/// The trees the global audit rules also watch. Every agent stack renders
+/// them (plus the options' extras) as `fs_watch_paths`, so the eBPF
+/// filesystem backend covers what the audit backend does.
+pub const BASE_FS_WATCH: [&str; 3] = ["/tmp/osiris-p10", "/var/www", "/etc/systemd/system"];
 
 pub struct Stack {
     dir: tempfile::TempDir,
@@ -175,6 +182,15 @@ impl Stack {
         );
 
         if let Some(a) = opts.agent {
+            let fs_watch_paths: Vec<PathBuf> = BASE_FS_WATCH
+                .iter()
+                .map(PathBuf::from)
+                .chain(a.extra_fs_watch)
+                .collect();
+            // The eBPF backend skips (and names) a missing path.
+            for p in &fs_watch_paths {
+                std::fs::create_dir_all(p).unwrap();
+            }
             let status_port = free_port();
             stack.status_port = Some(status_port);
             let agent_yaml = AgentYaml {
@@ -186,6 +202,7 @@ impl Stack {
                 health_interval_secs: 5,
                 status_port,
                 ebpf_object_dir: a.ebpf_object_dir,
+                fs_watch_paths,
             };
             std::fs::write(d.join("agent.yaml"), agent_yaml.render()).unwrap();
             // Owned by the Stack before the wait so a panic there still reaps it in Drop.

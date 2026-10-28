@@ -70,6 +70,10 @@ pub struct AgentYaml {
     /// Pre-built BPF object dir (Phase 11b-1): renders `ebpf: { object_dir }`
     /// so the process sensor runs on eBPF; `None` keeps it on audit.
     pub ebpf_object_dir: Option<PathBuf>,
+    /// Explicit filesystem watch list (Phase 11b-3), rendered as
+    /// `fs_watch_paths:`; empty renders nothing, so the sensor uses its
+    /// default list.
+    pub fs_watch_paths: Vec<PathBuf>,
 }
 
 /// `$OSIRIS_BPF_DIR` (set by the real-Linux workflow, built by
@@ -118,6 +122,12 @@ impl AgentYaml {
                 s.push_str(&format!("  - path: {}\n    kind: systemd_unit_dir\n", q(p)));
             }
         }
+        if !self.fs_watch_paths.is_empty() {
+            s.push_str("fs_watch_paths:\n");
+            for p in &self.fs_watch_paths {
+                s.push_str(&format!("  - {}\n", q(p)));
+            }
+        }
         if let Some(bpf) = &self.ebpf_object_dir {
             s.push_str(&format!("ebpf:\n  object_dir: {}\n", q(bpf)));
         }
@@ -162,6 +172,7 @@ mod tests {
             health_interval_secs: 5,
             status_port: 0,
             ebpf_object_dir: None,
+            fs_watch_paths: vec![],
         };
         let path = dir.path().join("agent.yaml");
         std::fs::write(&path, y.render()).unwrap();
@@ -190,6 +201,8 @@ mod tests {
         assert_eq!(cfg.forward.unwrap().server_addr, "127.0.0.1:18081");
         // No object dir: the process sensor stays on the audit backend.
         assert!(cfg.ebpf.is_none());
+        // No explicit list: the sensor's default watch list applies.
+        assert!(cfg.fs_watch_paths.is_empty());
     }
 
     #[test]
@@ -205,12 +218,20 @@ mod tests {
             health_interval_secs: 5,
             status_port: 18083,
             ebpf_object_dir: Some(bpf.clone()),
+            fs_watch_paths: vec![dir.path().join("watched dir"), "/var/www".into()],
         };
         let path = dir.path().join("agent.yaml");
         std::fs::write(&path, y.render()).unwrap();
         let cfg = osiris_agent::AgentConfig::load(&path).unwrap();
         assert_eq!(cfg.ebpf.unwrap().object_dir, bpf);
         assert_eq!(cfg.status_addr, "127.0.0.1:18083");
+        assert_eq!(
+            cfg.fs_watch_paths,
+            vec![
+                dir.path().join("watched dir").display().to_string(),
+                "/var/www".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -225,6 +246,7 @@ mod tests {
             health_interval_secs: 5,
             status_port: 0,
             ebpf_object_dir: None,
+            fs_watch_paths: vec![],
         };
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a.yaml");

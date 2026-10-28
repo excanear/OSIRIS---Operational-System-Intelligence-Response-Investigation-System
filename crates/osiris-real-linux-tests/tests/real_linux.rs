@@ -50,12 +50,24 @@ fn stack(persist: &Path) -> Stack {
 }
 
 fn stack_with_bpf(persist: &Path, ebpf_object_dir: Option<PathBuf>) -> Stack {
+    stack_with_fs(persist, ebpf_object_dir, vec![])
+}
+
+/// As [`stack_with_bpf`], with `extra_fs_watch` added to the filesystem watch
+/// list (the harness always renders `/tmp/osiris-p10`, `/var/www` and
+/// `/etc/systemd/system`).
+fn stack_with_fs(
+    persist: &Path,
+    ebpf_object_dir: Option<PathBuf>,
+    extra_fs_watch: Vec<PathBuf>,
+) -> Stack {
     std::fs::create_dir_all(persist).unwrap();
     Stack::start(StackOptions {
         agent: Some(AgentOptions {
             audit_log: PathBuf::from("/var/log/audit/audit.log"),
             persistence_dirs: vec![persist.to_path_buf()],
             ebpf_object_dir,
+            extra_fs_watch,
         }),
         ..Default::default()
     })
@@ -455,6 +467,9 @@ fn exec_and_exit_are_observed_via_ebpf() {
     assert_eq!(exit["provider"], json!(EBPF_PROVIDER), "exit: {exit}");
     assert_eq!(exit["event_data"]["exit_code"], json!(7), "exit: {exit}");
     assert_eq!(exit["process"]["pid"], json!(pid), "exit: {exit}");
+    // Phase 11b-3 (spec 2.5): once events are stored the sensor's health
+    // counters must show them (the roadmap's `process_exec` debt).
+    wait_sensor_counts_events(&s, "process_exec");
 }
 
 /// A copy of the object dir whose sidecar digest is altered fails the
@@ -820,4 +835,463 @@ fn corrupted_net_object_falls_back_to_procfs() {
         has_flag(&process, "ebpf"),
         "process sensor left eBPF: {process}"
     );
+}
+
+// ---- Phase 11b-3: the eBPF filesystem backend ----
+
+const FS_EBPF_PROVIDER: &str = "filesystem_sensor/ebpf";
+
+/// `/status` of `sensor` until it reports `events_emitted_total > 0` and a
+/// non-null `last_event_at` (bounded by DEADLINE), echoed for the annotation.
+fn wait_sensor_counts_events(s: &Stack, sensor: &str) -> Value {
+    let pick = |v: &Value| -> Option<Value> {
+        v["sensors"]
+            .as_array()?
+            .iter()
+            .find(|h| h["name"] == json!(sensor))
+            .filter(|h| {
+                h["events_emitted_total"].as_u64().unwrap_or(0) > 0 && !h["last_event_at"].is_null()
+            })
+            .cloned()
+    };
+    let status = s.wait_agent_status(DEADLINE, |v| pick(v).is_some());
+    let entry = pick(&status).unwrap();
+    eprintln!("osiris-ebpf: {sensor} counts events: {entry}");
+    entry
+}
+
+/// `realpath $(command -v python3)`: the exe every actor event must carry.
+fn python_exe() -> String {
+    let out = Command::new("/bin/bash")
+        .args(["-c", "realpath \"$(command -v python3)\""])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "realpath python3 failed: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Runs one `python3 -c script args...` actor (CWD `/`, bounded wait) and
+/// returns its pid; every operation of a scenario comes from this process.
+fn run_actor(script: &str, args: &[&str]) -> u32 {
+    let mut child = Command::new("python3")
+        .current_dir("/")
+        .arg("-c")
+        .arg(script)
+        .args(args)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let status = wait_child(&mut child, Duration::from_secs(30));
+    assert!(status.success(), "actor {pid} failed: {status}");
+    pid
+}
+
+fn fetch(s: &Stack, event_type: &str, since: u128) -> Value {
+    s.api_get(&format!(
+        "/api/v1/events?event_type={event_type}&since={since}&limit=1000"
+    ))
+}
+
+/// Every stored event of `event_type` from the eBPF filesystem backend that
+/// satisfies `pred`.
+fn ebpf_fs_events(v: &Value, event_type: &str, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+    objects_with(v, "event_type", &json!(event_type))
+        .into_iter()
+        .filter(|e| e["provider"] == json!(FS_EBPF_PROVIDER))
+        .filter(|e| pred(e))
+        .cloned()
+        .collect()
+}
+
+/// `path` as created/written/deleted (or the rename target) by `pid`.
+fn by_actor(pid: u32, path: &str) -> impl Fn(&Value) -> bool {
+    let path = path.to_string();
+    move |e| e["process"]["pid"] == json!(pid) && e["file"]["path"] == json!(path)
+}
+
+/// Waits for the eBPF event, returning it.
+fn wait_ebpf_fs(s: &Stack, event_type: &str, since: u128, pred: impl Fn(&Value) -> bool) -> Value {
+    let got = events(s, event_type, since, |v| {
+        !ebpf_fs_events(v, event_type, &pred).is_empty()
+    });
+    ebpf_fs_events(&got, event_type, &pred).remove(0)
+}
+
+/// Source, acting pid and exe of an eBPF filesystem event.
+fn assert_actor(e: &Value, pid: u32, exe: &str) {
+    assert_eq!(e["source"], json!("EBPF"), "source: {e}");
+    assert_eq!(e["process"]["pid"], json!(pid), "pid: {e}");
+    assert_eq!(e["process"]["exe_path"], json!(exe), "exe_path: {e}");
+}
+
+/// Time for a duplicate or late event to reach the store before counting.
+const SETTLE: Duration = Duration::from_secs(3);
+
+/// A fresh watched dir (created after the stack is up, so the watch list
+/// covers it through an ancestor) and its cleanup.
+fn watched_dir(name: &str, m: &str) -> (String, Cleanup) {
+    let d = format!("{WATCH_ROOT}/{name}-{m}");
+    std::fs::create_dir_all(&d).unwrap();
+    let c = Cleanup(vec![format!("rm -rf {d}")]);
+    (d, c)
+}
+
+/// With the objects built, the filesystem sensor runs on eBPF: HEALTHY with
+/// flag `ebpf`, no `audit_fallback`, and no skipped watch path (the explicit
+/// list rendered by the harness exists in full). The global fs audit rules
+/// are loaded but unused.
+#[test]
+#[ignore]
+fn filesystem_sensor_uses_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let health = sensor_health_reaches(&s, "filesystem", "HEALTHY");
+    assert!(
+        !health
+            .iter()
+            .any(|h| h["state"]["state"] != json!("HEALTHY")),
+        "filesystem not steadily HEALTHY in AGENT_HEALTH: {health:?}"
+    );
+    let status = sensor_status(&s, "filesystem");
+    assert_eq!(status["state"], json!("HEALTHY"), "status: {status}");
+    assert!(
+        has_flag(&status, "ebpf"),
+        "no `ebpf` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "audit_fallback"),
+        "eBPF active yet `audit_fallback` set: {status}"
+    );
+    assert!(
+        !status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("skipped")),
+        "a watch path was skipped though all exist: {status}"
+    );
+}
+
+/// create -> append-write -> rename -> delete by one python child: exactly
+/// one eBPF event each, with the child's pid, the python exe, the exact
+/// paths (old and new for the rename) and a non-null inode.
+#[test]
+#[ignore]
+fn fs_lifecycle_is_observed_via_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let (d, _c) = watched_dir("fs-ebpf", &m);
+    let (a, b) = (format!("{d}/a.txt"), format!("{d}/b.txt"));
+    let exe = python_exe();
+    let script = "import os, sys\n\
+                  a, b = sys.argv[1], sys.argv[2]\n\
+                  os.close(os.open(a, os.O_CREAT | os.O_WRONLY, 0o644))\n\
+                  fd = os.open(a, os.O_WRONLY | os.O_APPEND)\n\
+                  os.write(fd, b'more\\n')\n\
+                  os.close(fd)\n\
+                  os.rename(a, b)\n\
+                  os.unlink(b)\n";
+    let t0 = now_ns();
+    let pid = run_actor(script, &[&a, &b]);
+    let since = since_before(t0);
+
+    wait_ebpf_fs(&s, "FILE_DELETE", since, by_actor(pid, &b));
+    std::thread::sleep(SETTLE);
+
+    let one = |event_type: &str, path: &str| -> Value {
+        let got = ebpf_fs_events(
+            &fetch(&s, event_type, since),
+            event_type,
+            by_actor(pid, path),
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "expected one {event_type} for {path}: {got:?}"
+        );
+        let e = got.into_iter().next().unwrap();
+        assert_actor(&e, pid, &exe);
+        assert!(!e["file"]["inode"].is_null(), "null inode: {e}");
+        eprintln!("osiris-ebpf: {event_type}: {e}");
+        e
+    };
+    one("FILE_CREATE", &a);
+    one("FILE_WRITE", &a);
+    let rename = one("FILE_RENAME", &b);
+    assert_eq!(
+        rename["file"]["previous_path"],
+        json!(a),
+        "rename: {rename}"
+    );
+    one("FILE_DELETE", &b);
+}
+
+/// mkdir + rmdir yield one CREATE and one DELETE for the directory.
+#[test]
+#[ignore]
+fn fs_mkdir_rmdir_via_ebpf() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let (d, _c) = watched_dir("fs-dir", &m);
+    let sub = format!("{d}/sub");
+    let exe = python_exe();
+    let t0 = now_ns();
+    let pid = run_actor(
+        "import os, sys\nos.mkdir(sys.argv[1])\nos.rmdir(sys.argv[1])\n",
+        &[&sub],
+    );
+    let since = since_before(t0);
+    wait_ebpf_fs(&s, "FILE_DELETE", since, by_actor(pid, &sub));
+    std::thread::sleep(SETTLE);
+    for event_type in ["FILE_CREATE", "FILE_DELETE"] {
+        let got = ebpf_fs_events(
+            &fetch(&s, event_type, since),
+            event_type,
+            by_actor(pid, &sub),
+        );
+        assert_eq!(got.len(), 1, "expected one {event_type} for {sub}: {got:?}");
+        assert_actor(&got[0], pid, &exe);
+    }
+}
+
+/// Operations in a directory outside the watch list are never reported. The
+/// same child then creates a watched marker; once that is stored, "nothing"
+/// is not just "not yet".
+#[test]
+#[ignore]
+fn fs_unwatched_dir_is_silent() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let (d, _c) = watched_dir("fs-quiet", &m);
+    let unwatched = format!("/var/tmp/osiris-unwatched-{m}");
+    let _u = Cleanup(vec![format!("rm -rf {unwatched}")]);
+    let marker_path = format!("{d}/marker.txt");
+    let script = "import os, sys\n\
+                  u, mk = sys.argv[1], sys.argv[2]\n\
+                  os.mkdir(u)\n\
+                  os.mkdir(u + '/sub')\n\
+                  os.close(os.open(u + '/a.txt', os.O_CREAT | os.O_WRONLY, 0o644))\n\
+                  fd = os.open(u + '/a.txt', os.O_WRONLY | os.O_APPEND)\n\
+                  os.write(fd, b'x')\n\
+                  os.close(fd)\n\
+                  os.rename(u + '/a.txt', u + '/b.txt')\n\
+                  os.unlink(u + '/b.txt')\n\
+                  os.rmdir(u + '/sub')\n\
+                  os.rmdir(u)\n\
+                  os.close(os.open(mk, os.O_CREAT | os.O_WRONLY, 0o644))\n";
+    let t0 = now_ns();
+    let pid = run_actor(script, &[&unwatched, &marker_path]);
+    let since = since_before(t0);
+    wait_ebpf_fs(&s, "FILE_CREATE", since, by_actor(pid, &marker_path));
+    std::thread::sleep(SETTLE);
+    for event_type in ["FILE_CREATE", "FILE_WRITE", "FILE_DELETE", "FILE_RENAME"] {
+        let got = fetch(&s, event_type, since);
+        assert!(
+            !contains_str(&got, &unwatched),
+            "{event_type} reported for the unwatched dir {unwatched}: {got}"
+        );
+    }
+}
+
+/// Failures after the security hook fired are not reported: `rmdir` of a
+/// non-empty dir (ENOTEMPTY) and `unlink` of an immutable file (EPERM). A
+/// watched marker create bounds the wait.
+#[test]
+#[ignore]
+fn fs_failed_ops_after_hook_are_silent() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let d = format!("{WATCH_ROOT}/fs-fail-{m}");
+    std::fs::create_dir_all(&d).unwrap();
+    let (full, imm) = (format!("{d}/full"), format!("{d}/imm"));
+    // Runs on drop in order: lift the immutable flag before removing the tree.
+    let _c = Cleanup(vec![format!("chattr -i {imm}"), format!("rm -rf {d}")]);
+    let marker_path = format!("{d}/marker.txt");
+    let script = "import os, subprocess, sys\n\
+                  full, imm, mk = sys.argv[1], sys.argv[2], sys.argv[3]\n\
+                  os.mkdir(full)\n\
+                  open(full + '/f', 'w').close()\n\
+                  try:\n\
+                  \x20   os.rmdir(full)\n\
+                  \x20   sys.exit('rmdir of a non-empty dir succeeded')\n\
+                  except OSError:\n\
+                  \x20   pass\n\
+                  open(imm, 'w').close()\n\
+                  subprocess.run(['chattr', '+i', imm], check=True)\n\
+                  try:\n\
+                  \x20   os.unlink(imm)\n\
+                  \x20   sys.exit('unlink of an immutable file succeeded')\n\
+                  except OSError:\n\
+                  \x20   pass\n\
+                  open(mk, 'w').close()\n";
+    let t0 = now_ns();
+    let pid = run_actor(script, &[&full, &imm, &marker_path]);
+    let since = since_before(t0);
+    wait_ebpf_fs(&s, "FILE_CREATE", since, by_actor(pid, &marker_path));
+    std::thread::sleep(SETTLE);
+    let deletes = fetch(&s, "FILE_DELETE", since);
+    for path in [&full, &imm] {
+        let got: Vec<Value> = objects_with(&deletes, "event_type", &json!("FILE_DELETE"))
+            .into_iter()
+            .filter(|e| e["file"]["path"] == json!(path))
+            .cloned()
+            .collect();
+        assert!(got.is_empty(), "failed op on {path} was reported: {got:?}");
+    }
+}
+
+/// `openat(dirfd, "rel.txt", O_CREAT)` with the CWD elsewhere reports the
+/// directory's true absolute path (the case the audit backend gets wrong).
+#[test]
+#[ignore]
+fn fs_dirfd_relative_open_reports_true_path() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let (d, _c) = watched_dir("fs-dirfd", &m);
+    let sub = format!("{d}/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let want = format!("{sub}/rel.txt");
+    let script = "import os, sys\n\
+                  fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)\n\
+                  os.chdir('/')\n\
+                  os.close(os.open('rel.txt', os.O_CREAT | os.O_WRONLY, 0o644, dir_fd=fd))\n\
+                  os.close(fd)\n";
+    let t0 = now_ns();
+    let pid = run_actor(script, &[&sub]);
+    let e = wait_ebpf_fs(&s, "FILE_CREATE", since_before(t0), by_actor(pid, &want));
+    assert_eq!(e["file"]["path"], json!(want), "event: {e}");
+}
+
+/// A watched tmpfs directory (`/dev/shm`, a mount crossing) is reported with
+/// its full path.
+#[test]
+#[ignore]
+fn fs_tmpfs_mount_crossing() {
+    let m = marker();
+    let shm = format!("/dev/shm/osiris-{m}");
+    std::fs::create_dir_all(&shm).unwrap();
+    let _c = Cleanup(vec![format!("rm -rf {shm}")]);
+    let s = stack_with_fs(
+        &Path::new(WATCH_ROOT).join(&m),
+        Some(required_bpf_dir()),
+        vec![PathBuf::from(&shm)],
+    );
+    let want = format!("{shm}/x.txt");
+    let script = "import os, sys\n\
+                  os.close(os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644))\n";
+    let t0 = now_ns();
+    let pid = run_actor(script, &[&want]);
+    let prefix = format!("{shm}/");
+    let e = wait_ebpf_fs(&s, "FILE_CREATE", since_before(t0), |e| {
+        e["process"]["pid"] == json!(pid)
+            && e["file"]["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with(&prefix))
+    });
+    assert_eq!(e["file"]["path"], json!(want), "event: {e}");
+}
+
+/// An object dir without `fs.bpf.o` (the others intact): only the
+/// filesystem sensor falls back to audit (DEGRADED, flag `audit_fallback`,
+/// a reason naming `fs.bpf.o`); the process sensor stays on eBPF, and a
+/// python write under the watch root still arrives, from AUDIT.
+#[test]
+#[ignore]
+fn fs_missing_object_falls_back_to_audit() {
+    let m = marker();
+    let good = required_bpf_dir();
+    // Declared before the stack so it outlives the agent reading it.
+    let bad = tempfile::Builder::new()
+        .prefix("osiris-bpf-nofs-")
+        .tempdir()
+        .unwrap();
+    for entry in std::fs::read_dir(&good).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("fs.bpf.o") {
+            continue;
+        }
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), bad.path().join(&name)).unwrap();
+        }
+    }
+    assert!(!bad.path().join("fs.bpf.o").exists());
+    assert!(bad.path().join("process.bpf.o").exists());
+    let s = stack_with_bpf(
+        &Path::new(WATCH_ROOT).join(&m),
+        Some(bad.path().to_path_buf()),
+    );
+
+    let health = sensor_health_reaches(&s, "filesystem", "DEGRADED");
+    assert!(
+        health
+            .iter()
+            .filter(|h| h["state"]["state"] == json!("DEGRADED"))
+            .all(|h| h["state"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("fs.bpf.o"))),
+        "DEGRADED without a reason naming fs.bpf.o: {health:?}"
+    );
+    let status = sensor_status(&s, "filesystem");
+    assert_eq!(status["state"], json!("DEGRADED"), "status: {status}");
+    assert!(
+        has_flag(&status, "audit_fallback"),
+        "no `audit_fallback` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, "ebpf"),
+        "fell back yet `ebpf` set: {status}"
+    );
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("fs.bpf.o")),
+        "last_error does not name fs.bpf.o: {status}"
+    );
+    let process = process_status(&s);
+    assert_eq!(process["state"], json!("HEALTHY"), "process: {process}");
+    assert!(
+        has_flag(&process, "ebpf"),
+        "process sensor left eBPF: {process}"
+    );
+
+    let path = format!("{WATCH_ROOT}/fs-audit-{m}.txt");
+    let _c = Cleanup(vec![format!("rm -f {path}")]);
+    let t0 = now_ns();
+    run_actor(
+        "import os, sys\nfd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644)\n\
+         os.write(fd, b'x')\nos.close(fd)\n",
+        &[&path],
+    );
+    events(&s, "FILE_CREATE", t0, |v| {
+        objects_with(v, "event_type", &json!("FILE_CREATE"))
+            .iter()
+            .any(|e| e["source"] == json!("AUDIT") && e["file"]["path"] == json!(path))
+    });
+}
+
+/// After events are stored, `/status` shows them: `events_emitted_total > 0`
+/// and a non-null `last_event_at` for both `filesystem` and `process_exec`
+/// (spec 2.5; closes or reopens the roadmap's `process_exec` health debt).
+#[test]
+#[ignore]
+fn sensor_health_counts_events() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let (d, _c) = watched_dir("fs-health", &m);
+    let file = format!("{d}/a.txt");
+    let t0 = now_ns();
+    let pid = run_actor(
+        "import os, sys\nos.close(os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644))\n\
+         os.unlink(sys.argv[1])\n",
+        &[&file],
+    );
+    sh(&format!("/bin/sh -c 'true {m}'"));
+    let since = since_before(t0);
+    wait_ebpf_fs(&s, "FILE_DELETE", since, by_actor(pid, &file));
+    events(&s, "PROCESS_EXEC", since, |v| {
+        objects_with(v, "event_type", &json!("PROCESS_EXEC"))
+            .iter()
+            .any(|e| e["provider"] == json!(EBPF_PROVIDER) && contains_str(e, &m))
+    });
+    wait_sensor_counts_events(&s, "filesystem");
+    wait_sensor_counts_events(&s, "process_exec");
 }

@@ -24,6 +24,7 @@ pub fn run(rate: u64, duration_s: u64) -> Record {
             audit_log: "/var/log/audit/audit.log".into(),
             persistence_dirs: vec![persist.path().to_path_buf()],
             ebpf_object_dir: osiris_real_linux_tests::render::bpf_dir_from_env(),
+            extra_fs_watch: vec![],
         }),
         ..Default::default()
     });

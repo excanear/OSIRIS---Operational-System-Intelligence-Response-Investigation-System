@@ -11,6 +11,7 @@
 #   annotate.sh ebpf     <test-output> [kept-stack-dirs]
 #       ::warning:: with the eBPF backend status lines the scenarios echo and
 #       the agent log lines naming the eBPF loads or their fallback reasons
+#       (process, network and filesystem sensors)
 set -uo pipefail
 
 max_lines=20
@@ -57,9 +58,9 @@ ebpf)
     {
         [ -f "$out" ] && grep -h 'osiris-ebpf:' "$out"
         if [ -n "$kept" ] && [ -d "$kept" ]; then
-            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback|procfs fallback' {} +
+            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback|procfs fallback|fs watch' {} +
         fi
-    } | head -n "$max_lines" | emit warning "eBPF process and network backends"
+    } | head -n "$max_lines" | emit warning "eBPF process, network and filesystem backends"
     ;;
 *)
     echo "usage: $0 tail|failures|ebpf ..." >&2
