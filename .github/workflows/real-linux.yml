@@ -99,7 +99,7 @@ jobs:
         # fs_object_loads_and_attaches (tests/load_fs.rs) needs root: skipped
         # here, run by the next step.
         run: |
-          cargo test -p osiris-sensors-process -p osiris-sensors-net -p osiris-ebpf -- --include-ignored \
+          cargo test -p osiris-sensors-process -p osiris-sensors-net -p osiris-sensors-fs -p osiris-ebpf -- --include-ignored \
             --skip fs_object_loads_and_attaches 2>&1 \
             | tee "$RUNNER_TEMP/process-ebpf-unit-tests.txt"
           exit "${PIPESTATUS[0]}"

@@ -95,6 +95,15 @@ pub struct FileEventRaw {
     pub operation: FileOperation,
     /// Absolute path. For `Rename` this is the *destination* path.
     ///
+    /// eBPF backend: the path is rendered from the kernel dentry walk, so
+    /// `*at()` calls with a real dirfd are resolved against the directory
+    /// the dirfd actually names (the limitation below does not apply). A path
+    /// longer than the record buffer keeps its tail behind a leading `…/`
+    /// marker and is then *not* absolute; invalid UTF-8 is replaced
+    /// (lossy). The same applies to `previous_path`, which is `Some("")`
+    /// when the kernel could not supply a source for a `Rename`. eBPF
+    /// events carry no `audit_serial`.
+    ///
     /// KNOWN LIMITATION (audit backend): a relative `name=` from a `*at()`
     /// syscall (`openat`, `unlinkat`, `renameat`, ...) called with a real
     /// (non-`AT_FDCWD`) dirfd is resolved against the group's process-CWD

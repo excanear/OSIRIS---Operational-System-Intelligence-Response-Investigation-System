@@ -7,9 +7,15 @@ edition.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+tracing = { workspace = true }
 osiris-sensor-api = { path = "../../osiris-sensor-api" }
 osiris-schema = { path = "../../osiris-schema" }
 osiris-fileutil = { path = "../../osiris-fileutil" }
+osiris-ebpf = { path = "../../osiris-ebpf" }
+
+# statfs(2) for the filesystem magic of a watched path (watch-key rules).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

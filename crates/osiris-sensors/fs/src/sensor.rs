@@ -1,36 +1,61 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use osiris_ebpf::{
+    boot_wall_offset_ns, decode_fs, kernel_symbols_text, missing_kernel_symbols, probe, AttachKind,
+    DecodeError, DropCounter, EbpfSettings, FsEvent, LoadedObject, FS_OBJECT,
+};
 use osiris_fileutil::LineTailer;
 use osiris_sensor_api::{
     RawEvent, Sensor, SensorCapabilities, SensorContext, SensorError, SensorHealth, SensorMetrics,
     SensorState,
 };
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::assembler::AuditEventAssembler;
 use crate::audit_record::{parse_record, AuditRecord};
+use crate::ebpf_backend::fs_to_raw;
+use crate::watch::{resolve_watch_paths, WatchResolution, DEFAULT_WATCH_PATHS};
+
+/// How often the eBPF supervisor checks whether the reader thread ended.
+const READER_SUPERVISE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The real procfs root, used for `exe_path` resolution on the eBPF path.
+const PROC_ROOT: &str = "/proc";
+
+/// `WATCH_FLAGS` bit 0: an inode-only (`dev` 0) key exists.
+const WATCH_FLAG_INODE_ONLY: u32 = 1;
 
 struct HealthState {
     state: SensorState,
+    /// The state an emitted event (re)asserts: `Healthy`, or `Degraded`
+    /// while running on the audit fallback, so a later event never hides
+    /// that eBPF failed.
+    running_state: SensorState,
     events_emitted_total: u64,
     events_dropped_total: u64,
     last_error: Option<String>,
     last_event_at: Option<u64>,
     capability_flags: Vec<String>,
+    /// Why eBPF is off while running on the audit fallback; kept so a later
+    /// audit tail error is reported next to it, never instead of it.
+    fallback_reason: Option<String>,
 }
 
 impl Default for HealthState {
     fn default() -> Self {
         Self {
             state: SensorState::Starting,
+            running_state: SensorState::Healthy,
             events_emitted_total: 0,
             events_dropped_total: 0,
             last_error: None,
             last_event_at: None,
             capability_flags: vec![],
+            fallback_reason: None,
         }
     }
 }
@@ -44,11 +69,21 @@ fn lock_health(health: &Mutex<HealthState>) -> MutexGuard<'_, HealthState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The Filesystem sensor (ARCHITECTURE.md §4.3's Filesystem row), Phase 2
-/// scope: the Audit fallback backend only, consumed by tailing an
-/// auditd-format log file (plan Global Constraints #1/#2). eBPF LSM hooks
-/// and fanotify are additional `Sensor` implementations behind this same
-/// unchanged trait, not a rewrite of this one.
+/// The Filesystem sensor (ARCHITECTURE.md §4.3's Filesystem row), with two
+/// backends chosen at `initialize`, like the process sensor's:
+///
+/// - **eBPF** (when [`EbpfSettings`] are given and the host can load the
+///   `osiris-ebpf` fs program): create/write/delete/rename records for the
+///   watched directories from the ring buffer, read on a dedicated thread;
+///   health `Healthy`, capability flag `ebpf`. Watch paths that cannot be
+///   watched are named in `last_error` without degrading health; with none
+///   usable eBPF is unusable (Global Constraint #13).
+/// - **audit** log file (the only backend without `EbpfSettings`, exactly
+///   as before), consumed by tailing an auditd-format log. When eBPF was
+///   configured but could not be used it runs as the fallback: health
+///   `Degraded`, the reason in `last_error`, flag `audit_fallback`. With
+///   eBPF unusable and no audit log, `initialize` returns `Unsupported`
+///   with every reason and the sensor is `Failed`.
 ///
 /// Expected audit rules on a real host (the sensor does not install them;
 /// that is an operator/packaging concern):
@@ -59,19 +94,33 @@ fn lock_health(health: &Mutex<HealthState>) -> MutexGuard<'_, HealthState> {
 ///    -F dir=/var/www -F key=osiris_fs
 /// ```
 pub struct FilesystemSensor {
-    audit_log_path: PathBuf,
+    audit_log_path: Option<PathBuf>,
+    ebpf: Option<EbpfSettings>,
+    /// Directories the eBPF backend watches; empty means
+    /// [`DEFAULT_WATCH_PATHS`].
+    watch_paths: Vec<PathBuf>,
     poll_interval: Duration,
     completion_timeout: Duration,
     audit_key: Option<String>,
     cancellation: Option<CancellationToken>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     health: Arc<Mutex<HealthState>>,
+    /// BPF-side ring-buffer reservation failures, added to
+    /// `events_dropped_total` on every health/metrics read (eBPF only).
+    drop_counter: Option<DropCounter>,
 }
 
 impl FilesystemSensor {
-    pub fn new(audit_log_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        audit_log_path: Option<PathBuf>,
+        ebpf: Option<EbpfSettings>,
+        watch_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
-            audit_log_path: audit_log_path.into(),
+            audit_log_path,
+            ebpf,
+            watch_paths,
+            drop_counter: None,
             poll_interval: Duration::from_millis(200),
             // Comfortably longer than one poll, so a group split across two
             // polls is never released mid-way, but short enough that the
@@ -101,6 +150,205 @@ impl FilesystemSensor {
         self.audit_key = Some(key.into());
         self
     }
+
+    /// Sensor-side drops plus the BPF program's ring-buffer drops.
+    fn dropped_total(&self, h: &HealthState) -> u64 {
+        let bpf = self.drop_counter.as_ref().map_or(0, DropCounter::get);
+        h.events_dropped_total.saturating_add(bpf)
+    }
+
+    /// Why the audit backend cannot run, `None` when it can.
+    fn audit_unavailable_reason(&self) -> Option<String> {
+        match &self.audit_log_path {
+            Some(path) if path.exists() => None,
+            Some(path) => Some(format!("audit log not found at {}", path.display())),
+            None => Some("no audit log path configured".to_string()),
+        }
+    }
+
+    /// The configured watch paths, or the defaults when none are.
+    fn effective_watch_paths(&self) -> Vec<PathBuf> {
+        if self.watch_paths.is_empty() {
+            DEFAULT_WATCH_PATHS.iter().map(PathBuf::from).collect()
+        } else {
+            self.watch_paths.clone()
+        }
+    }
+
+    /// Start the eBPF backend: the reader thread plus an async supervisor
+    /// that records how the thread ended (a reader error moves health to
+    /// `Failed`, never a silent stop). `Err` (the thread could not be
+    /// started; the program is dropped and detached) means fall back.
+    fn start_ebpf(
+        &mut self,
+        loaded: Loaded,
+        output: mpsc::Sender<RawEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<(), String> {
+        let Loaded { prog, skipped } = loaded;
+        let drop_counter = prog.drop_counter();
+        let health = self.health.clone();
+        let proc_root = PathBuf::from(PROC_ROOT);
+        let reader = osiris_ebpf::spawn_reader(prog, decode_fs, cancellation, move |record| {
+            on_record(record, &boot_wall_offset_ns, &proc_root, &output, &health)
+        })
+        .map_err(|e| format!("eBPF unavailable: {e}"))?;
+        {
+            let mut h = lock_health(&self.health);
+            h.running_state = SensorState::Healthy;
+            h.capability_flags = vec!["ebpf".to_string()];
+            // Unwatched paths are reported but do not degrade health.
+            if !skipped.is_empty() {
+                h.last_error = Some(format!("fs watch paths skipped: {}", skipped.join("; ")));
+            }
+        }
+        self.drop_counter = Some(drop_counter);
+
+        let health = self.health.clone();
+        self.task_handle = Some(tokio::spawn(async move {
+            while !reader.is_finished() {
+                tokio::time::sleep(READER_SUPERVISE_INTERVAL).await;
+            }
+            let outcome = reader.join();
+            let mut h = lock_health(&health);
+            match outcome {
+                Ok(Ok(())) => h.state = SensorState::Stopped,
+                Ok(Err(e)) => {
+                    h.state = SensorState::Failed;
+                    h.last_error = Some(e.to_string());
+                }
+                Err(_) => {
+                    h.state = SensorState::Failed;
+                    h.last_error = Some("eBPF ring-buffer reader thread panicked".to_string());
+                }
+            }
+        }));
+        Ok(())
+    }
+}
+
+/// The fs program, loaded with its watch map and flags populated, plus the
+/// watch paths that could not be watched.
+struct Loaded {
+    prog: LoadedObject,
+    skipped: Vec<String>,
+}
+
+/// The fs object is x86_64-only (Global Constraint #6).
+fn arch_problem() -> Option<String> {
+    cfg!(not(target_arch = "x86_64")).then(|| "fs eBPF object is x86_64-only".to_string())
+}
+
+/// Required kprobe symbols of the fs object (Global Constraint #9), taken
+/// from the object spec so the two cannot drift apart.
+fn required_kprobes() -> Vec<&'static str> {
+    FS_OBJECT
+        .attach
+        .iter()
+        .filter(|p| p.required)
+        .filter_map(|p| match p.kind {
+            AttachKind::KProbe { symbol } => Some(symbol),
+            AttachKind::TracePoint { .. } => None,
+        })
+        .collect()
+}
+
+/// Probe the host, resolve the watch paths, load the fs program and fill its
+/// `WATCH`/`WATCH_FLAGS` maps. `Err` carries every reason found before
+/// loading (a missing object is named even when the probe also fails, so
+/// the operator sees the configuration problem as well as the host one).
+fn load_ebpf(settings: &EbpfSettings, watch_paths: &[PathBuf]) -> Result<Loaded, String> {
+    let mut reasons = vec![];
+    let object = settings.object_dir.join(FS_OBJECT.object_file);
+    reasons.extend(object_problem(&object));
+    reasons.extend(probe().reasons);
+    reasons.extend(arch_problem());
+    if let Some(symbols) = kernel_symbols_text() {
+        for name in missing_kernel_symbols(&symbols, &required_kprobes()) {
+            reasons.push(format!("required kernel symbol missing: {name}"));
+        }
+    }
+    let WatchResolution {
+        keys,
+        inode_only,
+        skipped,
+    } = resolve_watch_paths(watch_paths);
+    if keys.is_empty() {
+        reasons.push(format!(
+            "no usable fs watch path ({})",
+            if skipped.is_empty() {
+                "none configured".to_string()
+            } else {
+                skipped.join("; ")
+            }
+        ));
+    }
+    if !reasons.is_empty() {
+        return Err(format!("eBPF unavailable: {}", reasons.join("; ")));
+    }
+    let mut prog = LoadedObject::load(&settings.object_dir, &FS_OBJECT, settings.self_tgid)
+        .map_err(|e| format!("eBPF unavailable: {e}"))?;
+    for key in &keys {
+        prog.insert_watch(key.dev, key.ino)
+            .map_err(|e| format!("eBPF unavailable: {e}"))?;
+    }
+    if inode_only {
+        prog.set_watch_flags(WATCH_FLAG_INODE_ONLY)
+            .map_err(|e| format!("eBPF unavailable: {e}"))?;
+    }
+    Ok(Loaded { prog, skipped })
+}
+
+/// What is wrong with the BPF object path, truthfully: absent, present but
+/// not a regular file, or not even stat-able. `None` when it is a regular
+/// file. (Same rule as the process sensor's.)
+fn object_problem(object: &Path) -> Option<String> {
+    match std::fs::metadata(object) {
+        Ok(m) if m.is_file() => None,
+        Ok(_) => Some(format!(
+            "bpf object is not a regular file: {}",
+            object.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("bpf object file missing: {}", object.display()))
+        }
+        Err(e) => Some(format!(
+            "cannot access bpf object {}: {e}",
+            object.display()
+        )),
+    }
+}
+
+/// Reader-thread callback: convert and forward one record on its own. A
+/// record that does not decode is counted as dropped.
+/// `boot_wall_offset_ns` is called once per decoded record, so the
+/// realtime − monotonic offset is current for each event. Runs on the
+/// reader's own `std::thread`, so blocking on a full channel is
+/// backpressure, not a stalled async worker.
+fn on_record(
+    record: Result<FsEvent, DecodeError>,
+    boot_wall_offset_ns: &dyn Fn() -> i128,
+    proc_root: &Path,
+    output: &mpsc::Sender<RawEvent>,
+    health: &Mutex<HealthState>,
+) {
+    let raw = match record {
+        Ok(e) => fs_to_raw(&e, boot_wall_offset_ns(), proc_root),
+        Err(_) => {
+            lock_health(health).events_dropped_total += 1;
+            return;
+        }
+    };
+    let ts = raw.timestamp_ns;
+    let sent = output.blocking_send(RawEvent::File(raw)).is_ok();
+    let mut h = lock_health(health);
+    if sent {
+        h.events_emitted_total += 1;
+        h.last_event_at = Some(ts);
+        h.state = h.running_state;
+    } else {
+        h.events_dropped_total += 1;
+    }
 }
 
 /// True when this line should be fed to the assembler. A key filter can
@@ -118,46 +366,9 @@ fn passes_key_filter(line: &str, audit_key: Option<&str>) -> bool {
     }
 }
 
-#[async_trait]
-impl Sensor for FilesystemSensor {
-    fn name(&self) -> &'static str {
-        "filesystem"
-    }
-
-    fn capabilities(&self) -> SensorCapabilities {
-        if self.audit_log_path.exists() {
-            SensorCapabilities {
-                ebpf: false,
-                audit_fallback: true,
-                always_available: false,
-                unsupported_reason: None,
-            }
-        } else {
-            SensorCapabilities {
-                ebpf: false,
-                audit_fallback: false,
-                always_available: false,
-                unsupported_reason: Some(format!(
-                    "audit log not found at {}",
-                    self.audit_log_path.display()
-                )),
-            }
-        }
-    }
-
-    async fn initialize(&mut self, ctx: SensorContext) -> Result<(), SensorError> {
-        self.cancellation = Some(ctx.cancellation.clone());
-        lock_health(&self.health).state = SensorState::Starting;
-
-        let caps = self.capabilities();
-        if !caps.supported() {
-            let reason = caps.unsupported_reason.clone().unwrap_or_default();
-            lock_health(&self.health).last_error = Some(reason.clone());
-            return Err(SensorError::Unsupported(reason));
-        }
-        lock_health(&self.health).capability_flags = vec!["audit_fallback".to_string()];
-
-        let path = self.audit_log_path.clone();
+impl FilesystemSensor {
+    /// Start the audit log-file backend (the pre-eBPF behaviour).
+    fn start_audit(&mut self, path: PathBuf, ctx: SensorContext) {
         let poll_interval = self.poll_interval;
         let completion_timeout = self.completion_timeout;
         let audit_key = self.audit_key.clone();
@@ -171,7 +382,7 @@ impl Sensor for FilesystemSensor {
             loop {
                 if cancellation.is_cancelled() {
                     // Release whatever group was still open so the last
-                    // observed operation isn't silently dropped on shutdown.
+                    // observed operation is not silently dropped on shutdown.
                     for raw in assembler.flush() {
                         emit(&output, raw, &health).await;
                     }
@@ -195,7 +406,11 @@ impl Sensor for FilesystemSensor {
                     Err(e) => {
                         let mut h = lock_health(&health);
                         h.state = SensorState::Degraded;
-                        h.last_error = Some(e.to_string());
+                        // Never let a tail error hide why eBPF is off.
+                        h.last_error = Some(match &h.fallback_reason {
+                            Some(reason) => format!("{reason}; audit: {e}"),
+                            None => e.to_string(),
+                        });
                     }
                 }
                 tokio::select! {
@@ -211,14 +426,127 @@ impl Sensor for FilesystemSensor {
             }
         });
         self.task_handle = Some(handle);
+    }
+}
+
+#[async_trait]
+impl Sensor for FilesystemSensor {
+    fn name(&self) -> &'static str {
+        "filesystem"
+    }
+
+    fn capabilities(&self) -> SensorCapabilities {
+        let ebpf_report = self.ebpf.as_ref().map(|_| probe());
+        let arch_problem = arch_problem();
+        let ebpf = ebpf_report.as_ref().is_some_and(|r| r.supported) && arch_problem.is_none();
+        let audit_reason = self.audit_unavailable_reason();
+        let audit_fallback = audit_reason.is_none();
+        let unsupported_reason = if ebpf || audit_fallback {
+            None
+        } else {
+            let mut reasons = vec![];
+            if let Some(report) = &ebpf_report {
+                let mut why = report.reasons.clone();
+                why.extend(arch_problem);
+                reasons.push(format!("eBPF unavailable: {}", why.join("; ")));
+            }
+            reasons.extend(audit_reason);
+            Some(reasons.join("; "))
+        };
+        SensorCapabilities {
+            ebpf,
+            audit_fallback,
+            always_available: false,
+            unsupported_reason,
+        }
+    }
+
+    async fn initialize(&mut self, ctx: SensorContext) -> Result<(), SensorError> {
+        self.cancellation = Some(ctx.cancellation.clone());
+        {
+            // A re-initialize starts from a clean backend selection.
+            let mut h = lock_health(&self.health);
+            h.state = SensorState::Starting;
+            h.running_state = SensorState::Healthy;
+            h.last_error = None;
+            h.fallback_reason = None;
+            h.capability_flags = vec![];
+        }
+        self.drop_counter = None;
+
+        let mut fallback_reason = None;
+        if let Some(settings) = self.ebpf.clone() {
+            let watch_paths = self.effective_watch_paths();
+            let started = load_ebpf(&settings, &watch_paths).and_then(|loaded| {
+                self.start_ebpf(loaded, ctx.output.clone(), ctx.cancellation.clone())
+            });
+            // Logged as well as health-visible: the backend choice is the
+            // first thing a post-mortem of a real host needs.
+            match started {
+                Ok(()) => {
+                    tracing::info!(
+                        sensor = "filesystem",
+                        object_dir = %settings.object_dir.display(),
+                        "eBPF filesystem backend active"
+                    );
+                    return Ok(());
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        sensor = "filesystem",
+                        reason = %reason,
+                        "eBPF filesystem backend unavailable; trying the audit fallback"
+                    );
+                    fallback_reason = Some(reason);
+                }
+            }
+        }
+
+        let path = match (&self.audit_log_path, self.audit_unavailable_reason()) {
+            (Some(path), None) => path.clone(),
+            (_, audit_reason) => {
+                let audit_reason = audit_reason.unwrap_or_default();
+                let reason = match fallback_reason {
+                    // eBPF was configured and there is nothing to fall back to.
+                    Some(ebpf_reason) => {
+                        let reason = format!("{ebpf_reason}; no audit fallback: {audit_reason}");
+                        let mut h = lock_health(&self.health);
+                        h.state = SensorState::Failed;
+                        h.last_error = Some(reason.clone());
+                        reason
+                    }
+                    // No eBPF configured: today's behaviour.
+                    None => {
+                        lock_health(&self.health).last_error = Some(audit_reason.clone());
+                        audit_reason
+                    }
+                };
+                return Err(SensorError::Unsupported(reason));
+            }
+        };
+
+        {
+            let mut h = lock_health(&self.health);
+            if let Some(reason) = fallback_reason {
+                h.running_state = SensorState::Degraded;
+                h.last_error = Some(reason.clone());
+                h.fallback_reason = Some(reason);
+            }
+            h.capability_flags = vec!["audit_fallback".to_string()];
+        }
+        self.start_audit(path, ctx);
         Ok(())
     }
 
     async fn start(&mut self) -> Result<(), SensorError> {
-        // The polling task is already spawned in initialize(); this sensor
-        // has no separate "armed but not running" state, same as
-        // ProcessExecSensor.
-        lock_health(&self.health).state = SensorState::Healthy;
+        // The backend is already running from initialize(); start() only
+        // publishes its running state (Healthy, or Degraded on the audit
+        // fallback) unless the backend has already moved on (an eBPF reader
+        // that failed in between stays Failed).
+        let mut h = lock_health(&self.health);
+        if h.state == SensorState::Starting {
+            h.state = h.running_state;
+        }
         Ok(())
     }
 
@@ -239,7 +567,7 @@ impl Sensor for FilesystemSensor {
             name: self.name().to_string(),
             state: h.state,
             events_emitted_total: h.events_emitted_total,
-            events_dropped_total: h.events_dropped_total,
+            events_dropped_total: self.dropped_total(&h),
             last_error: h.last_error.clone(),
             last_event_at: h.last_event_at,
             capability_flags: h.capability_flags.clone(),
@@ -251,13 +579,15 @@ impl Sensor for FilesystemSensor {
         let h = lock_health(&self.health);
         SensorMetrics {
             events_emitted_total: h.events_emitted_total,
-            events_dropped_total: h.events_dropped_total,
+            events_dropped_total: self.dropped_total(&h),
         }
     }
 }
 
+/// Forward one audit event; it (re)asserts the running state, so the
+/// fallback stays `Degraded` while it emits.
 async fn emit(
-    output: &tokio::sync::mpsc::Sender<RawEvent>,
+    output: &mpsc::Sender<RawEvent>,
     raw: osiris_sensor_api::FileEventRaw,
     health: &Mutex<HealthState>,
 ) {
@@ -266,7 +596,7 @@ async fn emit(
         let mut h = lock_health(health);
         h.events_emitted_total += 1;
         h.last_event_at = Some(timestamp);
-        h.state = SensorState::Healthy;
+        h.state = h.running_state;
     } else {
         lock_health(health).events_dropped_total += 1;
     }
@@ -282,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn reports_unsupported_when_the_audit_log_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sensor = FilesystemSensor::new(dir.path().join("missing.log"));
+        let mut sensor = FilesystemSensor::new(Some(dir.path().join("missing.log")), None, vec![]);
         let caps = sensor.capabilities();
         assert!(!caps.supported());
         assert!(caps
@@ -304,7 +634,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "").unwrap();
 
-        let mut sensor = FilesystemSensor::new(&path)
+        let mut sensor = FilesystemSensor::new(Some(path.clone()), None, vec![])
             .with_poll_interval(Duration::from_millis(20))
             .with_completion_timeout(Duration::from_millis(40));
         let (tx, mut rx) = mpsc::channel(16);
@@ -353,7 +683,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         std::fs::write(&path, "").unwrap();
 
-        let mut sensor = FilesystemSensor::new(&path)
+        let mut sensor = FilesystemSensor::new(Some(path.clone()), None, vec![])
             .with_poll_interval(Duration::from_millis(20))
             .with_completion_timeout(Duration::from_millis(40))
             .with_audit_key("osiris_fs");
@@ -390,5 +720,189 @@ mod tests {
         }
         sensor.stop().await.unwrap();
         assert_eq!(sensor.health().events_emitted_total, 1);
+    }
+
+    fn ebpf_settings(dir: &Path) -> EbpfSettings {
+        EbpfSettings {
+            object_dir: dir.to_path_buf(),
+            self_tgid: std::process::id(),
+        }
+    }
+
+    fn append_audit_group(path: &Path) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, r#"type=SYSCALL msg=audit(1690000000.123:456): arch=c000003e syscall=257 success=yes exit=3 items=2 ppid=200 pid=300 uid=1000 comm="curl" exe="/usr/bin/curl" key="osiris_fs""#).unwrap();
+        writeln!(file, r#"type=PATH msg=audit(1690000000.123:456): item=0 name="/var/www/html" inode=200000 dev=08:01 mode=040755 ouid=0 ogid=0 nametype=PARENT"#).unwrap();
+        writeln!(file, r#"type=PATH msg=audit(1690000000.123:456): item=1 name="/var/www/html/shell.php" inode=200001 dev=08:01 mode=0100644 ouid=33 ogid=33 nametype=CREATE"#).unwrap();
+        file.flush().unwrap();
+    }
+
+    /// `ebpf` configured, but the object directory holds no `fs.bpf.o`: the
+    /// sensor runs the audit tailer, Degraded with the reason, and an
+    /// emitted event does not hide the fallback.
+    #[tokio::test]
+    async fn falls_back_to_audit_when_fs_object_missing() {
+        let objects = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("audit.log");
+        std::fs::write(&log, "").unwrap();
+        let mut sensor = FilesystemSensor::new(
+            Some(log.clone()),
+            Some(ebpf_settings(objects.path())),
+            vec![],
+        )
+        .with_poll_interval(Duration::from_millis(20))
+        .with_completion_timeout(Duration::from_millis(40));
+        let (tx, mut rx) = mpsc::channel(16);
+        sensor
+            .initialize(SensorContext::new(tx, CancellationToken::new()))
+            .await
+            .unwrap();
+        sensor.start().await.unwrap();
+
+        let health = sensor.health();
+        assert_eq!(health.state, SensorState::Degraded);
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("fs.bpf.o")),
+            "reason must name the missing object: {:?}",
+            health.last_error
+        );
+        assert_eq!(health.capability_flags, ["audit_fallback"]);
+
+        append_audit_group(&log);
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(RawEvent::File(raw))) => {
+                assert_eq!(raw.path, "/var/www/html/shell.php");
+                assert_eq!(raw.source, osiris_sensor_api::RawEventSource::Audit);
+            }
+            other => panic!("expected an audit File event, got {other:?}"),
+        }
+        assert_eq!(
+            sensor.health().state,
+            SensorState::Degraded,
+            "an emitted event must not hide the fallback"
+        );
+        sensor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_without_audit_when_ebpf_fails() {
+        let objects = tempfile::tempdir().unwrap();
+        let mut sensor = FilesystemSensor::new(None, Some(ebpf_settings(objects.path())), vec![]);
+        let (tx, _rx) = mpsc::channel(16);
+        let result = sensor
+            .initialize(SensorContext::new(tx, CancellationToken::new()))
+            .await;
+        match result {
+            Err(SensorError::Unsupported(reason)) => {
+                assert!(reason.contains("fs.bpf.o"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        let health = sensor.health();
+        assert_eq!(health.state, SensorState::Failed);
+        assert!(health
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("fs.bpf.o")));
+    }
+
+    #[tokio::test]
+    async fn no_ebpf_key_behaves_as_before() {
+        let logs = tempfile::tempdir().unwrap();
+        let log = logs.path().join("audit.log");
+        std::fs::write(&log, "").unwrap();
+        let mut sensor = FilesystemSensor::new(Some(log), None, vec![]);
+        let caps = sensor.capabilities();
+        assert!(caps.audit_fallback && !caps.ebpf && !caps.always_available);
+        let (tx, _rx) = mpsc::channel(16);
+        sensor
+            .initialize(SensorContext::new(tx, CancellationToken::new()))
+            .await
+            .unwrap();
+        sensor.start().await.unwrap();
+        let health = sensor.health();
+        assert_eq!(health.state, SensorState::Healthy);
+        assert_eq!(health.capability_flags, ["audit_fallback"]);
+        assert_eq!(health.last_error, None);
+        sensor.stop().await.unwrap();
+    }
+
+    #[test]
+    fn required_kprobes_come_from_the_object_spec() {
+        let k = required_kprobes();
+        assert_eq!(k.len(), 7, "{k:?}");
+        assert!(k.contains(&"security_file_open"));
+        assert!(!k.contains(&"security_file_truncate"), "optional");
+    }
+
+    fn fs_record() -> FsEvent {
+        FsEvent {
+            kind: osiris_ebpf::FsKind::Create,
+            pid: u32::MAX,
+            ppid: 1,
+            uid: 0,
+            ret: 0,
+            ktime_ns: 100,
+            comm: "touch".to_string(),
+            exe: None,
+            inode: None,
+            path: b"/tmp/x".to_vec(),
+            path_truncated: false,
+            old_path: None,
+            old_path_truncated: false,
+        }
+    }
+
+    /// The realtime − monotonic offset is resampled for every record (the
+    /// net sensor's `ebpf_on_record_resamples_offset`, for fs).
+    #[test]
+    fn ebpf_on_record_counts_and_resamples() {
+        let root = tempfile::tempdir().unwrap();
+        let health = Mutex::new(HealthState::default());
+        let (tx, mut rx) = mpsc::channel(4);
+        let offset = std::cell::Cell::new(1_000i128);
+        let sample = || {
+            let now = offset.get();
+            offset.set(now + 5_000); // the clock steps between records
+            now
+        };
+        on_record(Ok(fs_record()), &sample, root.path(), &tx, &health);
+        on_record(Ok(fs_record()), &sample, root.path(), &tx, &health);
+        on_record(
+            Err(DecodeError::ShorterThanHeader(3)),
+            &sample,
+            root.path(),
+            &tx,
+            &health,
+        );
+        let mut stamps = Vec::new();
+        while let Ok(RawEvent::File(raw)) = rx.try_recv() {
+            assert_eq!(raw.source, osiris_sensor_api::RawEventSource::Ebpf);
+            stamps.push(raw.timestamp_ns);
+        }
+        assert_eq!(stamps, [1_100, 6_100]);
+        // A record that does not decode is not stamped, so not sampled.
+        assert_eq!(offset.get(), 11_000);
+        let h = lock_health(&health);
+        assert_eq!(h.events_emitted_total, 2);
+        assert_eq!(h.events_dropped_total, 1);
+        assert_eq!(h.last_event_at, Some(6_100));
+    }
+
+    #[test]
+    fn ebpf_on_record_counts_a_closed_channel_as_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let health = Mutex::new(HealthState::default());
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        on_record(Ok(fs_record()), &|| 0, root.path(), &tx, &health);
+        let h = lock_health(&health);
+        assert_eq!(h.events_dropped_total, 1);
+        assert_eq!(h.events_emitted_total, 0);
+        assert_eq!(h.state, SensorState::Starting);
     }
 }

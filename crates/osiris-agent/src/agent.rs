@@ -112,10 +112,9 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
             (audit.is_some() || ebpf.is_some())
                 .then(|| Box::new(ProcessExecSensor::new(audit, ebpf)) as Box<dyn Sensor>)
         }
-        "filesystem" => config
-            .fs_audit_log_path
-            .clone()
-            .map(|p| Box::new(FilesystemSensor::new(p)) as Box<dyn Sensor>),
+        "filesystem" => config.fs_audit_log_path.clone().map(|p| {
+            Box::new(FilesystemSensor::new(Some(PathBuf::from(p)), None, vec![])) as Box<dyn Sensor>
+        }),
         "network" => {
             let proc_root = config.network_proc_root.clone().map(PathBuf::from);
             let ebpf = ebpf_settings(config);
