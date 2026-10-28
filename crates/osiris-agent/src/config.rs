@@ -206,6 +206,10 @@ pub struct AgentConfig {
     /// records the other consumes). Skipped, never silently, if absent.
     #[serde(default)]
     pub fs_audit_log_path: Option<String>,
+    /// Paths the eBPF Filesystem backend watches (Phase 11b-3). Empty means
+    /// the sensor's `DEFAULT_WATCH_PATHS`.
+    #[serde(default)]
+    pub fs_watch_paths: Vec<String>,
     /// Directory to poll for `/proc/net/tcp`-style Network sensor input
     /// (a real deployment points this at `/proc`). If absent or its
     /// `net/tcp` file doesn't exist, that sensor is skipped
@@ -614,6 +618,28 @@ control:
         );
         assert_eq!(config.k8s_context.ca_path.as_deref(), Some("/ca.pem"));
         assert_eq!(config.k8s_context.refresh_secs, 5);
+    }
+
+    #[test]
+    fn fs_watch_paths_parse_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\nfs_watch_paths: ['/srv']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            AgentConfig::load(&path).unwrap().fs_watch_paths,
+            vec!["/srv".to_string()]
+        );
+
+        std::fs::write(
+            &path,
+            "spool_path: /tmp/s.ndjson\nstatus_addr: 127.0.0.1:9200\n",
+        )
+        .unwrap();
+        assert!(AgentConfig::load(&path).unwrap().fs_watch_paths.is_empty());
     }
 
     #[test]

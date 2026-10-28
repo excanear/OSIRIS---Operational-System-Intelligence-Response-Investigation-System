@@ -112,9 +112,16 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
             (audit.is_some() || ebpf.is_some())
                 .then(|| Box::new(ProcessExecSensor::new(audit, ebpf)) as Box<dyn Sensor>)
         }
-        "filesystem" => config.fs_audit_log_path.clone().map(|p| {
-            Box::new(FilesystemSensor::new(Some(PathBuf::from(p)), None, vec![])) as Box<dyn Sensor>
-        }),
+        "filesystem" => {
+            let audit = config.fs_audit_log_path.clone().map(PathBuf::from);
+            let ebpf = ebpf_settings(config);
+            // An empty watch list makes the sensor fall back to DEFAULT_WATCH_PATHS.
+            let watch_paths: Vec<PathBuf> =
+                config.fs_watch_paths.iter().map(PathBuf::from).collect();
+            (audit.is_some() || ebpf.is_some()).then(|| {
+                Box::new(FilesystemSensor::new(audit, ebpf, watch_paths)) as Box<dyn Sensor>
+            })
+        }
         "network" => {
             let proc_root = config.network_proc_root.clone().map(PathBuf::from);
             let ebpf = ebpf_settings(config);
@@ -583,6 +590,7 @@ pub(crate) mod tests {
             control: None,
             audit_log_path: None,
             fs_audit_log_path: None,
+            fs_watch_paths: vec![],
             network_proc_root: None,
             identity_audit_log_path: None,
             systemd_audit_log_path: None,
@@ -652,6 +660,27 @@ pub(crate) mod tests {
         config.ebpf = None;
         let sensor = build_sensor(&config, "network").expect("network sensor built");
         assert_eq!(sensor.name(), "network");
+    }
+
+    #[test]
+    fn filesystem_sensor_built_from_ebpf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.fs_audit_log_path = None;
+        config.ebpf = Some(crate::config::EbpfConfig {
+            object_dir: dir.path().to_path_buf(),
+        });
+        let sensor = build_sensor(&config, "filesystem").expect("filesystem sensor built");
+        assert_eq!(sensor.name(), "filesystem");
+    }
+
+    #[test]
+    fn filesystem_sensor_absent_without_either_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.fs_audit_log_path = None;
+        config.ebpf = None;
+        assert!(build_sensor(&config, "filesystem").is_none());
     }
 
     #[test]
