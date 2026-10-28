@@ -39,12 +39,18 @@ pub const EXE_INDEX_CAPACITY: usize = 65_536;
 /// Minimum time between two rescans triggered by misses.
 pub const RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// See [`ExeIndex`]: path → `(st_dev, st_ino)`.
+type StatFn = Box<dyn Fn(&Path) -> Option<(u64, u64)> + Send>;
+
 pub struct ExeIndex {
     map: HashMap<(u64, u64), String>,
     dirs: Vec<PathBuf>,
     capacity: usize,
     rescan_interval: Duration,
     last_scan: Option<Instant>,
+    /// `(st_dev, st_ino)` of what a path points to (following symlinks);
+    /// a seam so the verification logic is testable on every OS.
+    stat: StatFn,
 }
 
 impl ExeIndex {
@@ -57,7 +63,17 @@ impl ExeIndex {
             capacity,
             rescan_interval,
             last_scan: None,
+            stat: Box::new(stat_identity),
         }
+    }
+
+    /// Replace the stat function (tests).
+    pub fn with_stat(
+        mut self,
+        stat: impl Fn(&Path) -> Option<(u64, u64)> + Send + 'static,
+    ) -> Self {
+        self.stat = Box::new(stat);
+        self
     }
 
     /// The production index over [`EXE_SCAN_DIRS`], already scanned.
@@ -84,22 +100,48 @@ impl ExeIndex {
         self.map.is_empty()
     }
 
-    /// Record `identity → path`. The first path for an identity wins; a
-    /// full index ignores new identities.
+    /// Record `identity → path`, for a pair the caller has already verified
+    /// (scan results). The first path for an identity wins, unless the
+    /// stored path no longer stats to that identity (stale: an inode
+    /// reused after an upgrade), in which case it is replaced. A full index
+    /// ignores new identities.
     pub fn insert(&mut self, identity: ExeIdentity, path: String) {
-        if self.map.len() >= self.capacity {
-            return;
+        let key = (identity.dev, identity.ino);
+        match self.map.get(&key) {
+            Some(old) if (self.stat)(Path::new(old)) == Some(key) => {}
+            Some(_) => {
+                self.map.insert(key, path);
+            }
+            None if self.map.len() >= self.capacity => {}
+            None => {
+                self.map.insert(key, path);
+            }
         }
-        self.map.entry((identity.dev, identity.ino)).or_insert(path);
     }
 
-    /// Path for `identity`. On a miss, rescans the directories if the last
-    /// scan is at least the rescan interval old (`now` is passed in so the
-    /// rate limit is testable), then looks again.
+    /// Learn `identity → path` only if `stat(path)` is exactly `identity`.
+    /// Returns whether the pair was verified (and so inserted). A path found
+    /// by a weaker rule (comm match) is never learned.
+    pub fn learn(&mut self, identity: ExeIdentity, path: &str) -> bool {
+        let verified = (self.stat)(Path::new(path)) == Some((identity.dev, identity.ino));
+        if verified {
+            self.insert(identity, path.to_string());
+        }
+        verified
+    }
+
+    /// Path for `identity`. A hit is re-verified: the stored path must still
+    /// stat to the key, else the entry is evicted and treated as a miss. On
+    /// a miss, rescans the directories if the last scan is at least the
+    /// rescan interval old (`now` is passed in so the rate limit is
+    /// testable), then looks again.
     pub fn lookup(&mut self, identity: ExeIdentity, now: Instant) -> Option<String> {
         let key = (identity.dev, identity.ino);
         if let Some(p) = self.map.get(&key) {
-            return Some(p.clone());
+            if (self.stat)(Path::new(p)) == Some(key) {
+                return Some(p.clone());
+            }
+            self.map.remove(&key);
         }
         let due = self
             .last_scan
@@ -155,12 +197,13 @@ impl ExeIndex {
     fn scan_dir(&mut self, _dir: &Path) {}
 
     /// `exe_path` for a record: the `/proc/<pid>/exe` link when
-    /// [`resolve_exe`] ties it to the record (also learned here), else the
-    /// path indexed for the record's kernel exe identity, else `""`.
+    /// [`resolve_exe`] ties it to the record (learned only when the path
+    /// stats to the record's identity), else the path indexed for the
+    /// record's kernel exe identity, else `""`.
     pub fn exe_path(&mut self, e: &FsEvent, proc_root: &Path) -> String {
         if let Some(path) = resolve_exe(proc_root, e.pid, e.exe, &e.comm) {
             if let Some(identity) = e.exe {
-                self.insert(identity, path.clone());
+                self.learn(identity, &path);
             }
             return path;
         }
@@ -170,17 +213,45 @@ impl ExeIndex {
     }
 }
 
+/// `(st_dev, st_ino)` of what `path` points to (`stat`, following links).
+#[cfg(unix)]
+fn stat_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// No `st_dev`/`st_ino` off unix: nothing verifies, so nothing is learned.
+#[cfg(not(unix))]
+fn stat_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use osiris_ebpf::FsKind;
 
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    type Fs = Arc<Mutex<HashMap<String, (u64, u64)>>>;
+
     fn id(dev: u64, ino: u64) -> ExeIdentity {
         ExeIdentity { dev, ino }
     }
 
-    fn index(capacity: usize) -> ExeIndex {
-        ExeIndex::new(vec![], capacity, Duration::from_secs(60))
+    /// An index whose `stat` reads a fake path → identity table.
+    fn index(capacity: usize) -> (ExeIndex, Fs) {
+        let fs: Fs = Arc::new(Mutex::new(HashMap::new()));
+        let table = fs.clone();
+        let ix = ExeIndex::new(vec![], capacity, Duration::from_secs(60))
+            .with_stat(move |p| table.lock().unwrap().get(p.to_str()?).copied());
+        (ix, fs)
+    }
+
+    fn put(fs: &Fs, path: &str, identity: (u64, u64)) {
+        fs.lock().unwrap().insert(path.to_string(), identity);
     }
 
     fn event(exe: Option<ExeIdentity>) -> FsEvent {
@@ -204,7 +275,9 @@ mod tests {
 
     #[test]
     fn insert_and_lookup_first_insert_wins() {
-        let mut ix = index(10);
+        let (mut ix, fs) = index(10);
+        put(&fs, "/usr/bin/bash", (1, 2));
+        put(&fs, "/bin/bash", (1, 2));
         ix.insert(id(1, 2), "/usr/bin/bash".into());
         ix.insert(id(1, 2), "/bin/bash".into());
         assert_eq!(
@@ -216,10 +289,11 @@ mod tests {
 
     #[test]
     fn a_full_index_stops_inserting() {
-        let mut ix = index(2);
-        ix.insert(id(1, 1), "/a".into());
-        ix.insert(id(1, 2), "/b".into());
-        ix.insert(id(1, 3), "/c".into());
+        let (mut ix, fs) = index(2);
+        for (p, i) in [("/a", 1), ("/b", 2), ("/c", 3)] {
+            put(&fs, p, (1, i));
+            ix.insert(id(1, i), p.into());
+        }
         assert_eq!(ix.len(), 2);
         assert_eq!(ix.lookup(id(1, 3), Instant::now()), None);
         assert_eq!(ix.lookup(id(1, 1), Instant::now()).as_deref(), Some("/a"));
@@ -228,7 +302,7 @@ mod tests {
     #[test]
     fn unknown_identity_or_none_gives_empty_exe_path() {
         let root = tempfile::tempdir().unwrap();
-        let mut ix = index(10);
+        let (mut ix, _fs) = index(10);
         assert_eq!(ix.exe_path(&event(None), root.path()), "");
         assert_eq!(ix.exe_path(&event(Some(id(5, 5))), root.path()), "");
     }
@@ -236,11 +310,56 @@ mod tests {
     #[test]
     fn an_indexed_identity_resolves_when_proc_is_gone() {
         let root = tempfile::tempdir().unwrap();
-        let mut ix = index(10);
+        let (mut ix, fs) = index(10);
+        put(&fs, "/usr/bin/bash", (5, 5));
         ix.insert(id(5, 5), "/usr/bin/bash".into());
         assert_eq!(
             ix.exe_path(&event(Some(id(5, 5))), root.path()),
             "/usr/bin/bash"
+        );
+    }
+
+    /// An inode reused after an upgrade: the stored path now stats to a
+    /// different identity, so the hit is evicted instead of mislabelling.
+    #[test]
+    fn a_stale_entry_is_evicted_on_lookup() {
+        let (mut ix, fs) = index(10);
+        put(&fs, "/usr/bin/foo", (1, 7));
+        ix.insert(id(1, 7), "/usr/bin/foo".into());
+        // foo was replaced; inode 7 now belongs to something else.
+        put(&fs, "/usr/bin/foo", (1, 99));
+        assert_eq!(ix.lookup(id(1, 7), Instant::now()), None);
+        assert_eq!(ix.len(), 0, "evicted");
+    }
+
+    #[test]
+    fn a_stale_entry_is_corrected_by_a_rescan_insert() {
+        let (mut ix, fs) = index(10);
+        put(&fs, "/usr/bin/foo", (1, 7));
+        ix.insert(id(1, 7), "/usr/bin/foo".into());
+        put(&fs, "/usr/bin/foo", (1, 99));
+        put(&fs, "/usr/bin/bash", (1, 7));
+        // A scan finds the real owner of (1, 7): it overwrites the stale one.
+        ix.insert(id(1, 7), "/usr/bin/bash".into());
+        assert_eq!(
+            ix.lookup(id(1, 7), Instant::now()).as_deref(),
+            Some("/usr/bin/bash")
+        );
+    }
+
+    #[test]
+    fn learning_requires_the_path_to_stat_to_the_identity() {
+        let (mut ix, fs) = index(10);
+        // A decoy keeping comm "bash": /tmp/bash is a different file.
+        put(&fs, "/tmp/bash", (1, 666));
+        assert!(!ix.learn(id(1, 7), "/tmp/bash"));
+        assert!(!ix.learn(id(1, 7), "/gone"));
+        assert!(ix.is_empty());
+        put(&fs, "/usr/bin/bash", (1, 7));
+        assert!(ix.learn(id(1, 7), "/usr/bin/bash"));
+        assert_eq!(
+            ix.lookup(id(1, 7), Instant::now()).as_deref(),
+            Some("/usr/bin/bash")
         );
     }
 
@@ -257,13 +376,13 @@ mod tests {
         std::fs::create_dir(&pid_dir).unwrap();
         std::os::unix::fs::symlink(&target, pid_dir.join("exe")).unwrap();
 
-        let mut ix = index(10);
+        let mut ix = ExeIndex::empty();
         ix.insert(identity, "/stale/other".into());
         // Link matches the identity: the link wins over the index...
         let got = ix.exe_path(&event(Some(identity)), root.path());
         assert_eq!(got, target.to_string_lossy());
         // ...and an unseen identity is learned from the hit.
-        let mut fresh = index(10);
+        let mut fresh = ExeIndex::empty();
         fresh.exe_path(&event(Some(identity)), root.path());
         assert_eq!(
             fresh.lookup(identity, Instant::now()).as_deref(),
@@ -305,5 +424,31 @@ mod tests {
         assert_eq!(ix.lookup(late_id, t0 + Duration::from_secs(10)), None);
         // ...but is once it has passed.
         assert!(ix.lookup(late_id, t0 + Duration::from_secs(61)).is_some());
+    }
+
+    /// A decoy that keeps comm "bash" passes `resolve_exe`'s comm rule but
+    /// does not stat to the record's identity: it is returned for that
+    /// record, never learned.
+    #[cfg(unix)]
+    #[test]
+    fn a_comm_matched_decoy_is_not_learned() {
+        let root = tempfile::tempdir().unwrap();
+        let decoy = root.path().join("bash");
+        std::fs::write(&decoy, b"x").unwrap();
+        let pid_dir = root.path().join("4242");
+        std::fs::create_dir(&pid_dir).unwrap();
+        std::os::unix::fs::symlink(&decoy, pid_dir.join("exe")).unwrap();
+        std::fs::write(
+            pid_dir.join("comm"),
+            b"bash
+",
+        )
+        .unwrap();
+
+        let real_bash = id(1, 7);
+        let mut ix = ExeIndex::empty();
+        let got = ix.exe_path(&event(Some(real_bash)), root.path());
+        assert_eq!(got, decoy.to_string_lossy());
+        assert!(ix.is_empty(), "unverified mapping must not be learned");
     }
 }
