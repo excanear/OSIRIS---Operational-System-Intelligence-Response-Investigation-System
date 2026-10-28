@@ -8,7 +8,9 @@
 
 use std::path::Path;
 
-use osiris_ebpf::{resolve_exe, FsEvent, FsKind};
+use osiris_ebpf::{FsEvent, FsKind};
+
+use crate::exe_index::ExeIndex;
 use osiris_schema::encode_device_id;
 use osiris_sensor_api::{FileEventRaw, FileOperation, RawEventSource};
 
@@ -30,12 +32,25 @@ fn render_path(bytes: &[u8], truncated: bool) -> String {
     }
 }
 
+/// [`fs_to_raw_indexed`] with an empty identity index: `exe_path` comes
+/// from `/proc/<pid>/exe` only, else `""`.
+pub fn fs_to_raw(e: &FsEvent, boot_wall_offset_ns: i128, proc_root: &Path) -> FileEventRaw {
+    fs_to_raw_indexed(e, boot_wall_offset_ns, proc_root, &mut ExeIndex::empty())
+}
+
 /// One decoded fs record as the existing `FileEventRaw`, converted without
 /// reference to any other record. `exe_path` is the `<proc_root>/<pid>/exe`
-/// link when [`resolve_exe`] can tie it to the record, else `""`. The
-/// record's `dev` is a kernel `dev_t` (`MAJOR << 20 | MINOR`); `device_id`
-/// is `encode_device_id(major, minor)`, matching the audit backend.
-pub fn fs_to_raw(e: &FsEvent, boot_wall_offset_ns: i128, proc_root: &Path) -> FileEventRaw {
+/// link when `resolve_exe` can tie it to the record; when the process is
+/// already gone, the path `exe_index` holds for the record's kernel exe
+/// identity; else `""`. The record's `dev` is a kernel `dev_t`
+/// (`MAJOR << 20 | MINOR`); `device_id` is `encode_device_id(major, minor)`,
+/// matching the audit backend.
+pub fn fs_to_raw_indexed(
+    e: &FsEvent,
+    boot_wall_offset_ns: i128,
+    proc_root: &Path,
+    exe_index: &mut ExeIndex,
+) -> FileEventRaw {
     let (operation, previous_path) = match e.kind {
         FsKind::Create => (FileOperation::Create, None),
         FsKind::Write => (FileOperation::Write, None),
@@ -62,7 +77,7 @@ pub fn fs_to_raw(e: &FsEvent, boot_wall_offset_ns: i128, proc_root: &Path) -> Fi
         pid: e.pid,
         ppid: e.ppid,
         uid: e.uid,
-        exe_path: resolve_exe(proc_root, e.pid, e.exe, &e.comm).unwrap_or_default(),
+        exe_path: exe_index.exe_path(e, proc_root),
         comm: e.comm.clone(),
         timestamp_ns: wall_clock_ns(e.ktime_ns, boot_wall_offset_ns),
         audit_serial: None,

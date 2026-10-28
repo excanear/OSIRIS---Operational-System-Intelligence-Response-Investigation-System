@@ -130,6 +130,10 @@ pub struct FileEventRaw {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
+    /// eBPF backend: `/proc/<pid>/exe` when it can be tied to the record,
+    /// else the path of the kernel-verified exe identity from a scan of the
+    /// standard binary directories (the process is often already gone), else
+    /// empty.
     pub exe_path: String,
     pub comm: String,
     /// Wall-clock nanoseconds, UTC, from the audit event header.

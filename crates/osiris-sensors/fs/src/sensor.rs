@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::assembler::AuditEventAssembler;
 use crate::audit_record::{parse_record, AuditRecord};
-use crate::ebpf_backend::fs_to_raw;
+use crate::ebpf_backend::fs_to_raw_indexed;
+use crate::exe_index::ExeIndex;
 use crate::watch::{resolve_watch_paths, WatchResolution, DEFAULT_WATCH_PATHS};
 
 /// How often the eBPF supervisor checks whether the reader thread ended.
@@ -189,8 +190,17 @@ impl FilesystemSensor {
         let drop_counter = prog.drop_counter();
         let health = self.health.clone();
         let proc_root = PathBuf::from(PROC_ROOT);
+        // Seeded before the reader starts; owned by the reader thread.
+        let mut exe_index = ExeIndex::with_default_dirs();
         let reader = osiris_ebpf::spawn_reader(prog, decode_fs, cancellation, move |record| {
-            on_record(record, &boot_wall_offset_ns, &proc_root, &output, &health)
+            on_record(
+                record,
+                &boot_wall_offset_ns,
+                &proc_root,
+                &mut exe_index,
+                &output,
+                &health,
+            )
         })
         .map_err(|e| format!("eBPF unavailable: {e}"))?;
         {
@@ -329,11 +339,12 @@ fn on_record(
     record: Result<FsEvent, DecodeError>,
     boot_wall_offset_ns: &dyn Fn() -> i128,
     proc_root: &Path,
+    exe_index: &mut ExeIndex,
     output: &mpsc::Sender<RawEvent>,
     health: &Mutex<HealthState>,
 ) {
     let raw = match record {
-        Ok(e) => fs_to_raw(&e, boot_wall_offset_ns(), proc_root),
+        Ok(e) => fs_to_raw_indexed(&e, boot_wall_offset_ns(), proc_root, exe_index),
         Err(_) => {
             lock_health(health).events_dropped_total += 1;
             return;
@@ -870,12 +881,27 @@ mod tests {
             offset.set(now + 5_000); // the clock steps between records
             now
         };
-        on_record(Ok(fs_record()), &sample, root.path(), &tx, &health);
-        on_record(Ok(fs_record()), &sample, root.path(), &tx, &health);
+        on_record(
+            Ok(fs_record()),
+            &sample,
+            root.path(),
+            &mut ExeIndex::empty(),
+            &tx,
+            &health,
+        );
+        on_record(
+            Ok(fs_record()),
+            &sample,
+            root.path(),
+            &mut ExeIndex::empty(),
+            &tx,
+            &health,
+        );
         on_record(
             Err(DecodeError::ShorterThanHeader(3)),
             &sample,
             root.path(),
+            &mut ExeIndex::empty(),
             &tx,
             &health,
         );
@@ -899,7 +925,14 @@ mod tests {
         let health = Mutex::new(HealthState::default());
         let (tx, rx) = mpsc::channel(4);
         drop(rx);
-        on_record(Ok(fs_record()), &|| 0, root.path(), &tx, &health);
+        on_record(
+            Ok(fs_record()),
+            &|| 0,
+            root.path(),
+            &mut ExeIndex::empty(),
+            &tx,
+            &health,
+        );
         let h = lock_health(&health);
         assert_eq!(h.events_dropped_total, 1);
         assert_eq!(h.events_emitted_total, 0);
