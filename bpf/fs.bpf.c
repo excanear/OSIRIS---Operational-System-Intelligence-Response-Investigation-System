@@ -46,7 +46,9 @@
  * The same walk writes the path right to left into SCRATCH.buf; it stops
  * at the root, at the global mount root, or after MAX_COMPONENTS steps. A
  * path that does not fit (or a walk that does not reach a root) is kept as
- * its tail, without a leading '/', and flagged truncated.
+ * its tail, without a leading '/', and flagged truncated; once the buffer
+ * is full the walk goes on WATCH-checking the ancestors (only the name
+ * writes stop), so a long path cannot hide an operation.
  *
  * Verifier notes (target: Linux 5.15+, privileged load):
  *  - every ring-buffer reservation is a constant sizeof(struct fs_record),
@@ -186,7 +188,7 @@ struct walk_state {
 	__u32 inode_only; /* WATCH_FLAGS[0] bit 0 */
 	__u32 matched;    /* a watched directory was seen (since walk_begin) */
 	__u32 complete;   /* the current walk reached a root */
-	__u32 _pad;
+	__u32 full;       /* a name did not fit: path is a tail, writes stop */
 };
 
 /*
@@ -335,22 +337,32 @@ static __always_inline int walk_step(struct scratch *s)
 	parent = BPF_CORE_READ(d, d_parent);
 	if (!parent || parent == d)
 		return 1; /* disconnected: not a path from the root */
+	/* Move up first: once the buffer is full, the ancestors are still
+	 * WATCH-checked (a long path must not hide an event), only their
+	 * names are no longer written. */
+	STORE(s->w.d, (__u64)parent);
+	if (LOAD(s->w.full))
+		return 0;
 	len = BPF_CORE_READ(d, d_name.len);
 	cur = LOAD(s->w.cur);
-	if (len > NAME_MAX || len + 1 > cur)
-		return 1; /* does not fit: keep the tail written so far */
+	if (len > NAME_MAX || len + 1 > cur) {
+		/* Does not fit: keep the tail written so far. */
+		STORE(s->w.full, 1);
+		return 0;
+	}
 	name = BPF_CORE_READ(d, d_name.name);
 	cur -= len;
 	pos = cur;
 	opaque(pos);
 	opaque(len);
+	/* Writes stay in buf[0..PATH_CAP): buf[PATH_CAP..] must never be
+	 * written, because stage_one's old_path zero-fill reads from it. */
 	bpf_probe_read_kernel(&s->buf[pos & CAP_MASK], len & NAME_MASK, name);
 	cur -= 1;
 	pos = cur;
 	opaque(pos);
 	s->buf[pos & CAP_MASK] = '/';
 	STORE(s->w.cur, cur);
-	STORE(s->w.d, (__u64)parent);
 	return 0;
 }
 
@@ -373,6 +385,7 @@ static __always_inline void walk_path(struct scratch *s, struct dentry *d,
 	STORE(s->w.m, (__u64)m);
 	STORE(s->w.cur, PATH_CAP);
 	STORE(s->w.complete, 0);
+	STORE(s->w.full, 0);
 
 #pragma clang loop unroll(disable)
 	for (i = 0; i < MAX_COMPONENTS; i++) {
@@ -381,7 +394,7 @@ static __always_inline void walk_path(struct scratch *s, struct dentry *d,
 	}
 
 	start = LOAD(s->w.cur);
-	if (LOAD(s->w.complete)) {
+	if (LOAD(s->w.complete) && !LOAD(s->w.full)) {
 		if (start == PATH_CAP) {
 			/* The operand is the root itself. */
 			start = PATH_CAP - 1;
