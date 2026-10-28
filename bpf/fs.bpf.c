@@ -52,7 +52,20 @@
  *  - every ring-buffer reservation is a constant sizeof(struct fs_record),
  *    filled by one constant-size bpf_probe_read_kernel from the PENDING
  *    value, and submitted (or discarded) on every path;
- *  - the walk loop is fully unrolled (MAX_COMPONENTS iterations);
+ *  - the walk is a bounded loop that is NOT unrolled (#pragma clang loop
+ *    unroll(disable); bounded loops need 5.3+, bpf_loop is not used because
+ *    it needs 5.17+). Every value carried from one step to the next (the
+ *    current dentry and mount, the write position, the matched / complete
+ *    flags, the root) lives in SCRATCH.w and is reloaded with a volatile
+ *    access. A scalar loaded from map memory is unknown and ends precision
+ *    backtracking, so the only state that differs between iterations is the
+ *    loop counter: all branches of one step reach the next loop head in
+ *    equal states and are pruned there. Cost is linear in MAX_COMPONENTS
+ *    (one body per iteration) instead of exponential in the branches, as
+ *    the fully unrolled walk was ("BPF program is too large");
+ *  - everything is __always_inline: no BPF-to-BPF calls, which on 5.15
+ *    would make precision backtracking give up and mark every scalar
+ *    precise;
  *  - every variable buffer offset and length is masked after a compiler
  *    barrier (offsets with PATH_CAP - 1, name lengths with NAME_MASK), and
  *    SCRATCH.buf is 2 * PATH_CAP bytes, so offset + length is always
@@ -105,6 +118,10 @@ _Static_assert(PATH_CAP - 1 + NAME_MASK < 2 * PATH_CAP, "masked name write fits 
 /* Hide a value from the compiler so the masked register is the one used. */
 #define opaque(x) asm volatile("" : "+r"(x))
 
+/* Forced memory accesses for the walk state (never cached in a register). */
+#define LOAD(x) (*(volatile __typeof__(x) *)&(x))
+#define STORE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 22);
@@ -156,13 +173,32 @@ struct {
 } WATCH_FLAGS SEC(".maps");
 
 /*
- * Per-CPU work area: the record being staged, and the path buffer the walk
- * writes right to left into buf[0..PATH_CAP). buf[PATH_CAP..] is never
- * written (zero) and only exists so masked accesses and the constant-size
- * copy-out stay inside the value. Kprobe programs do not nest on a CPU.
+ * The walk's loop-carried state. It is kept in SCRATCH, not in registers or
+ * on the stack, and only touched through LOAD/STORE; see the verifier notes
+ * in the header comment.
+ */
+struct walk_state {
+	__u64 d;          /* current dentry */
+	__u64 m;          /* current vfsmount */
+	__u64 root_d;     /* current->fs->root.dentry; 0 without an fs_struct */
+	__u64 root_m;     /* current->fs->root.mnt */
+	__u64 cur;        /* first written byte of buf; PATH_CAP = nothing yet */
+	__u32 inode_only; /* WATCH_FLAGS[0] bit 0 */
+	__u32 matched;    /* a watched directory was seen (since walk_begin) */
+	__u32 complete;   /* the current walk reached a root */
+	__u32 _pad;
+};
+
+/*
+ * Per-CPU work area: the record being staged, the walk state, and the path
+ * buffer the walk writes right to left into buf[0..PATH_CAP).
+ * buf[PATH_CAP..] is never written (zero) and only exists so masked
+ * accesses and the constant-size copy-out stay inside the value. Kprobe
+ * programs do not nest on a CPU.
  */
 struct scratch {
 	struct fs_record rec;
+	struct walk_state w;
 	__u8 buf[2 * PATH_CAP];
 };
 
@@ -238,109 +274,129 @@ static __always_inline struct vfsmount *mount_vfs(struct mount *mnt)
 	return (struct vfsmount *)((char *)mnt + mount_mnt_off());
 }
 
-/* The task's root (current->fs->root); zero when it has no fs_struct. */
-struct walk_root {
-	struct dentry *dentry;
-	struct vfsmount *mnt;
-};
-
-static __always_inline void task_root(struct walk_root *root)
+/*
+ * Start the walk(s) of one hook: record the task's root (current->fs->root;
+ * zero when it has no fs_struct, so the walk ends at the mount-tree root)
+ * and the inode-only flag, and clear `matched`.
+ */
+static __always_inline void walk_begin(struct scratch *s)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct fs_struct *fs = BPF_CORE_READ(task, fs);
+	__u64 root_d = 0, root_m = 0;
 
-	root->dentry = 0;
-	root->mnt = 0;
 	if (fs) {
-		root->dentry = BPF_CORE_READ(fs, root.dentry);
-		root->mnt = BPF_CORE_READ(fs, root.mnt);
+		root_d = (__u64)BPF_CORE_READ(fs, root.dentry);
+		root_m = (__u64)BPF_CORE_READ(fs, root.mnt);
 	}
+	STORE(s->w.root_d, root_d);
+	STORE(s->w.root_m, root_m);
+	STORE(s->w.inode_only, inode_only_keys());
+	STORE(s->w.matched, 0);
+}
+
+/*
+ * One step at (s->w.d, s->w.m): check WATCH, then either stop (returns 1;
+ * s->w.complete says whether a root was reached), cross to the mountpoint
+ * in the parent mount, or prepend "/name" to the path and move to the
+ * parent dentry (returns 0). Reads and writes its state only through
+ * LOAD/STORE, so nothing survives in a register to the next step.
+ */
+static __always_inline int walk_step(struct scratch *s)
+{
+	struct dentry *d = (struct dentry *)LOAD(s->w.d);
+	struct vfsmount *m = (struct vfsmount *)LOAD(s->w.m);
+	struct dentry *parent;
+	const unsigned char *name;
+	__u64 cur, len, pos;
+
+	if (!LOAD(s->w.matched) && is_watched(d, LOAD(s->w.inode_only)))
+		STORE(s->w.matched, 1);
+	if ((__u64)d == LOAD(s->w.root_d) && (__u64)m == LOAD(s->w.root_m)) {
+		STORE(s->w.complete, 1);
+		return 1;
+	}
+	if (d == BPF_CORE_READ(m, mnt_root)) {
+		/* A mount root: continue at the mountpoint in the parent
+		 * mount; the mount root itself has no name of its own. */
+		struct mount *mnt = real_mount(m);
+		struct mount *up = BPF_CORE_READ(mnt, mnt_parent);
+
+		if (!up || up == mnt) {
+			/* The root of the mount tree (or a detached mount):
+			 * as far as d_path() would go. */
+			STORE(s->w.complete, 1);
+			return 1;
+		}
+		STORE(s->w.d, (__u64)BPF_CORE_READ(mnt, mnt_mountpoint));
+		STORE(s->w.m, (__u64)mount_vfs(up));
+		return 0;
+	}
+	parent = BPF_CORE_READ(d, d_parent);
+	if (!parent || parent == d)
+		return 1; /* disconnected: not a path from the root */
+	len = BPF_CORE_READ(d, d_name.len);
+	cur = LOAD(s->w.cur);
+	if (len > NAME_MAX || len + 1 > cur)
+		return 1; /* does not fit: keep the tail written so far */
+	name = BPF_CORE_READ(d, d_name.name);
+	cur -= len;
+	pos = cur;
+	opaque(pos);
+	opaque(len);
+	bpf_probe_read_kernel(&s->buf[pos & CAP_MASK], len & NAME_MASK, name);
+	cur -= 1;
+	pos = cur;
+	opaque(pos);
+	s->buf[pos & CAP_MASK] = '/';
+	STORE(s->w.cur, cur);
+	STORE(s->w.d, (__u64)parent);
+	return 0;
 }
 
 /*
  * Walk from `d` (on mount `m`) to the root, checking WATCH at every dentry
- * and writing "/name" components right to left into s->buf[0..PATH_CAP).
+ * (s->w.matched is sticky from walk_begin, so a rename's two walks OR) and
+ * writing "/name" components right to left into s->buf[0..PATH_CAP).
  * Copies the result into `dst` (PATH_CAP bytes, zero past the path) and
- * stores its length and truncation flag. Returns 1 when a watched
- * directory was seen.
+ * stores its length and truncation flag through `len_out` / `trunc_out`.
+ * The loop is deliberately not unrolled; see the header comment.
  */
-static __always_inline int walk_path(struct scratch *s, struct dentry *d,
-				     struct vfsmount *m,
-				     const struct walk_root *root,
-				     __u32 inode_only, __u8 *dst,
-				     __u16 *len_out, __u8 *trunc_out)
+static __always_inline void walk_path(struct scratch *s, struct dentry *d,
+				      struct vfsmount *m, __u8 *dst,
+				      __u16 *len_out, __u8 *trunc_out)
 {
-	/* 64-bit, so the asm barriers below act on whole registers. */
-	__u64 cur = PATH_CAP;
 	__u64 start;
-	int matched = 0;
-	int complete = 0;
 	int i;
 
-#pragma unroll
+	STORE(s->w.d, (__u64)d);
+	STORE(s->w.m, (__u64)m);
+	STORE(s->w.cur, PATH_CAP);
+	STORE(s->w.complete, 0);
+
+#pragma clang loop unroll(disable)
 	for (i = 0; i < MAX_COMPONENTS; i++) {
-		struct dentry *parent;
-		const unsigned char *name;
-		__u64 len, pos;
-
-		if (!matched && is_watched(d, inode_only))
-			matched = 1;
-		if (d == root->dentry && m == root->mnt) {
-			complete = 1;
+		if (walk_step(s))
 			break;
-		}
-		if (d == BPF_CORE_READ(m, mnt_root)) {
-			/* A mount root: continue at the mountpoint in the parent
-			 * mount; the mount root itself has no name of its own. */
-			struct mount *mnt = real_mount(m);
-			struct mount *up = BPF_CORE_READ(mnt, mnt_parent);
-
-			if (!up || up == mnt) {
-				/* The root of the mount tree (or a detached
-				 * mount): as far as d_path() would go. */
-				complete = 1;
-				break;
-			}
-			d = BPF_CORE_READ(mnt, mnt_mountpoint);
-			m = mount_vfs(up);
-			continue;
-		}
-		parent = BPF_CORE_READ(d, d_parent);
-		if (!parent || parent == d)
-			break; /* disconnected: not a path from the root */
-		len = BPF_CORE_READ(d, d_name.len);
-		if (len > NAME_MAX || len + 1 > cur)
-			break; /* does not fit: keep the tail written so far */
-		name = BPF_CORE_READ(d, d_name.name);
-		cur -= len;
-		pos = cur;
-		opaque(pos);
-		opaque(len);
-		bpf_probe_read_kernel(&s->buf[pos & CAP_MASK], len & NAME_MASK, name);
-		cur -= 1;
-		pos = cur;
-		opaque(pos);
-		s->buf[pos & CAP_MASK] = '/';
-		d = parent;
 	}
 
-	if (complete) {
-		if (cur == PATH_CAP) {
+	start = LOAD(s->w.cur);
+	if (LOAD(s->w.complete)) {
+		if (start == PATH_CAP) {
 			/* The operand is the root itself. */
-			cur = PATH_CAP - 1;
+			start = PATH_CAP - 1;
 			s->buf[CAP_MASK] = '/';
 		}
-		start = cur;
 		*trunc_out = 0;
 	} else {
 		/* A tail is never rendered as absolute: drop its '/'. */
-		start = cur < PATH_CAP ? cur + 1 : PATH_CAP;
+		start = start < PATH_CAP ? start + 1 : PATH_CAP;
 		*trunc_out = 1;
 	}
-	*len_out = (__u16)(PATH_CAP - start);
 	opaque(start);
-	bpf_probe_read_kernel(dst, PATH_CAP, &s->buf[start & (2 * PATH_CAP - 1)]);
-	return matched;
+	start &= 2 * PATH_CAP - 1;
+	*len_out = (__u16)(PATH_CAP - start);
+	bpf_probe_read_kernel(dst, PATH_CAP, &s->buf[start]);
 }
 
 /* Copy `inode`'s identity into `r` (has_inode = 1), if there is one. */
@@ -357,9 +413,10 @@ static __always_inline void fill_inode(struct fs_record *r, struct inode *inode)
 }
 
 /*
- * Every non-path field of `r` for the calling task. The exe identity is
- * mm->exe_file's inode and the comm the thread-group leader's, as in
- * net.bpf.c; a kernel thread or a failed read leaves them 0 / empty.
+ * Every field of `r` except the paths, their lengths and truncation flags
+ * (written by walk_path and the callers), for the calling task. The exe
+ * identity is mm->exe_file's inode and the comm the thread-group leader's,
+ * as in net.bpf.c; a kernel thread or a failed read leaves them 0 / empty.
  */
 static __always_inline void fill_actor(struct fs_record *r, __u32 kind, __u64 id)
 {
@@ -388,11 +445,7 @@ static __always_inline void fill_actor(struct fs_record *r, __u32 kind, __u64 id
 	r->owner_uid = 0;
 	r->owner_gid = 0;
 	r->has_inode = 0;
-	r->path_truncated = 0;
-	r->old_path_truncated = 0;
 	r->_pad = 0;
-	r->path_len = 0;
-	r->old_path_len = 0;
 	r->_pad2 = 0;
 }
 
@@ -426,22 +479,20 @@ static __always_inline void stage_one(__u32 kind, struct dentry *dentry,
 				      struct vfsmount *mnt, struct inode *inode)
 {
 	__u64 id = bpf_get_current_pid_tgid();
-	struct walk_root root;
 	struct scratch *s;
-	__u16 len;
-	__u8 trunc;
 
 	s = stage_begin(id);
 	if (!s || !dentry || !mnt)
 		return;
-	task_root(&root);
-	if (!walk_path(s, dentry, mnt, &root, inode_only_keys(), s->rec.path,
-		       &len, &trunc))
+	walk_begin(s);
+	walk_path(s, dentry, mnt, s->rec.path, &s->rec.path_len,
+		  &s->rec.path_truncated);
+	if (!LOAD(s->w.matched))
 		return;
 	fill_actor(&s->rec, kind, id);
-	s->rec.path_len = len;
-	s->rec.path_truncated = trunc;
 	/* old_path is unused: a copy from the never-written zero half. */
+	s->rec.old_path_len = 0;
+	s->rec.old_path_truncated = 0;
 	bpf_probe_read_kernel(s->rec.old_path, PATH_CAP, &s->buf[PATH_CAP]);
 	fill_inode(&s->rec, inode);
 	stage_commit(s, id);
@@ -491,31 +542,22 @@ int BPF_KPROBE(kp_path_rename, struct path *old_dir,
 {
 	__u64 id = bpf_get_current_pid_tgid();
 	struct vfsmount *old_mnt, *new_mnt;
-	struct walk_root root;
 	struct scratch *s;
-	__u32 inode_only;
-	__u16 new_len, old_len;
-	__u8 new_trunc, old_trunc;
-	int matched;
 
 	s = stage_begin(id);
 	old_mnt = BPF_CORE_READ(old_dir, mnt);
 	new_mnt = BPF_CORE_READ(new_dir, mnt);
 	if (!s || !old_dentry || !new_dentry || !old_mnt || !new_mnt)
 		return 0;
-	task_root(&root);
-	inode_only = inode_only_keys();
-	matched = walk_path(s, new_dentry, new_mnt, &root, inode_only,
-			    s->rec.path, &new_len, &new_trunc);
-	matched |= walk_path(s, old_dentry, old_mnt, &root, inode_only,
-			     s->rec.old_path, &old_len, &old_trunc);
-	if (!matched)
+	walk_begin(s);
+	/* Both walks share s->w.matched: a match on either side counts. */
+	walk_path(s, new_dentry, new_mnt, s->rec.path, &s->rec.path_len,
+		  &s->rec.path_truncated);
+	walk_path(s, old_dentry, old_mnt, s->rec.old_path,
+		  &s->rec.old_path_len, &s->rec.old_path_truncated);
+	if (!LOAD(s->w.matched))
 		return 0;
 	fill_actor(&s->rec, KIND_FS_RENAME, id);
-	s->rec.path_len = new_len;
-	s->rec.path_truncated = new_trunc;
-	s->rec.old_path_len = old_len;
-	s->rec.old_path_truncated = old_trunc;
 	fill_inode(&s->rec, BPF_CORE_READ(old_dentry, d_inode));
 	stage_commit(s, id);
 	return 0;
