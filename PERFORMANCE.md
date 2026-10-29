@@ -96,7 +96,7 @@ audit cost.
 
 | Item | Value |
 |---|---|
-| Runner | `ubuntu-24.04` hosted runner, kernel 7.0.0-1017-azure, AMD EPYC 9V45, 4 vCPU |
+| Runner | `ubuntu-24.04` hosted runner, kernel 7.0.0-1017-azure (the agent table above ran on 6.17.0-1022-azure, a different image), AMD EPYC 9V45, 4 vCPU |
 | Run | `.github/workflows/real-linux-bench.yml`, run 40789871234, branch `real-linux-bench/t11b3-1`, code `91eb93c` |
 | Agent | process, network and filesystem sensors on eBPF, all `HEALTHY` |
 

@@ -292,9 +292,10 @@ exercised: the 5.15 floor is reasoned from CO-RE and ring-buffer support, not ru
 
 The eBPF filesystem backend (`bpf/fs.bpf.c`, `crates/osiris-sensors/fs`, `crates/osiris-ebpf`
 kprobe support) was built up over a series of `real-linux/t11b3-<n>` runs, each on
-`ubuntu-22.04` and `ubuntu-24.04`. The 22.04 runner kernel was `6.8.0-1070-azure` (seen in run
-40779488463); the 24.04 runner kernel is 6.17.x-azure. Exact kernel strings: `gh run view <id>
---log | grep -m2 azure`.
+`ubuntu-22.04` and `ubuntu-24.04`. The logs of run 40786985456 (t11b3-9) show the runner kernels
+`6.8.0-1070-azure` (ubuntu-22.04) and `7.0.0-1017-azure` (ubuntu-24.04); the 24.04 image moved
+from 6.17.0-1022-azure (the 11b-2 runs) to 7.0 since. Bench run 40789871234 also ran on
+`7.0.0-1017-azure`. Exact strings per run: `gh run view <id> --log | grep -o "[0-9.]*-[0-9]*-azure"`.
 
 | Run | Branch / commit | Outcome |
 |---|---|---|
@@ -306,7 +307,7 @@ kprobe support) was built up over a series of `real-linux/t11b3-<n>` runs, each 
 | 40781865893 | t11b3-6 @ `e1792b4` | Kernel exe-identity index for `exe_path`; green on both. |
 | 40783256483 | t11b3-7 @ `e7976d1` | Index entries verified against the identity; green on both. |
 | 40785524078 | t11b3-8 @ `4e8f90a` | Scenarios (a)-(i): `real_linux` 26/26 on both kernels. |
-| 40786985456 | t11b3-9 @ `b57b492` | Positive control for failed-operation silence. 24.04 green. 22.04 attempt 1: `dns_query_is_observed_and_alerts` and `process_sensor_uses_ebpf` flakes (below); attempt 2: `dns_query_is_observed_and_alerts` again. No green 22.04 attempt at this commit is recorded here; the same suite was 26/26 at `4e8f90a`, and `b57b492` only adds a test assertion. |
+| 40786985456 | t11b3-9 @ `b57b492` | Positive control for failed-operation silence. 24.04 green on every attempt. 22.04 attempt 1: `dns_query_is_observed_and_alerts` and `process_sensor_uses_ebpf` flakes (below); attempt 2: `dns_query_is_observed_and_alerts` again; **attempt 3 green on both 22.04 and 24.04**. `b57b492` therefore passed, after two flaky 22.04 attempts. |
 
 Scenarios that passed on both runners (run 40785524078):
 
@@ -363,9 +364,17 @@ None of these touch code changed in this phase except as noted.
   occurrences, the first in run 40768725486 (t11b3-2, before the filesystem wiring existed) and
   the last two in run 40786985456 attempts 1 and 2 (ubuntu-22.04). In those two attempts every
   `DNS_QUERY` event in the stack had `process: null`, including `curl`'s and the system's, so
-  attribution failed across the board. Cause: under investigation. The DNS code is untouched by
-  this branch, and the 22.04 runner kernel moved from `6.8.0-1064` to `6.8.0-1070` between the 11b-2
-  and 11b-3 runs.
+  attribution failed across the board. Cause (ruling): a pre-existing race in the DNS sensor's
+  user-space attribution. It reads `/proc/net/udp` and `/proc/*/fd` when the agent processes a
+  captured packet, but `curl`'s stub-resolver socket and systemd-resolved's upstream sockets close
+  within milliseconds of the answer. When the agent's DNS thread lags, whole bursts are
+  unattributed (uid 0, process null), which breaks the test's `exe_path` ends-with-`curl` matcher.
+  The DNS sensor code is untouched by 11b-3 and the first occurrence (t11b3-2) predates the
+  filesystem wiring. master `88ee9bc` ran green 2/2 on both kernels on the same runners
+  (diagnostic run 40790007073), while this branch saw 3 DNS failures in about 20 job attempts, so
+  11b-3's extra agent load may widen the race; that is not proven. The fix is Phase 11b-4 (the
+  DNS uprobe captures the pid in the kernel at query time, removing the race by design); carried
+  as a debt in `docs/ROADMAP-REMAINING.md`.
 - `corrupted_object_falls_back_to_audit`: `PROCESS_EXEC` never matched in 45 s (1 occurrence,
   run 40775169390, ubuntu-22.04; rerun green).
 - `process_sensor_uses_ebpf`: the server failed with "cannot bind control listener ...: Address

@@ -133,7 +133,7 @@ revisão final independente → merge → push.
   `security_path_*` e `security_file_open`, eventos CREATE/WRITE/DELETE/RENAME só de operações
   bem-sucedidas, filtro por diretórios vigiados no kernel, `fs_watch_paths` com lista padrão, fallback
   para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-9`, Ubuntu 22.04 com kernel
-  6.8.0-1070-azure e 24.04 com 6.17.x-azure) e medido em `PERFORMANCE.md` (a lentidão em diretórios
+  6.8.0-1070-azure e 24.04 com 7.0.0-1017-azure) e medido em `PERFORMANCE.md` (a lentidão em diretórios
   não vigiados passa de 10 %, com aviso). Ver `docs/operators-ebpf.md`,
   `docs/adr/ADR-010-ebpf-loader-aya.md` e `docs/VALIDATION.md`.
   Resultados das dívidas herdadas:
@@ -166,9 +166,14 @@ revisão final independente → merge → push.
   - O caminho de attach opcional (`security_file_truncate` ausente antes do kernel 6.2) não é
     exercitado nos runners (ambos >= 6.2); só teste unitário.
   - O piso de kernel 5.15 segue raciocinado, não executado.
-  - Flakes da suíte real_linux observados e não corrigidos: `dns_query_is_observed_and_alerts` (em
-    investigação), `corrupted_object_falls_back_to_audit`, e `free_port()` entregando a mesma porta
-    duas vezes numa stack.
+  - Flakes da suíte real_linux observados e não corrigidos: `corrupted_object_falls_back_to_audit` (1
+    ocorrência) e `free_port()` entregando a mesma porta duas vezes numa stack (1 ocorrência).
+  - Dívida carregada para a 11b-4: `dns_query_is_observed_and_alerts` falha de forma intermitente por
+    uma corrida preexistente na atribuição em espaço de usuário do sensor DNS (lê `/proc/net/udp` e
+    `/proc/*/fd` ao processar o pacote, mas os sockets do `curl` e do systemd-resolved fecham em ms;
+    com a thread DNS atrasada, rajadas inteiras ficam sem processo). O código DNS não mudou na
+    11b-3; a carga extra do agente pode ampliar a corrida (não provado). A 11b-4 (uprobe de DNS)
+    captura o pid no kernel na hora da consulta e elimina a corrida.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)
