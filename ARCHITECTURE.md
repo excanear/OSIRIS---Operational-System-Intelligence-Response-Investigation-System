@@ -240,7 +240,7 @@ Sensors do not import each other. Cross-sensor relationships (e.g., "this networ
 | Sensor | Primary backend | Fallback backend | Telemetry level introduced |
 |---|---|---|---|
 | Process/Exec | eBPF (tracepoint `sched_process_exec`, `sched_process_fork`, `sched_process_exit`) | Linux Audit (`execve` rules) | MINIMAL |
-| Filesystem | eBPF (LSM hooks `path_mknod`, `path_rename`, `inode_permission` where available) + fanotify | Audit (`watch` rules), inotify | STANDARD |
+| Filesystem | eBPF (LSM hooks `path_mknod`, `path_rename`, `inode_permission` where available) + fanotify. **Status (Phase 11b-3):** the eBPF backend is delivered as kprobes on `security_path_*` and `security_file_open` (create, write, delete, rename on watched dirs, successful operations only; x86_64 only; no BPF-LSM, no fanotify, no inode_permission), validated on the runner kernels; see `docs/operators-ebpf.md` | Audit (`watch` rules), inotify | STANDARD |
 | Network | eBPF (kprobes/tracepoints on `tcp_connect`, `tcp_close`, `udp_sendmsg`, cgroup skb hooks) | `/proc/net/tcp[6]` polling + conntrack | STANDARD |
 | DNS | eBPF uprobe on resolver libs (best-effort) + AF_PACKET/pcap on port 53 | passive pcap only | DETAILED |
 | Identity/Session | Linux Audit (`PAM`, `login`), `/var/run/utmp`, `/proc/<pid>/loginuid` | utmp/wtmp polling | MINIMAL |

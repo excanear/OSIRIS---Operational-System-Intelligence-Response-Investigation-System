@@ -99,7 +99,7 @@ revisão final independente → merge → push.
   backend eBPF de exec/exit do sensor `process_exec`, com fallback para audit. Validado em Linux real
   (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/ADR-010-ebpf-loader-aya.md`,
   `docs/operators-ebpf.md` e `docs/VALIDATION.md`.
-  Próximos (cada um com seu brainstorming/spec/plano): **11b-3** filesystem, **11b-4** uprobe de DNS
+  Próximos (cada um com seu brainstorming/spec/plano): **11b-4** uprobe de DNS
   em bibliotecas de resolução.
   Dívidas da 11b-1:
   - `PROCESS_FORK` não é emitido (só exec e exit).
@@ -108,6 +108,7 @@ revisão final independente → merge → push.
   - Redução de privilégios do agente a um conjunto mínimo de capabilities (§15).
   - Empacotamento do objeto BPF (.deb/.rpm, unit systemd): Fase 13.
   - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com a 11b-3
+    (RESOLVIDA na 11b-3: mantido o espelho manual, ver ADR-010)
     (agora são três registros espelhados).
 - **Fase 11b-2 (feita)**: backend eBPF TCP do sensor de rede (`bpf/net.bpf.c`: connect/accept/close,
   IPv4 e IPv6, fallback para procfs) e registro de processo v2 (identidade do executável capturada no
@@ -127,6 +128,47 @@ revisão final independente → merge → push.
   - O piso de kernel 5.15 é raciocinado (CO-RE), não executado: os runners usam 6.8 e 6.17.
   - O sensor `process_exec` mostra `events_emitted_total` 0 e `last_event_at` nulo em `/status` com o
     backend eBPF (o caminho eBPF de rede conta corretamente); herdado da 11b-1.
+    (RESOLVIDA na 11b-3: era um erro de leitura do teste, ver a 11b-3 abaixo)
+- **Fase 11b-3 (feita)**: backend eBPF do sensor `filesystem` (`bpf/fs.bpf.c`, kprobes nos hooks LSM
+  `security_path_*` e `security_file_open`, eventos CREATE/WRITE/DELETE/RENAME só de operações
+  bem-sucedidas, filtro por diretórios vigiados no kernel, `fs_watch_paths` com lista padrão, fallback
+  para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-9`, Ubuntu 22.04 com kernel
+  6.8.0-1070-azure e 24.04 com 6.17.x-azure) e medido em `PERFORMANCE.md` (a lentidão em diretórios
+  não vigiados passa de 10 %, com aviso). Ver `docs/operators-ebpf.md`,
+  `docs/adr/ADR-010-ebpf-loader-aya.md` e `docs/VALIDATION.md`.
+  Resultados das dívidas herdadas:
+  - Dívida de saúde do `process_exec` (11b-1, `events_emitted_total` 0 / `last_event_at` nulo):
+    resolvida, era um erro de leitura do teste. Com os testes esperando o armazenamento primeiro,
+    `/status` mostra contagem > 0 e `last_event_at` não nulo para `process_exec` e `filesystem`
+    (consistência eventual; o `process_exec` conta desde o início do agente).
+  - Dívida do layout dos registros (reavaliar com a 11b-3): resolvida como mantida. O espelho
+    manual com `_Static_assert`, testes de offset, teste do texto do header C e checagem de
+    `schema_version` continua; codegen exigiria toolchain C no build do workspace.
+  Dívidas da 11b-3:
+  - io_uring (`IORING_OP_OPENAT`/`UNLINKAT`/`RENAMEAT`), `open_by_handle_at` e syscalls compat 32-bit
+    não são vistos; threads de kernel idem. Fica uma entrada `PENDING` velha até o próximo syscall
+    coberto ou a saída da thread.
+  - Sem eventos de link/symlink/chmod/chown/xattr nem de leitura.
+  - A lista de vigilância não é re-resolvida se um diretório vigiado for removido e recriado.
+  - Namespaces de montagem de contêiner: caminhos são relativos à raiz do processo, sem tradução.
+  - Em btrfs/overlayfs o casamento é só por inode (pode reportar a mais); o índice de `exe_path`
+    por identidade (`st_dev`, `st_ino`) também não funciona lá, e fica `""` para atores de vida
+    curta ou binários fora dos diretórios padrão.
+  - Objeto fs só para x86_64 (kprobes dependem da arquitetura); outras arquiteturas caem para
+    audit. Objetos por arquitetura: Fase 13.
+  - Estouro de `PENDING` (10 240 operações em voo): a operação se perde, contada em
+    `events_dropped_total`. Não provocado na validação.
+  - Evasão conhecida: arquivo aninhado a mais de 32 componentes (cruzamentos de montagem contam)
+    abaixo de um diretório vigiado nunca casa (orçamento do verificador). Uma fase futura pode
+    adicionar uma continuação barata só de casamento.
+  - Mais de 64 chaves de vigilância: o insert falha e todo o backend fs cai para audit (poderia
+    limitar e ignorar o excesso).
+  - O caminho de attach opcional (`security_file_truncate` ausente antes do kernel 6.2) não é
+    exercitado nos runners (ambos >= 6.2); só teste unitário.
+  - O piso de kernel 5.15 segue raciocinado, não executado.
+  - Flakes da suíte real_linux observados e não corrigidos: `dns_query_is_observed_and_alerts` (em
+    investigação), `corrupted_object_falls_back_to_audit`, e `free_port()` entregando a mesma porta
+    duas vezes numa stack.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)

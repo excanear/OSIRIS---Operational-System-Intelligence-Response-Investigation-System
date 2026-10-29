@@ -1,4 +1,4 @@
-# Operator guide — eBPF process and network backends (agent.yaml)
+# Operator guide — eBPF process, network and filesystem backends (agent.yaml)
 
 The `process_exec` sensor can use an eBPF backend (tracepoints `sched_process_exec` and
 `sched_process_exit`) instead of the Linux audit log. It reports provider
@@ -6,7 +6,8 @@ The `process_exec` sensor can use an eBPF backend (tracepoints `sched_process_ex
 `docs/adr/ADR-010-ebpf-loader-aya.md`.
 
 The `network_sensor` can use a second eBPF backend (TCP connect, accept and close) instead of
-procfs polling; it is described in "Network backend" below. Both backends share the `ebpf` key
+procfs polling; it is described in "Network backend" below. The `filesystem` sensor can use a third
+eBPF backend instead of the audit log ("Filesystem backend" below). All backends share the `ebpf` key
 and the object directory.
 
 ## Building the object
@@ -17,10 +18,10 @@ The BPF object is not built by cargo. On a Linux build host with `clang` and `li
 tools/ebpf/build.sh /usr/lib/osiris/bpf
 ```
 
-This writes `process.bpf.o` and `net.bpf.o`, each with a `.sha256` sidecar, into the directory.
-There is one object per sensor, and `object_dir` must hold both. The agent verifies each digest at
+This writes `process.bpf.o`, `net.bpf.o` and `fs.bpf.o`, each with a `.sha256` sidecar, into the directory.
+There is one object per sensor, and `object_dir` must hold all three. The agent verifies each digest at
 load time and refuses an object whose `schema_version` differs from what it expects (process 2,
-net 1). Nothing compiled is committed to git. Packaging (.deb/.rpm) is Phase 13.
+net 1, fs 1). Nothing compiled is committed to git. Packaging (.deb/.rpm) is Phase 13.
 
 ## Configuration
 
@@ -31,8 +32,8 @@ ebpf:
 
 - `ebpf` absent: the process sensor uses the audit backend only and the network sensor the procfs
   poller only, exactly as before.
-- `ebpf` present: both the process sensor and the network sensor try eBPF, so `object_dir` must
-  hold `process.bpf.o` and `net.bpf.o` with their sidecars.
+- `ebpf` present: the process, network and filesystem sensors try eBPF, so `object_dir` must
+  hold `process.bpf.o`, `net.bpf.o` and `fs.bpf.o` with their sidecars.
 - `ebpf: {}`: `object_dir` defaults to `/usr/lib/osiris/bpf`.
 - Backend choice at start: probe OK and load OK gives the eBPF backend (health `HEALTHY`,
   capability flag `ebpf`). Otherwise, if `audit_log_path` is configured, the sensor falls back to
@@ -165,3 +166,128 @@ falls back as above.
 - The agent must run in the host pid, network and root time namespaces. A connection in another
   network namespace is reported with that namespace's addresses, without namespace context.
 - Event volume is higher than with procfs, because every short-lived connection is seen.
+
+## Filesystem backend
+
+With `ebpf` configured, the `filesystem` sensor uses a third eBPF backend instead of the Linux
+audit log. It reports source `EBPF` and the event types `FILE_CREATE`, `FILE_WRITE`, `FILE_DELETE`
+and `FILE_RENAME`. Object: `fs.bpf.o`, built by `tools/ebpf/build.sh` next to the other two
+(record schema 1). `object_dir` must now hold `process.bpf.o`, `net.bpf.o` and `fs.bpf.o`.
+
+Hooks are kprobes on the LSM path hooks (not BPF-LSM programs, which need `lsm=...,bpf` on the
+kernel command line): `security_path_mknod` and `security_path_mkdir` (CREATE),
+`security_path_unlink` and `security_path_rmdir` (DELETE), `security_path_rename` (RENAME),
+`security_file_open` with write intent (WRITE), and `security_path_truncate` and
+`security_file_truncate` (WRITE). `security_file_truncate` exists only on kernels 6.2 and later;
+it is an optional attach point, so its absence is skipped and listed in the load report. A missing
+required attach point fails the load.
+
+Only successful operations are reported. The hook stages the operation and a per-syscall exit
+tracepoint emits it when the return value is not negative, so a failed `unlink` or `rmdir`
+produces no event.
+
+### Requirements and platform
+
+- `CONFIG_SECURITY_PATH=y`. Ubuntu, Debian and RHEL kernels set it. The probe checks that each
+  required symbol is attachable; if one is missing the sensor falls back to audit and the reason
+  names the symbol.
+- **x86_64 only.** Kprobe argument access depends on the architecture and the object is built with
+  `-D__TARGET_ARCH_x86`. On other architectures the probe reports "fs eBPF object is x86_64-only"
+  and the sensor falls back to audit. The process and network objects use only tracepoints and are
+  not affected.
+- The kernel statements under "Requirements" above apply. The fs object was validated on the
+  runner kernels only (see `docs/VALIDATION.md`).
+
+### Watch list and default
+
+The sensor only reports operations under a watched directory. The list is the agent config key
+`fs_watch_paths`. When it is empty and `ebpf` is configured, the default is:
+
+```
+/etc /usr/bin /usr/sbin /usr/local/bin /usr/lib/systemd /var/spool/cron /var/www /root /tmp /var/tmp /dev/shm
+```
+
+These are persistence, binary and web-shell locations plus the usual staging dirs. `/home` is
+excluded because browser and editor churn would dominate the volume; add it if you want it.
+
+```yaml
+fs_watch_paths:
+  - /etc
+  - /var/www
+```
+
+Each path is resolved at start with `stat` (symlinks followed). A path that does not exist or is
+not a directory is skipped and named in `last_error`, and the sensor stays `HEALTHY`. If no path
+resolves, eBPF counts as unusable and the sensor falls back. The kernel map holds at most 64
+watched directories; more than that makes the insert fail and the whole filesystem sensor falls
+back to audit.
+
+On btrfs and overlayfs a watched directory is matched by inode number only (`stat`'s device does
+not equal the kernel's there). This can over-report, never silently miss.
+
+### Warning: do not watch a same-host server's data directory
+
+Only the agent's own process is excluded in the kernel. If the OSIRIS server runs on the same host
+as the agent and its data directory (SQLite databases, spool) is inside a watched tree, each
+database write becomes an event, and storing those events causes more writes: a feedback loop.
+The default list contains none of the documented server data paths. If you move the server data
+under `/tmp`, `/var/tmp` or another watched tree, remove that tree from `fs_watch_paths`.
+
+### Backend choice at start
+
+- Probe and load OK: health `HEALTHY`, capability flag `ebpf`.
+- Probe or load fails (missing or corrupted `fs.bpf.o`, missing symbol, non-x86_64, no watch path
+  resolved) and an audit log is configured: the sensor falls back to the audit backend, health
+  `DEGRADED`, flag `audit_fallback`, reason in `last_error`. The process and network sensors are
+  not affected.
+- Neither backend usable: `FAILED` or unsupported, with every reason.
+- No `ebpf` key: audit only, exactly as before.
+
+### Upgrading from 11b-2
+
+- Rebuild all three objects (`tools/ebpf/build.sh <object_dir>`).
+- **The `ebpf` key now also enables the filesystem sensor's eBPF backend**, and the sensor is
+  built even when no `fs_audit_log_path` is set. An existing eBPF deployment therefore starts
+  watching the default list above after upgrading. This is intended. Set `fs_watch_paths`
+  explicitly to change it. Without `fs.bpf.o` in `object_dir` the sensor is `DEGRADED` on audit
+  (or skipped as unsupported when no audit log is configured).
+- Expect more events than before on busy `/tmp` and `/var/tmp`.
+
+### Known behaviour of the filesystem backend
+
+- Paths are relative to the acting task's root and mount namespace. A process inside a container
+  reports container-relative paths, and a watch dir resolved in the host namespace will not match
+  the inodes a container sees under a different overlay.
+- On btrfs and overlayfs, watched dirs match by inode only and can over-report.
+- The ancestor walk stops after 32 components (mount crossings count). A file nested deeper than 32
+  levels below its watched ancestor is **not matched**: this is a known evasion, a consequence of
+  the verifier's instruction budget. A path longer than `PATH_CAP` (1024 bytes) is rendered as a
+  truncated tail with a `…/` prefix, so it can never be mistaken for an absolute path; the walk
+  keeps checking ancestors against the watch list after the buffer is full.
+- A `rename` within one watched dir is one RENAME. A rename *into* a watched dir from an
+  unwatched one is also reported (the destination matched), with the true source path.
+  `RENAME_EXCHANGE` is one RENAME.
+- `open` with write intent counts as WRITE even if the process never writes a byte (the audit
+  backend has the same semantics, `perm=wa`). The first hook in a syscall wins: `open(O_CREAT)` on
+  a new file reports CREATE, not CREATE + WRITE.
+- Non-regular files (fifo, socket, device) are not reported as CREATE.
+- `PENDING` holds at most 10 240 in-flight operations. Past that the operation is lost and counted
+  in `events_dropped_total`.
+- Every `open`/`openat`/`openat2` on the host pays one hash delete on enter and one lookup on
+  exit, whatever the path; only write-opens pay the ancestor walk. Measured cost: see
+  `PERFORMANCE.md`. In a tight create/write/delete loop the unwatched-dir slowdown is above 10 %,
+  and that file carries a warning.
+- Not reported: io_uring file operations (`IORING_OP_OPENAT`, `UNLINKAT`, `RENAMEAT`),
+  `open_by_handle_at`, 32-bit compat syscalls, hard links, symlink creation, `chmod`/`chown`/xattr
+  changes, `mmap` writes, `splice`/`sendfile`, and reads. For a kernel thread or an io_uring
+  submission the hook fires but no covered syscall exit follows, so nothing is reported and the
+  staged entry stays until that thread's next covered syscall or exit.
+- A watched directory that is removed and recreated after start is not re-resolved.
+- `exe_path` is the `/proc/<pid>/exe` target (identity-checked, `comm` fallback) when the actor is
+  still alive. Otherwise the agent looks the kernel's executable identity (`st_dev`, `st_ino`) up
+  in an index of the standard binary directories (`/usr/local/sbin`, `/usr/local/bin`,
+  `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`; canonicalised, first wins). Every hit is re-verified
+  against the identity, the index is rescanned at most once per 60 s, and its capacity is 65 536.
+  An unknown binary gives `""`. The index does not work on btrfs subvolumes or overlayfs, and a
+  binary outside those directories gives `""` when the actor has already gone.
+- The agent must run in the host pid and root time namespaces.

@@ -15,6 +15,7 @@ configuration ran once. Load phases last 30 s.
 | `query` | Fills a fresh SQLite `events.db` with N events from the same mix (chunks of 5 000 through `batch_write`), then writes N/100 alerts. It then reports the median of 5 runs each for: the default event list (`QueryPlan::new()`), a `PROCESS_EXEC` filter, and the default alert list. `fill_ms` covers **both** the event writes and the alert writes, so it is not comparable with the Task 6 `fill_ms`, which covered events only. |
 | `ingest` | Starts the real `osiris-server` binary. The bench acts as the agent: it appends paced exec-chain events to a spool, and the real mTLS forwarder (`run_forwarder`) ships them to the server's agent listener. Every 100 ms one event is a marker, and the bench polls `events.db` until each marker becomes visible. After the 30 s load phase it drains for up to 30 s. `stored_eps_over_run` = events in `events.db` at the end ÷ (load + drain time), which is the server-side throughput. The latency percentiles cover delivered markers only. A lost marker (not visible when the drain ends) is excluded from them, so read them together with `markers_lost`. |
 | `agent` | Starts the real `osirisd` on real auditd, spawns `/bin/true` at the target rate, and samples the agent's `/proc/<pid>/stat` and `status` on a fixed 1 s tick. CPU % is relative to one core. |
+| `fs-loop` | Create, write 4 KiB, close and delete a file, 10 000 times, timing every iteration. Run in a watched and an unwatched dir, first without the agent, then with the real `osirisd` (eBPF backends). Single run, so the overheads below carry run-to-run noise that was not measured. |
 
 `saturated` means the load generator itself fell more than one 100 ms slice behind its target at
 some point. When `achieved` is far below `target`, the driver could not keep up, and the result
@@ -85,6 +86,51 @@ were lost, so those percentiles understate the real latency.
 
 At a target of 10 000 exec/s, the single-thread spawner reached only about 2 300 exec/s, so that
 row shows the agent at about 2 300 exec/s, not at 10 000. `sample_read_failures` was 0 in every row.
+
+### Filesystem sensor, eBPF backend (GitHub Actions)
+
+One create + 4 KiB write + close + delete per iteration, 10 000 iterations, each iteration timed
+on its own. The watched dir is passed to the agent as an `fs_watch_paths` entry. The unwatched dir
+is not in the list. Neither dir is under the global audit rules, so the no-agent rows carry no
+audit cost.
+
+| Item | Value |
+|---|---|
+| Runner | `ubuntu-24.04` hosted runner, kernel 7.0.0-1017-azure, AMD EPYC 9V45, 4 vCPU |
+| Run | `.github/workflows/real-linux-bench.yml`, run 40789871234, branch `real-linux-bench/t11b3-1`, code `91eb93c` |
+| Agent | process, network and filesystem sensors on eBPF, all `HEALTHY` |
+
+| Agent | Dir | Total | Iterations/s | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| off | watched | 272.52 ms | 36 694.44 | 26.60 us | 27.70 us | 35.64 us | 132.46 us |
+| off | unwatched | 274.46 ms | 36 435.28 | 26.69 us | 28.32 us | 35.81 us | 161.37 us |
+| on | watched | 387.99 ms | 25 773.99 | 37.06 us | 46.86 us | 69.24 us | 157.79 us |
+| on | unwatched | 325.51 ms | 30 721.07 | 31.05 us | 38.61 us | 48.05 us | 109.88 us |
+
+Overhead of running the agent, computed from the table (total time, p50 in brackets):
+
+| Dir | Overhead | Per iteration |
+|---|---|---|
+| unwatched | +18.6 % (+16.3 %) | +5.1 us |
+| watched | +42.4 % (+39.3 %) | +11.5 us |
+
+Over the three loops with the agent on, the agent used 0.73 s of CPU. Its status afterwards showed
+`filesystem` `events_emitted_total` 20 000 and `events_dropped_total` 0. That is one CREATE and one
+DELETE for each of the 10 000 watched iterations. The 4 KiB write is not a separate WRITE event:
+the file was just created by `open(O_CREAT)`, and the first hook in a syscall wins (CREATE, not
+CREATE + WRITE; see `docs/operators-ebpf.md`). Do not expect 30 000 events. The unwatched loops
+produced no events.
+
+> **Warning: the agent slows file operations in unwatched directories by more than 10 %.** In this
+> create/write/delete loop the unwatched-dir loop took 18.6 % longer with the agent running
+> (p50 per iteration 26.69 us to 31.05 us). The kernel hooks cannot know a directory is unwatched
+> until they have looked at it: each `open`/`openat`/`creat` pays a map delete on syscall enter and
+> a lookup on exit, and every create, unlink and rename walks the ancestors to test them against
+> the watch list. The loop is a worst case (nothing else happens in it, so the hook cost is the
+> whole difference). The absolute cost is about 5 us per iteration, not per byte, so
+> file-metadata-heavy workloads (unpacking archives, builds, many small files) see it most.
+> Watched dirs cost about 11.5 us per iteration on top of that (+42.4 %) because the event is also
+> built and sent.
 
 ### Before/after F1 (WSL, ingest at 1 000 eps target, 30 s)
 
@@ -161,7 +207,9 @@ to 1 591.01 (same tree, pragmas disabled versus enabled). The final matrix run a
 tools/real-linux/bench.sh --skip-agent /tmp/bench-ubuntu.jsonl
 # Agent bench (needs real auditd): push to a real-linux-bench/** branch, or run on a VM:
 git push origin HEAD:refs/heads/real-linux-bench/<name>   # .github/workflows/real-linux-bench.yml
-tools/real-linux/bench.sh --agent-only /tmp/bench-agent.jsonl
+tools/real-linux/bench.sh --agent-only /tmp/bench-agent.jsonl   # includes the fs loop
+# The fs loop alone (OSIRIS_BPF_DIR must point at the built objects):
+$CARGO_TARGET_DIR/release/osiris-bench fs-loop --iterations 10000
 # Single configurations:
 $CARGO_TARGET_DIR/release/osiris-bench ingest --rate 1000 --duration 30
 ```

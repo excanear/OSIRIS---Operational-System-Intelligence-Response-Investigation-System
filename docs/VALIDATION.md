@@ -212,7 +212,7 @@ replayed by the host test suite (`cargo test` on Windows and in CI), not in run 
 
 The eBPF engine (`crates/osiris-ebpf`) and the eBPF exec/exit backend of `process_exec` were
 validated on GitHub Actions run 39139529617 (commit `e5becff`, branch `real-linux/t11b1-1`),
-green on `ubuntu-22.04` and `ubuntu-24.04` on the first run (kernel versions as reported at the time: 5.15 and 6.x; later runs did not record `uname -r`, so treat them as unconfirmed). The object was
+green on `ubuntu-22.04` and `ubuntu-24.04` on the first run (that run did not record `uname -r`. The ubuntu-22.04 runner kernel is 6.8 (`6.8.0-1064-azure` in run 40043542332), not 5.15, so no 5.15 kernel has been run). The object was
 built on the runner by `tools/ebpf/build.sh` (clang, libbpf-dev).
 
 - `process_exec` reported `HEALTHY` with capability flag `ebpf`.
@@ -287,6 +287,109 @@ exercised: the 5.15 floor is reasoned from CO-RE and ring-buffer support, not ru
 - Ring-buffer drops and LRU eviction were not provoked in validation.
 - On a real kernel only the worker-thread group exit is asserted; the leader `pthread_exit` and
   non-leader `execve` cases were not provoked.
+
+## eBPF filesystem backend (Phase 11b-3)
+
+The eBPF filesystem backend (`bpf/fs.bpf.c`, `crates/osiris-sensors/fs`, `crates/osiris-ebpf`
+kprobe support) was built up over a series of `real-linux/t11b3-<n>` runs, each on
+`ubuntu-22.04` and `ubuntu-24.04`. The 22.04 runner kernel was `6.8.0-1070-azure` (seen in run
+40779488463); the 24.04 runner kernel is 6.17.x-azure. Exact kernel strings: `gh run view <id>
+--log | grep -m2 azure`.
+
+| Run | Branch / commit | Outcome |
+|---|---|---|
+| 40432835805 | t11b3-1 @ `f82cdc8` | `fs.bpf.o` compiled; load failed on both: verifier "BPF program is too large" (1M instructions) from the 32-step unrolled ancestor walk. |
+| 40768725486 | t11b3-2 @ `3e916cf` | Bounded non-unrolled walk, loop state in a per-CPU scratch map: object loads and attaches on both. (24.04 first attempt: DNS flake, rerun green.) |
+| 40771969598 | t11b3-3 @ `1992de3` | Ancestors keep being checked against `WATCH` after a full path buffer; green on both. |
+| 40775169390 | t11b3-4 @ `c721fdc` | Filesystem sensor eBPF backend; green. (22.04 first attempt: `corrupted_object_falls_back_to_audit` flake, rerun green.) |
+| 40779488463 | t11b3-5 @ `6e54396` | Agent wiring. 22.04 `web_root_drop_raises_an_alert` failed: the eBPF `FILE_CREATE` had `exe_path` `""` (the short-lived `bash -c` was gone from `/proc`). Real bug, fixed. |
+| 40781865893 | t11b3-6 @ `e1792b4` | Kernel exe-identity index for `exe_path`; green on both. |
+| 40783256483 | t11b3-7 @ `e7976d1` | Index entries verified against the identity; green on both. |
+| 40785524078 | t11b3-8 @ `4e8f90a` | Scenarios (a)-(i): `real_linux` 26/26 on both kernels. |
+| 40786985456 | t11b3-9 @ `b57b492` | Positive control for failed-operation silence. 24.04 green. 22.04 attempt 1: `dns_query_is_observed_and_alerts` and `process_sensor_uses_ebpf` flakes (below); attempt 2: `dns_query_is_observed_and_alerts` again. No green 22.04 attempt at this commit is recorded here; the same suite was 26/26 at `4e8f90a`, and `b57b492` only adds a test assertion. |
+
+Scenarios that passed on both runners (run 40785524078):
+
+- (a) `filesystem` `HEALTHY` with flag `ebpf`, without `audit_fallback`.
+- (b) create, write, rename and delete in a fresh watched dir by one `python3` child: one stored
+  event each, source `EBPF`, the child's pid, the `python3` `exe_path`, the exact absolute path
+  (old and new for rename) and a non-null inode.
+- (c) `mkdir` and `rmdir` give CREATE and DELETE.
+- (d) the same operations in an unwatched dir give nothing, checked after a later watched marker.
+- (e) failed operations give nothing: `rmdir` of a non-empty dir and `unlink` of a `chattr +i`
+  file. Run 40786985456 adds a positive control (the same operation succeeds once the obstacle is
+  removed and is then reported), so the silence is not a missed hook.
+- (f) `openat(dirfd, "rel.txt", O_CREAT)` with a `dirfd` outside the CWD reports the true absolute
+  path, which the audit backend gets wrong.
+- (g) an operation in a watched tmpfs `/dev/shm/osiris-<n>` (a mount crossing) reports a path
+  starting `/dev/shm/osiris-<n>/`.
+- (h) with `fs.bpf.o` missing from the object dir, `filesystem` is `DEGRADED` with
+  `audit_fallback` and a write still arrives with source `AUDIT`, while the other sensors are
+  unaffected.
+- (i) the health assertion below.
+- The existing `file_lifecycle_is_observed` and `web_root_drop_raises_an_alert` now run on the
+  eBPF backend.
+
+### Bench run
+
+Run 40789871234 (`real-linux-bench/t11b3-1` @ `91eb93c`, ubuntu-24.04, kernel 7.0.0-1017-azure)
+ran the create/write/delete loop. The agent had the process, network and filesystem sensors
+`HEALTHY` on eBPF, and the filesystem sensor emitted 20 000 events (create + delete for each of
+10 000 watched iterations) with 0 dropped. The numbers and the unwatched-dir overhead warning are
+in `PERFORMANCE.md`.
+
+### Optional attach points are not exercised on the runners
+
+`security_file_truncate` exists only on kernels 6.2 and later and is an optional attach point. Both
+runner kernels are 6.2 or later, so the skip-and-list path never runs there. It is covered by a
+loader unit test with a spec that names a nonexistent symbol as optional, not by a real kernel
+that lacks the symbol.
+
+### Outcome of the process_exec health debt
+
+The 11b-1 debt said `process_exec` showed `events_emitted_total` 0 and `last_event_at` null in
+`/status` with the eBPF backend. It was a test misreading, not a code bug. Once the tests wait for
+the events to be stored first, `/status` shows `events_emitted_total` > 0 and a non-null
+`last_event_at` for both `process_exec` and `filesystem` (runs 40785524078 onward; the bench run
+shows `process_exec` at 36 and 38 events and `filesystem` at 0 then 20 000). The evidence is
+ordering after storage plus eventual consistency, not an instantaneous read: the check polls until
+the counts appear (flake-free), and `process_exec` counts from agent start. Debt closed.
+
+### Observed flakes (not fixed this phase)
+
+None of these touch code changed in this phase except as noted.
+
+- `dns_query_is_observed_and_alerts`: the 45 s matcher timed out with DNS events present. Four
+  occurrences, the first in run 40768725486 (t11b3-2, before the filesystem wiring existed) and
+  the last two in run 40786985456 attempts 1 and 2 (ubuntu-22.04). In those two attempts every
+  `DNS_QUERY` event in the stack had `process: null`, including `curl`'s and the system's, so
+  attribution failed across the board. Cause: under investigation. The DNS code is untouched by
+  this branch, and the 22.04 runner kernel moved from `6.8.0-1064` to `6.8.0-1070` between the 11b-2
+  and 11b-3 runs.
+- `corrupted_object_falls_back_to_audit`: `PROCESS_EXEC` never matched in 45 s (1 occurrence,
+  run 40775169390, ubuntu-22.04; rerun green).
+- `process_sensor_uses_ebpf`: the server failed with "cannot bind control listener ...: Address
+  already in use" because the test harness's `free_port()` released a port and handed it out
+  twice within one stack (1 occurrence, run 40786985456 attempt 1). Harness issue: allocate all
+  ports while holding the listeners, or retry.
+
+### Known limitations
+
+- Not covered: kernels other than the runners', a kernel-version VM matrix (ARCHITECTURE §26).
+  The 5.15 floor is reasoned, not run.
+- The fs object is x86_64 only; elsewhere the sensor falls back to audit.
+- A file nested more than 32 path components below a watched dir is never matched (known evasion).
+- io_uring file operations, `open_by_handle_at`, 32-bit compat syscalls and kernel threads are not
+  reported. Hard links, symlink creation, `chmod`/`chown`/xattr changes and reads are never
+  reported.
+- Container mount namespaces are not translated; btrfs and overlayfs match by inode only and can
+  over-report.
+- The watch list is not re-resolved after start. More than 64 watch keys make the whole fs eBPF
+  backend fall back to audit.
+- `exe_path` is `""` for a short-lived actor on btrfs/overlayfs, or whose binary is outside the
+  standard bin directories. `PENDING` overflow (10 240) and ring-buffer drops were not provoked in
+  validation.
+- See `docs/operators-ebpf.md` for the full list.
 
 ## Findings
 
