@@ -108,8 +108,7 @@ revisão final independente → merge → push.
   - Redução de privilégios do agente a um conjunto mínimo de capabilities (§15).
   - Empacotamento do objeto BPF (.deb/.rpm, unit systemd): Fase 13.
   - Layout dos registros espelhado à mão (testes + versão de schema), sem codegen: reavaliar com a 11b-3
-    (RESOLVIDA na 11b-3: mantido o espelho manual, ver ADR-010)
-    (agora são três registros espelhados).
+    (agora são três registros espelhados). (RESOLVIDA na 11b-3: mantido o espelho manual, ver ADR-010)
 - **Fase 11b-2 (feita)**: backend eBPF TCP do sensor de rede (`bpf/net.bpf.c`: connect/accept/close,
   IPv4 e IPv6, fallback para procfs) e registro de processo v2 (identidade do executável capturada no
   kernel, uma saída por grupo de threads; resolve as saídas de thread não-líder/`pthread_exit` e a

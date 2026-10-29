@@ -123,14 +123,17 @@ produced no events.
 
 > **Warning: the agent slows file operations in unwatched directories by more than 10 %.** In this
 > create/write/delete loop the unwatched-dir loop took 18.6 % longer with the agent running
-> (p50 per iteration 26.69 us to 31.05 us). The kernel hooks cannot know a directory is unwatched
-> until they have looked at it: each `open`/`openat`/`creat` pays a map delete on syscall enter and
-> a lookup on exit, and every create, unlink and rename walks the ancestors to test them against
-> the watch list. The loop is a worst case (nothing else happens in it, so the hook cost is the
-> whole difference). The absolute cost is about 5 us per iteration, not per byte, so
-> file-metadata-heavy workloads (unpacking archives, builds, many small files) see it most.
-> Watched dirs cost about 11.5 us per iteration on top of that (+42.4 %) because the event is also
-> built and sent.
+> (p50 per iteration 26.69 us to 31.05 us). The likely cause is the hooks: they cannot know a
+> directory is unwatched until they have looked at it. Each `open`/`openat`/`creat` pays a map
+> delete on syscall enter and a lookup on exit, and every create, unlink and rename walks the
+> ancestors to test them against the watch list. This attribution is not isolated by the bench.
+> One confound: the unwatched loop ran after the watched loop, while the agent may still have been
+> draining about 10 000 watched-dir events, which could inflate the unwatched figure. The loop is
+> a worst case (nothing else happens in it, so the hook cost is the whole difference). The absolute
+> cost is about 5 us per iteration, not per byte, so file-metadata-heavy workloads (unpacking
+> archives, builds, many small files) see it most. The watched-dir overhead versus no agent is
+> about 11.5 us per iteration (+42.4 %); that is about 6.4 us more than the unwatched dir, which is
+> the added cost of building and sending the events.
 
 ### Before/after F1 (WSL, ingest at 1 000 eps target, 30 s)
 

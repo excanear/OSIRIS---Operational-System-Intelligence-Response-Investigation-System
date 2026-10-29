@@ -354,15 +354,15 @@ the events to be stored first, `/status` shows `events_emitted_total` > 0 and a 
 `last_event_at` for both `process_exec` and `filesystem` (runs 40785524078 onward; the bench run
 shows `process_exec` at 36 and 38 events and `filesystem` at 0 then 20 000). The evidence is
 ordering after storage plus eventual consistency, not an instantaneous read: the check polls until
-the counts appear (flake-free), and `process_exec` counts from agent start. Debt closed.
+the check polls until counts appear, and `process_exec` counts from agent start. Debt closed.
 
 ### Observed flakes (not fixed this phase)
 
 None of these touch code changed in this phase except as noted.
 
-- `dns_query_is_observed_and_alerts`: the 45 s matcher timed out with DNS events present. Four
-  occurrences, the first in run 40768725486 (t11b3-2, before the filesystem wiring existed) and
-  the last two in run 40786985456 attempts 1 and 2 (ubuntu-22.04). In those two attempts every
+- `dns_query_is_observed_and_alerts`: the 45 s matcher timed out with DNS events present. Three
+  occurrences: run 40768725486 (t11b3-2, ubuntu-24.04, before the filesystem wiring existed) and
+  run 40786985456 attempts 1 and 2 (ubuntu-22.04). In the last two every
   `DNS_QUERY` event in the stack had `process: null`, including `curl`'s and the system's, so
   attribution failed across the board. Cause (ruling): a pre-existing race in the DNS sensor's
   user-space attribution. It reads `/proc/net/udp` and `/proc/*/fd` when the agent processes a

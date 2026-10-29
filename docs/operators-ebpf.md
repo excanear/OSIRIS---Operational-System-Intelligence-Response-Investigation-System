@@ -262,7 +262,8 @@ under `/tmp`, `/var/tmp` or another watched tree, remove that tree from `fs_watc
 - The ancestor walk stops after 32 components (mount crossings count). A file nested deeper than 32
   levels below its watched ancestor is **not matched**: this is a known evasion, a consequence of
   the verifier's instruction budget. A path longer than `PATH_CAP` (1024 bytes) is rendered as a
-  truncated tail with a `…/` prefix, so it can never be mistaken for an absolute path; the walk
+  truncated tail with a `…/` prefix, as is a path of more than 32 components, so it can never be
+  mistaken for an absolute path; the walk
   keeps checking ancestors against the watch list after the buffer is full.
 - A `rename` within one watched dir is one RENAME. A rename *into* a watched dir from an
   unwatched one is also reported (the destination matched), with the true source path.
