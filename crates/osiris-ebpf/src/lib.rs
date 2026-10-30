@@ -1,12 +1,13 @@
 //! Shared eBPF engine for OSIRIS sensors.
 //!
 //! OS-neutral pieces: the `#[repr(C)]` record ABIs shared with the C BPF
-//! programs (`record` for process, `net_record` for TCP), BPF object
-//! integrity checking (`integrity`), the kernel exe identity and `exe_path`
-//! resolver (`exe`), the capability probe's parsing and kernel-symbol check
-//! (`probe`), the object specs (tracepoint and kprobe attach points, some
-//! optional) and schema lookup (`loader`) and the kernel-clock offset
-//! (`clock`).
+//! programs (`record` for process, `net_record` for TCP, `fs_record` for
+//! filesystem create/write/delete/rename), BPF object integrity checking
+//! (`integrity`), the kernel exe identity and `exe_path` resolver (`exe`),
+//! the capability probe's parsing and kernel-symbol check (`probe`), the
+//! object specs (tracepoint and kprobe attach points; the fs object has
+//! one optional kprobe) and schema lookup (`loader`) and the kernel-clock
+//! offset (`clock`).
 //! Loading, attaching and ring-buffer reading use `aya` and are Linux-only;
 //! off Linux `probe` reports unsupported and [`LoadedObject::load`] always
 //! fails. It must not depend on `osiris-sensor-api`.

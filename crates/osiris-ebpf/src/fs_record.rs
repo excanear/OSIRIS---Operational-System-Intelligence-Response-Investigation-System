@@ -392,9 +392,7 @@ mod tests {
         ] {
             want.push((prog.into(), AttachKind::KProbe { symbol: sym }, req));
         }
-        let optional = [
-            "open", "creat", "mknod", "mkdir", "unlink", "rmdir", "rename", "openat2",
-        ];
+        // Every syscall tracepoint is required.
         for sc in [
             "open",
             "openat",
@@ -413,7 +411,6 @@ mod tests {
             "renameat",
             "renameat2",
         ] {
-            let req = !optional.contains(&sc);
             for dir in ["enter", "exit"] {
                 // Leak is fine in a test: AttachKind wants 'static strs.
                 let name: &'static str = Box::leak(format!("sys_{dir}_{sc}").into_boxed_str());
@@ -423,7 +420,7 @@ mod tests {
                         category: "syscalls",
                         name,
                     },
-                    req,
+                    true,
                 ));
             }
         }

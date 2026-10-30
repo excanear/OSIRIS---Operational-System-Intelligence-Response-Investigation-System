@@ -183,15 +183,21 @@ impl FilesystemSensor {
     fn start_ebpf(
         &mut self,
         loaded: Loaded,
+        exe_index: ExeIndex,
         output: mpsc::Sender<RawEvent>,
         cancellation: CancellationToken,
     ) -> Result<(), String> {
-        let Loaded { prog, skipped } = loaded;
+        let Loaded {
+            prog,
+            watch_skipped,
+            attach_skipped,
+        } = loaded;
         let drop_counter = prog.drop_counter();
         let health = self.health.clone();
         let proc_root = PathBuf::from(PROC_ROOT);
-        // Seeded before the reader starts; owned by the reader thread.
-        let mut exe_index = ExeIndex::with_default_dirs();
+        // Seeded by the caller off the async workers; owned by the reader
+        // thread from here on.
+        let mut exe_index = exe_index;
         let reader = osiris_ebpf::spawn_reader(prog, decode_fs, cancellation, move |record| {
             on_record(
                 record,
@@ -207,10 +213,18 @@ impl FilesystemSensor {
             let mut h = lock_health(&self.health);
             h.running_state = SensorState::Healthy;
             h.capability_flags = vec!["ebpf".to_string()];
-            // Unwatched paths are reported but do not degrade health.
-            if !skipped.is_empty() {
-                h.last_error = Some(format!("fs watch paths skipped: {}", skipped.join("; ")));
+            // Unwatched paths and skipped optional attach points are
+            // reported but do not degrade health.
+            if let Some(notes) = ebpf_start_notes(&watch_skipped, &attach_skipped) {
+                h.last_error = Some(notes);
             }
+        }
+        if !attach_skipped.is_empty() {
+            tracing::warn!(
+                sensor = "filesystem",
+                skipped = %attach_skipped.join("; "),
+                "eBPF filesystem backend running without optional attach points"
+            );
         }
         self.drop_counter = Some(drop_counter);
 
@@ -238,10 +252,42 @@ impl FilesystemSensor {
 }
 
 /// The fs program, loaded with its watch map and flags populated, plus the
-/// watch paths that could not be watched.
+/// watch paths that could not be watched and the optional attach points
+/// that were skipped.
 struct Loaded {
     prog: LoadedObject,
-    skipped: Vec<String>,
+    watch_skipped: Vec<String>,
+    attach_skipped: Vec<String>,
+}
+
+/// `last_error` for a running eBPF backend: the watch paths that could not
+/// be watched and the optional attach points that were skipped, `None`
+/// when there are neither. Neither degrades health.
+fn ebpf_start_notes(watch_skipped: &[String], attach_skipped: &[String]) -> Option<String> {
+    let mut notes = vec![];
+    if !watch_skipped.is_empty() {
+        notes.push(format!(
+            "fs watch paths skipped: {}",
+            watch_skipped.join("; ")
+        ));
+    }
+    if !attach_skipped.is_empty() {
+        notes.push(format!(
+            "fs optional attach points skipped: {}",
+            attach_skipped.join("; ")
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
+/// The exe identity index, scanned on a blocking thread so the scan of the
+/// executable directories never stalls an async worker. If that thread
+/// panics, an unscanned index is used (it scans on its first miss, on the
+/// reader thread).
+async fn seed_exe_index() -> ExeIndex {
+    tokio::task::spawn_blocking(ExeIndex::with_default_dirs)
+        .await
+        .unwrap_or_else(|_| ExeIndex::default_dirs_unscanned())
 }
 
 /// The fs object is x86_64-only (Global Constraint #6).
@@ -271,13 +317,7 @@ fn load_ebpf(settings: &EbpfSettings, watch_paths: &[PathBuf]) -> Result<Loaded,
     let mut reasons = vec![];
     let object = settings.object_dir.join(FS_OBJECT.object_file);
     reasons.extend(object_problem(&object));
-    reasons.extend(probe().reasons);
-    reasons.extend(arch_problem());
-    if let Some(symbols) = kernel_symbols_text() {
-        for name in missing_kernel_symbols(&symbols, &required_kprobes()) {
-            reasons.push(format!("required kernel symbol missing: {name}"));
-        }
-    }
+    reasons.extend(host_problems());
     let WatchResolution {
         keys,
         inode_only,
@@ -306,7 +346,26 @@ fn load_ebpf(settings: &EbpfSettings, watch_paths: &[PathBuf]) -> Result<Loaded,
         prog.set_watch_flags(WATCH_FLAG_INODE_ONLY)
             .map_err(|e| format!("eBPF unavailable: {e}"))?;
     }
-    Ok(Loaded { prog, skipped })
+    let attach_skipped = prog.skipped_attach_points().to_vec();
+    Ok(Loaded {
+        prog,
+        watch_skipped: skipped,
+        attach_skipped,
+    })
+}
+
+/// Why this host cannot run the fs program, before the object is looked
+/// at: the generic eBPF probe, the architecture, and the required kprobe
+/// symbols (when the kernel's symbol list is readable). Empty when none.
+fn host_problems() -> Vec<String> {
+    let mut reasons = probe().reasons;
+    reasons.extend(arch_problem());
+    if let Some(symbols) = kernel_symbols_text() {
+        for name in missing_kernel_symbols(&symbols, &required_kprobes()) {
+            reasons.push(format!("required kernel symbol missing: {name}"));
+        }
+    }
+    reasons
 }
 
 /// What is wrong with the BPF object path, truthfully: absent, present but
@@ -447,18 +506,18 @@ impl Sensor for FilesystemSensor {
     }
 
     fn capabilities(&self) -> SensorCapabilities {
-        let ebpf_report = self.ebpf.as_ref().map(|_| probe());
-        let arch_problem = arch_problem();
-        let ebpf = ebpf_report.as_ref().is_some_and(|r| r.supported) && arch_problem.is_none();
+        // The same host checks load_ebpf makes (probe, arch, required
+        // kernel symbols), so `ebpf: true` is never claimed for a host
+        // whose kernel lacks a required kprobe target.
+        let ebpf_problems = self.ebpf.as_ref().map(|_| host_problems());
+        let ebpf = ebpf_problems.as_ref().is_some_and(Vec::is_empty);
         let audit_reason = self.audit_unavailable_reason();
         let audit_fallback = audit_reason.is_none();
         let unsupported_reason = if ebpf || audit_fallback {
             None
         } else {
             let mut reasons = vec![];
-            if let Some(report) = &ebpf_report {
-                let mut why = report.reasons.clone();
-                why.extend(arch_problem);
+            if let Some(why) = &ebpf_problems {
                 reasons.push(format!("eBPF unavailable: {}", why.join("; ")));
             }
             reasons.extend(audit_reason);
@@ -488,9 +547,18 @@ impl Sensor for FilesystemSensor {
         let mut fallback_reason = None;
         if let Some(settings) = self.ebpf.clone() {
             let watch_paths = self.effective_watch_paths();
-            let started = load_ebpf(&settings, &watch_paths).and_then(|loaded| {
-                self.start_ebpf(loaded, ctx.output.clone(), ctx.cancellation.clone())
-            });
+            let started = match load_ebpf(&settings, &watch_paths) {
+                Ok(loaded) => {
+                    let exe_index = seed_exe_index().await;
+                    self.start_ebpf(
+                        loaded,
+                        exe_index,
+                        ctx.output.clone(),
+                        ctx.cancellation.clone(),
+                    )
+                }
+                Err(reason) => Err(reason),
+            };
             // Logged as well as health-visible: the backend choice is the
             // first thing a post-mortem of a real host needs.
             match started {
@@ -848,6 +916,41 @@ mod tests {
         assert_eq!(k.len(), 7, "{k:?}");
         assert!(k.contains(&"security_file_open"));
         assert!(!k.contains(&"security_file_truncate"), "optional");
+    }
+
+    #[test]
+    fn skipped_attach_points_reach_last_error_next_to_skipped_watch_paths() {
+        assert_eq!(ebpf_start_notes(&[], &[]), None);
+        let attach = vec!["kp_file_truncate: security_file_truncate: not present".to_string()];
+        assert_eq!(
+            ebpf_start_notes(&[], &attach).as_deref(),
+            Some(
+                "fs optional attach points skipped: \
+                 kp_file_truncate: security_file_truncate: not present"
+            )
+        );
+        let watch = vec!["/var/www: not found".to_string()];
+        let both = ebpf_start_notes(&watch, &attach).unwrap();
+        assert!(
+            both.starts_with("fs watch paths skipped: /var/www: not found; "),
+            "{both}"
+        );
+        assert!(both.contains("security_file_truncate"), "{both}");
+    }
+
+    /// Off a usable eBPF host, `capabilities()` must not claim eBPF; the
+    /// reason lists the same host checks `load_ebpf` makes.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn capabilities_report_host_problems_like_load_ebpf() {
+        let dir = tempfile::tempdir().unwrap();
+        let sensor = FilesystemSensor::new(None, Some(ebpf_settings(dir.path())), vec![]);
+        let caps = sensor.capabilities();
+        assert!(!caps.ebpf);
+        let reason = caps.unsupported_reason.unwrap();
+        for problem in host_problems() {
+            assert!(reason.contains(&problem), "{reason} lacks {problem}");
+        }
     }
 
     fn fs_record() -> FsEvent {

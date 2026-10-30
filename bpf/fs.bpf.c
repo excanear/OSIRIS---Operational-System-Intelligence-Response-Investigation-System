@@ -43,12 +43,20 @@
  * mnt)->mnt_parent / mnt_mountpoint. With WATCH_FLAGS[0] bit 0 set (an
  * inode-only key exists, for btrfs/overlayfs) a miss is retried as
  * (0, i_ino). A rename matches if the source or the destination side does.
- * The same walk writes the path right to left into SCRATCH.buf; it stops
- * at the root, at the global mount root, or after MAX_COMPONENTS steps. A
- * path that does not fit (or a walk that does not reach a root) is kept as
- * its tail, without a leading '/', and flagged truncated; once the buffer
- * is full the walk goes on WATCH-checking the ancestors (only the name
- * writes stop), so a long path cannot hide an operation.
+ * The same walk writes the path right to left into SCRATCH.buf. Name
+ * writes stop at the task's root (the path is then complete, as d_path()
+ * shows it to the task) or when a name does not fit; the walk itself goes
+ * on WATCH-checking the ancestors, crossing mounts, until the top of the
+ * mount tree (or a detached mount's root) or MAX_COMPONENTS steps. So a
+ * long path, a chroot or pivot_root inside a watched tree, or a write
+ * through a detached mount of a watched directory cannot hide an
+ * operation. Only a walk that reached the task's root with every name
+ * written is complete; any other path (it did not fit, the walk ran out of
+ * steps, or the operand is outside the task's root: a detached mount, an
+ * fd opened before a chroot) is kept as its tail, without a leading '/',
+ * and flagged truncated. Not covered: a bind mount of a watched
+ * directory's SUBdirectory (the walk crosses from that mount's root to
+ * its mountpoint and never visits the watched ancestor).
  *
  * Verifier notes (target: Linux 5.15+, privileged load):
  *  - every ring-buffer reservation is a constant sizeof(struct fs_record),
@@ -187,8 +195,8 @@ struct walk_state {
 	__u64 cur;        /* first written byte of buf; PATH_CAP = nothing yet */
 	__u32 inode_only; /* WATCH_FLAGS[0] bit 0 */
 	__u32 matched;    /* a watched directory was seen (since walk_begin) */
-	__u32 complete;   /* the current walk reached a root */
-	__u32 full;       /* a name did not fit: path is a tail, writes stop */
+	__u32 complete;   /* reached the task root with every name written */
+	__u32 full;       /* name writes stopped (no fit, or past the root) */
 };
 
 /*
@@ -278,7 +286,8 @@ static __always_inline struct vfsmount *mount_vfs(struct mount *mnt)
 
 /*
  * Start the walk(s) of one hook: record the task's root (current->fs->root;
- * zero when it has no fs_struct, so the walk ends at the mount-tree root)
+ * zero when it has no fs_struct: the root is then never met, the walk ends
+ * at the top of the mount tree and the path is reported as a tail)
  * and the inode-only flag, and clear `matched`.
  */
 static __always_inline void walk_begin(struct scratch *s)
@@ -298,9 +307,11 @@ static __always_inline void walk_begin(struct scratch *s)
 }
 
 /*
- * One step at (s->w.d, s->w.m): check WATCH, then either stop (returns 1;
- * s->w.complete says whether a root was reached), cross to the mountpoint
- * in the parent mount, or prepend "/name" to the path and move to the
+ * One step at (s->w.d, s->w.m): check WATCH; at the task's root mark the
+ * path complete (if every name fit) and stop writing names; then either
+ * stop (returns 1: the top of the mount tree, a detached mount's root or a
+ * disconnected dentry), cross to the mountpoint in the parent mount, or
+ * prepend "/name" to the path (unless writes stopped) and move to the
  * parent dentry (returns 0). Reads and writes its state only through
  * LOAD/STORE, so nothing survives in a register to the next step.
  */
@@ -315,8 +326,13 @@ static __always_inline int walk_step(struct scratch *s)
 	if (!LOAD(s->w.matched) && is_watched(d, LOAD(s->w.inode_only)))
 		STORE(s->w.matched, 1);
 	if ((__u64)d == LOAD(s->w.root_d) && (__u64)m == LOAD(s->w.root_m)) {
-		STORE(s->w.complete, 1);
-		return 1;
+		/* The task's root: the path written so far is the one the
+		 * task sees. The walk goes on past it (a chroot or
+		 * pivot_root inside a watched tree must not hide the
+		 * operation), only WATCH-checking from here on. */
+		if (!LOAD(s->w.full))
+			STORE(s->w.complete, 1);
+		STORE(s->w.full, 1);
 	}
 	if (d == BPF_CORE_READ(m, mnt_root)) {
 		/* A mount root: continue at the mountpoint in the parent
@@ -325,9 +341,11 @@ static __always_inline int walk_step(struct scratch *s)
 		struct mount *up = BPF_CORE_READ(mnt, mnt_parent);
 
 		if (!up || up == mnt) {
-			/* The root of the mount tree (or a detached mount):
-			 * as far as d_path() would go. */
-			STORE(s->w.complete, 1);
+			/* The top of the mount tree, or a detached mount
+			 * (open_tree(OPEN_TREE_CLONE), lazily unmounted):
+			 * nothing above. `complete` is left as it is: unless
+			 * the task's root was passed on the way, the operand
+			 * is outside it and the path is only a tail. */
 			return 1;
 		}
 		STORE(s->w.d, (__u64)BPF_CORE_READ(mnt, mnt_mountpoint));
@@ -337,9 +355,10 @@ static __always_inline int walk_step(struct scratch *s)
 	parent = BPF_CORE_READ(d, d_parent);
 	if (!parent || parent == d)
 		return 1; /* disconnected: not a path from the root */
-	/* Move up first: once the buffer is full, the ancestors are still
-	 * WATCH-checked (a long path must not hide an event), only their
-	 * names are no longer written. */
+	/* Move up first: once writes stopped (a name did not fit, or past
+	 * the task's root) the ancestors are still WATCH-checked (a long
+	 * path or a chroot must not hide an event), only their names are no
+	 * longer written. */
 	STORE(s->w.d, (__u64)parent);
 	if (LOAD(s->w.full))
 		return 0;
@@ -367,7 +386,7 @@ static __always_inline int walk_step(struct scratch *s)
 }
 
 /*
- * Walk from `d` (on mount `m`) to the root, checking WATCH at every dentry
+ * Walk from `d` (on mount `m`) upwards, checking WATCH at every dentry
  * (s->w.matched is sticky from walk_begin, so a rename's two walks OR) and
  * writing "/name" components right to left into s->buf[0..PATH_CAP).
  * Copies the result into `dst` (PATH_CAP bytes, zero past the path) and
@@ -394,7 +413,8 @@ static __always_inline void walk_path(struct scratch *s, struct dentry *d,
 	}
 
 	start = LOAD(s->w.cur);
-	if (LOAD(s->w.complete) && !LOAD(s->w.full)) {
+	/* `complete` is only ever set while every name had fit. */
+	if (LOAD(s->w.complete)) {
 		if (start == PATH_CAP) {
 			/* The operand is the root itself. */
 			start = PATH_CAP - 1;

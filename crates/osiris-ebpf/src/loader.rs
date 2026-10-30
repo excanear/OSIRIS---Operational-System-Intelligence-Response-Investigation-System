@@ -112,23 +112,23 @@ const fn kprobe(program: &'static str, symbol: &'static str, required: bool) -> 
     }
 }
 
-const fn sys_tp(program: &'static str, name: &'static str, required: bool) -> AttachPoint {
-    AttachPoint {
-        program,
-        kind: AttachKind::TracePoint {
-            category: "syscalls",
-            name,
-        },
-        required,
-    }
-}
-
-/// Enter and exit tracepoint points of one syscall.
+/// Enter and exit tracepoint points of one syscall. All are required on
+/// x86_64 (glibc calls the legacy unlink/mkdir/rename/rmdir syscalls
+/// directly there), so a missing one fails the load instead of leaving a
+/// `Healthy` sensor blind to those calls.
 macro_rules! sys_pair {
-    ($sc:literal, $req:literal) => {
+    ($sc:literal) => {
         [
-            sys_tp(concat!("tp_enter_", $sc), concat!("sys_enter_", $sc), $req),
-            sys_tp(concat!("tp_exit_", $sc), concat!("sys_exit_", $sc), $req),
+            required_tp(
+                concat!("tp_enter_", $sc),
+                "syscalls",
+                concat!("sys_enter_", $sc),
+            ),
+            required_tp(
+                concat!("tp_exit_", $sc),
+                "syscalls",
+                concat!("sys_exit_", $sc),
+            ),
         ]
     };
 }
@@ -148,22 +148,22 @@ const fn fs_attach_points() -> [AttachPoint; FS_ATTACH_LEN] {
         kprobe("kp_file_truncate", "security_file_truncate", false),
     ];
     let syscalls = [
-        sys_pair!("open", false),
-        sys_pair!("openat", true),
-        sys_pair!("openat2", false),
-        sys_pair!("creat", false),
-        sys_pair!("truncate", true),
-        sys_pair!("ftruncate", true),
-        sys_pair!("mknod", false),
-        sys_pair!("mknodat", true),
-        sys_pair!("mkdir", false),
-        sys_pair!("mkdirat", true),
-        sys_pair!("unlink", false),
-        sys_pair!("unlinkat", true),
-        sys_pair!("rmdir", false),
-        sys_pair!("rename", false),
-        sys_pair!("renameat", true),
-        sys_pair!("renameat2", true),
+        sys_pair!("open"),
+        sys_pair!("openat"),
+        sys_pair!("openat2"),
+        sys_pair!("creat"),
+        sys_pair!("truncate"),
+        sys_pair!("ftruncate"),
+        sys_pair!("mknod"),
+        sys_pair!("mknodat"),
+        sys_pair!("mkdir"),
+        sys_pair!("mkdirat"),
+        sys_pair!("unlink"),
+        sys_pair!("unlinkat"),
+        sys_pair!("rmdir"),
+        sys_pair!("rename"),
+        sys_pair!("renameat"),
+        sys_pair!("renameat2"),
     ];
     let mut out = [kps[0]; FS_ATTACH_LEN];
     let mut n = 0;
@@ -296,6 +296,22 @@ impl LoadedObject {
         #[cfg(target_os = "linux")]
         {
             &self.inner.skipped
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// `(program, verified instructions)` for every program of the object,
+    /// sorted by program name: the verifier's processed-instruction count
+    /// (`bpf_prog_info.verified_insns`, kernel 5.16+). `None` for a program
+    /// that was not loaded (a skipped optional point) or when the kernel
+    /// does not report it. Diagnostics only.
+    pub fn verified_instruction_counts(&self) -> Vec<(String, Option<u32>)> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.verified_instruction_counts()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -597,7 +613,7 @@ mod linux {
         watch_flags: Option<Array<MapData, u32>>,
         pub(crate) skipped: Vec<String>,
         /// Owns the programs and links; kept alive for the attachment's life.
-        _ebpf: Ebpf,
+        ebpf: Ebpf,
     }
 
     fn tracepoint_exists(category: &str, name: &str) -> bool {
@@ -715,8 +731,24 @@ mod linux {
                 watch,
                 watch_flags,
                 skipped,
-                _ebpf: ebpf,
+                ebpf,
             })
+        }
+
+        pub(crate) fn verified_instruction_counts(&self) -> Vec<(String, Option<u32>)> {
+            let mut counts: Vec<(String, Option<u32>)> = self
+                .ebpf
+                .programs()
+                .map(|(name, program)| {
+                    let insns = program
+                        .info()
+                        .ok()
+                        .and_then(|info| info.verified_instruction_count());
+                    (name.to_string(), insns)
+                })
+                .collect();
+            counts.sort();
+            counts
         }
 
         pub(crate) fn insert_watch(&mut self, dev: u32, ino: u64) -> Result<(), LoadError> {
@@ -811,6 +843,27 @@ mod tests {
         assert_eq!(only_req[0].program, "req_prog");
         let err = plan_attach(&points, |p| p.program == "opt_prog").unwrap_err();
         assert!(err.contains("req_prog"), "{err}");
+
+        // The fs object: only security_file_truncate (6.2+) is optional;
+        // every syscall tracepoint is required (Global Constraint #9 as
+        // amended by the final review).
+        let optional: Vec<String> = FS_OBJECT
+            .attach
+            .iter()
+            .filter(|p| !p.required)
+            .map(AttachPoint::target)
+            .collect();
+        assert_eq!(optional, ["security_file_truncate"]);
+        // A missing legacy syscall tracepoint (unlink: glibc x86_64 calls
+        // it directly) fails the load, naming it.
+        let err = plan_attach(FS_OBJECT.attach, |p| p.program != "tp_enter_unlink").unwrap_err();
+        assert!(
+            err.contains("tp_enter_unlink") && err.contains("syscalls/sys_enter_unlink"),
+            "{err}"
+        );
+        // A missing security_file_truncate is skipped, not fatal.
+        let plan = plan_attach(FS_OBJECT.attach, |p| p.program != "kp_file_truncate").unwrap();
+        assert_eq!(plan.len(), FS_OBJECT.attach.len() - 1);
     }
 
     /// The process object's sidecar, as 11b-1 named it.

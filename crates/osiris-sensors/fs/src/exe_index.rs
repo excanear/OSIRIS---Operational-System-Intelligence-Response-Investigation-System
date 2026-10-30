@@ -78,13 +78,19 @@ impl ExeIndex {
 
     /// The production index over [`EXE_SCAN_DIRS`], already scanned.
     pub fn with_default_dirs() -> Self {
-        let mut index = Self::new(
+        let mut index = Self::default_dirs_unscanned();
+        index.rescan(Instant::now());
+        index
+    }
+
+    /// The production index over [`EXE_SCAN_DIRS`], not scanned yet (the
+    /// first miss scans).
+    pub fn default_dirs_unscanned() -> Self {
+        Self::new(
             EXE_SCAN_DIRS.iter().map(PathBuf::from).collect(),
             EXE_INDEX_CAPACITY,
             RESCAN_INTERVAL,
-        );
-        index.rescan(Instant::now());
-        index
+        )
     }
 
     /// An index that never scans (pure conversion, tests).
@@ -196,20 +202,47 @@ impl ExeIndex {
     #[cfg(not(unix))]
     fn scan_dir(&mut self, _dir: &Path) {}
 
-    /// `exe_path` for a record: the `/proc/<pid>/exe` link when
-    /// [`resolve_exe`] ties it to the record (learned only when the path
-    /// stats to the record's identity), else the path indexed for the
-    /// record's kernel exe identity, else `""`.
+    /// `exe_path` for a record:
+    ///
+    /// 1. the `/proc/<pid>/exe` link when [`resolve_exe`] ties it to the
+    ///    record and the link's path (learned) or the proc link itself
+    ///    stats to the record's identity;
+    /// 2. the path indexed for the record's kernel exe identity, when the
+    ///    link is missing or tied only by its comm (a later exec that kept
+    ///    the comm, e.g. `/tmp/bash` exec'ing `/usr/bin/bash`, must not
+    ///    lend the new image to the old record);
+    /// 3. a comm-tied link, unless its path stats to a different inode on
+    ///    the record identity's own device (then it is certainly another
+    ///    file). A different device is no proof: btrfs and overlayfs
+    ///    report a `st_dev` other than the kernel's, so there the link is
+    ///    kept, as in 11b-1;
+    /// 4. else `""`.
     pub fn exe_path(&mut self, e: &FsEvent, proc_root: &Path) -> String {
-        if let Some(path) = resolve_exe(proc_root, e.pid, e.exe, &e.comm) {
-            if let Some(identity) = e.exe {
-                self.learn(identity, &path);
+        let link = resolve_exe(proc_root, e.pid, e.exe, &e.comm);
+        let Some(identity) = e.exe else {
+            return link.unwrap_or_default();
+        };
+        if let Some(path) = &link {
+            if self.learn(identity, path) {
+                return path.clone();
             }
-            return path;
+            // Tied by identity through the proc link itself, though the
+            // path no longer stats to it (replaced or deleted since).
+            let proc_exe = proc_root.join(e.pid.to_string()).join("exe");
+            if (self.stat)(&proc_exe) == Some((identity.dev, identity.ino)) {
+                return path.clone();
+            }
         }
-        e.exe
-            .and_then(|identity| self.lookup(identity, Instant::now()))
-            .unwrap_or_default()
+        if let Some(indexed) = self.lookup(identity, Instant::now()) {
+            return indexed;
+        }
+        match link {
+            Some(path) => match (self.stat)(Path::new(&path)) {
+                Some((dev, ino)) if dev == identity.dev && ino != identity.ino => String::new(),
+                _ => path,
+            },
+            None => String::new(),
+        }
     }
 }
 
@@ -450,5 +483,64 @@ mod tests {
         let got = ix.exe_path(&event(Some(real_bash)), root.path());
         assert_eq!(got, decoy.to_string_lossy());
         assert!(ix.is_empty(), "unverified mapping must not be learned");
+    }
+
+    /// `/proc/4242/exe` → `<root>/later-bash` with comm "bash", as after
+    /// `/tmp/bash` (the record's exe) exec'd `/usr/bin/bash`.
+    #[cfg(unix)]
+    fn exec_since_record(root: &Path) -> String {
+        let later = root.join("later-bash");
+        std::fs::write(&later, b"x").unwrap();
+        let pid_dir = root.join("4242");
+        std::fs::create_dir(&pid_dir).unwrap();
+        std::os::unix::fs::symlink(&later, pid_dir.join("exe")).unwrap();
+        std::fs::write(pid_dir.join("comm"), b"bash\n").unwrap();
+        later.to_string_lossy().into_owned()
+    }
+
+    /// A comm-tied link whose path is a different inode on the record
+    /// identity's own device is certainly another image: not reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_comm_tied_link_to_another_inode_on_the_same_device_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let later = exec_since_record(root.path());
+        let (mut ix, fs) = index(10);
+        put(&fs, &later, (1, 99)); // /usr/bin/bash
+        let tmp_bash = id(1, 7); // the record's exe
+        assert_eq!(ix.exe_path(&event(Some(tmp_bash)), root.path()), "");
+        assert!(ix.is_empty());
+    }
+
+    /// The same case with the record's identity indexed: the indexed path
+    /// wins over the comm-tied link.
+    #[cfg(unix)]
+    #[test]
+    fn an_indexed_identity_wins_over_a_comm_tied_link() {
+        let root = tempfile::tempdir().unwrap();
+        let later = exec_since_record(root.path());
+        let (mut ix, fs) = index(10);
+        put(&fs, &later, (1, 99));
+        put(&fs, "/opt/tools/bash", (1, 7));
+        ix.insert(id(1, 7), "/opt/tools/bash".into());
+        assert_eq!(
+            ix.exe_path(&event(Some(id(1, 7))), root.path()),
+            "/opt/tools/bash"
+        );
+    }
+
+    /// The proc link itself stats to the record's identity although its
+    /// path now names another file (replaced since): still the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_tied_by_the_proc_entry_is_kept_when_its_path_was_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let later = exec_since_record(root.path());
+        let proc_exe = root.path().join("4242").join("exe");
+        let (mut ix, fs) = index(10);
+        put(&fs, &later, (1, 99));
+        put(&fs, &proc_exe.to_string_lossy(), (1, 7));
+        assert_eq!(ix.exe_path(&event(Some(id(1, 7))), root.path()), later);
+        assert!(ix.is_empty(), "the replaced path must not be learned");
     }
 }
