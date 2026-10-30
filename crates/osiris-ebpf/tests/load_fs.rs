@@ -288,10 +288,19 @@ fn fs_object_loads_and_attaches_sees_past_a_chroot() {
     assert!(jail.join("payload").exists(), "created inside the jail");
 
     let pid = std::process::id();
-    let (found, seen) = events.wait_for(|ev| ev.kind == FsKind::Create && ev.pid == pid);
+    let payload_ino = std::fs::metadata(jail.join("payload"))
+        .expect("stat payload")
+        .ino();
+    // The jail mkdir above is also a CREATE by this pid in the watched dir
+    // (staged while the programs were already attached), so match the
+    // payload itself: its inode, or a path ending in its name.
+    let (found, seen) = events.wait_for(|ev| is_payload_create(ev, pid, payload_ino));
     events.stop();
     let ev = found.unwrap_or_else(|| {
-        panic!("no CREATE from inside the chroot within 5 s; other events: {seen:?}")
+        panic!(
+            "no CREATE of the payload (ino {payload_ino}) from inside the chroot within 5 s; \
+             other events: {seen:?}"
+        )
     });
     println!(
         "osiris-ebpf: fs chroot create: path {:?} truncated {}",
@@ -300,6 +309,17 @@ fn fs_object_loads_and_attaches_sees_past_a_chroot() {
     );
     assert_eq!(ev.path, b"/payload", "{ev:?}");
     assert!(!ev.path_truncated, "{ev:?}");
+    assert_eq!(ev.inode.map(|i| i.ino), Some(payload_ino), "{ev:?}");
+}
+
+/// A CREATE by `pid` of the test's `payload` file: matched by inode (filled
+/// in by security_file_open) or, should that be missing, by a path whose
+/// last component is `payload`.
+fn is_payload_create(ev: &FsEvent, pid: u32, payload_ino: u64) -> bool {
+    ev.kind == FsKind::Create
+        && ev.pid == pid
+        && (ev.inode.is_some_and(|i| i.ino == payload_ino)
+            || ev.path.rsplit(|b| *b == b'/').next() == Some(b"payload".as_slice()))
 }
 
 /// A create through a detached (lazily unmounted) bind mount of a watched
@@ -326,11 +346,17 @@ fn fs_object_loads_and_attaches_sees_through_a_detached_mount() {
     assert!(dir_path.join("payload").exists(), "same directory");
 
     let pid = std::process::id();
-    let (found, seen) = events.wait_for(|ev| ev.kind == FsKind::Create && ev.pid == pid);
+    let payload_ino = std::fs::metadata(dir_path.join("payload"))
+        .expect("stat payload")
+        .ino();
+    let (found, seen) = events.wait_for(|ev| is_payload_create(ev, pid, payload_ino));
     events.stop();
     drop(held);
     let ev = found.unwrap_or_else(|| {
-        panic!("no CREATE through the detached mount within 5 s; other events: {seen:?}")
+        panic!(
+            "no CREATE of the payload (ino {payload_ino}) through the detached mount within 5 s; \
+             other events: {seen:?}"
+        )
     });
     println!(
         "osiris-ebpf: fs detached-mount create: path {:?} truncated {}",
@@ -342,4 +368,5 @@ fn fs_object_loads_and_attaches_sees_through_a_detached_mount() {
         ev.path, b"payload",
         "the tail, without a leading '/': {ev:?}"
     );
+    assert_eq!(ev.inode.map(|i| i.ino), Some(payload_ino), "{ev:?}");
 }
