@@ -131,9 +131,9 @@ revisão final independente → merge → push.
 - **Fase 11b-3 (feita)**: backend eBPF do sensor `filesystem` (`bpf/fs.bpf.c`, kprobes nos hooks LSM
   `security_path_*` e `security_file_open`, eventos CREATE/WRITE/DELETE/RENAME só de operações
   bem-sucedidas, filtro por diretórios vigiados no kernel, `fs_watch_paths` com lista padrão, fallback
-  para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-9`, Ubuntu 22.04 e 24.04;
-  os kernels 6.8.0-1070-azure e 7.0.0-1017-azure foram conferidos nos logs da rodada 40786985456,
-  não em todas) e medido em `PERFORMANCE.md` (a lentidão em diretórios
+  para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-11`, Ubuntu 22.04 e 24.04;
+  os kernels 6.8.0-1070-azure e 7.0.0-1017-azure foram conferidos nos logs das rodadas 40786985456
+  e 40999372578, não em todas; a última, t11b3-11 @ `8e814ac`, passou nos dois na primeira tentativa) e medido em `PERFORMANCE.md` (a lentidão em diretórios
   não vigiados passa de 10 %, com aviso). Ver `docs/operators-ebpf.md`,
   `docs/adr/ADR-010-ebpf-loader-aya.md` e `docs/VALIDATION.md`.
   Resultados das dívidas herdadas:
@@ -169,6 +169,14 @@ revisão final independente → merge → push.
   - Chroot/pivot_root: a caminhada passa da raiz da tarefa (corrigido na revisão final), mas o
     caminho reportado é o visto pela tarefa (`/x` dentro do chroot), sem tradução para o host. Um
     operando fora da raiz da tarefa (montagem destacada, fd aberto antes do chroot) sai como `…/`.
+    Quando o casamento só acontece por um ancestral vigiado acima da raiz do chroot, o evento sai
+    com caminho absoluto "completo" relativo ao chroot (prefixo escondido, pode gerar acerto falso
+    em regra de caminho do host). Correção futura: marcar `truncated` quando o casamento só ocorre
+    depois da raiz da tarefa.
+  - `exe_index.rs`: a busca no índice passou a rodar também para links casados só por `comm`; em
+    hosts btrfs/overlayfs isso dispara rescans limitados (60 s) na thread leitora, com pausas de
+    dezenas de ms e possíveis perdas em rajada. Correção futura: pular a busca quando o `dev` do
+    link difere do `dev` da identidade.
   - `O_TMPFILE`: o WRITE sai com caminho terminado em `//` e o `linkat` posterior que dá nome ao
     arquivo não é reportado.
   - Custo no caminho quente não vigiado: um `File::create` num diretório não vigiado faz duas

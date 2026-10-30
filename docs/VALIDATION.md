@@ -308,6 +308,8 @@ from 6.17.0-1022-azure (the 11b-2 runs) to 7.0 since. Bench run 40789871234 also
 | 40783256483 | t11b3-7 @ `e7976d1` | Index entries verified against the identity; green on both. |
 | 40785524078 | t11b3-8 @ `4e8f90a` | Scenarios (a)-(i): `real_linux` 26/26 on both kernels. |
 | 40786985456 | t11b3-9 @ `b57b492` | Positive control for failed-operation silence. 24.04 green on every attempt. 22.04 attempt 1: `dns_query_is_observed_and_alerts` and `process_sensor_uses_ebpf` flakes (below); attempt 2: `dns_query_is_observed_and_alerts` again; **attempt 3 green on both 22.04 and 24.04**. `b57b492` therefore passed, after two flaky 22.04 attempts. |
+| 40989019470 | t11b3-10 @ `9a8331e` | Final-review fixes. Verifier accepts the objects on both kernels (kprobe programs about 20.3k instructions, rename 40 151; no attach point skipped). Self-filter and detached-mount tests green. The chroot test failed on both kernels from a test-matcher bug (it matched the jail `mkdir`, not the payload create); 22.04 also had the known DNS flake. |
+| 40999372578 | t11b3-11 @ `8e814ac` | Chroot test matcher fixed (BPF unchanged). **Green on both 22.04 (6.8.0-1070-azure) and 24.04 (7.0.0-1017-azure) on the first attempt**; `real_linux` 26/26, the chroot create reported as `/payload`. |
 
 Scenarios that passed on both runners (run 40785524078):
 
