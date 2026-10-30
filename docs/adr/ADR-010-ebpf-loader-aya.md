@@ -100,12 +100,17 @@ stays at 0.14.0. Validation runs are listed in `docs/VALIDATION.md`.
   needs 6.0+. The `security_path_*` signatures have been stable since well before 5.15. `ObjectSpec`
   gained a kprobe list and the loader attaches them with aya's `KProbe`.
 - **Optional attach points.** Every tracepoint or kprobe entry has a `required` flag. A missing
-  optional one (`security_file_truncate` before kernel 6.2, a legacy syscall tracepoint absent on
-  some architectures) is skipped and listed in the load report. A missing required one fails the
-  load with a reason naming it, and the sensor falls back to audit. The process and net specs keep
-  all entries required. The optional path is covered by a loader unit test (a spec naming a
-  nonexistent symbol as optional); it is not exercised on the runners, whose kernels are all 6.2 or
-  later.
+  optional one is skipped, listed in the load report, logged as a warning and named in the fs
+  sensor's `last_error` (health stays `HEALTHY`). A missing required one fails the load with a
+  reason naming it, and the sensor falls back to audit. The process and net specs keep all entries
+  required. In the fs spec the only optional point is `security_file_truncate` (kernel 6.2+). The
+  first cut also made the legacy syscall tracepoints (`open`, `creat`, `mknod`, `mkdir`, `unlink`,
+  `rmdir`, `rename`) and `openat2` optional; the final review made them required, because the
+  object is x86_64-only, where they all exist and glibc calls `unlink`/`mkdir`/`rename`/`rmdir`
+  directly, and an optional tracepoint pre-check against two fixed tracefs paths could skip all of
+  them on a host with tracefs mounted elsewhere, leaving a `HEALTHY` sensor that never emits. The
+  optional path is covered by a loader unit test; it is not exercised on the runners, whose
+  kernels are all 6.2 or later.
 - **Stage at the hook, emit at syscall exit.** A path hook fires before the operation can fail, so
   it only stages the operation in a `PENDING` hash (keyed by `pid_tgid`, `BPF_F_NO_PREALLOC`,
   10 240 entries). A per-syscall `sys_exit_*` tracepoint emits it when the return value is not
@@ -126,6 +131,19 @@ stays at 0.14.0. Validation runs are listed in `docs/VALIDATION.md`.
   count) below its watched directory is never matched, because the walk gives up before reaching
   the watched ancestor. It was accepted for the verifier budget. A later phase could add a cheaper
   match-only continuation past 32 components that builds no path.
+- **The walk does not stop at the task's root (final-review fix).** The first cut ended the walk at
+  `current->fs->root`, so a task chrooted into a subdirectory of a watched tree never reached the
+  watched ancestor, and it treated a detached mount's root (`mnt_parent == mnt`) as the top of the
+  tree, emitting an untruncated absolute path that was wrong. Now the walk only stops *writing
+  names* at the task's root (the path is complete as the task sees it) and keeps crossing mounts
+  and testing `WATCH` within the same 32-step budget; reaching the top of a mount tree without
+  passing the task's root yields a `…/` tail. Same loop, same per-CPU state, no unrolling.
+- **Known evasion: bind mounts of a watched subtree.** At a mount root the walk continues at the
+  mountpoint, so a bind mount of a *subdirectory* of a watched directory (`mount --bind
+  /etc/cron.d /mnt/x` with `/etc` watched) is never matched through `/mnt/x`. Covering it would
+  need a second, match-only walk up the bind root's own `d_parent` chain (that dentry is not its
+  superblock's root), roughly doubling the verifier budget; not done. Documented in
+  `docs/operators-ebpf.md` and carried in `docs/ROADMAP-REMAINING.md`.
 - **x86_64 only.** Kprobe argument access is architecture-specific and the object is built with
   `-D__TARGET_ARCH_x86`; elsewhere the probe reports it and the sensor falls back. Per-arch objects
   are Phase 13 packaging work.

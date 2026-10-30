@@ -131,8 +131,9 @@ revisão final independente → merge → push.
 - **Fase 11b-3 (feita)**: backend eBPF do sensor `filesystem` (`bpf/fs.bpf.c`, kprobes nos hooks LSM
   `security_path_*` e `security_file_open`, eventos CREATE/WRITE/DELETE/RENAME só de operações
   bem-sucedidas, filtro por diretórios vigiados no kernel, `fs_watch_paths` com lista padrão, fallback
-  para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-9`, Ubuntu 22.04 com kernel
-  6.8.0-1070-azure e 24.04 com 7.0.0-1017-azure) e medido em `PERFORMANCE.md` (a lentidão em diretórios
+  para audit). Validado em Linux real (rodadas `real-linux/t11b3-1` a `-9`, Ubuntu 22.04 e 24.04;
+  os kernels 6.8.0-1070-azure e 7.0.0-1017-azure foram conferidos nos logs da rodada 40786985456,
+  não em todas) e medido em `PERFORMANCE.md` (a lentidão em diretórios
   não vigiados passa de 10 %, com aviso). Ver `docs/operators-ebpf.md`,
   `docs/adr/ADR-010-ebpf-loader-aya.md` e `docs/VALIDATION.md`.
   Resultados das dívidas herdadas:
@@ -159,11 +160,28 @@ revisão final independente → merge → push.
     `events_dropped_total`. Não provocado na validação.
   - Evasão conhecida: arquivo aninhado a mais de 32 componentes (cruzamentos de montagem contam)
     abaixo de um diretório vigiado nunca casa (orçamento do verificador). Uma fase futura pode
-    adicionar uma continuação barata só de casamento.
+    adicionar uma continuação barata só de casamento; a revisão final pede prioridade (exploração
+    barata sob `/tmp` ou `/var/www`).
+  - Evasão conhecida: bind mount de um *subdiretório* de um diretório vigiado (`mount --bind
+    /etc/cron.d /mnt/x` com `/etc` vigiado) não casa por `/mnt/x`: na raiz da montagem a caminhada
+    segue para o ponto de montagem e nunca visita `/etc`. Cobrir exigiria uma segunda caminhada só
+    de casamento pelo `d_parent` da raiz do bind.
+  - Chroot/pivot_root: a caminhada passa da raiz da tarefa (corrigido na revisão final), mas o
+    caminho reportado é o visto pela tarefa (`/x` dentro do chroot), sem tradução para o host. Um
+    operando fora da raiz da tarefa (montagem destacada, fd aberto antes do chroot) sai como `…/`.
+  - `O_TMPFILE`: o WRITE sai com caminho terminado em `//` e o `linkat` posterior que dá nome ao
+    arquivo não é reportado.
+  - Custo no caminho quente não vigiado: um `File::create` num diretório não vigiado faz duas
+    caminhadas completas (falha no `security_path_mknod`, de novo no `security_file_open`). Um
+    marcador por thread "caminhado, sem casamento" no `PENDING` cortaria boa parte dos 18,6 %.
+  - Contagem de instruções do verificador: impressa pelo `load_fs` (kernel 5.16+) a partir da
+    rodada t11b3-10; a poda em 5.15 segue não provada.
   - Mais de 64 chaves de vigilância: o insert falha e todo o backend fs cai para audit (poderia
     limitar e ignorar o excesso).
-  - O caminho de attach opcional (`security_file_truncate` ausente antes do kernel 6.2) não é
-    exercitado nos runners (ambos >= 6.2); só teste unitário.
+  - O caminho de attach opcional (`security_file_truncate` ausente antes do kernel 6.2, o único
+    ponto opcional; todos os tracepoints de syscall passaram a ser obrigatórios na revisão final) não
+    é exercitado nos runners (ambos >= 6.2); só teste unitário. Quando pulado, aparece em
+    `last_error` e num `warn!`.
   - O piso de kernel 5.15 segue raciocinado, não executado.
   - Flakes da suíte real_linux observados e não corrigidos: `corrupted_object_falls_back_to_audit` (1
     ocorrência) e `free_port()` entregando a mesma porta duas vezes numa stack (1 ocorrência).
@@ -172,7 +190,8 @@ revisão final independente → merge → push.
     `/proc/*/fd` ao processar o pacote, mas os sockets do `curl` e do systemd-resolved fecham em ms;
     com a thread DNS atrasada, rajadas inteiras ficam sem processo). O código DNS não mudou na
     11b-3; a carga extra do agente pode ampliar a corrida (não provado). A 11b-4 (uprobe de DNS)
-    captura o pid no kernel na hora da consulta e elimina a corrida.
+    captura o pid no kernel na hora da consulta e elimina a corrida. **Antes de começar a 11b-4**,
+    fazer um A/B do teste DNS com o sensor fs desligado (aceite condicional da revisão final).
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)

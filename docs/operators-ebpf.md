@@ -179,8 +179,12 @@ kernel command line): `security_path_mknod` and `security_path_mkdir` (CREATE),
 `security_path_unlink` and `security_path_rmdir` (DELETE), `security_path_rename` (RENAME),
 `security_file_open` with write intent (WRITE), and `security_path_truncate` and
 `security_file_truncate` (WRITE). `security_file_truncate` exists only on kernels 6.2 and later;
-it is an optional attach point, so its absence is skipped and listed in the load report. A missing
-required attach point fails the load.
+it is the only optional attach point: its absence is skipped, logged as a warning and named in
+the sensor's `last_error` (health stays `HEALTHY`). Every other kprobe and every syscall
+tracepoint (`open`, `openat`, `openat2`, `creat`, `truncate`, `ftruncate`, `mknod`, `mknodat`,
+`mkdir`, `mkdirat`, `unlink`, `unlinkat`, `rmdir`, `rename`, `renameat`, `renameat2`, enter and
+exit) is required: a missing one fails the load and the sensor falls back to audit, so the backend
+never runs `HEALTHY` while blind to, say, glibc's direct `unlink`/`mkdir`/`rename`/`rmdir` calls.
 
 Only successful operations are reported. The hook stages the operation and a per-syscall exit
 tracepoint emits it when the return value is not negative, so a failed `unlink` or `rmdir`
@@ -265,6 +269,21 @@ under `/tmp`, `/var/tmp` or another watched tree, remove that tree from `fs_watc
   truncated tail with a `…/` prefix, as is a path of more than 32 components, so it can never be
   mistaken for an absolute path; the walk
   keeps checking ancestors against the watch list after the buffer is full.
+- **Chroot and detached mounts.** The walk does not stop at the acting task's root: past it
+  (`chroot`, `pivot_root`) it keeps crossing mounts and checking ancestors against the watch
+  list, without writing more names, so a task chrooted into a subdirectory of a watched tree is
+  still seen. Its path is the one the task sees (a chroot into `/etc/cron.d` writing `/x` reports
+  `/x`, as `d_path()` would). An operand outside the task's root (a detached mount from
+  `open_tree(OPEN_TREE_CLONE)` or a lazy `umount -l`, or a directory fd opened before a chroot) is
+  reported with a truncated `…/` tail, never as an absolute path.
+- **Known evasion: bind mounts of a watched subtree.** `mount --bind /etc/cron.d /mnt/x` with only
+  `/etc` watched: a write through `/mnt/x` is **not matched**. At the bind mount's root the walk
+  continues at its mountpoint (`/mnt/x`) and never visits `/etc`. A bind mount of the watched
+  directory itself is matched (its root is the watched inode). Watch the subdirectory too if bind
+  mounts of it are a concern.
+- `O_TMPFILE`: an anonymous file opened with write intent in a watched dir is reported as a WRITE
+  whose path ends in `//` (`/watched/dir//`: the kernel names the unlinked dentry `/`); a later
+  `linkat` that gives it a name is **not reported** (hard links are not covered). Known gap.
 - A `rename` within one watched dir is one RENAME. A rename *into* a watched dir from an
   unwatched one is also reported (the destination matched), with the true source path.
   `RENAME_EXCHANGE` is one RENAME.
@@ -285,7 +304,10 @@ under `/tmp`, `/var/tmp` or another watched tree, remove that tree from `fs_watc
   staged entry stays until that thread's next covered syscall or exit.
 - A watched directory that is removed and recreated after start is not re-resolved.
 - `exe_path` is the `/proc/<pid>/exe` target (identity-checked, `comm` fallback) when the actor is
-  still alive. Otherwise the agent looks the kernel's executable identity (`st_dev`, `st_ino`) up
+  still alive. A link tied only by `comm` loses to an index hit for the kernel's identity, and is
+  dropped (`""`) when its path is a different inode on the identity's own device (the actor has
+  exec'd another binary with the same comm since, e.g. `/tmp/bash` → `/usr/bin/bash`); on btrfs and
+  overlayfs that check cannot be made and the `comm`-tied link is kept. Otherwise the agent looks the kernel's executable identity (`st_dev`, `st_ino`) up
   in an index of the standard binary directories (`/usr/local/sbin`, `/usr/local/bin`,
   `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`; canonicalised, first wins). Every hit is re-verified
   against the identity, the index is rescanned at most once per 60 s, and its capacity is 65 536.

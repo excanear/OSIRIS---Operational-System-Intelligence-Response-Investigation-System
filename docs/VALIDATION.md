@@ -325,8 +325,8 @@ Scenarios that passed on both runners (run 40785524078):
 - (g) an operation in a watched tmpfs `/dev/shm/osiris-<n>` (a mount crossing) reports a path
   starting `/dev/shm/osiris-<n>/`.
 - (h) with `fs.bpf.o` missing from the object dir, `filesystem` is `DEGRADED` with
-  `audit_fallback` and a write still arrives with source `AUDIT`, while the other sensors are
-  unaffected.
+  `audit_fallback` and a write still arrives with source `AUDIT`, while the process sensor stays
+  `HEALTHY` on eBPF (the network sensor is not checked by this scenario).
 - (i) the health assertion below.
 - The existing `file_lifecycle_is_observed` and `web_root_drop_raises_an_alert` now run on the
   eBPF backend.
@@ -341,7 +341,8 @@ in `PERFORMANCE.md`.
 
 ### Optional attach points are not exercised on the runners
 
-`security_file_truncate` exists only on kernels 6.2 and later and is an optional attach point. Both
+`security_file_truncate` exists only on kernels 6.2 and later and is the only optional attach point
+(every syscall tracepoint is required since the final review). Both
 runner kernels are 6.2 or later, so the skip-and-list path never runs there. It is covered by a
 loader unit test with a spec that names a nonexistent symbol as optional, not by a real kernel
 that lacks the symbol.
@@ -354,7 +355,7 @@ the events to be stored first, `/status` shows `events_emitted_total` > 0 and a 
 `last_event_at` for both `process_exec` and `filesystem` (runs 40785524078 onward; the bench run
 shows `process_exec` at 36 and 38 events and `filesystem` at 0 then 20 000). The evidence is
 ordering after storage plus eventual consistency, not an instantaneous read: the check polls until
-the check polls until counts appear, and `process_exec` counts from agent start. Debt closed.
+counts appear, and `process_exec` counts from agent start. Debt closed.
 
 ### Observed flakes (not fixed this phase)
 

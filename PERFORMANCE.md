@@ -128,12 +128,16 @@ produced no events.
 > delete on syscall enter and a lookup on exit, and every create, unlink and rename walks the
 > ancestors to test them against the watch list. This attribution is not isolated by the bench.
 > One confound: the unwatched loop ran after the watched loop, while the agent may still have been
-> draining about 10 000 watched-dir events, which could inflate the unwatched figure. The loop is
+> draining about 20 000 watched-dir events (a CREATE and a DELETE per watched iteration), which
+> could inflate the unwatched figure. The loop is
 > a worst case (nothing else happens in it, so the hook cost is the whole difference). The absolute
 > cost is about 5 us per iteration, not per byte, so file-metadata-heavy workloads (unpacking
 > archives, builds, many small files) see it most. The watched-dir overhead versus no agent is
 > about 11.5 us per iteration (+42.4 %); that is about 6.4 us more than the unwatched dir, which is
-> the added cost of building and sending the events.
+> the added cost of building and sending the events. Known cost driver and future optimisation:
+> a create in an unwatched dir walks the ancestors twice (`security_path_mknod` misses, then
+> `security_file_open` walks again for the write-open); a per-thread "walked, no match" marker
+> would skip the second walk.
 
 ### Before/after F1 (WSL, ingest at 1 000 eps target, 30 s)
 
