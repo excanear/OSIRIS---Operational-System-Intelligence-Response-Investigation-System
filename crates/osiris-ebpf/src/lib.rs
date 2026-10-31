@@ -2,7 +2,7 @@
 //!
 //! OS-neutral pieces: the `#[repr(C)]` record ABIs shared with the C BPF
 //! programs (`record` for process, `net_record` for TCP, `fs_record` for
-//! filesystem create/write/delete/rename), BPF object integrity checking
+//! filesystem create/write/delete/rename, `dns_record` for UDP port-53 sends), BPF object integrity checking
 //! (`integrity`), the kernel exe identity and `exe_path` resolver (`exe`),
 //! the capability probe's parsing and kernel-symbol check (`probe`), the
 //! object specs (tracepoint and kprobe attach points; the fs object has
@@ -13,6 +13,7 @@
 //! fails. It must not depend on `osiris-sensor-api`.
 
 pub mod clock;
+pub mod dns_record;
 pub mod exe;
 pub mod fs_record;
 pub mod integrity;
@@ -23,6 +24,7 @@ pub mod reader;
 pub mod record;
 
 pub use clock::boot_wall_offset_ns;
+pub use dns_record::{decode_dns, DnsRecord, DnsSendEvent, DNS_SCHEMA_VERSION, KIND_DNS_SEND};
 pub use exe::{dev_from_user, dev_to_user, resolve_exe, ExeIdentity};
 pub use fs_record::{
     decode_fs, FsEvent, FsInode, FsKind, FsRecord, FS_SCHEMA_VERSION, KIND_FS_CREATE,
@@ -31,7 +33,8 @@ pub use fs_record::{
 pub use integrity::{verify_object, IntegrityError};
 pub use loader::{
     object_schema_version, sidecar_name, AttachKind, AttachPoint, DropCounter, EbpfSettings,
-    LoadError, LoadedObject, ObjectSpec, FS_OBJECT, NET_OBJECT, PROCESS_OBJECT,
+    LoadError, LoadedObject, ObjectSpec, DNS_OBJECT, DNS_REQUIRED_KPROBES, FS_OBJECT, NET_OBJECT,
+    PROCESS_OBJECT,
 };
 pub use net_record::{
     decode_net, NetEvent, NetKind, NetRecord, AF_INET, AF_INET6, DIR_INBOUND, DIR_OUTBOUND,

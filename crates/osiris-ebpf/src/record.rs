@@ -105,7 +105,7 @@ pub enum DecodeError {
     UnknownKind(u32),
     #[error("record truncated for kind {kind}: {got} < {need} bytes")]
     Truncated { kind: u32, got: usize, need: usize },
-    /// A net record whose address family is neither `AF_INET` nor `AF_INET6`.
+    /// A net or dns record whose address family is neither `AF_INET` nor `AF_INET6`.
     #[error("unknown address family {0}")]
     UnknownFamily(u16),
     /// A net record whose direction is neither outbound nor inbound.

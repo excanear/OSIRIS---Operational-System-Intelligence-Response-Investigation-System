@@ -8,10 +8,11 @@ use std::mem::{offset_of, size_of};
 use std::path::Path;
 
 use osiris_ebpf::{
-    ExecRecord, ExitRecord, FsRecord, NetRecord, AF_INET, AF_INET6, ARGS_MAX, COMM_LEN,
-    DIR_INBOUND, DIR_OUTBOUND, FILENAME_MAX, FS_SCHEMA_VERSION, KIND_EXEC, KIND_EXIT,
-    KIND_FS_CREATE, KIND_FS_DELETE, KIND_FS_RENAME, KIND_FS_WRITE, KIND_NET_ACCEPT, KIND_NET_CLOSE,
-    KIND_NET_CONNECT, NET_SCHEMA_VERSION, PATH_CAP, PROCESS_SCHEMA_VERSION,
+    DnsRecord, ExecRecord, ExitRecord, FsRecord, NetRecord, AF_INET, AF_INET6, ARGS_MAX, COMM_LEN,
+    DIR_INBOUND, DIR_OUTBOUND, DNS_SCHEMA_VERSION, FILENAME_MAX, FS_SCHEMA_VERSION, KIND_DNS_SEND,
+    KIND_EXEC, KIND_EXIT, KIND_FS_CREATE, KIND_FS_DELETE, KIND_FS_RENAME, KIND_FS_WRITE,
+    KIND_NET_ACCEPT, KIND_NET_CLOSE, KIND_NET_CONNECT, NET_SCHEMA_VERSION, PATH_CAP,
+    PROCESS_SCHEMA_VERSION,
 };
 
 fn header() -> String {
@@ -190,4 +191,52 @@ fn fs_c_header_matches_rust_constants() {
     assert!(h.contains("#define KIND_FS_RENAME 9"));
     assert!(h.contains("#define PATH_CAP 1024"));
     assert!(h.contains("_Static_assert(sizeof(struct fs_record) == 2144,"));
+}
+
+fn dns_header() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bpf/dns.h");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+#[test]
+fn dns_c_header_matches_rust_constants() {
+    let h = dns_header();
+    let mut expected = vec![
+        format!("#define SCHEMA_VERSION {DNS_SCHEMA_VERSION}"),
+        format!("#define KIND_DNS_SEND {KIND_DNS_SEND}"),
+        format!("#define AF_INET {AF_INET}"),
+        format!("#define AF_INET6 {AF_INET6}"),
+        format!("#define COMM_LEN {COMM_LEN}"),
+        format!(
+            "_Static_assert(sizeof(struct dns_record) == {},",
+            size_of::<DnsRecord>()
+        ),
+    ];
+    let offsets = [
+        ("pid", offset_of!(DnsRecord, pid)),
+        ("tid", offset_of!(DnsRecord, tid)),
+        ("uid", offset_of!(DnsRecord, uid)),
+        ("family", offset_of!(DnsRecord, family)),
+        ("lport", offset_of!(DnsRecord, lport)),
+        ("ktime_ns", offset_of!(DnsRecord, ktime_ns)),
+        ("comm", offset_of!(DnsRecord, comm)),
+        ("exe_dev", offset_of!(DnsRecord, exe_dev)),
+        ("netns_ino", offset_of!(DnsRecord, netns_ino)),
+        ("exe_ino", offset_of!(DnsRecord, exe_ino)),
+        ("rport", offset_of!(DnsRecord, rport)),
+        ("laddr", offset_of!(DnsRecord, laddr)),
+        ("raddr", offset_of!(DnsRecord, raddr)),
+    ];
+    for (field, off) in offsets {
+        expected.push(format!(
+            "_Static_assert(__builtin_offsetof(struct dns_record, {field}) == {off},"
+        ));
+    }
+    for line in &expected {
+        assert!(h.contains(line.as_str()), "bpf/dns.h lacks `{line}`");
+    }
+    // Pinned values from the brief, independent of the Rust constants.
+    assert!(h.contains("#define SCHEMA_VERSION 1"));
+    assert!(h.contains("#define KIND_DNS_SEND 10"));
+    assert!(h.contains("_Static_assert(sizeof(struct dns_record) == 104,"));
 }

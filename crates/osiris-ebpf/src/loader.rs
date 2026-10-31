@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::dns_record::DNS_SCHEMA_VERSION;
 use crate::fs_record::FS_SCHEMA_VERSION;
 use crate::integrity::{verify_object, IntegrityError};
 use crate::net_record::NET_SCHEMA_VERSION;
@@ -189,6 +190,19 @@ pub const FS_OBJECT: ObjectSpec = ObjectSpec {
     object_file: "fs.bpf.o",
     expected_schema: FS_SCHEMA_VERSION,
     attach: &FS_ATTACH,
+};
+
+/// Kernel functions the DNS object probes; both are required.
+pub const DNS_REQUIRED_KPROBES: &[&str] = &["udp_sendmsg", "udpv6_sendmsg"];
+
+/// The DNS (UDP port-53 send) object: one kprobe per address family.
+pub const DNS_OBJECT: ObjectSpec = ObjectSpec {
+    object_file: "dns.bpf.o",
+    expected_schema: DNS_SCHEMA_VERSION,
+    attach: &[
+        kprobe("kp_udp_sendmsg", "udp_sendmsg", true),
+        kprobe("kp_udpv6_sendmsg", "udpv6_sendmsg", true),
+    ],
 };
 
 /// Choose which of `points` to attach. `exists` says whether a point's
@@ -828,6 +842,30 @@ mod tests {
                 ("handle_accept_exit", "syscalls", "sys_exit_accept"),
             ]
         );
+        assert_eq!(FS_OBJECT.attach.len(), FS_ATTACH_LEN);
+        assert_eq!(FS_OBJECT.object_file, "fs.bpf.o");
+        assert_eq!(NET_OBJECT.object_file, "net.bpf.o");
+        assert_eq!(PROCESS_OBJECT.object_file, "process.bpf.o");
+    }
+
+    #[test]
+    fn dns_object_spec_names() {
+        assert_eq!(DNS_OBJECT.object_file, "dns.bpf.o");
+        assert_eq!(DNS_OBJECT.expected_schema, 1);
+        let got: Vec<(&str, String, bool)> = DNS_OBJECT
+            .attach
+            .iter()
+            .map(|a| (a.program, a.target(), a.required))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("kp_udp_sendmsg", "udp_sendmsg".to_string(), true),
+                ("kp_udpv6_sendmsg", "udpv6_sendmsg".to_string(), true),
+            ]
+        );
+        let syms: Vec<String> = DNS_OBJECT.attach.iter().map(AttachPoint::target).collect();
+        assert_eq!(syms, DNS_REQUIRED_KPROBES);
     }
 
     #[test]
