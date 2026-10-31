@@ -215,6 +215,24 @@ impl Tracker {
         Some(p.close(CloseKind::Response, ips, ttl))
     }
 
+    /// Close every pending transaction now, oldest first, as a timeout
+    /// (shutdown). The timeout counter is not bumped: none actually timed out.
+    pub fn drain_all(&mut self) -> Vec<Closed> {
+        let order = std::mem::take(&mut self.order);
+        let mut out: Vec<Closed> = order
+            .into_values()
+            .filter_map(|key| self.pending.remove(&key))
+            .map(|p| p.close(CloseKind::Timeout, Vec::new(), None))
+            .collect();
+        // `order` and `pending` always agree; this is only defensive.
+        out.extend(
+            self.pending
+                .drain()
+                .map(|(_, p)| p.close(CloseKind::Timeout, Vec::new(), None)),
+        );
+        out
+    }
+
     /// Close every pending transaction whose deadline has passed as a
     /// timeout (empty ips, no ttl). Deadlines are monotonic in insertion
     /// order, so scanning stops at the first entry not yet due.

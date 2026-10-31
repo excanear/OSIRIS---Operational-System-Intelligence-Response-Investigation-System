@@ -243,7 +243,7 @@ impl Sensor for DnsSensor {
 mod linux {
     use super::*;
     use crate::capture::{Capture, Recv, RECV_BUF};
-    use crate::engine::Engine;
+    use crate::engine::{wall_ns, Engine};
     use osiris_sensor_api::RawEvent;
     use tokio::sync::mpsc::Sender;
 
@@ -261,13 +261,6 @@ mod linux {
         SocketError(i32),
     }
 
-    fn wall_ns() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
-    }
-
     impl Worker {
         /// Blocking capture loop with reopen-on-error; returns on
         /// cancellation or when the event receiver is gone.
@@ -276,6 +269,7 @@ mod linux {
             let mut backoff = BACKOFF_INITIAL;
             let mut buf = vec![0u8; RECV_BUF];
             let mut window = DegradeWindow::default();
+            let mut channel_closed = false;
             while !self.cancellation.is_cancelled() {
                 let capture = match next.take() {
                     Some(c) => Ok(c),
@@ -283,7 +277,11 @@ mod linux {
                 };
                 let error = match capture {
                     Ok(cap) => match self.capture(&cap, &mut buf, &mut window, &mut backoff) {
-                        Exit::Cancelled | Exit::ChannelClosed => break,
+                        Exit::Cancelled => break,
+                        Exit::ChannelClosed => {
+                            channel_closed = true;
+                            break;
+                        }
                         Exit::SocketError(errno) => format!("AF_PACKET recv failed: errno {errno}"),
                     },
                     Err(e) => e.to_string(),
@@ -297,6 +295,15 @@ mod linux {
                     break;
                 }
                 backoff = (backoff * 2).min(BACKOFF_MAX);
+            }
+            if !channel_closed {
+                // Cancelled: flush held and pending transactions once.
+                // Best effort: stop at the first failed send.
+                for event in self.engine.drain(Instant::now()) {
+                    if !self.send(event) {
+                        break;
+                    }
+                }
             }
             lock_health(&self.health).state = SensorState::Stopped;
         }

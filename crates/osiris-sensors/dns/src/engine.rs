@@ -34,6 +34,8 @@ pub const MAX_PENDING: usize = 4096;
 /// How long a response that closed an unattributed transaction waits for a
 /// late kernel record (GC 9).
 pub const ATTRIBUTION_GRACE: Duration = Duration::from_millis(250);
+/// Minimum spacing between expiry scans of the kernel send table.
+pub const SEND_EXPIRE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Current wall-clock time in ns since the Unix epoch.
 pub fn wall_ns() -> u64 {
@@ -97,6 +99,8 @@ pub struct Engine {
     tracker: Tracker,
     held: VecDeque<Held>,
     held_capacity: usize,
+    /// When old kernel sends were last expired.
+    last_expire: Option<Instant>,
     packets: u64,
     parse_errors: u64,
     direction_mismatches: u64,
@@ -129,6 +133,7 @@ impl Engine {
             tracker: Tracker::new(timeout, capacity),
             held: VecDeque::new(),
             held_capacity: capacity.max(1),
+            last_expire: None,
             packets: 0,
             parse_errors: 0,
             direction_mismatches: 0,
@@ -394,8 +399,41 @@ impl Engine {
                 }
             }
         }
-        if let AttributionMode::Kernel(table) = &self.mode {
-            lock_table(table).expire(wall_ns());
+        self.expire_sends(now);
+        self.wrap(raw)
+    }
+
+    /// Expires old kernel sends at most once per [`SEND_EXPIRE_INTERVAL`]:
+    /// the expiry is a full scan under the lock the reader thread shares.
+    fn expire_sends(&mut self, now: Instant) {
+        let AttributionMode::Kernel(table) = &self.mode else {
+            return;
+        };
+        let due = self
+            .last_expire
+            .is_none_or(|t| now.saturating_duration_since(t) >= SEND_EXPIRE_INTERVAL);
+        if !due {
+            return;
+        }
+        let wall = wall_ns();
+        lock_table(table).expire(wall);
+        self.last_expire = Some(now);
+    }
+
+    /// Shutdown flush: closes every pending transaction (as a timeout,
+    /// with one final attribution attempt) and every held response (one
+    /// final re-check), so nothing is lost on cancel. Each is emitted once.
+    pub fn drain(&mut self, now: Instant) -> Vec<RawEvent> {
+        let mut raw = Vec::new();
+        for closed in self.tracker.drain_all() {
+            self.close(closed, now, &mut raw);
+        }
+        for mut h in std::mem::take(&mut self.held) {
+            match self.resolve(&h.pending, h.client, now) {
+                Resolved::Done(a) => apply(&mut h.event, a),
+                Resolved::Miss => self.unattributed += 1,
+            }
+            raw.push(h.event);
         }
         self.wrap(raw)
     }
@@ -947,6 +985,52 @@ mod tests {
         assert_eq!(lock_table(&table).len(), 1);
         e.tick(Instant::now());
         assert!(lock_table(&table).is_empty());
+    }
+
+    #[test]
+    fn drain_emits_held_and_pending_once() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        // Transaction 1: response held (no record). Transaction 2: query
+        // still pending, whose record arrives before the drain.
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
+        e.on_packet(&kq(2), true, base + 3 * MS, now);
+        insert_send(&table, base + 2 * MS);
+        let evs = e.drain(now + Duration::from_millis(10));
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        let pids: Vec<Option<u32>> = evs
+            .iter()
+            .map(|ev| match ev {
+                RawEvent::Dns(d) => d.pid,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(
+            pids.contains(&None) && pids.contains(&Some(777)),
+            "{pids:?}"
+        );
+        let m = e.metrics();
+        assert_eq!((m.emitted, m.unattributed, m.attributed_kernel), (2, 1, 1));
+        assert!(e.tick(now + Duration::from_secs(10)).is_empty());
+        assert!(e.drain(now + Duration::from_secs(10)).is_empty());
+    }
+
+    #[test]
+    fn expire_is_throttled() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let old = || wall_ns().saturating_sub(11_000 * MS);
+        let now = Instant::now();
+        insert_send(&table, old());
+        e.tick(now);
+        assert!(lock_table(&table).is_empty());
+        insert_send(&table, old());
+        e.tick(now + Duration::from_millis(100));
+        assert_eq!(lock_table(&table).len(), 1);
+        e.tick(now + Duration::from_millis(1000));
+        assert!(lock_table(&table).is_empty());
+        assert_eq!(lock_table(&table).counters().expired, 2);
     }
 
     #[test]
