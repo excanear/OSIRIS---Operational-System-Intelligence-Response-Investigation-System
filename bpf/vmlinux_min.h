@@ -49,6 +49,8 @@ typedef unsigned short umode_t;
 typedef unsigned int fmode_t;
 /* Kernel-internal dev_t: MAJOR = dev >> 20, MINOR = dev & 0xfffff. */
 typedef __u32 dev_t;
+/* Clang's builtin; no <stddef.h> needed (kprobe prototypes use size_t). */
+typedef __SIZE_TYPE__ size_t;
 
 /* include/linux/types.h; the kernel's BTF has the same anonymous struct. */
 typedef struct {
@@ -167,6 +169,26 @@ struct in6_addr {
 	} in6_u;
 } __attribute__((preserve_access_index));
 
+/* include/linux/ns_common.h: inum is the /proc/<pid>/ns/<type> inode. */
+struct ns_common {
+	unsigned int inum;
+} __attribute__((preserve_access_index));
+
+/* include/net/net_namespace.h */
+struct net {
+	struct ns_common ns;
+} __attribute__((preserve_access_index));
+
+/*
+ * include/net/net_namespace.h: an anonymous struct behind a typedef, as in
+ * the kernel's BTF (atomic_t above is matched the same way). `net` is an
+ * __rcu pointer and exists only with CONFIG_NET_NS (set on every distro
+ * kernel the agent targets).
+ */
+typedef struct {
+	struct net *net;
+} __attribute__((preserve_access_index)) possible_net_t;
+
 /*
  * include/net/sock.h. In the kernel skc_daddr/skc_rcv_saddr and
  * skc_dport/skc_num sit in anonymous structs inside unions; CO-RE matching
@@ -184,6 +206,8 @@ struct sock_common {
 	unsigned char skc_state;
 	struct in6_addr skc_v6_daddr;
 	struct in6_addr skc_v6_rcv_saddr;
+	/* The socket's network namespace. */
+	possible_net_t skc_net;
 } __attribute__((preserve_access_index));
 
 struct socket;
@@ -193,6 +217,36 @@ struct sock {
 	/* A plain u16 since Linux 5.6 (an 8-bit bitfield before). */
 	u16 sk_protocol;
 	struct socket *sk_socket;
+} __attribute__((preserve_access_index));
+
+/*
+ * include/linux/socket.h. In udp_sendmsg()/udpv6_sendmsg() msg_name points
+ * at kernel memory (the syscall's sockaddr_storage copy, or the stack
+ * sockaddr_in udpv6_sendmsg builds for an IPv4-mapped destination).
+ */
+struct msghdr {
+	void *msg_name;
+	int msg_namelen;
+} __attribute__((preserve_access_index));
+
+/* include/uapi/linux/in.h */
+struct in_addr {
+	__be32 s_addr;
+} __attribute__((preserve_access_index));
+
+struct sockaddr_in {
+	unsigned short sin_family;
+	__be16 sin_port;
+	struct in_addr sin_addr;
+} __attribute__((preserve_access_index));
+
+/* include/uapi/linux/in6.h */
+struct sockaddr_in6 {
+	unsigned short sin6_family;
+	__be16 sin6_port;
+	__be32 sin6_flowinfo;
+	struct in6_addr sin6_addr;
+	__u32 sin6_scope_id;
 } __attribute__((preserve_access_index));
 
 /* include/linux/net.h */
