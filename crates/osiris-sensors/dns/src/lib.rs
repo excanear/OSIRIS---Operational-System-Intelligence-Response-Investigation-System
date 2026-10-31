@@ -4,6 +4,7 @@ pub mod attribution;
 pub mod bpf;
 #[cfg(target_os = "linux")]
 mod capture;
+pub mod ebpf_backend;
 pub mod engine;
 pub mod frame;
 pub mod proc_udp;

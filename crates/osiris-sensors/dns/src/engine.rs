@@ -445,7 +445,7 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::send_table::{KernelSend, SendTable};
     use std::net::{Ipv6Addr, SocketAddr};
@@ -521,7 +521,7 @@ mod tests {
         p
     }
 
-    fn only_dns(mut evs: Vec<RawEvent>) -> DnsEventRaw {
+    pub(crate) fn only_dns(mut evs: Vec<RawEvent>) -> DnsEventRaw {
         assert_eq!(evs.len(), 1, "{evs:?}");
         match evs.remove(0) {
             RawEvent::Dns(d) => d,
@@ -764,7 +764,7 @@ mod tests {
         dir
     }
 
-    fn kernel_engine(with_row: bool) -> (Engine, SharedSendTable, tempfile::TempDir) {
+    pub(crate) fn kernel_engine(with_row: bool) -> (Engine, SharedSendTable, tempfile::TempDir) {
         let dir = proc_fixture(with_row);
         let table: SharedSendTable = Arc::new(Mutex::new(SendTable::new()));
         let e = Engine::new(
@@ -802,7 +802,7 @@ mod tests {
         });
     }
 
-    fn kq(id: u16) -> Vec<u8> {
+    pub(crate) fn kq(id: u16) -> Vec<u8> {
         v4(
             CLIENT,
             SERVER,
@@ -810,7 +810,7 @@ mod tests {
         )
     }
 
-    fn kr(id: u16) -> Vec<u8> {
+    pub(crate) fn kr(id: u16) -> Vec<u8> {
         v4(
             SERVER,
             CLIENT,

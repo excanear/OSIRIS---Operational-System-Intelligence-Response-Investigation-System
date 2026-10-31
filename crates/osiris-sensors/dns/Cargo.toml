@@ -7,8 +7,10 @@ edition.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+tracing = { workspace = true }
 osiris-sensor-api = { path = "../../osiris-sensor-api" }
 osiris-sensors-net = { path = "../net" }
+osiris-ebpf = { path = "../../osiris-ebpf" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

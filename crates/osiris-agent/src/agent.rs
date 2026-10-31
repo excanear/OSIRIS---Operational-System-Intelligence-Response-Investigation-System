@@ -95,7 +95,7 @@ pub enum SensorChange {
     Failed(String),
 }
 
-/// The eBPF settings shared by the process and network sensors; `None` without an `ebpf` key.
+/// The eBPF settings shared by the process, network, filesystem and DNS sensors; `None` without an `ebpf` key.
 fn ebpf_settings(config: &AgentConfig) -> Option<EbpfSettings> {
     config.ebpf.as_ref().map(|c| EbpfSettings {
         object_dir: c.object_dir.clone(),
@@ -144,16 +144,23 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
         "container" => (!config.container_cgroup_roots.is_empty()).then(|| {
             Box::new(ContainerSensor::new(config.container_cgroup_roots.clone())) as Box<dyn Sensor>
         }),
-        // Reuses `config.proc_root` (same /proc root as the resolver) for /proc/net/udp attribution.
-        "dns" => config.dns_capture.as_ref().map(|c| {
-            let proc_root = config.proc_root.as_deref().unwrap_or("/proc");
-            Box::new(DnsSensor::new(
-                PathBuf::from(proc_root),
-                c.interface.clone(),
-            )) as Box<dyn Sensor>
-        }),
+        "dns" => build_dns_sensor(config).map(|s| Box::new(s) as Box<dyn Sensor>),
         _ => None,
     }
+}
+
+/// The DNS sensor when `dns_capture` is set. Reuses `config.proc_root`
+/// (same /proc root as the resolver) for /proc attribution and exe
+/// resolution; kernel attribution whenever `ebpf` is set too.
+fn build_dns_sensor(config: &AgentConfig) -> Option<DnsSensor> {
+    config.dns_capture.as_ref().map(|c| {
+        let proc_root = config.proc_root.as_deref().unwrap_or("/proc");
+        DnsSensor::new(
+            PathBuf::from(proc_root),
+            c.interface.clone(),
+            ebpf_settings(config),
+        )
+    })
 }
 
 /// Capability check, initialize and start; a sensor that cannot run is
@@ -696,6 +703,25 @@ pub(crate) mod tests {
         config.dns_capture = Some(crate::config::DnsCaptureConfig { interface: None });
         let sensor = build_sensor(&config, "dns").expect("dns sensor built");
         assert_eq!(sensor.name(), "dns");
+    }
+
+    #[test]
+    fn dns_sensor_gets_ebpf_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir);
+        config.dns_capture = Some(crate::config::DnsCaptureConfig { interface: None });
+        config.ebpf = Some(crate::config::EbpfConfig {
+            object_dir: dir.path().to_path_buf(),
+        });
+        let dns = build_dns_sensor(&config).expect("dns sensor built");
+        let settings = dns.ebpf_settings().expect("dns sensor gets ebpf settings");
+        assert_eq!(settings.object_dir, dir.path());
+        assert_eq!(settings.self_tgid, std::process::id());
+        let sensor = build_sensor(&config, "dns").expect("dns sensor built");
+        assert_eq!(sensor.name(), "dns");
+        // Without dns_capture the ebpf key alone builds no DNS sensor.
+        config.dns_capture = None;
+        assert!(build_sensor(&config, "dns").is_none());
     }
 
     #[tokio::test]
