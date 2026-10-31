@@ -113,6 +113,12 @@ fn build_sensor(config: &AgentConfig, name: &str) -> Option<Box<dyn Sensor>> {
                 .then(|| Box::new(ProcessExecSensor::new(audit, ebpf)) as Box<dyn Sensor>)
         }
         "filesystem" => {
+            // TEMPORARY A/B (real-linux/t11b4-ab only): disable the fs sensor.
+            if std::env::var_os("OSIRIS_AB_NO_FS").is_some() {
+                let _ =
+                    std::fs::write(format!("/tmp/osiris-ab-fs-off-{}", std::process::id()), b"");
+                return None;
+            }
             let audit = config.fs_audit_log_path.clone().map(PathBuf::from);
             let ebpf = ebpf_settings(config);
             // An empty watch list makes the sensor fall back to DEFAULT_WATCH_PATHS.

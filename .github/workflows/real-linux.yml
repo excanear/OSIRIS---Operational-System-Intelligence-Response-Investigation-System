@@ -13,7 +13,7 @@ jobs:
   real-linux:
     name: real-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +49,7 @@ jobs:
       - name: Run the real-Linux suite as root
         id: suite
         # Build ~5 min + suite ~2 min; a hang fails here, not at the job cap.
-        timeout-minutes: 25
+        timeout-minutes: 80
         # Root needs the runner's toolchain: keep PATH and cargo/rustup homes.
         # TMPDIR makes the harness's kept stack dirs findable for the artifact.
         # --nocapture keeps the eBPF scenarios' `osiris-ebpf:` status lines.
@@ -59,7 +59,7 @@ jobs:
           sudo -E env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
             "TMPDIR=$RUNNER_TEMP/osiris-kept" CARGO_TARGET_DIR=/root/osiris-target \
             "OSIRIS_BPF_DIR=$OSIRIS_BPF_DIR" \
-            tools/real-linux/run.sh --nocapture 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
+            tools/real-linux/ab-loop.sh 15 "$RUNNER_TEMP/artifacts" 2>&1 | tee "$RUNNER_TEMP/real-linux-output.txt"
           exit "${PIPESTATUS[0]}"
       - name: Annotate suite failures
         # Annotations are public; job logs and artifacts need GitHub auth.
