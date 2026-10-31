@@ -3,20 +3,53 @@
 //! Composes frame decoding, DNS wire parsing, the transaction tracker and
 //! process attribution. The Linux capture loop owns I/O and calls
 //! [`Engine::on_packet`] per packet and [`Engine::tick`] periodically.
+//!
+//! Attribution has two modes. In [`AttributionMode::Procfs`] the query's
+//! owner is looked up in `/proc` when the query packet is seen (11a). In
+//! [`AttributionMode::Kernel`] the query packet is joined with the kernel's
+//! record of the send ([`SendTable`]) and `/proc` is never read. Packet and
+//! record race, so a miss at query time is retried when the transaction
+//! closes, and a response that still misses is held for
+//! [`ATTRIBUTION_GRACE`], re-checked on every tick, before it is emitted
+//! unattributed. [`Engine::latch_procfs`] switches to `/proc` for good.
 
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use osiris_sensor_api::{DnsEventRaw, RawEvent};
 
 use crate::attribution::Attributor;
 use crate::frame::{classify, decode_l3, Direction};
-use crate::tracker::{Attribution, Tracker, TrackerCounters, TxKey};
+use crate::send_table::{lock_table, SendKey, SharedSendTable};
+use crate::tracker::{
+    Attribution, CloseKind, Closed, PendingAttribution, Tracker, TrackerCounters, TxKey,
+};
 use crate::wire::parse_message;
 
 /// How long a query waits for its response before a timeout event.
 pub const TX_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum number of simultaneously pending transactions.
 pub const MAX_PENDING: usize = 4096;
+/// How long a response that closed an unattributed transaction waits for a
+/// late kernel record (GC 9).
+pub const ATTRIBUTION_GRACE: Duration = Duration::from_millis(250);
+
+/// Current wall-clock time in ns since the Unix epoch.
+pub fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Where query owners come from.
+pub enum AttributionMode {
+    /// Join packets with kernel-reported sends; never read `/proc`.
+    Kernel(SharedSendTable),
+    /// Look the owner up in `/proc` at query time.
+    Procfs,
+}
 
 /// Snapshot of engine counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,33 +59,86 @@ pub struct EngineMetrics {
     /// Packets whose QR bit contradicted the port-derived direction.
     pub direction_mismatches: u64,
     pub emitted: u64,
+    /// `attributed_kernel + attributed_procfs`.
     pub attributed: u64,
     pub unattributed: u64,
     pub tracker: TrackerCounters,
+    /// Transactions attributed from a kernel send record.
+    pub attributed_kernel: u64,
+    /// Transactions attributed by a `/proc` lookup.
+    pub attributed_procfs: u64,
+    /// Kernel attributions found only when the transaction closed.
+    pub attribution_late: u64,
+    /// Responses held waiting for a late kernel record (cumulative).
+    pub held: u64,
+    /// Packets without a kernel receive timestamp (processing time used).
+    pub timestamp_fallbacks: u64,
+}
+
+/// A closed, still-unattributed response waiting for its kernel record.
+struct Held {
+    event: DnsEventRaw,
+    client: SocketAddr,
+    pending: PendingAttribution,
+    deadline: Instant,
+}
+
+/// Outcome of retrying attribution for a closed transaction.
+enum Resolved {
+    /// Final attribution (counters already updated).
+    Done(Attribution),
+    /// Kernel mode, no record yet.
+    Miss,
 }
 
 pub struct Engine {
     attributor: Attributor,
+    mode: AttributionMode,
     tracker: Tracker,
+    held: VecDeque<Held>,
+    held_capacity: usize,
     packets: u64,
     parse_errors: u64,
     direction_mismatches: u64,
     emitted: u64,
-    attributed: u64,
+    attributed_kernel: u64,
+    attributed_procfs: u64,
+    attribution_late: u64,
     unattributed: u64,
+    held_total: u64,
+    timestamp_fallbacks: u64,
+}
+
+fn apply(event: &mut DnsEventRaw, a: Attribution) {
+    event.pid = a.pid;
+    event.uid = a.uid;
+    event.exe_path = a.exe_path;
+    event.comm = a.comm;
 }
 
 impl Engine {
-    pub fn new(attributor: Attributor, timeout: Duration, capacity: usize) -> Self {
+    pub fn new(
+        attributor: Attributor,
+        mode: AttributionMode,
+        timeout: Duration,
+        capacity: usize,
+    ) -> Self {
         Self {
             attributor,
+            mode,
             tracker: Tracker::new(timeout, capacity),
+            held: VecDeque::new(),
+            held_capacity: capacity.max(1),
             packets: 0,
             parse_errors: 0,
             direction_mismatches: 0,
             emitted: 0,
-            attributed: 0,
+            attributed_kernel: 0,
+            attributed_procfs: 0,
+            attribution_late: 0,
             unattributed: 0,
+            held_total: 0,
+            timestamp_fallbacks: 0,
         }
     }
 
@@ -62,10 +148,27 @@ impl Engine {
             parse_errors: self.parse_errors,
             direction_mismatches: self.direction_mismatches,
             emitted: self.emitted,
-            attributed: self.attributed,
+            attributed: self.attributed_kernel + self.attributed_procfs,
             unattributed: self.unattributed,
             tracker: self.tracker.counters(),
+            attributed_kernel: self.attributed_kernel,
+            attributed_procfs: self.attributed_procfs,
+            attribution_late: self.attribution_late,
+            held: self.held_total,
+            timestamp_fallbacks: self.timestamp_fallbacks,
         }
+    }
+
+    /// Counts a packet that carried no kernel receive timestamp.
+    pub fn record_timestamp_fallback(&mut self) {
+        self.timestamp_fallbacks += 1;
+    }
+
+    /// One-way switch to `/proc` attribution (GC 10/12): later queries are
+    /// looked up in `/proc`, and transactions still pending attribution get
+    /// a `/proc` lookup when they close (held ones on the next tick).
+    pub fn latch_procfs(&mut self) {
+        self.mode = AttributionMode::Procfs;
     }
 
     /// Process one raw L3 packet. Never panics on malformed input.
@@ -74,6 +177,9 @@ impl Engine {
     /// capture loop sets it from `sll_pkttype == PACKET_OUTGOING`, or when it
     /// arrived on the loopback interface). Queries from remote clients are
     /// never attributed: their source port says nothing about local sockets.
+    ///
+    /// `timestamp_ns` is the packet's wall-clock time: the kernel receive
+    /// timestamp when present, else the processing time.
     pub fn on_packet(
         &mut self,
         l3: &[u8],
@@ -112,20 +218,18 @@ impl Engine {
                     server: dg.dst.ip(),
                     id: msg.id,
                 };
-                let attribution = if local_origin {
-                    self.attributor.lookup(dg.src, now)
-                } else {
-                    Attribution::default()
-                };
-                if attribution.pid.is_some() {
-                    self.attributed += 1;
-                } else {
+                let (attribution, pending) = if !local_origin {
                     self.unattributed += 1;
-                }
-                raw.extend(
+                    (Attribution::default(), None)
+                } else {
+                    self.attribute_query(key, dg.dst, timestamp_ns, now)
+                };
+                if let Some(closed) =
                     self.tracker
-                        .on_query(key, &msg, attribution, timestamp_ns, now),
-                );
+                        .on_query(key, &msg, attribution, pending, timestamp_ns, now)
+                {
+                    self.close(closed, now, &mut raw);
+                }
             }
             Direction::Response => {
                 if !msg.is_response {
@@ -137,15 +241,162 @@ impl Engine {
                     server: dg.src.ip(),
                     id: msg.id,
                 };
-                raw.extend(self.tracker.on_response(key, &msg));
+                if let Some(closed) = self.tracker.on_response(key, &msg) {
+                    self.close(closed, now, &mut raw);
+                }
             }
         }
         self.wrap(raw)
     }
 
-    /// Emit timeouts for transactions whose deadline has passed.
+    /// Attribution of a local query packet at query time: the owner, plus
+    /// the kernel join still owed when the kernel record has not arrived.
+    fn attribute_query(
+        &mut self,
+        key: TxKey,
+        server: SocketAddr,
+        timestamp_ns: u64,
+        now: Instant,
+    ) -> (Attribution, Option<PendingAttribution>) {
+        let table = match &self.mode {
+            AttributionMode::Procfs => {
+                let a = self.attributor.lookup(key.client, now);
+                self.count_procfs(&a);
+                return (a, None);
+            }
+            AttributionMode::Kernel(table) => table,
+        };
+        let send_key = SendKey::new(key.client, server);
+        let laddr = key.client.ip();
+        // The lock is held only for the lookup itself.
+        let hit = lock_table(table).take(&send_key, laddr, timestamp_ns);
+        if self.tracker.contains(&key) {
+            // Retransmit: its own record (if any) was consumed above, and
+            // it may complete a transaction whose first record was lost.
+            // The tracker counts the duplicate and keeps the first packet.
+            if let Some(a) = hit {
+                if self.tracker.resolve_pending(&key, a) {
+                    self.attributed_kernel += 1;
+                }
+            }
+            return (Attribution::default(), None);
+        }
+        match hit {
+            Some(a) => {
+                self.attributed_kernel += 1;
+                (a, None)
+            }
+            None => (
+                Attribution::default(),
+                Some(PendingAttribution {
+                    key: send_key,
+                    laddr,
+                    packet_ts_ns: timestamp_ns,
+                }),
+            ),
+        }
+    }
+
+    fn count_procfs(&mut self, a: &Attribution) {
+        if a.pid.is_some() {
+            self.attributed_procfs += 1;
+        } else {
+            self.unattributed += 1;
+        }
+    }
+
+    /// Retries attribution for a transaction that closed pending it.
+    fn resolve(
+        &mut self,
+        pending: &PendingAttribution,
+        client: SocketAddr,
+        now: Instant,
+    ) -> Resolved {
+        match &self.mode {
+            AttributionMode::Kernel(table) => {
+                let hit = lock_table(table).take(&pending.key, pending.laddr, pending.packet_ts_ns);
+                match hit {
+                    Some(a) => {
+                        self.attributed_kernel += 1;
+                        self.attribution_late += 1;
+                        Resolved::Done(a)
+                    }
+                    None => Resolved::Miss,
+                }
+            }
+            AttributionMode::Procfs => {
+                let a = self.attributor.lookup(client, now);
+                self.count_procfs(&a);
+                Resolved::Done(a)
+            }
+        }
+    }
+
+    /// Finishes a closed transaction: emits it, or holds a response whose
+    /// kernel record has not arrived yet.
+    fn close(&mut self, closed: Closed, now: Instant, out: &mut Vec<DnsEventRaw>) {
+        let Closed {
+            mut event,
+            kind,
+            client,
+            pending,
+        } = closed;
+        let Some(pending) = pending else {
+            out.push(event);
+            return;
+        };
+        match self.resolve(&pending, client, now) {
+            Resolved::Done(a) => {
+                apply(&mut event, a);
+                out.push(event);
+            }
+            Resolved::Miss if kind == CloseKind::Response => {
+                if self.held.len() >= self.held_capacity {
+                    if let Some(oldest) = self.held.pop_front() {
+                        self.unattributed += 1;
+                        out.push(oldest.event);
+                    }
+                }
+                self.held_total += 1;
+                self.held.push_back(Held {
+                    event,
+                    client,
+                    pending,
+                    deadline: now + ATTRIBUTION_GRACE,
+                });
+            }
+            Resolved::Miss => {
+                // Timeouts and evictions are re-checked once (GC 9).
+                self.unattributed += 1;
+                out.push(event);
+            }
+        }
+    }
+
+    /// Emit timeouts, re-check held responses (emitting them on a hit or
+    /// once their grace has passed) and expire old kernel sends.
     pub fn tick(&mut self, now: Instant) -> Vec<RawEvent> {
-        let raw = self.tracker.expire(now);
+        let mut raw = Vec::new();
+        for closed in self.tracker.expire(now) {
+            self.close(closed, now, &mut raw);
+        }
+        let held = std::mem::take(&mut self.held);
+        for mut h in held {
+            match self.resolve(&h.pending, h.client, now) {
+                Resolved::Done(a) => {
+                    apply(&mut h.event, a);
+                    raw.push(h.event);
+                }
+                Resolved::Miss if h.deadline > now => self.held.push_back(h),
+                Resolved::Miss => {
+                    self.unattributed += 1;
+                    raw.push(h.event);
+                }
+            }
+        }
+        if let AttributionMode::Kernel(table) = &self.mode {
+            lock_table(table).expire(wall_ns());
+        }
         self.wrap(raw)
     }
 
@@ -158,11 +409,18 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
+    use crate::send_table::{KernelSend, SendTable};
+    use std::net::{Ipv6Addr, SocketAddr};
+    use std::sync::{Arc, Mutex};
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let e = Engine::new(Attributor::new(dir.path().to_path_buf()), TX_TIMEOUT, 16);
+        let e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Procfs,
+            TX_TIMEOUT,
+            16,
+        );
         (e, dir)
     }
 
@@ -342,7 +600,12 @@ mod tests {
         std::fs::create_dir_all(&net).unwrap();
         std::fs::write(net.join("udp"), format!("{hdr}{row}")).unwrap();
         std::fs::write(net.join("udp6"), hdr).unwrap();
-        let mut e = Engine::new(Attributor::new(dir.path().to_path_buf()), TX_TIMEOUT, 16);
+        let mut e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Procfs,
+            TX_TIMEOUT,
+            16,
+        );
         let now = Instant::now();
         let q = |id: u16| {
             v4(
@@ -410,7 +673,12 @@ mod tests {
     #[test]
     fn evicted_transaction_is_emitted() {
         let dir = tempfile::tempdir().unwrap();
-        let mut e = Engine::new(Attributor::new(dir.path().to_path_buf()), TX_TIMEOUT, 1);
+        let mut e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Procfs,
+            TX_TIMEOUT,
+            1,
+        );
         let now = Instant::now();
         let mk = |id: u16, name: &str| {
             v4(
@@ -425,5 +693,282 @@ mod tests {
         let ev = only_dns(e.on_packet(&mk(2, "b.example.com"), true, 2, now));
         assert_eq!(ev.query, "a.example.com");
         assert!(ev.response_ips.is_empty());
+    }
+
+    // ---- Kernel attribution mode -------------------------------------
+
+    const CLIENT: [u8; 4] = [10, 0, 0, 2];
+    const SERVER: [u8; 4] = [10, 0, 0, 1];
+    const CPORT: u16 = 41000;
+    const MS: u64 = 1_000_000;
+
+    /// A proc root whose `/proc/net/udp` has a row for the client socket
+    /// (uid 1000, inode 4242); `with_row == false` leaves the tables empty.
+    fn proc_fixture(with_row: bool) -> tempfile::TempDir {
+        let hdr = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+        let row = "  1: 0200000A:A028 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4242 2 0000000000000000 0\n";
+        let dir = tempfile::tempdir().unwrap();
+        let net = dir.path().join("net");
+        std::fs::create_dir_all(&net).unwrap();
+        let udp = if with_row {
+            format!("{hdr}{row}")
+        } else {
+            hdr.to_string()
+        };
+        std::fs::write(net.join("udp"), udp).unwrap();
+        std::fs::write(net.join("udp6"), hdr).unwrap();
+        // fd -> socket inode; best effort (symlinks may be unavailable).
+        let fd = dir.path().join("300").join("fd");
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::write(dir.path().join("300").join("comm"), "resolver\n").unwrap();
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink("socket:[4242]", fd.join("3"));
+        dir
+    }
+
+    fn kernel_engine(with_row: bool) -> (Engine, SharedSendTable, tempfile::TempDir) {
+        let dir = proc_fixture(with_row);
+        let table: SharedSendTable = Arc::new(Mutex::new(SendTable::new()));
+        let e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Kernel(table.clone()),
+            TX_TIMEOUT,
+            16,
+        );
+        (e, table, dir)
+    }
+
+    fn client_addr() -> SocketAddr {
+        SocketAddr::from((CLIENT, CPORT))
+    }
+
+    fn server_addr() -> SocketAddr {
+        SocketAddr::from((SERVER, 53))
+    }
+
+    fn owner() -> Attribution {
+        Attribution {
+            pid: Some(777),
+            uid: 1001,
+            exe_path: "/usr/bin/dig".into(),
+            comm: "dig".into(),
+        }
+    }
+
+    fn insert_send(table: &SharedSendTable, sent_wall_ns: u64) {
+        lock_table(table).insert(KernelSend {
+            key: SendKey::new(client_addr(), server_addr()),
+            laddr: client_addr().ip(),
+            sent_wall_ns,
+            owner: owner(),
+        });
+    }
+
+    fn kq(id: u16) -> Vec<u8> {
+        v4(
+            CLIENT,
+            SERVER,
+            &udp(CPORT, 53, &dns(id, 0x0100, "k.example.com", 1, None)),
+        )
+    }
+
+    fn kr(id: u16) -> Vec<u8> {
+        v4(
+            SERVER,
+            CLIENT,
+            &udp(
+                53,
+                CPORT,
+                &dns(id, 0x8180, "k.example.com", 1, Some((1, &[1, 2, 3, 4]))),
+            ),
+        )
+    }
+
+    #[test]
+    fn kernel_mode_attributes_from_table() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        insert_send(&table, base);
+        assert!(e.on_packet(&kq(1), true, base + MS, now).is_empty());
+        let ev = only_dns(e.on_packet(&kr(1), true, base + 2 * MS, now));
+        assert_eq!(ev.pid, Some(777));
+        assert_eq!(ev.uid, 1001);
+        assert_eq!(ev.exe_path, "/usr/bin/dig");
+        assert_eq!(ev.comm, "dig");
+        assert_eq!(ev.timestamp_ns, base + MS);
+        let m = e.metrics();
+        assert_eq!(m.attributed_kernel, 1);
+        assert_eq!(m.attributed_procfs, 0);
+        assert_eq!(m.attributed, 1);
+        assert_eq!((m.attribution_late, m.unattributed, m.held), (0, 0, 0));
+        assert!(lock_table(&table).is_empty());
+    }
+
+    #[test]
+    fn kernel_mode_never_reads_proc() {
+        let (mut e, _table, _d) = kernel_engine(true);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
+        assert_eq!(e.metrics().held, 1);
+        let ev = only_dns(e.tick(now + Duration::from_millis(251)));
+        // The /proc row (uid 1000) was never consulted.
+        assert_eq!(ev.pid, None);
+        assert_eq!(ev.uid, 0);
+        let m = e.metrics();
+        assert_eq!((m.unattributed, m.attributed), (1, 0));
+    }
+
+    #[test]
+    fn late_record_attributes_held_response() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        assert!(e.on_packet(&kq(1), true, base + MS, now).is_empty());
+        assert!(e.on_packet(&kr(1), true, base + 2 * MS, now).is_empty());
+        insert_send(&table, base);
+        let ev = only_dns(e.tick(now + Duration::from_millis(100)));
+        assert_eq!(ev.pid, Some(777));
+        assert_eq!(ev.response_ips, vec!["1.2.3.4"]);
+        let m = e.metrics();
+        assert_eq!((m.attribution_late, m.attributed_kernel), (1, 1));
+        assert_eq!((m.unattributed, m.held, m.emitted), (0, 1, 1));
+        assert!(e.tick(now + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn held_response_emits_unattributed_after_grace() {
+        let (mut e, _table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
+        assert!(e.tick(now + Duration::from_millis(249)).is_empty());
+        let ev = only_dns(e.tick(now + Duration::from_millis(251)));
+        assert_eq!(ev.pid, None);
+        assert_eq!(ev.response_ips, vec!["1.2.3.4"]);
+        assert_eq!(e.metrics().unattributed, 1);
+        assert!(e.tick(now + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn timeout_close_rechecks_table() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        insert_send(&table, base);
+        let ev = only_dns(e.tick(now + TX_TIMEOUT + Duration::from_millis(1)));
+        assert_eq!(ev.pid, Some(777));
+        assert!(ev.response_ips.is_empty());
+        let m = e.metrics();
+        assert_eq!((m.attribution_late, m.attributed_kernel), (1, 1));
+        assert_eq!((m.tracker.timeouts, m.held), (1, 0));
+    }
+
+    #[test]
+    fn timeout_close_miss_emits_without_hold() {
+        let (mut e, _table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        e.on_packet(&kq(1), true, wall_ns(), now);
+        let ev = only_dns(e.tick(now + TX_TIMEOUT + Duration::from_millis(1)));
+        assert_eq!(ev.pid, None);
+        let m = e.metrics();
+        assert_eq!((m.unattributed, m.held), (1, 0));
+    }
+
+    #[test]
+    fn retransmit_hit_attributes_pending_transaction() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        // First packet's record is lost; the retransmit's record is present.
+        e.on_packet(&kq(1), true, base, now);
+        insert_send(&table, base + 10 * MS);
+        e.on_packet(&kq(1), true, base + 11 * MS, now);
+        let ev = only_dns(e.on_packet(&kr(1), true, base + 12 * MS, now));
+        assert_eq!(ev.pid, Some(777));
+        assert_eq!(ev.timestamp_ns, base);
+        let m = e.metrics();
+        assert_eq!((m.attributed_kernel, m.unattributed), (1, 0));
+        assert_eq!(m.tracker.duplicates, 1);
+    }
+
+    #[test]
+    fn remote_query_in_kernel_mode_is_unattributed_without_hold() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        insert_send(&table, base);
+        e.on_packet(&kq(1), false, base + MS, now);
+        let ev = only_dns(e.on_packet(&kr(1), false, base + 2 * MS, now));
+        assert_eq!(ev.pid, None);
+        let m = e.metrics();
+        assert_eq!((m.unattributed, m.held, m.attributed), (1, 0, 0));
+        // The kernel send was not consumed by a remote packet.
+        assert_eq!(lock_table(&table).len(), 1);
+    }
+
+    #[test]
+    fn latch_switches_to_procfs() {
+        let (mut e, _table, _d) = kernel_engine(true);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        e.latch_procfs();
+        let ev = only_dns(e.on_packet(&kr(1), true, base + MS, now));
+        // uid 1000 comes from the /proc/net/udp fixture.
+        assert_eq!(ev.uid, 1000);
+        assert_eq!(e.metrics().held, 0);
+        // A new query also uses /proc.
+        e.on_packet(&kq(2), true, base + 2 * MS, now);
+        let ev = only_dns(e.on_packet(&kr(2), true, base + 3 * MS, now));
+        assert_eq!(ev.uid, 1000);
+    }
+
+    #[test]
+    fn latch_resolves_held_response_via_procfs() {
+        let (mut e, _table, _d) = kernel_engine(true);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
+        e.latch_procfs();
+        let ev = only_dns(e.tick(now + Duration::from_millis(10)));
+        assert_eq!(ev.uid, 1000);
+    }
+
+    #[test]
+    fn tick_expires_send_table() {
+        let (mut e, table, _d) = kernel_engine(false);
+        insert_send(&table, wall_ns().saturating_sub(11_000 * MS));
+        assert_eq!(lock_table(&table).len(), 1);
+        e.tick(Instant::now());
+        assert!(lock_table(&table).is_empty());
+    }
+
+    #[test]
+    fn held_queue_is_bounded() {
+        let dir = proc_fixture(false);
+        let table: SharedSendTable = Arc::new(Mutex::new(SendTable::new()));
+        let mut e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Kernel(table),
+            TX_TIMEOUT,
+            2,
+        );
+        let now = Instant::now();
+        let base = wall_ns();
+        let mut emitted = 0;
+        for id in 0..5u16 {
+            e.on_packet(&kq(id), true, base, now);
+            emitted += e.on_packet(&kr(id), true, base, now).len();
+        }
+        // Capacity 2: three were forced out unattributed, two still held.
+        assert_eq!(emitted, 3);
+        assert_eq!(e.tick(now + Duration::from_secs(1)).len(), 2);
+        assert_eq!(e.metrics().unattributed, 5);
     }
 }

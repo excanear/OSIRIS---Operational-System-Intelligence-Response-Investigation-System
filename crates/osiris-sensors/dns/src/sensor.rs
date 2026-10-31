@@ -165,7 +165,7 @@ impl Sensor for DnsSensor {
         {
             use crate::attribution::Attributor;
             use crate::capture::Capture;
-            use crate::engine::{Engine, MAX_PENDING, TX_TIMEOUT};
+            use crate::engine::{AttributionMode, Engine, MAX_PENDING, TX_TIMEOUT};
 
             let capture = Capture::open(self.interface.as_deref()).map_err(|e| {
                 let mut h = lock_health(&self.health);
@@ -177,6 +177,7 @@ impl Sensor for DnsSensor {
 
             let engine = Engine::new(
                 Attributor::new(self.proc_root.clone()),
+                AttributionMode::Procfs,
                 TX_TIMEOUT,
                 MAX_PENDING,
             );
@@ -314,9 +315,17 @@ mod linux {
                 let recv = cap.recv(buf);
                 let now = Instant::now();
                 let mut events = match recv {
-                    Recv::Packet { len, local_origin } => {
+                    Recv::Packet {
+                        len,
+                        local_origin,
+                        ts_wall_ns,
+                    } => {
+                        let timestamp_ns = ts_wall_ns.unwrap_or_else(|| {
+                            self.engine.record_timestamp_fallback();
+                            wall_ns()
+                        });
                         let l3 = buf.get(..len).unwrap_or_default();
-                        self.engine.on_packet(l3, local_origin, wall_ns(), now)
+                        self.engine.on_packet(l3, local_origin, timestamp_ns, now)
                     }
                     Recv::Skip | Recv::Timeout => Vec::new(),
                     Recv::Error(errno) => return Exit::SocketError(errno),

@@ -1,6 +1,6 @@
 //! DNS transaction tracker: pairs a query with its response (or a timeout)
-//! and yields exactly one `DnsEventRaw` per transaction. Time is always passed
-//! in so behaviour is deterministic; the pending table is bounded.
+//! and yields exactly one closed transaction per query. Time is always
+//! passed in so behaviour is deterministic; the pending table is bounded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use osiris_sensor_api::{DnsEventRaw, RawEventSource};
 
+use crate::send_table::SendKey;
 use crate::wire::{qtype_mnemonic, DnsMessage};
 
 const TYPE_A: u16 = 1;
@@ -38,28 +39,64 @@ pub struct TrackerCounters {
     pub duplicates: u64,
 }
 
+/// Kernel join still owed by a transaction whose query packet found no
+/// kernel send (eBPF mode). Re-tried when the transaction closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingAttribution {
+    pub key: SendKey,
+    pub laddr: IpAddr,
+    /// The query packet's wall-clock timestamp: the join's reference time.
+    pub packet_ts_ns: u64,
+}
+
+/// Why a transaction closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseKind {
+    Response,
+    Timeout,
+    Evicted,
+}
+
+/// A closed transaction: its event plus what the engine needs to finish
+/// attributing it.
+#[derive(Debug, Clone)]
+pub struct Closed {
+    pub event: DnsEventRaw,
+    pub kind: CloseKind,
+    /// The query's client endpoint (the `/proc` lookup key).
+    pub client: SocketAddr,
+    pub pending: Option<PendingAttribution>,
+}
+
 struct Pending {
     seq: u64,
     deadline: Instant,
+    client: SocketAddr,
     query: String,
     qtype: String,
     attribution: Attribution,
+    pending: Option<PendingAttribution>,
     timestamp_ns: u64,
 }
 
 impl Pending {
-    fn into_event(self, response_ips: Vec<String>, ttl: Option<u32>) -> DnsEventRaw {
-        DnsEventRaw {
-            query: self.query,
-            qtype: self.qtype,
-            response_ips,
-            ttl,
-            pid: self.attribution.pid,
-            uid: self.attribution.uid,
-            exe_path: self.attribution.exe_path,
-            comm: self.attribution.comm,
-            timestamp_ns: self.timestamp_ns,
-            source: RawEventSource::Packet,
+    fn close(self, kind: CloseKind, response_ips: Vec<String>, ttl: Option<u32>) -> Closed {
+        Closed {
+            event: DnsEventRaw {
+                query: self.query,
+                qtype: self.qtype,
+                response_ips,
+                ttl,
+                pid: self.attribution.pid,
+                uid: self.attribution.uid,
+                exe_path: self.attribution.exe_path,
+                comm: self.attribution.comm,
+                timestamp_ns: self.timestamp_ns,
+                source: RawEventSource::Packet,
+            },
+            kind,
+            client: self.client,
+            pending: self.pending,
         }
     }
 }
@@ -90,16 +127,36 @@ impl Tracker {
         self.counters
     }
 
+    /// True when a transaction with `key` is already pending (a retransmit).
+    pub fn contains(&self, key: &TxKey) -> bool {
+        self.pending.contains_key(key)
+    }
+
+    /// Gives a transaction still pending attribution its owner. False when
+    /// the transaction is unknown or not pending attribution.
+    pub fn resolve_pending(&mut self, key: &TxKey, attribution: Attribution) -> bool {
+        match self.pending.get_mut(key) {
+            Some(p) if p.pending.is_some() => {
+                p.pending = None;
+                p.attribution = attribution;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Register a query. When the table is full the oldest pending
     /// transaction is evicted and returned, to be emitted as a timeout.
+    /// `pending` is set when the kernel join must be retried at close.
     pub fn on_query(
         &mut self,
         key: TxKey,
         msg: &DnsMessage,
         attribution: Attribution,
+        pending: Option<PendingAttribution>,
         timestamp_ns: u64,
         now: Instant,
-    ) -> Option<DnsEventRaw> {
+    ) -> Option<Closed> {
         let q = msg.question.as_ref()?;
         if self.pending.contains_key(&key) {
             self.counters.duplicates += 1;
@@ -110,7 +167,7 @@ impl Tracker {
             if let Some((_, oldest)) = self.order.pop_first() {
                 if let Some(p) = self.pending.remove(&oldest) {
                     self.counters.overflow_evictions += 1;
-                    evicted = Some(p.into_event(Vec::new(), None));
+                    evicted = Some(p.close(CloseKind::Evicted, Vec::new(), None));
                 }
             }
         }
@@ -122,9 +179,11 @@ impl Tracker {
             Pending {
                 seq,
                 deadline: now + self.timeout,
+                client: key.client,
                 query: q.name.clone(),
                 qtype: qtype_mnemonic(q.qtype),
                 attribution,
+                pending,
                 timestamp_ns,
             },
         );
@@ -136,7 +195,7 @@ impl Tracker {
         self.pending.len()
     }
 
-    pub fn on_response(&mut self, key: TxKey, msg: &DnsMessage) -> Option<DnsEventRaw> {
+    pub fn on_response(&mut self, key: TxKey, msg: &DnsMessage) -> Option<Closed> {
         let Some(p) = self.pending.remove(&key) else {
             self.counters.unmatched_responses += 1;
             return None;
@@ -153,13 +212,13 @@ impl Tracker {
                 ttl = Some(ttl.map_or(a.ttl, |t| t.min(a.ttl)));
             }
         }
-        Some(p.into_event(ips, ttl))
+        Some(p.close(CloseKind::Response, ips, ttl))
     }
 
-    /// Emit every pending transaction whose deadline has passed as a
+    /// Close every pending transaction whose deadline has passed as a
     /// timeout (empty ips, no ttl). Deadlines are monotonic in insertion
     /// order, so scanning stops at the first entry not yet due.
-    pub fn expire(&mut self, now: Instant) -> Vec<DnsEventRaw> {
+    pub fn expire(&mut self, now: Instant) -> Vec<Closed> {
         let mut out = Vec::new();
         while let Some(entry) = self.order.first_entry() {
             let key = *entry.get();
@@ -170,7 +229,7 @@ impl Tracker {
             entry.remove();
             if let Some(p) = self.pending.remove(&key) {
                 self.counters.timeouts += 1;
-                out.push(p.into_event(Vec::new(), None));
+                out.push(p.close(CloseKind::Timeout, Vec::new(), None));
             }
         }
         out
@@ -234,13 +293,14 @@ mod tests {
     fn query_then_response_emits_one_event() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
         let now = Instant::now();
-        t.on_query(key(1000, 1), &query("example.com"), attr(), 77, now);
+        t.on_query(key(1000, 1), &query("example.com"), attr(), None, 77, now);
         let ev = t
             .on_response(
                 key(1000, 1),
                 &response(0, vec![a("1.2.3.4", 300), a("1.2.3.5", 60)]),
             )
-            .unwrap();
+            .unwrap()
+            .event;
         assert_eq!(ev.query, "example.com");
         assert_eq!(ev.qtype, "A");
         assert_eq!(ev.response_ips, vec!["1.2.3.4", "1.2.3.5"]);
@@ -255,12 +315,12 @@ mod tests {
     fn timeout_after_5s_emits_empty() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
         let now = Instant::now();
-        t.on_query(key(1000, 1), &query("example.com"), attr(), 1, now);
+        t.on_query(key(1000, 1), &query("example.com"), attr(), None, 1, now);
         assert!(t.expire(now + Duration::from_secs(4)).is_empty());
         let evs = t.expire(now + Duration::from_secs(5));
         assert_eq!(evs.len(), 1);
-        assert!(evs[0].response_ips.is_empty());
-        assert_eq!(evs[0].ttl, None);
+        assert!(evs[0].event.response_ips.is_empty());
+        assert_eq!(evs[0].event.ttl, None);
         assert_eq!(t.counters().timeouts, 1);
     }
 
@@ -275,12 +335,13 @@ mod tests {
     fn retransmit_keeps_single_transaction() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
         let now = Instant::now();
-        t.on_query(key(1000, 1), &query("example.com"), attr(), 1, now);
-        t.on_query(key(1000, 1), &query("example.com"), attr(), 2, now);
+        t.on_query(key(1000, 1), &query("example.com"), attr(), None, 1, now);
+        t.on_query(key(1000, 1), &query("example.com"), attr(), None, 2, now);
         assert_eq!(t.counters().duplicates, 1);
         let ev = t
             .on_response(key(1000, 1), &response(0, vec![a("1.2.3.4", 5)]))
-            .unwrap();
+            .unwrap()
+            .event;
         assert_eq!(ev.timestamp_ns, 1);
         assert!(t.expire(now + Duration::from_secs(60)).is_empty());
     }
@@ -288,13 +349,16 @@ mod tests {
     #[test]
     fn cname_only_response_completes_immediately() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
-        t.on_query(key(1, 1), &query("x.com"), attr(), 1, Instant::now());
+        t.on_query(key(1, 1), &query("x.com"), attr(), None, 1, Instant::now());
         let cname = Answer {
             rtype: 5,
             ttl: 30,
             addr: None,
         };
-        let ev = t.on_response(key(1, 1), &response(0, vec![cname])).unwrap();
+        let ev = t
+            .on_response(key(1, 1), &response(0, vec![cname]))
+            .unwrap()
+            .event;
         assert!(ev.response_ips.is_empty());
         assert_eq!(ev.ttl, None);
     }
@@ -302,8 +366,11 @@ mod tests {
     #[test]
     fn nxdomain_completes_immediately() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
-        t.on_query(key(1, 1), &query("x.com"), attr(), 1, Instant::now());
-        let ev = t.on_response(key(1, 1), &response(3, vec![])).unwrap();
+        t.on_query(key(1, 1), &query("x.com"), attr(), None, 1, Instant::now());
+        let ev = t
+            .on_response(key(1, 1), &response(3, vec![]))
+            .unwrap()
+            .event;
         assert!(ev.response_ips.is_empty());
         assert_eq!(ev.ttl, None);
     }
@@ -312,12 +379,18 @@ mod tests {
     fn same_id_different_port_are_distinct() {
         let mut t = Tracker::new(Duration::from_secs(5), 16);
         let now = Instant::now();
-        t.on_query(key(1000, 1), &query("a.com"), attr(), 1, now);
-        t.on_query(key(1001, 1), &query("b.com"), attr(), 2, now);
+        t.on_query(key(1000, 1), &query("a.com"), attr(), None, 1, now);
+        t.on_query(key(1001, 1), &query("b.com"), attr(), None, 2, now);
         assert_eq!(t.counters().duplicates, 0);
-        let ev = t.on_response(key(1001, 1), &response(0, vec![])).unwrap();
+        let ev = t
+            .on_response(key(1001, 1), &response(0, vec![]))
+            .unwrap()
+            .event;
         assert_eq!(ev.query, "b.com");
-        let ev = t.on_response(key(1000, 1), &response(0, vec![])).unwrap();
+        let ev = t
+            .on_response(key(1000, 1), &response(0, vec![]))
+            .unwrap()
+            .event;
         assert_eq!(ev.query, "a.com");
     }
 
@@ -325,11 +398,12 @@ mod tests {
     fn overflow_evicts_oldest_as_timeout() {
         let mut t = Tracker::new(Duration::from_secs(5), 2);
         let now = Instant::now();
-        t.on_query(key(1, 1), &query("a.com"), attr(), 1, now);
-        t.on_query(key(2, 1), &query("b.com"), attr(), 2, now);
+        t.on_query(key(1, 1), &query("a.com"), attr(), None, 1, now);
+        t.on_query(key(2, 1), &query("b.com"), attr(), None, 2, now);
         let ev = t
-            .on_query(key(3, 1), &query("c.com"), attr(), 3, now)
-            .unwrap();
+            .on_query(key(3, 1), &query("c.com"), attr(), None, 3, now)
+            .unwrap()
+            .event;
         assert_eq!(t.counters().overflow_evictions, 1);
         assert_eq!(ev.query, "a.com");
         assert!(ev.response_ips.is_empty());
@@ -350,7 +424,9 @@ mod tests {
                     .unwrap(),
                 ..key(1000, 1)
             };
-            if t.on_query(k, &query("x.com"), attr(), 1, now).is_some() {
+            if t.on_query(k, &query("x.com"), attr(), None, 1, now)
+                .is_some()
+            {
                 evicted += 1;
             }
             assert!(t.pending_len() <= 4);
@@ -366,8 +442,63 @@ mod tests {
         let now = Instant::now();
         let mut m = query("x.com");
         m.question = None;
-        t.on_query(key(1, 1), &m, attr(), 1, now);
+        t.on_query(key(1, 1), &m, attr(), None, 1, now);
         assert!(t.expire(now + Duration::from_secs(60)).is_empty());
         assert!(t.on_response(key(1, 1), &response(0, vec![])).is_none());
+    }
+
+    fn pending_attr() -> PendingAttribution {
+        PendingAttribution {
+            key: SendKey::new(key(1000, 1).client, "10.0.0.1:53".parse().unwrap()),
+            laddr: "10.0.0.2".parse().unwrap(),
+            packet_ts_ns: 9,
+        }
+    }
+
+    #[test]
+    fn closed_carries_kind_client_and_pending() {
+        let mut t = Tracker::new(Duration::from_secs(5), 1);
+        let now = Instant::now();
+        let p = pending_attr();
+        t.on_query(
+            key(1000, 1),
+            &query("a.com"),
+            Attribution::default(),
+            Some(p),
+            9,
+            now,
+        );
+        let c = t
+            .on_query(key(1001, 1), &query("b.com"), attr(), None, 10, now)
+            .unwrap();
+        assert_eq!(c.kind, CloseKind::Evicted);
+        assert_eq!(c.client, key(1000, 1).client);
+        assert_eq!(c.pending, Some(p));
+        let c = t.on_response(key(1001, 1), &response(0, vec![])).unwrap();
+        assert_eq!((c.kind, c.pending), (CloseKind::Response, None));
+        t.on_query(key(1002, 1), &query("c.com"), attr(), None, 11, now);
+        let evs = t.expire(now + Duration::from_secs(5));
+        assert_eq!(evs[0].kind, CloseKind::Timeout);
+    }
+
+    #[test]
+    fn resolve_pending_sets_owner_once() {
+        let mut t = Tracker::new(Duration::from_secs(5), 4);
+        let now = Instant::now();
+        assert!(!t.resolve_pending(&key(1000, 1), attr()));
+        t.on_query(
+            key(1000, 1),
+            &query("a.com"),
+            Attribution::default(),
+            Some(pending_attr()),
+            1,
+            now,
+        );
+        assert!(t.contains(&key(1000, 1)));
+        assert!(t.resolve_pending(&key(1000, 1), attr()));
+        assert!(!t.resolve_pending(&key(1000, 1), Attribution::default()));
+        let c = t.on_response(key(1000, 1), &response(0, vec![])).unwrap();
+        assert_eq!(c.pending, None);
+        assert_eq!(c.event.pid, Some(42));
     }
 }

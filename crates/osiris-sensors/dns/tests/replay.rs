@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use osiris_sensor_api::RawEvent;
 use osiris_sensors_dns::attribution::Attributor;
-use osiris_sensors_dns::engine::{Engine, MAX_PENDING, TX_TIMEOUT};
+use osiris_sensors_dns::engine::{AttributionMode, Engine, MAX_PENDING, TX_TIMEOUT};
 
 fn unhex(s: &str) -> Vec<u8> {
     assert!(s.len().is_multiple_of(2), "odd hex length");
@@ -47,6 +47,7 @@ fn replays_fixture_files() {
         let proc_root = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(
             Attributor::new(proc_root.path().to_path_buf()),
+            AttributionMode::Procfs,
             TX_TIMEOUT,
             MAX_PENDING,
         );
