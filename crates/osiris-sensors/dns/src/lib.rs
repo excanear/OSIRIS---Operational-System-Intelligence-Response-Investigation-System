@@ -7,6 +7,7 @@ mod capture;
 pub mod engine;
 pub mod frame;
 pub mod proc_udp;
+pub mod send_table;
 pub mod sensor;
 pub mod tracker;
 pub mod wire;
