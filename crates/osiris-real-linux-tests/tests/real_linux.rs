@@ -1308,3 +1308,424 @@ fn sensor_health_counts_events() {
     wait_sensor_counts_events(&s, "filesystem");
     wait_sensor_counts_events(&s, "process_exec");
 }
+
+// ---- Phase 11b-4: kernel attribution of DNS queries ----
+
+/// The DNS sensor's capability flags (spec 11b-4 GC 10).
+const DNS_FLAG_EBPF: &str = "ebpf_attribution";
+const DNS_FLAG_PROCFS: &str = "procfs_attribution";
+
+/// Fake resolver on `127.0.0.1:53`: echoes each query back as a response
+/// with one A answer (`127.0.0.2`) after 300 ms, so the query and the answer
+/// are both seen on `lo` with no internet dependency. Single-threaded: a
+/// FIFO of due answers (the delay is constant) and a `select` timeout.
+const FAKE_RESOLVER: &str = r#"
+import select, socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 53))
+sys.stdout.write("ready\n")
+sys.stdout.flush()
+answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x7f\x00\x00\x02"
+due = []
+while True:
+    now = time.monotonic()
+    while due and due[0][0] <= now:
+        _, data, addr = due.pop(0)
+        try:
+            s.sendto(data, addr)
+        except OSError:
+            pass
+    timeout = max(0.0, due[0][0] - now) if due else 0.5
+    r, _, _ = select.select([s], [], [], timeout)
+    if not r:
+        continue
+    try:
+        q, addr = s.recvfrom(4096)
+    except OSError:
+        continue
+    if len(q) < 12:
+        continue
+    resp = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:] + answer
+    due.append((time.monotonic() + 0.3, resp, addr))
+"#;
+
+/// DNS client: `python3 -c CLIENT <then> <first-id> <name>...`. Each name is
+/// one A query sent with `sendto` on its own fresh UDP socket to
+/// `127.0.0.1:53` (raw `socket`, never `getaddrinfo`), closed right after;
+/// query ids count up from `<first-id>`. Then the client sleeps 2 s
+/// (`<then>` = `sleep`) or exits at once (`exit`).
+const DNS_CLIENT: &str = r#"
+import socket, struct, sys, time
+then, qid = sys.argv[1], int(sys.argv[2])
+for i, name in enumerate(sys.argv[3:]):
+    q = struct.pack(">HHHHHH", (qid + i) & 0xffff, 0x0100, 1, 0, 0, 0)
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.sendto(q, ("127.0.0.1", 53))
+    s.close()
+if then == "sleep":
+    time.sleep(2)
+"#;
+
+/// The fake resolver's process, killed and reaped on drop (even when an
+/// assertion panics).
+struct FakeResolver(Child);
+impl Drop for FakeResolver {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts [`FAKE_RESOLVER`] and waits (bounded) until it is bound.
+fn fake_resolver() -> FakeResolver {
+    use std::io::BufRead;
+    let mut child = Command::new("python3")
+        .current_dir("/")
+        .arg("-c")
+        .arg(FAKE_RESOLVER)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let guard = FakeResolver(child);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("fake resolver not ready within 10s");
+    assert_eq!(
+        line.trim(),
+        "ready",
+        "fake resolver failed to bind 127.0.0.1:53"
+    );
+    guard
+}
+
+/// Spawns one [`DNS_CLIENT`] (CWD `/`); the caller waits for it.
+fn spawn_dns_client(then: &str, first_id: u16, names: &[String]) -> Child {
+    Command::new("python3")
+        .current_dir("/")
+        .arg("-c")
+        .arg(DNS_CLIENT)
+        .arg(then)
+        .arg(first_id.to_string())
+        .args(names)
+        .spawn()
+        .unwrap()
+}
+
+/// Every stored `DNS_QUERY` for `name`.
+fn dns_queries_for<'a>(v: &'a Value, name: &str) -> Vec<&'a Value> {
+    objects_with(v, "event_type", &json!("DNS_QUERY"))
+        .into_iter()
+        .filter(|e| e["dns"]["query"] == json!(name))
+        .collect()
+}
+
+/// Waits for the attributed `DNS_QUERY` of `name`, lets duplicates settle,
+/// and returns every stored query of `name` (at least one).
+fn wait_dns_query(s: &Stack, name: &str, since: u128) -> Vec<Value> {
+    events(s, "DNS_QUERY", since, |v| {
+        dns_queries_for(v, name)
+            .iter()
+            .any(|e| !e["process"].is_null())
+    });
+    std::thread::sleep(SETTLE);
+    dns_queries_for(&fetch(s, "DNS_QUERY", since), name)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// The one attributed query among `got`, after checking that none names a
+/// pid other than `pid` (a wrong owner is worse than none).
+fn only_attributed(got: &[Value], pid: u32) -> &Value {
+    for e in got {
+        assert!(
+            e["process"].is_null() || e["process"]["pid"] == json!(pid),
+            "query attributed to another process (client pid {pid}): {e}"
+        );
+    }
+    let attributed: Vec<&Value> = got.iter().filter(|e| !e["process"].is_null()).collect();
+    assert_eq!(
+        attributed.len(),
+        1,
+        "one attributed query expected: {got:?}"
+    );
+    attributed[0]
+}
+
+/// (a) With the objects built, the DNS sensor attributes from kernel sends:
+/// HEALTHY with flag `ebpf_attribution` and without `procfs_attribution`.
+#[test]
+#[ignore]
+fn dns_sensor_uses_ebpf_attribution() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let health = sensor_health_reaches(&s, "dns", "HEALTHY");
+    assert!(
+        !health
+            .iter()
+            .any(|h| h["state"]["state"] != json!("HEALTHY")),
+        "dns not steadily HEALTHY in AGENT_HEALTH: {health:?}"
+    );
+    let status = sensor_status(&s, "dns");
+    assert_eq!(status["state"], json!("HEALTHY"), "status: {status}");
+    assert!(
+        has_flag(&status, DNS_FLAG_EBPF),
+        "no `{DNS_FLAG_EBPF}` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, DNS_FLAG_PROCFS),
+        "kernel attribution active yet `{DNS_FLAG_PROCFS}` set: {status}"
+    );
+}
+
+/// (c) A python client sends one A query for `<marker>.xyz` on a fresh UDP
+/// socket, closes it at once and sleeps 2 s: the stored query carries the
+/// client's pid and the python exe (the socket is gone when the answer
+/// arrives 300 ms later).
+#[test]
+#[ignore]
+fn dns_closed_socket_client_is_attributed() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    sensor_status(&s, "dns");
+    let _resolver = fake_resolver();
+    let exe = python_exe();
+    let name = format!("{m}.xyz");
+    let t0 = now_ns();
+    let mut client = spawn_dns_client("sleep", 0x1100, std::slice::from_ref(&name));
+    let pid = client.id();
+    let status = wait_child(&mut client, Duration::from_secs(30));
+    assert!(status.success(), "client {pid} failed: {status}");
+
+    let got = wait_dns_query(&s, &name, since_before(t0));
+    let e = only_attributed(&got, pid);
+    assert_eq!(
+        e["provider"],
+        json!("dns_sensor/af_packet"),
+        "provider: {e}"
+    );
+    assert_eq!(e["process"]["pid"], json!(pid), "pid: {e}");
+    assert_eq!(e["process"]["exe_path"], json!(exe), "exe_path: {e}");
+}
+
+/// (d) As (c), but the client exits right after closing the socket: the
+/// stored query still carries its pid, and its exe is the python path or
+/// empty, never another process's.
+#[test]
+#[ignore]
+fn dns_exited_client_keeps_its_pid() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    sensor_status(&s, "dns");
+    let _resolver = fake_resolver();
+    let exe = python_exe();
+    let name = format!("{m}.xyz");
+    let t0 = now_ns();
+    let mut client = spawn_dns_client("exit", 0x2200, std::slice::from_ref(&name));
+    let pid = client.id();
+    let status = wait_child(&mut client, Duration::from_secs(30));
+    assert!(status.success(), "client {pid} failed: {status}");
+
+    let got = wait_dns_query(&s, &name, since_before(t0));
+    let e = only_attributed(&got, pid);
+    assert_eq!(e["process"]["pid"], json!(pid), "pid: {e}");
+    assert!(
+        e["process"]["exe_path"] == json!(exe) || e["process"]["exe_path"] == json!(""),
+        "exe_path neither {exe} nor empty: {e}"
+    );
+}
+
+/// (e) An object dir without `dns.bpf.o` (the others intact): the DNS
+/// sensor attributes via `/proc` (DEGRADED, flag `procfs_attribution`, a
+/// reason naming `dns.bpf.o`), the process sensor stays on eBPF, and the
+/// curl query is still stored (its attribution is best-effort here).
+#[test]
+#[ignore]
+fn dns_missing_object_falls_back_to_procfs() {
+    let m = marker();
+    let good = required_bpf_dir();
+    // Declared before the stack so it outlives the agent reading it.
+    let bad = tempfile::Builder::new()
+        .prefix("osiris-bpf-nodns-")
+        .tempdir()
+        .unwrap();
+    for entry in std::fs::read_dir(&good).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("dns.bpf.o") {
+            continue;
+        }
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), bad.path().join(&name)).unwrap();
+        }
+    }
+    assert!(!bad.path().join("dns.bpf.o").exists());
+    assert!(bad.path().join("process.bpf.o").exists());
+    let s = stack_with_bpf(
+        &Path::new(WATCH_ROOT).join(&m),
+        Some(bad.path().to_path_buf()),
+    );
+
+    let health = sensor_health_reaches(&s, "dns", "DEGRADED");
+    assert!(
+        health
+            .iter()
+            .filter(|h| h["state"]["state"] == json!("DEGRADED"))
+            .all(|h| h["state"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("dns.bpf.o"))),
+        "DEGRADED without a reason naming dns.bpf.o: {health:?}"
+    );
+    let status = sensor_status(&s, "dns");
+    assert_eq!(status["state"], json!("DEGRADED"), "status: {status}");
+    assert!(
+        has_flag(&status, DNS_FLAG_PROCFS),
+        "no `{DNS_FLAG_PROCFS}` capability flag: {status}"
+    );
+    assert!(
+        !has_flag(&status, DNS_FLAG_EBPF),
+        "fell back yet `{DNS_FLAG_EBPF}` set: {status}"
+    );
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("dns.bpf.o")),
+        "last_error does not name dns.bpf.o: {status}"
+    );
+    let process = process_status(&s);
+    assert_eq!(process["state"], json!("HEALTHY"), "process: {process}");
+    assert!(
+        has_flag(&process, "ebpf"),
+        "process sensor left eBPF: {process}"
+    );
+
+    let name = format!("{m}.xyz");
+    let t0 = now_ns();
+    sh(&format!("curl -s -m 5 http://{name}/ || true"));
+    events(&s, "DNS_QUERY", since_before(t0), |v| {
+        !dns_queries_for(v, &name).is_empty()
+    });
+}
+
+/// Clients and queries per client in the burst (f).
+const BURST_CLIENTS: usize = 20;
+const BURST_QUERIES: usize = 10;
+/// Names that must be stored with their sender's pid: 99 % of 200.
+const BURST_MIN_RIGHT: usize = 198;
+/// Bound on the burst's events reaching the store.
+const BURST_DEADLINE: Duration = Duration::from_secs(90);
+
+/// (f) The old flake's shape: 20 concurrent python clients each send 10
+/// queries, every query on its own socket closed at once, with a unique name
+/// `<marker>-<i>-<j>.xyz`, while the full agent runs (process, network and
+/// filesystem sensors on eBPF). Any query attributed to a pid other than its
+/// sender's fails at once; at least 198 of the 200 names must be stored with
+/// the right pid; and if fewer than 200 are attributed, `/status` for `dns`
+/// must show the loss in `events_dropped_total`.
+#[test]
+#[ignore]
+fn dns_burst_attribution_is_near_complete() {
+    use std::collections::{HashMap, HashSet};
+
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let status = sensor_status(&s, "dns");
+    assert!(
+        has_flag(&status, DNS_FLAG_EBPF),
+        "the burst needs kernel attribution: {status}"
+    );
+    let _resolver = fake_resolver();
+
+    // name -> the pid of the client that sent it.
+    let mut expected: HashMap<String, u32> = HashMap::new();
+    let t0 = now_ns();
+    let mut clients = Vec::with_capacity(BURST_CLIENTS);
+    for i in 0..BURST_CLIENTS {
+        let names: Vec<String> = (0..BURST_QUERIES)
+            .map(|j| format!("{m}-{i}-{j}.xyz"))
+            .collect();
+        // Query ids are distinct across the whole burst.
+        let first_id = u16::try_from(i * BURST_QUERIES + 1).unwrap();
+        let child = spawn_dns_client("sleep", first_id, &names);
+        for n in names {
+            expected.insert(n, child.id());
+        }
+        clients.push(child);
+    }
+    for c in &mut clients {
+        let pid = c.id();
+        let st = wait_child(c, Duration::from_secs(60));
+        assert!(st.success(), "client {pid} failed: {st}");
+    }
+    let total = expected.len();
+    let since = since_before(t0);
+
+    // Bounded poll until every name is stored (attributed or not).
+    let stored_names = |v: &Value| -> HashSet<String> {
+        objects_with(v, "event_type", &json!("DNS_QUERY"))
+            .into_iter()
+            .filter_map(|e| e["dns"]["query"].as_str())
+            .filter(|q| expected.contains_key(*q))
+            .map(str::to_string)
+            .collect()
+    };
+    let end = Instant::now() + BURST_DEADLINE;
+    while stored_names(&fetch(&s, "DNS_QUERY", since)).len() < total && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::thread::sleep(SETTLE);
+    let v = fetch(&s, "DNS_QUERY", since);
+
+    let mut stored = HashSet::new();
+    let mut right = HashSet::new();
+    for e in objects_with(&v, "event_type", &json!("DNS_QUERY")) {
+        let Some(q) = e["dns"]["query"].as_str() else {
+            continue;
+        };
+        let Some(&want) = expected.get(q) else {
+            continue;
+        };
+        stored.insert(q.to_string());
+        if e["process"].is_null() {
+            continue;
+        }
+        assert_eq!(
+            e["process"]["pid"],
+            json!(want),
+            "{q} attributed to the wrong pid (sender {want}): {e}"
+        );
+        right.insert(q.to_string());
+    }
+    let dns = sensor_status(&s, "dns");
+    let dropped = dns["events_dropped_total"].as_u64().unwrap_or(0);
+    eprintln!(
+        "osiris-ebpf: dns burst: {} of {total} stored, {} attributed to the sender, \
+         events_dropped_total {dropped}",
+        stored.len(),
+        right.len()
+    );
+    assert!(
+        right.len() >= BURST_MIN_RIGHT,
+        "only {} of {total} queries attributed to their sender ({} stored, dropped {dropped}): {dns}",
+        right.len(),
+        stored.len()
+    );
+    if right.len() < total {
+        assert!(
+            dropped > 0,
+            "{} of {total} attributed but `events_dropped_total` is 0: {dns}",
+            right.len()
+        );
+    }
+}

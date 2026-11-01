@@ -11,7 +11,7 @@
 #   annotate.sh ebpf     <test-output> [kept-stack-dirs]
 #       ::warning:: with the eBPF backend status lines the scenarios echo and
 #       the agent log lines naming the eBPF loads or their fallback reasons
-#       (process, network and filesystem sensors)
+#       (process, network, filesystem and dns sensors; dns also on its own)
 set -uo pipefail
 
 max_lines=20
@@ -58,9 +58,17 @@ ebpf)
     {
         [ -f "$out" ] && grep -h 'osiris-ebpf:' "$out"
         if [ -n "$kept" ] && [ -d "$kept" ]; then
-            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback|procfs fallback|fs watch' {} +
+            find "$kept" -name agent.log -exec grep -hiE 'ebpf|bpf object|audit fallback|procfs fallback|fs watch|dns kernel attribution' {} +
         fi
-    } | head -n "$max_lines" | emit warning "eBPF process, network and filesystem backends"
+    } | head -n "$max_lines" | emit warning "eBPF process, network, filesystem and dns backends"
+    # The dns scenarios run last, so the cap above can cut them: their own
+    # annotation (status lines, burst counts, attribution load/fallback).
+    {
+        [ -f "$out" ] && grep -h 'osiris-ebpf: dns' "$out"
+        if [ -n "$kept" ] && [ -d "$kept" ]; then
+            find "$kept" -name agent.log -exec grep -hiE 'dns attribution|dns kernel attribution' {} +
+        fi
+    } | head -n "$max_lines" | emit warning "eBPF dns attribution"
     ;;
 *)
     echo "usage: $0 tail|failures|ebpf ..." >&2
