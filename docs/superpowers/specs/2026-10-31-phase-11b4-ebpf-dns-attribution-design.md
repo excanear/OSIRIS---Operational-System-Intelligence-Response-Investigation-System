@@ -152,14 +152,19 @@ source and are a non-goal here.
      immediately** with `osiris_ebpf::resolve_exe` while the sender is almost certainly still
      alive. It converts `ktime_ns` to wall time with the per-record boot offset (`clock.rs`), then
      inserts the resulting owner into a shared `SendTable`. Ring-buffer drops are added to
-     `events_dropped_total`.
+     `events_dropped_total`. *(amended, final fix wave)* So are the capture socket's own drops
+     (`PACKET_STATISTICS` `tp_drops`, which the kernel resets on each read: accumulated with
+     saturating adds, read at most once a second and once more before a socket is closed). The
+     counter therefore mixes units: ring-buffer records, capture packets (on `lo` both copies of a
+     packet are queued, so either can count) and failed channel sends.
    - **Reader failure mid-run is a one-way latch** *(call)*. The sensor becomes `Degraded`, the
      reason goes into `last_error`, and the flag changes from `ebpf_attribution` to
      `procfs_attribution` for the rest of the run, until restart. The engine switches to `/proc`
      lookups for new queries. Transactions still pending attribution get a `/proc` lookup when they
      close (best-effort). Capture still works, so the sensor is not `Failed`.
    - **Health rule** *(call)*: the reported state is the worse of the backend state and the
-     existing parse/eviction window. A backend `Degraded` (fallback at start or the latch) stays
+     existing parse/eviction window, which *(amended, final fix wave)* also opens on capture-socket
+     drops, so a lossy flood reports `Degraded`. A backend `Degraded` (fallback at start or the latch) stays
      `Degraded` for the whole run. The capture loop must stop overwriting it, which it does today
      (`h.state = window.observe(..)`).
    - **procfs fallback** (eBPF configured but unusable): today's `Attributor`, `Degraded`, flag
@@ -211,7 +216,11 @@ source and are a non-goal here.
        can swap owners (§6);
      - a claim dropped at the cap no longer protects its entry, so a newer packet can take it;
      - when a captured packet is dropped, its sender's record has no claim, and a later packet on
-       the key within the 2 s lookback can take it;
+       the key within the 2 s lookback can take it. This one is not rare: once the capture socket
+       drops packets, for example under a flood, wrong owners become likely, and an attacker can
+       cause it on purpose by flooding port 53 from a decoy and then reusing its ports. *(amended,
+       final fix wave)* The drops now show in `events_dropped_total` and the sensor reports
+       `Degraded`; a stronger join key (for example the DNS id read in-kernel) is roadmap debt;
      - when a packet's own kernel record is lost (ring-buffer drop), its claim can take an entry
        sent on the key within the 5 ms slack after the packet;
      - a retransmit whose packet arrives before its own kernel record makes no claim, so its late
@@ -231,7 +240,11 @@ source and are a non-goal here.
    - When the transaction closes (response, timeout or eviction), a pending one looks in the
      `SendTable` again.
    - A response that closes a still-unattributed transaction holds it for at most **250 ms**
-     *(call)*, re-checked on each tick, before it is emitted unattributed. Unattributed events keep
+     *(call)* before it is emitted unattributed. *(amended, final fix wave)* Held responses are
+     re-checked on a tick only when the `SendTable` received a new entry since the last re-check
+     (its `inserted` counter, read without the lock) or at least 10 ms have passed; a hold whose
+     deadline has passed gets one last check and is emitted from the front of the queue (deadlines
+     are monotonic in push order). Unattributed events keep
      11a's contract (`pid: None`, uid 0).
    - Metrics split `attributed` into `attributed_kernel` / `attributed_procfs`, plus
      `attribution_late` (hits found only at close) and `send_table_evictions`.

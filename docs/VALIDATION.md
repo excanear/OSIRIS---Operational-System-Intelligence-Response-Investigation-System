@@ -450,32 +450,41 @@ Scenarios that passed on both runners (runs 41321051436 and 41323245111):
 - (f) `dns_burst_attribution_is_near_complete`: 200 closed-socket queries from 20 concurrent clients
   under the full agent (process, network, filesystem on eBPF). Any query attributed to a pid other
   than its sender's fails the test. Result: 200/200 right pid, 0 dropped, both runners.
+- (g) `dns_flood_loss_is_counted` (final fix wave): 10 000 unanswered queries from one socket on
+  `lo` as fast as `sendto` goes. After every transaction has closed, if the sensor emitted fewer
+  events than queries were sent, `events_dropped_total` must have risen. Not yet run on the
+  runners when this was written.
 
 ### Bench run
 
 Run 41326077476 measured the send path in four configurations (no agent; full agent; full agent
 without `dns.bpf.o`; full agent without the DNS sensor), 5 interleaved rounds each. The kprobes
-alone cost +4.50 % (+0.17 us per send) on sends to a port other than 53, below the spec's 5 %
-warning threshold but close to it, and +4.58 % on port 53. The loops last 40-90 ms on a shared
+alone cost +4.50 % (+0.17 us per send) on sends to a port other than 53, within noise of the
+spec's 5 % warning threshold (not a measured pass), and +4.58 % on port 53. The loops last 40-90 ms on a shared
 runner and are noisy: one pair came out negative. Details and the full table are in
 `PERFORMANCE.md`.
 
-Each agent run ended with an unanswered 10 000-query flood on `lo`:
+Each agent run ended with an unanswered 10 000-query flood on `lo`. These flood numbers were
+measured before the sensor counted capture-socket drops:
 
 - **Ring-buffer loss under a burst.** With kernel attribution, 4 574-5 368 of the 10 000 send
   records were lost in each round. The ring buffer is 256 KiB (about 2 340 records), and the reader
   resolves each sender's exe through `/proc` before taking the next record. The loss is counted in
   `events_dropped_total` (the BPF `DROPS` counter), and the queries whose record was lost are
   emitted unattributed. Debts: ring-buffer size, and the reader's per-record cost.
-- **Uncounted capture loss (pre-existing, 11a).** Only about 3 000 query events (kernel
-  attribution) and about 850 (`/proc` fallback) came out of each flood. The others are not counted
-  anywhere. The likely cause is the `AF_PACKET` receive queue overflowing while the capture loop
-  falls behind, which is worse when every query costs a `/proc` lookup. The sensor does not read
-  `PACKET_STATISTICS` (`tp_drops`), an 11a debt that this bench makes visible.
+- **Capture loss (pre-existing, 11a; now counted).** Only about 3 000 query events (kernel
+  attribution) and about 850 (`/proc` fallback) came out of each flood, and in this run the others
+  were counted nowhere. The likely cause is the `AF_PACKET` receive queue overflowing while the
+  capture loop falls behind, which is worse when every query costs a `/proc` lookup. The final fix
+  wave made the sensor read `PACKET_STATISTICS` (`tp_drops`) at most once a second and before a
+  socket is closed, and add it to `events_dropped_total`. That counter now mixes units:
+  ring-buffer records, capture packets (on `lo` both copies of a packet can count) and failed
+  channel sends. Test (g) `dns_flood_loss_is_counted` checks that a flood's loss shows there.
 - **Health under a flood.** With kernel attribution the sensor stayed `HEALTHY` in 5/5 rounds of
-  run 41326077476. The first bench run (41324827608) ended `DEGRADED` after its flood. A flood
-  degrades the sensor only through the 11a parse/eviction window (60 s after a parse error or a
-  tracker overflow eviction at 4 096 pending), so `DEGRADED` is possible, not guaranteed.
+  run 41326077476, before capture drops counted. The first bench run (41324827608) ended `DEGRADED`
+  after its flood. Capture-socket drops now also open the 60 s `DEGRADED` window, next to parse
+  errors and tracker overflow evictions at 4 096 pending, so a flood that loses packets reports
+  `DEGRADED`.
 
 ### Known limitations
 
@@ -492,6 +501,9 @@ Each agent run ended with an unanswered 10 000-query flood on `lo`:
   a claim dropped at the 16 384 cap, a captured-packet drop, a lost kernel record whose claim takes
   an entry sent within 5 ms after the packet, a retransmit whose packet arrives before its own
   record, and a tombstone that consumes an older orphan entry. None was provoked in validation.
+  The captured-packet drop is not rare: once the capture socket drops packets (a flood, which an
+  attacker can cause on purpose from a decoy before reusing its ports) wrong owners become likely.
+  The drops now show in `events_dropped_total` and as `DEGRADED`.
 - `timestamp_fallbacks`, `send_table_evictions` and `foreign_netns` are readable only through
   `DnsSensor::attribution_metrics`; `claims_dropped` and `tombstone_consumed` only in the send
   table's counters. None is in `/status`.

@@ -175,7 +175,8 @@ Overhead pairs, computed from the median rates (time per send), with the p50 dif
 | B vs A | the whole agent | +13.8 % (+0.435 us) | +16.0 % (+2.018 us) |
 
 - **The 11b-4 cost on a send to a port other than 53 is +4.50 %, about 0.17 us per send.** That is
-  below the 5 % threshold of the spec, so no warning is required here, but it is close to it. A
+  within noise of the spec's 5 % threshold (see "Noise" below), not a measured pass: the bench
+  cannot tell 4.5 % from 5 %. A
   kprobe has a fixed entry cost even when the program returns at once, so this is the price of
   seeing every UDP sender in the kernel.
 - On port 53 the kprobes cost +4.58 % (+0.65 us per send): the program also reserves and submits a
@@ -188,9 +189,13 @@ Overhead pairs, computed from the median rates (time per send), with the p50 dif
 - A first run (41324827608, `t11b4-1` @ `1748899`) had one round and no variants and showed
   +51.8 % on port 5300 for the whole agent. That figure is superseded: a single short loop with no
   variants could not attribute the cost to anything.
-- The agent used 0.14-0.17 s of CPU over the four loops in B, and 0.17-0.19 s in C.
+- The agent used 0.14-0.17 s of CPU over the three loops (warm-up, port 5300, port 53) in B, and
+  0.17-0.19 s in C.
 
-**The unanswered port-53 flood.** The `dns` status, sampled 1-10 s after each flood:
+**The unanswered port-53 flood.** The `dns` status, sampled 1-10 s after each flood. These numbers
+were measured before the sensor counted capture-socket drops (`PACKET_STATISTICS`): today's
+`events_dropped_total` would be higher by those drops, and the capture drops would also report
+`DEGRADED`.
 
 | Config | State | `events_dropped_total` after the flood | `events_emitted_total` |
 |---|---|---|---|
@@ -207,19 +212,21 @@ Overhead pairs, computed from the median rates (time per send), with the p50 dif
   unattributed. The bench sends from one socket, so every send also lands on one send-table key,
   whose queue holds 8 entries: the bench is a worst case for attribution, and only the drop count is
   read from it.
-- **Far fewer than 10 000 query events come out, and the missing ones are counted nowhere.** B
-  emitted about 3 000 and C about 850. The likely cause is the `AF_PACKET` socket's receive queue
-  overflowing while the capture loop falls behind. This is pre-existing from 11a. It is worse in C,
-  where every query costs a `/proc` lookup. The sensor never reads the kernel's `PACKET_STATISTICS`
-  (`tp_drops`), so this loss is silent: an observed limit, carried as a debt in
-  `docs/ROADMAP-REMAINING.md`.
-- **A flood does not necessarily degrade the sensor.** `DEGRADED` from the capture side is the 11a
-  parse/eviction window: it is reported for 60 s after parse errors or tracker overflow evictions
-  (more than 4 096 pending transactions). In this run nothing was emitted before the 5 s timeout, and an
-  overflow eviction is emitted at once, so the tracker evicted nothing: the capture saw fewer than
-  4 096 queries, and B stayed `HEALTHY` in 5/5 rounds. The first run (41324827608) ended `DEGRADED` after
-  its flood. Treat `DEGRADED` as possible under a flood, not as a guarantee, and do not read
-  `HEALTHY` as "nothing lost": check `events_dropped_total`.
+- **Far fewer than 10 000 query events come out.** B emitted about 3 000 and C about 850. The
+  likely cause is the `AF_PACKET` socket's receive queue overflowing while the capture loop falls
+  behind. This is pre-existing from 11a. It is worse in C, where every query costs a `/proc`
+  lookup. In this run the loss was silent. Since the 11b-4 final fix the sensor reads the kernel's
+  `PACKET_STATISTICS` (`tp_drops`, accumulated, read at most once a second and before the socket
+  is closed) and adds it to `events_dropped_total`.
+- **`events_dropped_total` mixes units.** It now adds ring-buffer records (lost or undecodable),
+  capture packets (on `lo` the socket queues both copies of each packet, so one lost query can
+  count twice) and failed channel sends. It shows that something was lost, not how many queries.
+- **A flood now degrades the sensor when the capture socket drops.** `DEGRADED` from the capture
+  side is reported for 60 s after parse errors, tracker overflow evictions (more than 4 096
+  pending transactions) or capture-socket drops. In the run above, before capture drops counted,
+  nothing was emitted before the 5 s timeout and an overflow eviction is emitted at once, so the
+  tracker evicted nothing: the capture saw fewer than 4 096 queries, and B stayed `HEALTHY` in 5/5
+  rounds. The first run (41324827608) ended `DEGRADED` after its flood.
 
 ### Before/after F1 (WSL, ingest at 1 000 eps target, 30 s)
 

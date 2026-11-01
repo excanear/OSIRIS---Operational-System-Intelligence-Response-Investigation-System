@@ -93,8 +93,12 @@ revisão final independente → merge → push.
   - O contador de descartes do kernel (`PACKET_STATISTICS`, `tp_drops`) nunca é lido. A perda
     por estouro do buffer de recepção em host ocupado passa em silêncio. **Observado na 11b-4**
     (bench 41326077476): numa enxurrada de 10 000 consultas sem resposta em `lo` saíram só ~3 000
-    eventos com atribuição pelo kernel e ~850 com atribuição por `/proc`, sem contagem da perda.
-    Correção proposta: ler `tp_drops` e somar em `events_dropped_total`.
+    eventos no modo de atribuição pelo kernel e ~850 no modo de atribuição por `/proc`, sem
+    contagem da perda. (RESOLVIDA na revisão final da 11b-4: `tp_drops` é lido no máximo uma vez
+    por segundo e antes de fechar o socket, acumulado e somado em `events_dropped_total`, e abre a
+    janela `DEGRADED`. O contador passa a misturar unidades: registros do ring buffer, pacotes da
+    captura, em que as duas cópias de `lo` podem contar, e envios ao canal. Os números do bench
+    acima foram medidos antes deste contador.)
   - Tráfego encaminhado ou com NAT (Docker, roteador): a cópia de egresso (`PACKET_OUTGOING`)
     conta como local e gera um segundo evento. Se a porta colidir, esse evento pode ser atribuído
     a um processo do host sem relação. Correção futura: comparar o IP de origem com os endereços
@@ -214,7 +218,7 @@ revisão final independente → merge → push.
   Validado em Linux real (rodadas `real-linux/t11b4-1` a `-4`, Ubuntu 22.04 com kernel
   6.8.0-1070-azure e 24.04 com 7.0.0-1017-azure; t11b4-3 @ `94d1444` verde nos dois na primeira
   tentativa e t11b4-4 @ `d3355d7` verde nos dois, rajada 200/200 com o pid certo) e medido em `PERFORMANCE.md`
-  (kprobes: +4,50 % num envio para porta diferente de 53, abaixo do limite de 5 %). Ver
+  (kprobes: +4,50 % num envio para porta diferente de 53, dentro do ruído do limite de 5 %, não uma aprovação medida). Ver
   `docs/operators-ebpf.md`, `docs/operators-dns-sensor.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
   `docs/VALIDATION.md`. **Com a 11b-4 a Fase 11b está encerrada.**
   Dívidas da 11b-4:
@@ -235,6 +239,21 @@ revisão final independente → merge → push.
     ser tomado por um pacote mais novo na porta reutilizada em até 2 s.
   - Um tombstone pode consumir uma entrada órfã mais antiga na sua janela (pacote capturado perdido)
     e deixar o próprio registro tardio sem claim.
+  - Um claim descartado no limite de 16 384 deixa de proteger a sua entrada, e um pacote mais novo
+    pode tomá-la (dono errado possível).
+  - Pacote capturado perdido: o registro do envio fica sem claim, e uma consulta mais nova na mesma
+    porta em até 2 s pode tomá-lo (dono errado). Não é raro: quando o socket de captura descarta
+    pacotes, por exemplo numa enxurrada, donos errados ficam prováveis, e um atacante pode provocar
+    isso de propósito inundando a porta 53 a partir de um processo isca e depois reutilizando as
+    portas dele. Os descartes agora aparecem em `events_dropped_total` e o sensor fica `DEGRADED`.
+    Correção futura: uma chave de junção mais forte, por exemplo o id DNS lido no kernel.
+  - Custo de claim por chave (M1): a reserva percorre os claims e a fila da chave a cada busca,
+    linear no número de claims da chave; limitado (fila de 8, claims até o TTL), mas caro numa
+    chave com muitos pacotes sem registro.
+  - Tabela travada após o latch (M2): depois da troca para `/proc` a tabela de envios fica guardada
+    só para liberar claims e nunca mais expira; limitada pela capacidade de 16 384.
+  - Filtro de netns no kernel (M3): envios de outros namespaces de rede ainda gastam espaço no ring
+    buffer e só são descartados (e contados em `foreign_netns`) no espaço de usuário.
   - `timestamp_fallbacks`, `send_table_evictions` e `foreign_netns` só podem ser lidos por
     `DnsSensor::attribution_metrics`, e `claims_dropped` e `tombstone_consumed` só pelos contadores
     da tabela de envios; nenhum está em `/status` (decisão da Task 5).
@@ -245,7 +264,8 @@ revisão final independente → merge → push.
     o próximo, o que alonga o esvaziamento do ring buffer numa rajada. Avaliar cache por
     (pid, identidade) ou resolução fora da thread leitora.
   - Perda silenciosa do socket AF_PACKET sob enxurrada (ver a dívida `tp_drops` da 11a acima), agora
-    observada no bench.
+    observada no bench. (RESOLVIDA na revisão final da 11b-4: a perda é contada em
+    `events_dropped_total` e deixa o sensor `DEGRADED`.)
   - O piso de kernel 5.15 segue raciocinado, não executado.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 

@@ -200,5 +200,8 @@ kprobe and required/optional support from 11b-3 covers it. Validation runs are l
   build requirement of the workspace. Revisit if a layout test misses a real mismatch.
 - **Debts this adds** (also in `docs/ROADMAP-REMAINING.md`): x86_64-only kprobe objects,
   pid-namespace-aware pids for all 11b objects, foreign-netns attribution, the `SO_REUSEPORT` 5 ms
-  ambiguity, ring-buffer size and reader cost under a burst, and uprobes as an optional future
-  source.
+  ambiguity, ring-buffer size and reader cost under a burst, a stronger join key (for example the
+  DNS id read in-kernel) against wrong owners after captured-packet drops, and uprobes as an
+  optional future source. The cases where a wrong owner is still possible are the Known limits in
+  the 11b-4 spec, §3.3 item 8
+  (`docs/superpowers/specs/2026-10-31-phase-11b4-ebpf-dns-attribution-design.md`).

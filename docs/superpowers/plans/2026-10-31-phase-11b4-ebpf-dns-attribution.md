@@ -38,13 +38,13 @@
    - TTL **10 s**, capacity **16 384** entries, oldest evicted and counted;
    - the local address is compared only when both sides are non-wildcard.
 8. Only sends whose `netns_ino` equals the agent's own netns inode (`stat("/proc/self/ns/net").st_ino`) enter the table. Others are counted as `foreign_netns`. If the agent's netns cannot be read, eBPF attribution is unusable (fallback).
-9. A response that closes an unattributed transaction is held for at most **250 ms**, re-checked on each tick, and then emitted unattributed. Timeouts and evictions are re-checked once at close and emitted.
+9. A response that closes an unattributed transaction is held for at most **250 ms** and then emitted unattributed. *(amended, final fix wave)* It is re-checked on a tick only when the send table's `inserted` counter changed since the last re-check or ≥ 10 ms passed; a hold past its deadline gets one last check and is emitted from the front (deadlines are monotonic in push order). Timeouts and evictions are re-checked once at close and emitted.
 10. DNS health and flags:
     - eBPF working: `Healthy`, flag `ebpf_attribution`.
     - eBPF configured but unusable: `Degraded`, flag `procfs_attribution`, `last_error` with the reason (containing `dns.bpf.o` when the object is the problem).
     - No `ebpf` key: `Healthy`, flag `procfs_attribution`.
     - A reader failure mid-run is a **one-way latch** to `Degraded` + `procfs_attribution` until restart.
-    - Reported state = worse of the backend state and the parse/eviction window. The capture loop never overwrites a backend `Degraded`.
+    - Reported state = worse of the backend state and the parse/eviction window. The capture loop never overwrites a backend `Degraded`. *(amended, final fix wave)* The window also opens on capture-socket drops (`PACKET_STATISTICS` `tp_drops`, accumulated, read ≤ 1/s and before a socket is dropped), which are added to `events_dropped_total`; that counter now mixes units (ring-buffer records, capture packets, channel sends).
     - Existing capture flags are kept.
 11. No schema change: `source` stays `PACKET`, provider `dns_sensor/af_packet`. `DnsEventRaw`/`DnsRef` are untouched. No new agent config key: the DNS sensor gets `ebpf_settings(config)`.
 12. In eBPF mode the engine **never** does the `/proc` lookup on the query path. After the latch, new queries use `/proc` and pending ones get a `/proc` lookup at close.

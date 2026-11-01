@@ -341,8 +341,12 @@ alive), keeps the send in a short-lived table keyed by local port, remote addres
 and joins each captured query with the oldest matching send within `[packet − 2 s, packet + 5 ms]`.
 A client that closes its socket or exits right after sending is still attributed. A query whose
 send record has not arrived yet waits: a response that closes it is held for up to 250 ms, and an
-unanswered query is retried when it times out. Port reuse is handled so that a query is never given
-to the process that used the port before (see `docs/operators-dns-sensor.md` for the exceptions).
+unanswered query is retried when it times out. Port reuse is handled so that a query is normally
+not given to the process that used the port before, with exceptions listed in
+`docs/operators-dns-sensor.md`. One of them is not rare: when the capture socket drops packets, for
+example under a flood, wrong owners become likely, and an attacker can cause this on purpose by
+flooding port 53 from a decoy process and then reusing the decoy's ports. The drops show in
+`events_dropped_total` and the sensor reports `DEGRADED`.
 
 ### Network namespace rule
 
@@ -389,7 +393,11 @@ agent cannot read its own namespace, kernel attribution is unusable and the sens
   attributed to the app, and systemd-resolved's upstream query, attributed to `systemd-resolved`.
   Both are true.
 - Two sockets sharing one local port (`SO_REUSEPORT`) and sending to the same resolver within
-  5 ms can swap owners. Sequential port reuse is handled.
+  5 ms can swap owners. Sequential port reuse is handled while the capture socket keeps up. Once
+  it drops packets (a flood, possibly an attacker flooding port 53 from a decoy and then reusing
+  the decoy's ports), a query whose packet was lost leaves its send record behind, and a later
+  query on the same port can take it: a wrong owner. The drops show in `events_dropped_total` and
+  the sensor reports `DEGRADED` for 60 s.
 - Queries from other network namespaces, queries sent before the agent started, and queries whose
   send record was dropped are unattributed. There is no `/proc` retry for them.
 - Queries forwarded for other hosts (the host is itself a resolver) are not attributed.
