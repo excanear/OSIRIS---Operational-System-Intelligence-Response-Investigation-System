@@ -9,3 +9,9 @@ osiris-schema = { path = "../osiris-schema" }
 osiris-query = { path = "../osiris-query" }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Backend-neutral `Storage` conformance suite (`osiris_storage::conformance`),
+# run by each backend's own integration tests.
+conformance = ["dep:serde_json"]

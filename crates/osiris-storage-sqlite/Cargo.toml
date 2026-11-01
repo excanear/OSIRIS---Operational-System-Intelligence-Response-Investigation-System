@@ -14,3 +14,4 @@ osiris-query = { path = "../osiris-query" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+osiris-storage = { path = "../osiris-storage", features = ["conformance"] }

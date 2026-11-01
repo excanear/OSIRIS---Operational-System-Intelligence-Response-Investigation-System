@@ -1,6 +1,11 @@
 use osiris_schema::{EntityRef, EventType, FileIdentity, ProcessKey};
 use uuid::Uuid;
 
+/// The most tenant hosts one query may be scoped to. A larger `host_ids` set
+/// is a clear `StorageError::Backend("tenant host set too large ...")`, never
+/// a silent truncation.
+pub const MAX_TENANT_HOSTS: usize = 30_000;
+
 /// This phase's minimal query surface (plan Global Constraints #11) — what
 /// the API needs and no more: event_type/time-range filtering, a
 /// process_key lookup, and the two file lookups the File Story composes.
