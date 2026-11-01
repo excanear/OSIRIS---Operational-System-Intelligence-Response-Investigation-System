@@ -108,7 +108,11 @@ impl Transport {
 
     /// Runs `sql` in the configured database and returns the response body.
     ///
-    /// `params` become `param_<name>` URL parameters. `tables` turn the
+    /// `params` become `param_<name>` URL parameters. They are for **scalar
+    /// values only**: each value is TSV-escaped, which is what ClickHouse
+    /// expects for a scalar `{name:Type}`. A list must go through `tables`
+    /// as an external table. Passing an `Array`/`Tuple` literal as a param
+    /// would escape it a second time and corrupt it. `tables` turn the
     /// request into a multipart form with one part per external table.
     /// `body`, when given, is the data of an `INSERT ... FORMAT ...` query;
     /// the query then moves to the `query` URL parameter. `tables` and
@@ -149,6 +153,12 @@ impl Transport {
             if let Some(db) = database {
                 q.append_pair("database", db);
             }
+            // Without this, an exception raised after the first blocks were
+            // flushed arrives as HTTP 200 with a partial body and an
+            // `__exception__` trailer (verified on 26.3). With it, the
+            // server buffers the whole result and returns a real error
+            // status. `send` also checks for the trailer, as a backstop.
+            q.append_pair("wait_end_of_query", "1");
             for (name, value) in params {
                 // ClickHouse parses a parameter value in its escaped (TSV)
                 // text form: an unescaped tab or backslash cuts the value
@@ -278,6 +288,11 @@ fn send(req: reqwest::blocking::RequestBuilder) -> Result<String, StorageError> 
         .get("X-ClickHouse-Exception-Code")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let exception_tag = resp
+        .headers()
+        .get("X-ClickHouse-Exception-Tag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let text = resp.text().map_err(|e| {
         StorageError::Backend(format!(
             "clickhouse: reading response failed: {}",
@@ -291,7 +306,38 @@ fn send(req: reqwest::blocking::RequestBuilder) -> Result<String, StorageError> 
             truncate(&text, ERROR_BODY_LIMIT)
         )));
     }
+    if let Some(message) = exception_trailer(&text, exception_tag.as_deref()) {
+        return Err(StorageError::Backend(format!(
+            "clickhouse: {}: {}",
+            status,
+            truncate(message, ERROR_BODY_LIMIT)
+        )));
+    }
     Ok(text)
+}
+
+/// Backstop for an exception raised mid-stream (which `wait_end_of_query=1`
+/// should already prevent). On 26.3 the body then ends with
+/// `\n__exception__\n<tag>\n<message>\n<len> <tag>\n__exception__\n`, where
+/// `<tag>` is the random `X-ClickHouse-Exception-Tag` response header, so a
+/// data row cannot fake it. Returns the exception message if present.
+fn exception_trailer<'a>(body: &'a str, tag: Option<&str>) -> Option<&'a str> {
+    let tag = tag.filter(|t| !t.is_empty())?;
+    let end_marker = format!("{tag}\n__exception__");
+    let trimmed = body.trim_end_matches('\n');
+    if !trimmed.ends_with(&end_marker) {
+        return None;
+    }
+    let start_marker = format!("__exception__\n{tag}\n");
+    let start = trimmed.rfind(&start_marker)? + start_marker.len();
+    let message = &trimmed[start..trimmed.len() - end_marker.len()];
+    // Drop the trailing `<len> ` length field.
+    let message = message.trim_end();
+    let message = message
+        .rsplit_once('\n')
+        .map(|(m, _len)| m)
+        .unwrap_or(message);
+    Some(message.trim())
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -375,6 +421,21 @@ mod tests {
         assert!(body.contains("name=\"ids\"; filename=\"ids\""));
         assert!(body.contains("\r\n\r\na\nb\\tc\n\r\n"));
         assert!(body.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn exception_trailer_is_detected_only_with_the_matching_tag() {
+        // The shape ClickHouse 26.3 emits after a mid-stream exception.
+        let body = "95\t0\n99999\t0\n\n__exception__\noeaqwyeogsepvaad\n\
+                    Code: 395. DB::Exception: boom. (FUNCTION_THROW_IF_VALUE_IS_NON_ZERO)\n\
+                    291 oeaqwyeogsepvaad\n__exception__\n";
+        assert_eq!(
+            exception_trailer(body, Some("oeaqwyeogsepvaad")),
+            Some("Code: 395. DB::Exception: boom. (FUNCTION_THROW_IF_VALUE_IS_NON_ZERO)")
+        );
+        assert_eq!(exception_trailer(body, Some("othertagxxxxxxxx")), None);
+        assert_eq!(exception_trailer(body, None), None);
+        assert_eq!(exception_trailer("1\n2\n", Some("oeaqwyeogsepvaad")), None);
     }
 
     #[test]

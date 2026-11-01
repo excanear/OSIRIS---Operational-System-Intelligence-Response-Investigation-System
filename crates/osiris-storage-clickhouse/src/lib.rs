@@ -337,6 +337,33 @@ mod tests {
         }
     }
 
+    /// Needs a server: an exception raised after the first blocks have
+    /// been streamed must surface as `Err`, never as a partial result.
+    #[test]
+    #[ignore = "needs OSIRIS_CLICKHOUSE_URL"]
+    fn mid_stream_exception_is_an_error_not_a_partial_result() {
+        let url = std::env::var("OSIRIS_CLICKHOUSE_URL")
+            .expect("OSIRIS_CLICKHOUSE_URL must be set to run the ClickHouse tests");
+        let mut o = opts(&url, "default");
+        o.timeout = Duration::from_secs(30);
+        let storage = ClickHouseStorage::open_without_schema(o).unwrap();
+        for format in ["TSV", "JSONEachRow"] {
+            let sql = format!(
+                "SELECT toString(number) AS s, throwIf(number = 100000) FROM numbers(200000) \
+                 SETTINGS max_block_size = 1000 FORMAT {format}"
+            );
+            let result = storage.transport.execute(&sql, &[], &[], None);
+            let err = match result {
+                Ok(body) => panic!("{format}: got Ok with {} bytes", body.len()),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("FUNCTION_THROW_IF_VALUE_IS_NON_ZERO"),
+                "{format}: {err}"
+            );
+        }
+    }
+
     /// Needs a server: a recorded version above `SCHEMA_VERSION` must make
     /// `open` fail.
     #[test]
