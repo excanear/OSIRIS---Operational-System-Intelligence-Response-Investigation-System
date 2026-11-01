@@ -84,6 +84,9 @@ check_forbidden osiris-server osiris-sensors osiris-ebpf osiris-kernel
 # Global Constraint #5: osiris-query may depend on osiris-schema and
 # nothing else OSIRIS-internal.
 check_only_internal_deps osiris-query osiris-schema
+# Phase 11c: the ClickHouse backend implements the storage trait over the
+# schema and query types, and reaches nothing else OSIRIS-internal.
+check_only_internal_deps osiris-storage-clickhouse osiris-storage osiris-schema osiris-query
 check_forbidden osiris-query osiris-sensors osiris-agent osiris-ebpf osiris-kernel
 check_forbidden osiris-investigate osiris-sensors osiris-agent osiris-ebpf osiris-kernel
 # Global Constraint #6: osiris-evidence must never reach osiris-storage.

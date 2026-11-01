@@ -1,0 +1,17 @@
+[package]
+name = "osiris-storage-clickhouse"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+osiris-schema = { path = "../osiris-schema" }
+osiris-storage = { path = "../osiris-storage" }
+osiris-query = { path = "../osiris-query" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+osiris-storage = { path = "../osiris-storage", features = ["conformance"] }

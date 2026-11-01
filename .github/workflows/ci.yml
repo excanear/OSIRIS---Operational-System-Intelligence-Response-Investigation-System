@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, "ci/**"]
   pull_request:
 
 jobs:
@@ -43,3 +43,34 @@ jobs:
       - name: Build
         working-directory: console
         run: npm run build
+
+  # Phase 11c: the ClickHouse storage backend's own tests and the shared
+  # Storage conformance suite, against the pinned LTS server. 26.3 rather
+  # than 26.8: the 26.8 amd64 build needs AVX2 (SIGILL on older CPUs), and
+  # the dev server (tools/clickhouse/dev-server.sh) pins the same version.
+  clickhouse:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.3.60.2
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: 1
+    env:
+      OSIRIS_CLICKHOUSE_URL: http://127.0.0.1:8123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Wait for ClickHouse
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8123/ping; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Test (including ClickHouse-only tests)
+        run: cargo test -p osiris-storage-clickhouse -- --include-ignored

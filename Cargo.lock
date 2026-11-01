@@ -1999,6 +1999,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-storage-clickhouse"
+version = "0.1.0"
+dependencies = [
+ "osiris-query",
+ "osiris-schema",
+ "osiris-storage",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "osiris-storage-sqlite"
 version = "0.1.0"
 dependencies = [
