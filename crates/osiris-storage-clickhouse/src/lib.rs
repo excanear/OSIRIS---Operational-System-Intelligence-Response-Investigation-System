@@ -10,6 +10,7 @@
 //! constraint, so write-once semantics on ids are enforced under a
 //! process-local writer mutex (design §5.4).
 
+mod events;
 mod schema;
 mod transport;
 
@@ -85,9 +86,7 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
 pub struct ClickHouseStorage {
     transport: Transport,
     database: String,
-    /// Serialises the dedupe-then-insert write path (design §5.4). Used by
-    /// the write methods from Task 3 on.
-    #[allow(dead_code)]
+    /// Serialises the dedupe-then-insert write path (design §5.4).
     writer: Mutex<()>,
 }
 
@@ -174,16 +173,16 @@ fn not_implemented() -> StorageError {
 }
 
 impl Storage for ClickHouseStorage {
-    fn write(&self, _event: &CanonicalEvent) -> Result<(), StorageError> {
-        Err(not_implemented())
+    fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError> {
+        self.events_write(event)
     }
 
-    fn batch_write(&self, _events: &[CanonicalEvent]) -> Result<WriteReport, StorageError> {
-        Err(not_implemented())
+    fn batch_write(&self, events: &[CanonicalEvent]) -> Result<WriteReport, StorageError> {
+        self.events_batch_write(events)
     }
 
-    fn event_owner(&self, _event_id: Uuid) -> Result<Option<Uuid>, StorageError> {
-        Err(not_implemented())
+    fn event_owner(&self, event_id: Uuid) -> Result<Option<Uuid>, StorageError> {
+        self.events_owner(event_id)
     }
 
     fn query(&self, _plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError> {
@@ -197,35 +196,20 @@ impl Storage for ClickHouseStorage {
         Err(not_implemented())
     }
 
-    fn get_event(&self, _event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError> {
-        Err(not_implemented())
+    fn get_event(&self, event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError> {
+        self.events_get(event_id)
     }
 
-    fn delete(&self, _criteria: &DeleteCriteria) -> Result<u64, StorageError> {
-        Err(not_implemented())
+    fn delete(&self, criteria: &DeleteCriteria) -> Result<u64, StorageError> {
+        self.events_delete(criteria)
     }
 
-    fn retention_apply(&self, _policy: &RetentionPolicy) -> Result<RetentionReport, StorageError> {
-        Err(not_implemented())
+    fn retention_apply(&self, policy: &RetentionPolicy) -> Result<RetentionReport, StorageError> {
+        self.events_retention_apply(policy)
     }
 
     fn health(&self) -> StorageHealth {
-        // Bounded by the transport timeout; never panics. `event_count` and
-        // `last_write_at` are filled in with the events table (Task 3).
-        match self.transport.execute("SELECT 1", &[], &[], None) {
-            Ok(_) => StorageHealth {
-                healthy: true,
-                event_count: 0,
-                last_write_at: None,
-                detail: None,
-            },
-            Err(e) => StorageHealth {
-                healthy: false,
-                event_count: 0,
-                last_write_at: None,
-                detail: Some(e.to_string()),
-            },
-        }
+        self.events_health()
     }
 
     fn write_alerts(&self, _alerts: &[Alert]) -> Result<WriteReport, StorageError> {

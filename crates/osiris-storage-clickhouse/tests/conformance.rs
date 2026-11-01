@@ -47,7 +47,6 @@ fn fresh_name() -> String {
     format!("osiris_t_{}", uuid::Uuid::new_v4().simple())
 }
 
-#[allow(dead_code)] // Invoked by the conformance groups from Task 3 on.
 fn fresh() -> TestDb {
     let storage = ClickHouseStorage::open(options(&fresh_name())).expect("open fresh database");
     TestDb { storage }
@@ -64,3 +63,5 @@ fn open_creates_schema_and_is_idempotent() {
     assert!(first.health().healthy, "{:?}", first.health().detail);
     assert!(second.health().healthy, "{:?}", second.health().detail);
 }
+
+osiris_storage::conformance_events_tests!(fresh, ignore = "needs OSIRIS_CLICKHOUSE_URL");
