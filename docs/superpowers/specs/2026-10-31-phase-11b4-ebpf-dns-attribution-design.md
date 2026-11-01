@@ -186,10 +186,21 @@ source and are a non-goal here.
      ktime-to-wall conversion. When the packet has no kernel timestamp (7), the upper bound becomes
      the processing time *(calls: 2 s, 5 ms)*.
    - **Why this is safe under port reuse.** Process A closes port P. Process B binds P and sends to
-     the same resolver. A's send happened before B's, so A's entry is older and A's packet consumes
-     it, even when B's record is read first. B's packet then consumes B's entry. A packet whose own
-     record was dropped finds no entry in its time window older than itself, so it comes out
-     unattributed rather than misattributed. Unit tests cover these interleavings.
+     the same resolver. A's send happened before B's, so A's entry is older. Packet and record
+     travel on separate paths, so A's packet may be processed before A's record is in the table,
+     and B's packet may arrive after both records. Lookup by age alone would then hand A's entry
+     to B. So a packet that misses registers a **claim** `(key, local address, packet_ts)`, kept in
+     its pending transaction. **Older unresolved packets on a key have priority over newer ones**:
+     claims older than the packet (earlier `packet_ts`, ties broken by claim order) first reserve,
+     oldest claim first, the oldest entries inside their own windows with compatible local
+     addresses; the packet takes the oldest entry left. A claimed packet's retry (at close and on
+     each hold tick) applies the same rule against claims older than itself and drops its claim on
+     a hit. Entries a live claim could still take are not discarded by a newer lookup. A claim is
+     released when the engine gives up (emitted unattributed) or resolves through `/proc` after the
+     latch; retransmits make none. Claims expire with the 10 s TTL and are capped at 16,384, oldest
+     dropped. A claim whose own record was lost blocks only entries inside its window
+     (`[packet_ts − 2 s, packet_ts + 5 ms]`), which B's later send normally is not, so the worst
+     case is a miss, never a wrong owner. Unit tests cover these interleavings.
    - **Limits:** entries expire after **10 s** *(call: two 11a tracker timeouts)*. The table holds
      at most **16,384** entries; on overflow the oldest entry is evicted and counted *(call)*.
    - **Local address:** matched when both sides have one, ignored when the send came from a

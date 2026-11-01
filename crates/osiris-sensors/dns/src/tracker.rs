@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use osiris_sensor_api::{DnsEventRaw, RawEventSource};
 
-use crate::send_table::SendKey;
+use crate::send_table::{ClaimId, SendKey};
 use crate::wire::{qtype_mnemonic, DnsMessage};
 
 const TYPE_A: u16 = 1;
@@ -47,6 +47,9 @@ pub struct PendingAttribution {
     pub laddr: IpAddr,
     /// The query packet's wall-clock timestamp: the join's reference time.
     pub packet_ts_ns: u64,
+    /// The packet's claim in the send table, released when the join is
+    /// given up.
+    pub claim: ClaimId,
 }
 
 /// Why a transaction closed.
@@ -132,17 +135,18 @@ impl Tracker {
         self.pending.contains_key(key)
     }
 
-    /// Gives a transaction still pending attribution its owner. False when
-    /// the transaction is unknown or not pending attribution.
-    pub fn resolve_pending(&mut self, key: &TxKey, attribution: Attribution) -> bool {
-        match self.pending.get_mut(key) {
-            Some(p) if p.pending.is_some() => {
-                p.pending = None;
-                p.attribution = attribution;
-                true
-            }
-            _ => false,
-        }
+    /// Gives a transaction still pending attribution its owner and returns
+    /// the join it no longer owes. None when the transaction is unknown or
+    /// not pending attribution.
+    pub fn resolve_pending(
+        &mut self,
+        key: &TxKey,
+        attribution: Attribution,
+    ) -> Option<PendingAttribution> {
+        let p = self.pending.get_mut(key)?;
+        let owed = p.pending.take()?;
+        p.attribution = attribution;
+        Some(owed)
     }
 
     /// Register a query. When the table is full the oldest pending
@@ -470,6 +474,11 @@ mod tests {
             key: SendKey::new(key(1000, 1).client, "10.0.0.1:53".parse().unwrap()),
             laddr: "10.0.0.2".parse().unwrap(),
             packet_ts_ns: 9,
+            claim: crate::send_table::SendTable::new().claim(
+                SendKey::new(key(1000, 1).client, "10.0.0.1:53".parse().unwrap()),
+                "10.0.0.2".parse().unwrap(),
+                9,
+            ),
         }
     }
 
@@ -503,7 +512,7 @@ mod tests {
     fn resolve_pending_sets_owner_once() {
         let mut t = Tracker::new(Duration::from_secs(5), 4);
         let now = Instant::now();
-        assert!(!t.resolve_pending(&key(1000, 1), attr()));
+        assert!(t.resolve_pending(&key(1000, 1), attr()).is_none());
         t.on_query(
             key(1000, 1),
             &query("a.com"),
@@ -513,8 +522,13 @@ mod tests {
             now,
         );
         assert!(t.contains(&key(1000, 1)));
-        assert!(t.resolve_pending(&key(1000, 1), attr()));
-        assert!(!t.resolve_pending(&key(1000, 1), Attribution::default()));
+        assert_eq!(
+            t.resolve_pending(&key(1000, 1), attr()),
+            Some(pending_attr())
+        );
+        assert!(t
+            .resolve_pending(&key(1000, 1), Attribution::default())
+            .is_none());
         let c = t.on_response(key(1000, 1), &response(0, vec![])).unwrap();
         assert_eq!(c.pending, None);
         assert_eq!(c.event.pid, Some(42));

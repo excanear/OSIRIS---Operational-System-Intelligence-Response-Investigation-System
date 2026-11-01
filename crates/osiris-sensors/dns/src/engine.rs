@@ -8,8 +8,9 @@
 //! owner is looked up in `/proc` when the query packet is seen (11a). In
 //! [`AttributionMode::Kernel`] the query packet is joined with the kernel's
 //! record of the send ([`SendTable`]) and `/proc` is never read. Packet and
-//! record race, so a miss at query time is retried when the transaction
-//! closes, and a response that still misses is held for
+//! record race, so a miss at query time claims its place in the table (newer
+//! packets on the key cannot take what it may still join) and is retried
+//! when the transaction closes, and a response that still misses is held for
 //! [`ATTRIBUTION_GRACE`], re-checked on every tick, before it is emitted
 //! unattributed. [`Engine::latch_procfs`] switches to `/proc` for good.
 
@@ -21,7 +22,7 @@ use osiris_sensor_api::{DnsEventRaw, RawEvent};
 
 use crate::attribution::Attributor;
 use crate::frame::{classify, decode_l3, Direction};
-use crate::send_table::{lock_table, SendKey, SharedSendTable};
+use crate::send_table::{lock_table, ClaimId, SendKey, SharedSendTable};
 use crate::tracker::{
     Attribution, CloseKind, Closed, PendingAttribution, Tracker, TrackerCounters, TxKey,
 };
@@ -101,6 +102,9 @@ pub struct Engine {
     held_capacity: usize,
     /// When old kernel sends were last expired.
     last_expire: Option<Instant>,
+    /// The kernel table kept after [`Engine::latch_procfs`], only so claims
+    /// of transactions still pending can be released.
+    latched_table: Option<SharedSendTable>,
     packets: u64,
     parse_errors: u64,
     direction_mismatches: u64,
@@ -134,6 +138,7 @@ impl Engine {
             held: VecDeque::new(),
             held_capacity: capacity.max(1),
             last_expire: None,
+            latched_table: None,
             packets: 0,
             parse_errors: 0,
             direction_mismatches: 0,
@@ -173,7 +178,23 @@ impl Engine {
     /// looked up in `/proc`, and transactions still pending attribution get
     /// a `/proc` lookup when they close (held ones on the next tick).
     pub fn latch_procfs(&mut self) {
-        self.mode = AttributionMode::Procfs;
+        if let AttributionMode::Kernel(table) =
+            std::mem::replace(&mut self.mode, AttributionMode::Procfs)
+        {
+            self.latched_table = Some(table);
+        }
+    }
+
+    /// Releases the send-table claim of a transaction whose kernel join is
+    /// no longer attempted, so it stops reserving entries.
+    fn release_claim(&self, claim: ClaimId) {
+        let table = match &self.mode {
+            AttributionMode::Kernel(table) => Some(table),
+            AttributionMode::Procfs => self.latched_table.as_ref(),
+        };
+        if let Some(table) = table {
+            lock_table(table).release(claim);
+        }
     }
 
     /// Process one raw L3 packet. Never panics on malformed input.
@@ -229,11 +250,18 @@ impl Engine {
                 } else {
                     self.attribute_query(key, dg.dst, timestamp_ns, now)
                 };
+                let claim = pending.map(|p| p.claim);
                 if let Some(closed) =
                     self.tracker
                         .on_query(key, &msg, attribution, pending, timestamp_ns, now)
                 {
                     self.close(closed, now, &mut raw);
+                }
+                // A query the tracker did not keep (no question) owes no join.
+                if let Some(claim) = claim {
+                    if !self.tracker.contains(&key) {
+                        self.release_claim(claim);
+                    }
                 }
             }
             Direction::Response => {
@@ -273,30 +301,39 @@ impl Engine {
         };
         let send_key = SendKey::new(key.client, server);
         let laddr = key.client.ip();
-        // The lock is held only for the lookup itself.
-        let hit = lock_table(table).take(&send_key, laddr, timestamp_ns);
         if self.tracker.contains(&key) {
-            // Retransmit: its own record (if any) was consumed above, and
-            // it may complete a transaction whose first record was lost.
-            // The tracker counts the duplicate and keeps the first packet.
+            // Retransmit: it consumes its own record (if any) and may
+            // complete a transaction whose first record was lost. It makes
+            // no claim. The tracker counts the duplicate and keeps the
+            // first packet. The lock is held only for the lookup itself.
+            let hit = lock_table(table).take(&send_key, laddr, timestamp_ns);
             if let Some(a) = hit {
-                if self.tracker.resolve_pending(&key, a) {
+                if let Some(owed) = self.tracker.resolve_pending(&key, a) {
                     self.attributed_kernel += 1;
+                    lock_table(table).release(owed.claim);
                 }
             }
             return (Attribution::default(), None);
         }
-        match hit {
-            Some(a) => {
+        // A miss claims the packet's place, so a newer packet on a reused
+        // port cannot take the record this one still waits for.
+        let joined = {
+            let mut t = lock_table(table);
+            t.take(&send_key, laddr, timestamp_ns)
+                .ok_or_else(|| t.claim(send_key, laddr, timestamp_ns))
+        };
+        match joined {
+            Ok(a) => {
                 self.attributed_kernel += 1;
                 (a, None)
             }
-            None => (
+            Err(claim) => (
                 Attribution::default(),
                 Some(PendingAttribution {
                     key: send_key,
                     laddr,
                     packet_ts_ns: timestamp_ns,
+                    claim,
                 }),
             ),
         }
@@ -319,7 +356,12 @@ impl Engine {
     ) -> Resolved {
         match &self.mode {
             AttributionMode::Kernel(table) => {
-                let hit = lock_table(table).take(&pending.key, pending.laddr, pending.packet_ts_ns);
+                let hit = lock_table(table).take_claimed(
+                    pending.claim,
+                    &pending.key,
+                    pending.laddr,
+                    pending.packet_ts_ns,
+                );
                 match hit {
                     Some(a) => {
                         self.attributed_kernel += 1;
@@ -330,6 +372,7 @@ impl Engine {
                 }
             }
             AttributionMode::Procfs => {
+                self.release_claim(pending.claim);
                 let a = self.attributor.lookup(client, now);
                 self.count_procfs(&a);
                 Resolved::Done(a)
@@ -358,6 +401,7 @@ impl Engine {
             Resolved::Miss if kind == CloseKind::Response => {
                 if self.held.len() >= self.held_capacity {
                     if let Some(oldest) = self.held.pop_front() {
+                        self.release_claim(oldest.pending.claim);
                         self.unattributed += 1;
                         out.push(oldest.event);
                     }
@@ -372,6 +416,7 @@ impl Engine {
             }
             Resolved::Miss => {
                 // Timeouts and evictions are re-checked once (GC 9).
+                self.release_claim(pending.claim);
                 self.unattributed += 1;
                 out.push(event);
             }
@@ -394,6 +439,7 @@ impl Engine {
                 }
                 Resolved::Miss if h.deadline > now => self.held.push_back(h),
                 Resolved::Miss => {
+                    self.release_claim(h.pending.claim);
                     self.unattributed += 1;
                     raw.push(h.event);
                 }
@@ -431,7 +477,10 @@ impl Engine {
         for mut h in std::mem::take(&mut self.held) {
             match self.resolve(&h.pending, h.client, now) {
                 Resolved::Done(a) => apply(&mut h.event, a),
-                Resolved::Miss => self.unattributed += 1,
+                Resolved::Miss => {
+                    self.release_claim(h.pending.claim);
+                    self.unattributed += 1;
+                }
             }
             raw.push(h.event);
         }
@@ -794,12 +843,134 @@ pub(crate) mod tests {
     }
 
     fn insert_send(table: &SharedSendTable, sent_wall_ns: u64) {
+        insert_send_as(table, sent_wall_ns, owner());
+    }
+
+    fn insert_send_as(table: &SharedSendTable, sent_wall_ns: u64, owner: Attribution) {
         lock_table(table).insert(KernelSend {
             key: SendKey::new(client_addr(), server_addr()),
             laddr: client_addr().ip(),
             sent_wall_ns,
-            owner: owner(),
+            owner,
         });
+    }
+
+    fn other_owner() -> Attribution {
+        Attribution {
+            pid: Some(888),
+            uid: 1002,
+            exe_path: "/usr/bin/host".into(),
+            comm: "host".into(),
+        }
+    }
+
+    fn pids(evs: &[RawEvent]) -> Vec<Option<u32>> {
+        evs.iter()
+            .map(|ev| match ev {
+                RawEvent::Dns(d) => d.pid,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reused_port_keeps_older_pending_owner() {
+        // A's query packet beats A's record; A closes the port, B reuses it
+        // for the same resolver; A's then B's records land; B's packet.
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        assert!(e.on_packet(&kq(1), true, base + MS, now).is_empty());
+        insert_send(&table, base);
+        insert_send_as(&table, base + 100 * MS, other_owner());
+        assert!(e.on_packet(&kq(2), true, base + 101 * MS, now).is_empty());
+        let b = only_dns(e.on_packet(&kr(2), true, base + 102 * MS, now));
+        assert_eq!(b.pid, Some(888));
+        let a = only_dns(e.on_packet(&kr(1), true, base + 103 * MS, now));
+        assert_eq!(a.pid, Some(777));
+        assert!(lock_table(&table).is_empty());
+        assert_eq!(lock_table(&table).claims_len(), 0);
+        assert_eq!(e.metrics().held, 0);
+    }
+
+    #[test]
+    fn reused_port_newer_packet_waits_for_its_own_record() {
+        // As above, but B's packet also beats B's record. A's response
+        // arrives last; nothing may ever carry the other's pid.
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        insert_send(&table, base);
+        e.on_packet(&kq(2), true, base + 101 * MS, now);
+        assert!(e.on_packet(&kr(2), true, base + 102 * MS, now).is_empty());
+        insert_send_as(&table, base + 100 * MS, other_owner());
+        let b = only_dns(e.tick(now + Duration::from_millis(10)));
+        assert_eq!(b.pid, Some(888));
+        let a = only_dns(e.on_packet(&kr(1), true, base + 103 * MS, now));
+        assert_eq!(a.pid, Some(777));
+        assert_eq!(lock_table(&table).claims_len(), 0);
+    }
+
+    #[test]
+    fn given_up_transactions_release_their_claims() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        // Held response past its grace; timeout miss; drain miss.
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
+        e.on_packet(&kq(2), true, base + 2 * MS, now);
+        assert_eq!(lock_table(&table).claims_len(), 2);
+        assert_eq!(pids(&e.tick(now + Duration::from_millis(251))), vec![None]);
+        assert_eq!(lock_table(&table).claims_len(), 1);
+        assert_eq!(
+            pids(&e.tick(now + TX_TIMEOUT + Duration::from_millis(1))),
+            vec![None]
+        );
+        assert_eq!(lock_table(&table).claims_len(), 0);
+        e.on_packet(&kq(3), true, base + 3 * MS, now);
+        assert!(e.on_packet(&kr(3), true, base + 4 * MS, now).is_empty());
+        e.on_packet(&kq(4), true, base + 5 * MS, now);
+        assert_eq!(lock_table(&table).claims_len(), 2);
+        assert_eq!(e.drain(now).len(), 2);
+        assert_eq!(lock_table(&table).claims_len(), 0);
+    }
+
+    #[test]
+    fn retransmit_and_latch_release_claims() {
+        let (mut e, table, _d) = kernel_engine(true);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        insert_send(&table, base + 10 * MS);
+        e.on_packet(&kq(1), true, base + 11 * MS, now);
+        assert_eq!(lock_table(&table).claims_len(), 0);
+        e.on_packet(&kq(2), true, base + 20 * MS, now);
+        assert_eq!(lock_table(&table).claims_len(), 1);
+        e.latch_procfs();
+        let ev = only_dns(e.on_packet(&kr(2), true, base + 21 * MS, now));
+        assert_eq!(ev.uid, 1000);
+        assert_eq!(lock_table(&table).claims_len(), 0);
+    }
+
+    #[test]
+    fn held_overflow_releases_claim() {
+        let dir = proc_fixture(false);
+        let table: SharedSendTable = Arc::new(Mutex::new(SendTable::new()));
+        let mut e = Engine::new(
+            Attributor::new(dir.path().to_path_buf()),
+            AttributionMode::Kernel(table.clone()),
+            TX_TIMEOUT,
+            1,
+        );
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base, now);
+        assert!(e.on_packet(&kr(1), true, base, now).is_empty());
+        e.on_packet(&kq(2), true, base, now);
+        assert_eq!(e.on_packet(&kr(2), true, base, now).len(), 1);
+        assert_eq!(lock_table(&table).claims_len(), 1);
     }
 
     pub(crate) fn kq(id: u16) -> Vec<u8> {
