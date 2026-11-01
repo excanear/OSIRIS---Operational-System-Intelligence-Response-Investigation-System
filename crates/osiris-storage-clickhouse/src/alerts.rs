@@ -35,9 +35,13 @@ impl ClickHouseStorage {
             unique.iter().map(|a| a.alert_id().to_string()).collect(),
         )?;
 
-        // 3. Evidence first, then the alerts: a failure between the two
-        // inserts leaves only invisible evidence rows, and a retry still
-        // sees the alert as new.
+        // 3. Evidence first, then the alerts. A failure between the two
+        // inserts leaves orphan evidence rows: they are hidden from a retry
+        // of the same alert (which resends identical evidence, so the
+        // `alert_id IN` lookup still returns it once), but if the same
+        // alert_id were ever retried with different evidence, a lookup by an
+        // orphan event id would return that alert. Alert ids are per-alert
+        // UUIDs, so this does not arise.
         let mut alert_rows = String::new();
         let mut evidence_rows = String::new();
         let mut inserted = 0usize;
