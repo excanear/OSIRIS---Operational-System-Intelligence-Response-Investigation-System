@@ -11,6 +11,7 @@
 //! process-local writer mutex (design §5.4).
 
 mod events;
+mod query;
 mod schema;
 mod transport;
 
@@ -185,15 +186,15 @@ impl Storage for ClickHouseStorage {
         self.events_owner(event_id)
     }
 
-    fn query(&self, _plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError> {
-        Err(not_implemented())
+    fn query(&self, plan: &QueryPlan) -> Result<Vec<CanonicalEvent>, StorageError> {
+        self.events_query(plan)
     }
 
     fn query_events(
         &self,
-        _plan: &osiris_query::EventQueryPlan,
+        plan: &osiris_query::EventQueryPlan,
     ) -> Result<Vec<CanonicalEvent>, StorageError> {
-        Err(not_implemented())
+        self.events_query_events(plan)
     }
 
     fn get_event(&self, event_id: Uuid) -> Result<Option<CanonicalEvent>, StorageError> {

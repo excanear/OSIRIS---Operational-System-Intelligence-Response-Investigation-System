@@ -65,3 +65,5 @@ fn open_creates_schema_and_is_idempotent() {
 }
 
 osiris_storage::conformance_events_tests!(fresh, ignore = "needs OSIRIS_CLICKHOUSE_URL");
+
+osiris_storage::conformance_query_tests!(fresh, ignore = "needs OSIRIS_CLICKHOUSE_URL");
