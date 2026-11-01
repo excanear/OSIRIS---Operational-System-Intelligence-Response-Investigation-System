@@ -1,4 +1,4 @@
-# Operator guide — eBPF process, network and filesystem backends (agent.yaml)
+# Operator guide — eBPF process, network, filesystem and DNS backends (agent.yaml)
 
 The `process_exec` sensor can use an eBPF backend (tracepoints `sched_process_exec` and
 `sched_process_exit`) instead of the Linux audit log. It reports provider
@@ -7,8 +7,9 @@ The `process_exec` sensor can use an eBPF backend (tracepoints `sched_process_ex
 
 The `network_sensor` can use a second eBPF backend (TCP connect, accept and close) instead of
 procfs polling; it is described in "Network backend" below. The `filesystem` sensor can use a third
-eBPF backend instead of the audit log ("Filesystem backend" below). All backends share the `ebpf` key
-and the object directory.
+eBPF backend instead of the audit log ("Filesystem backend" below). The `dns` sensor uses a fourth
+object to attribute each DNS query to its sending process in the kernel ("DNS attribution" below).
+All backends share the `ebpf` key and the object directory.
 
 ## Building the object
 
@@ -18,10 +19,10 @@ The BPF object is not built by cargo. On a Linux build host with `clang` and `li
 tools/ebpf/build.sh /usr/lib/osiris/bpf
 ```
 
-This writes `process.bpf.o`, `net.bpf.o` and `fs.bpf.o`, each with a `.sha256` sidecar, into the directory.
-There is one object per sensor, and `object_dir` must hold all three. The agent verifies each digest at
-load time and refuses an object whose `schema_version` differs from what it expects (process 2,
-net 1, fs 1). Nothing compiled is committed to git. Packaging (.deb/.rpm) is Phase 13.
+This writes `process.bpf.o`, `net.bpf.o`, `fs.bpf.o` and `dns.bpf.o`, each with a `.sha256`
+sidecar, into the directory. There is one object per sensor, and `object_dir` must hold all four.
+The agent verifies each digest at load time and refuses an object whose `schema_version` differs from what it expects (process 2,
+net 1, fs 1, dns 1). Nothing compiled is committed to git. Packaging (.deb/.rpm) is Phase 13.
 
 ## Configuration
 
@@ -32,8 +33,9 @@ ebpf:
 
 - `ebpf` absent: the process sensor uses the audit backend only and the network sensor the procfs
   poller only, exactly as before.
-- `ebpf` present: the process, network and filesystem sensors try eBPF, so `object_dir` must
-  hold `process.bpf.o`, `net.bpf.o` and `fs.bpf.o` with their sidecars.
+- `ebpf` present: the process, network and filesystem sensors try eBPF, and the `dns` sensor
+  (when `dns_capture` is set) tries kernel attribution, so `object_dir` must hold
+  `process.bpf.o`, `net.bpf.o`, `fs.bpf.o` and `dns.bpf.o` with their sidecars.
 - `ebpf: {}`: `object_dir` defaults to `/usr/lib/osiris/bpf`.
 - Backend choice at start: probe OK and load OK gives the eBPF backend (health `HEALTHY`,
   capability flag `ebpf`). Otherwise, if `audit_log_path` is configured, the sensor falls back to
@@ -314,3 +316,85 @@ under `/tmp`, `/var/tmp` or another watched tree, remove that tree from `fs_watc
   An unknown binary gives `""`. The index does not work on btrfs subvolumes or overlayfs, and a
   binary outside those directories gives `""` when the actor has already gone.
 - The agent must run in the host pid and root time namespaces.
+
+## DNS attribution
+
+With both `dns_capture` and `ebpf` configured, the `dns` sensor takes the owner of each DNS query
+from the kernel instead of from `/proc`. Capture and content do not change: the `AF_PACKET` socket
+still captures the packets, and events keep source `PACKET` and provider `dns_sensor/af_packet`.
+Object: `dns.bpf.o` (record schema 1), built by `tools/ebpf/build.sh` next to the other three.
+`object_dir` must now hold all four objects. Operator view of the sensor:
+`docs/operators-dns-sensor.md`.
+
+Hooks are two required kprobes, `udp_sendmsg` (IPv4, and IPv4-mapped destinations sent from IPv6
+sockets) and `udpv6_sendmsg` (IPv6). They run in the sending task's context at send time. The
+program reads the destination from `msg_name` (an unconnected `sendto`) or from the socket (a
+connected socket), and **returns at once unless the destination port is 53**. For a port-53 send it
+emits a record with the sender's pid, tid, uid, comm and executable identity, the local and remote
+address and port, a kernel timestamp and the socket's network namespace inode. No payload is read.
+An IPv4-mapped send is reported once, as IPv4. The agent's own sends are emitted too, so its own
+lookups stay attributed. Ring buffer 256 KiB; a record that does not fit increments a per-CPU
+counter reported in `events_dropped_total`.
+
+User space resolves the exe as soon as the record arrives (while the sender is almost certainly
+alive), keeps the send in a short-lived table keyed by local port, remote address and remote port,
+and joins each captured query with the oldest matching send within `[packet − 2 s, packet + 5 ms]`.
+A client that closes its socket or exits right after sending is still attributed. A query whose
+send record has not arrived yet waits: a response that closes it is held for up to 250 ms, and an
+unanswered query is retried when it times out. Port reuse is handled so that a query is never given
+to the process that used the port before (see `docs/operators-dns-sensor.md` for the exceptions).
+
+### Network namespace rule
+
+Only sends from the agent's own network namespace (the inode of `/proc/self/ns/net`) enter the
+table. Sends from other namespaces (containers without host networking) are counted as
+`foreign_netns` and their queries stay unattributed, as they were with `/proc` attribution. If the
+agent cannot read its own namespace, kernel attribution is unusable and the sensor falls back.
+
+### Backend choice at start
+
+- Probe and load OK: health `HEALTHY`, capability flag `ebpf_attribution` (plus the capture flag
+  `af_packet`).
+- Probe or load fails (missing or corrupted `dns.bpf.o`, a missing kprobe symbol, non-x86_64, the
+  agent's network namespace unreadable): `/proc` attribution, health `DEGRADED`, flag
+  `procfs_attribution`, the reason in `last_error` (naming `dns.bpf.o` when the object is the
+  problem). Capture keeps working.
+- The kernel reader fails mid-run: a one-way switch to `DEGRADED` and `procfs_attribution` until
+  the agent restarts. New queries use `/proc`; queries still waiting for a send record get a
+  `/proc` lookup when they close.
+- No `ebpf` key: `/proc` attribution, health `HEALTHY`, flag `procfs_attribution`.
+- With kernel attribution the sensor never runs the `/proc` lookup on the query path.
+
+### Requirements and platform
+
+- **x86_64 only**, like the fs object. On other architectures the reason is
+  `dns eBPF object is x86_64-only` and the sensor uses `/proc` attribution.
+- The kernel statements under "Requirements" above apply. The object was validated on the runner
+  kernels `6.8.0-1070-azure` (ubuntu-22.04) and `7.0.0-1017-azure` (ubuntu-24.04); see
+  `docs/VALIDATION.md`.
+- The agent must run in the host pid namespace: the kernel reports root-namespace pids.
+
+### Upgrading from 11b-3
+
+- Rebuild all four objects (`tools/ebpf/build.sh <object_dir>`).
+- **An existing deployment with both `dns_capture` and `ebpf` switches to kernel attribution on
+  upgrade.** No config change is needed or possible. Without `dns.bpf.o` in `object_dir` the `dns`
+  sensor runs `DEGRADED` on `/proc` attribution.
+- The `dns` sensor now reports a capability flag for its attribution backend (`ebpf_attribution`
+  or `procfs_attribution`), also without `ebpf`.
+
+### Known behaviour of DNS attribution
+
+- With systemd-resolved, each lookup still yields two events: the app's query to 127.0.0.53,
+  attributed to the app, and systemd-resolved's upstream query, attributed to `systemd-resolved`.
+  Both are true.
+- Two sockets sharing one local port (`SO_REUSEPORT`) and sending to the same resolver within
+  5 ms can swap owners. Sequential port reuse is handled.
+- Queries from other network namespaces, queries sent before the agent started, and queries whose
+  send record was dropped are unattributed. There is no `/proc` retry for them.
+- Queries forwarded for other hosts (the host is itself a resolver) are not attributed.
+- Lookups that never reach a UDP socket (nscd over a Unix socket, `/etc/hosts`) are not seen, as
+  in 11a. Resolver uprobes were ruled out (see ADR-010 and the 11b-4 design).
+- Cost: every UDP send on the host pays the kprobe, about 0.17 us (+4.5 %) on a send to a port
+  other than 53 in a tight loop on `lo`. A burst of thousands of port-53 sends can overflow the ring
+  buffer (counted in `events_dropped_total`). See `PERFORMANCE.md`, "DNS send path".

@@ -82,15 +82,19 @@ revisão final independente → merge → push.
 ## Fase 11 — Backends de telemetria (§5, §10)
 - **Fase 11a (feita)**: sensor de DNS real via AF_PACKET (dívida da Fase 10), validado em Linux real
   (run 39087535939, Ubuntu 22.04 e 24.04). Ver `docs/VALIDATION.md` e `docs/operators-dns-sensor.md`.
-  Dívida: backend eBPF uprobe (11b); pontos cegos DNS sobre TCP, DoT, DoH e mDNS; o sensor não
-  tenta reabrir o socket se o `initialize` falhar.
+  Dívida: backend eBPF uprobe (11b) (RESOLVIDA na 11b-4 com kprobes no envio UDP em vez de uprobes,
+  ver a 11b-4 abaixo); pontos cegos DNS sobre TCP, DoT, DoH e mDNS; o sensor não tenta reabrir o
+  socket se o `initialize` falhar.
   Dívidas da revisão final da 11a:
   - Os contadores `EngineMetrics` (spec §10: pacotes, erros de parse, divergências de direção,
     timeouts, respostas sem par, despejos por overflow, duplicatas, atribuídos e não atribuídos)
     só podem ser lidos por `DnsSensor::engine_metrics()`, que nada chama. Não são exportados:
     falta uma mudança em sensor-api ou em selftelemetry.
   - O contador de descartes do kernel (`PACKET_STATISTICS`, `tp_drops`) nunca é lido. A perda
-    por estouro do buffer de recepção em host ocupado passa em silêncio.
+    por estouro do buffer de recepção em host ocupado passa em silêncio. **Observado na 11b-4**
+    (bench 41326077476): numa enxurrada de 10 000 consultas sem resposta em `lo` saíram só ~3 000
+    eventos com atribuição pelo kernel e ~850 com atribuição por `/proc`, sem contagem da perda.
+    Correção proposta: ler `tp_drops` e somar em `events_dropped_total`.
   - Tráfego encaminhado ou com NAT (Docker, roteador): a cópia de egresso (`PACKET_OUTGOING`)
     conta como local e gera um segundo evento. Se a porta colidir, esse evento pode ser atribuído
     a um processo do host sem relação. Correção futura: comparar o IP de origem com os endereços
@@ -99,8 +103,8 @@ revisão final independente → merge → push.
   backend eBPF de exec/exit do sensor `process_exec`, com fallback para audit. Validado em Linux real
   (run 39139529617, Ubuntu 22.04 e 24.04). Ver `docs/adr/ADR-010-ebpf-loader-aya.md`,
   `docs/operators-ebpf.md` e `docs/VALIDATION.md`.
-  Próximos (cada um com seu brainstorming/spec/plano): **11b-4** uprobe de DNS
-  em bibliotecas de resolução.
+  Próximos: nenhum. A 11b-4 (atribuição de DNS) foi feita com kprobes no envio UDP em vez de
+  uprobes em bibliotecas de resolução; com ela a Fase 11b está encerrada.
   Dívidas da 11b-1:
   - `PROCESS_FORK` não é emitido (só exec e exit).
   - Níveis de telemetria por entidade em mapas no kernel (§6): ainda não.
@@ -200,6 +204,49 @@ revisão final independente → merge → push.
     11b-3; a carga extra do agente pode ampliar a corrida (não provado). A 11b-4 (uprobe de DNS)
     captura o pid no kernel na hora da consulta e elimina a corrida. **Antes de começar a 11b-4**,
     fazer um A/B do teste DNS com o sensor fs desligado (aceite condicional da revisão final).
+    (RESOLVIDA na 11b-4: A/B 60/60 verde na run 41227648672; com atribuição pelo kernel o teste
+    passou nos dois runners em todas as rodadas desde t11b4-3, ver `docs/VALIDATION.md`.)
+- **Fase 11b-4 (feita)**: atribuição de DNS pelo kernel (`bpf/dns.bpf.c`, kprobes obrigatórios em
+  `udp_sendmsg` e `udpv6_sendmsg`, só envios para a porta 53; tabela de envios com claims e
+  tombstones no sensor `dns`; o conteúdo segue vindo do AF_PACKET da 11a; fallback para atribuição
+  por `/proc`, `DEGRADED` com `procfs_attribution`). Uprobes nas bibliotecas de resolução foram
+  descartados (não veem Go, musl, binários estáticos nem UDP cru; ver ARCHITECTURE §4.3 e ADR-010).
+  Validado em Linux real (rodadas `real-linux/t11b4-1` a `-4`, Ubuntu 22.04 com kernel
+  6.8.0-1070-azure e 24.04 com 7.0.0-1017-azure; t11b4-3 @ `94d1444` verde nos dois na primeira
+  tentativa e t11b4-4 @ `d3355d7` verde nos dois, rajada 200/200 com o pid certo) e medido em `PERFORMANCE.md`
+  (kprobes: +4,50 % num envio para porta diferente de 53, abaixo do limite de 5 %). Ver
+  `docs/operators-ebpf.md`, `docs/operators-dns-sensor.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
+  `docs/VALIDATION.md`. **Com a 11b-4 a Fase 11b está encerrada.**
+  Dívidas da 11b-4:
+  - PIDs cientes de namespace de pid para todos os objetos da 11b: `bpf_get_current_pid_tgid()`
+    devolve pids do namespace inicial; um agente num namespace de pid filho (WSL2, contêiner sem
+    `hostPID`) vê pids que não batem com o seu `/proc`. Candidato: `bpf_get_ns_current_pid_tgid`.
+  - Atribuição de DNS de outros namespaces de rede (contêineres sem rede do host): os envios são só
+    contados (`foreign_netns`) e as consultas saem sem processo.
+  - Objetos com kprobes (fs, dns) só para x86_64; outras arquiteturas caem para audit ou `/proc`.
+    Objetos por arquitetura: Fase 13.
+  - Uprobes em bibliotecas de resolução como fonte adicional opcional (nome pretendido de consultas
+    respondidas do cache sem pacote); não fazem parte da 11b.
+  - Ambiguidade de 5 ms: dois sockets na mesma porta (`SO_REUSEPORT`), ou dois envios na mesma
+    chave em até 5 ms, podem trocar de dono.
+  - Um registro de kernel perdido deixa o claim do seu pacote tomar uma entrada enviada até 5 ms
+    depois do pacote (dono errado possível).
+  - Uma retransmissão cujo pacote chega antes do seu registro não faz claim; o registro tardio pode
+    ser tomado por um pacote mais novo na porta reutilizada em até 2 s.
+  - Um tombstone pode consumir uma entrada órfã mais antiga na sua janela (pacote capturado perdido)
+    e deixar o próprio registro tardio sem claim.
+  - `timestamp_fallbacks`, `send_table_evictions` e `foreign_netns` só podem ser lidos por
+    `DnsSensor::attribution_metrics`, e `claims_dropped` e `tombstone_consumed` só pelos contadores
+    da tabela de envios; nenhum está em `/status` (decisão da Task 5).
+  - Ring buffer do objeto dns (256 KiB, ~2 340 registros) pequeno para rajadas: o bench perdeu
+    ~4 600-5 400 de 10 000 envios por rodada (contados em `events_dropped_total`; as consultas
+    saem sem processo). Avaliar um buffer maior.
+  - Custo por registro na thread leitora: `resolve_exe` lê `/proc` para cada registro antes de pegar
+    o próximo, o que alonga o esvaziamento do ring buffer numa rajada. Avaliar cache por
+    (pid, identidade) ou resolução fora da thread leitora.
+  - Perda silenciosa do socket AF_PACKET sob enxurrada (ver a dívida `tp_drops` da 11a acima), agora
+    observada no bench.
+  - O piso de kernel 5.15 segue raciocinado, não executado.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 
 ## Fase 12 — Extensibilidade e integração (§20)

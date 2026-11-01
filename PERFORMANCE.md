@@ -16,6 +16,7 @@ configuration ran once. Load phases last 30 s.
 | `ingest` | Starts the real `osiris-server` binary. The bench acts as the agent: it appends paced exec-chain events to a spool, and the real mTLS forwarder (`run_forwarder`) ships them to the server's agent listener. Every 100 ms one event is a marker, and the bench polls `events.db` until each marker becomes visible. After the 30 s load phase it drains for up to 30 s. `stored_eps_over_run` = events in `events.db` at the end ÷ (load + drain time), which is the server-side throughput. The latency percentiles cover delivered markers only. A lost marker (not visible when the drain ends) is excluded from them, so read them together with `markers_lost`. |
 | `agent` | Starts the real `osirisd` on real auditd, spawns `/bin/true` at the target rate, and samples the agent's `/proc/<pid>/stat` and `status` on a fixed 1 s tick. CPU % is relative to one core. |
 | `fs-loop` | Create, write 4 KiB, close and delete a file, 10 000 times, timing every iteration. Run in a watched and an unwatched dir, first without the agent, then with the real `osirisd` (eBPF backends). Single run, so the overheads below carry run-to-run noise that was not measured. |
+| `dns-send` | 10 000 timed `sendto` calls of a well-formed DNS A query from one UDP socket to `127.0.0.1:5300`, then 10 000 to `127.0.0.1:53`, each port with a listener that drains and never answers. Four configurations (no agent; full agent; full agent without `dns.bpf.o`; full agent without `dns_capture`), 5 interleaved rounds, medians reported. After each agent run's port-53 flood the `dns` status is sampled every second for 10 s. |
 
 `saturated` means the load generator itself fell more than one 100 ms slice behind its target at
 some point. When `achieved` is far below `target`, the driver could not keep up, and the result
@@ -139,6 +140,87 @@ produced no events.
 > `security_file_open` walks again for the write-open); a per-thread "walked, no match" marker
 > would skip the second walk.
 
+### DNS send path, eBPF DNS attribution (GitHub Actions)
+
+The 11b-4 kprobes on `udp_sendmsg`/`udpv6_sendmsg` run on every UDP send on the host. They return
+after the destination-port check for every port other than 53, so the number that matters is the
+slowdown of a send to a port other than 53. The bench sends to port 5300 for that, and to port 53
+for the full DNS path. Each loop is 10 000 `sendto` calls of the same well-formed A query from one
+socket, each call timed. The listeners drain and never answer, so the port-53 loop is an
+unanswered 10 000-query flood.
+
+| Item | Value |
+|---|---|
+| Runner | `ubuntu-24.04` hosted runner, kernel 7.0.0-1017-azure |
+| Run | `.github/workflows/real-linux-bench.yml`, run 41326077476, branch `real-linux-bench/t11b4-2`, code `696698f` |
+| Configurations | A: no agent. B: the full agent (process, network, filesystem on eBPF; `dns` on `ebpf_attribution`). C: B with `dns.bpf.o*` removed from a copy of the object dir, so `dns` runs AF_PACKET + `/proc` attribution and no kprobes. D: B without `dns_capture`, so no DNS sensor. |
+| Rounds | 5 per configuration, interleaved (the order rotates every round), medians below |
+
+Medians over the 5 rounds (send rate; p50 and p99 of one `sendto`):
+
+| Config | Port 5300 sends/s | p50 | p99 | Port 53 sends/s | p50 | p99 |
+|---|---|---|---|---|---|---|
+| A no agent | 270 862 | 2.878 us | 6.606 us | 128 433 | 5.283 us | 23.313 us |
+| B full agent | 237 988 | 3.313 us | 8.035 us | 110 679 | 7.301 us | 22.242 us |
+| C no `dns.bpf.o` | 248 709 | 3.145 us | 7.221 us | 115 744 | 6.649 us | 20.789 us |
+| D no DNS sensor | 201 624 | 3.280 us | 12.218 us | 127 992 | 5.295 us | 23.564 us |
+
+Overhead pairs, computed from the median rates (time per send), with the p50 difference:
+
+| Pair | What it isolates | Port 5300 | Port 53 |
+|---|---|---|---|
+| B vs C | **the 11b-4 kprobes** | **+4.50 %** (+0.168 us) | +4.58 % (+0.652 us) |
+| C vs D | the 11a AF_PACKET capture (on port 53 also `/proc` attribution) | −18.9 % (−0.135 us), noise | +10.58 % (+1.354 us) |
+| D vs A | the rest of the agent | +34.3 % (+0.402 us), noisy | +0.34 % (+0.012 us) |
+| B vs A | the whole agent | +13.8 % (+0.435 us) | +16.0 % (+2.018 us) |
+
+- **The 11b-4 cost on a send to a port other than 53 is +4.50 %, about 0.17 us per send.** That is
+  below the 5 % threshold of the spec, so no warning is required here, but it is close to it. A
+  kprobe has a fixed entry cost even when the program returns at once, so this is the price of
+  seeing every UDP sender in the kernel.
+- On port 53 the kprobes cost +4.58 % (+0.65 us per send): the program also reserves and submits a
+  ring-buffer record.
+- **Noise.** One loop of 10 000 sends lasts about 40-90 ms on a shared hosted runner. The C vs D
+  port-5300 figure is negative, and D's port-5300 rate (201 624/s, p99 12.2 us) is below both C and
+  A, which no agent configuration can explain. It is noise, and it also inflates D vs A on port
+  5300. Read the pairs as about ±10 %, and trust B vs C most: B and C differ only in the kprobes and
+  ran interleaved.
+- A first run (41324827608, `t11b4-1` @ `1748899`) had one round and no variants and showed
+  +51.8 % on port 5300 for the whole agent. That figure is superseded: a single short loop with no
+  variants could not attribute the cost to anything.
+- The agent used 0.14-0.17 s of CPU over the four loops in B, and 0.17-0.19 s in C.
+
+**The unanswered port-53 flood.** The `dns` status, sampled 1-10 s after each flood:
+
+| Config | State | `events_dropped_total` after the flood | `events_emitted_total` |
+|---|---|---|---|
+| B, 5/5 rounds | `HEALTHY` throughout | 5 317 / 4 574 / 5 056 / 4 672 / 5 368, final already at 1 s | 0 until about 5 s, then 3 245 / 2 843 / 3 320 / 2 894 / 3 193 |
+| C, 5/5 rounds | `DEGRADED` before and after (the missing `dns.bpf.o` fallback, by design) | 0 | 0 until about 5 s, then 859 / 845 / 777 / 864 / 878 |
+
+- Emission waits about 5 s because an unanswered query is emitted when the 11a tracker times it
+  out (`TX_TIMEOUT` 5 s).
+- **The kernel ring buffer loses about half of a 10 000-send burst.** The `dns` object's ring
+  buffer is 256 KiB, about 2 340 records of 112 bytes (104 + 8 header). The reader thread resolves
+  the sender's exe through `/proc` for every record before it takes the next one, and 10 000 sends
+  arrive in about 0.1 s. A record that does not fit increments the `DROPS` counter, which is part of
+  `events_dropped_total`, so the loss is counted. A query whose record was lost is emitted
+  unattributed. The bench sends from one socket, so every send also lands on one send-table key,
+  whose queue holds 8 entries: the bench is a worst case for attribution, and only the drop count is
+  read from it.
+- **Far fewer than 10 000 query events come out, and the missing ones are counted nowhere.** B
+  emitted about 3 000 and C about 850. The likely cause is the `AF_PACKET` socket's receive queue
+  overflowing while the capture loop falls behind. This is pre-existing from 11a. It is worse in C,
+  where every query costs a `/proc` lookup. The sensor never reads the kernel's `PACKET_STATISTICS`
+  (`tp_drops`), so this loss is silent: an observed limit, carried as a debt in
+  `docs/ROADMAP-REMAINING.md`.
+- **A flood does not necessarily degrade the sensor.** `DEGRADED` from the capture side is the 11a
+  parse/eviction window: it is reported for 60 s after parse errors or tracker overflow evictions
+  (more than 4 096 pending transactions). In this run nothing was emitted before the 5 s timeout, and an
+  overflow eviction is emitted at once, so the tracker evicted nothing: the capture saw fewer than
+  4 096 queries, and B stayed `HEALTHY` in 5/5 rounds. The first run (41324827608) ended `DEGRADED` after
+  its flood. Treat `DEGRADED` as possible under a flood, not as a guarantee, and do not read
+  `HEALTHY` as "nothing lost": check `events_dropped_total`.
+
 ### Before/after F1 (WSL, ingest at 1 000 eps target, 30 s)
 
 | Code | Stored eps over run | Markers lost | Delivered p50 |
@@ -214,9 +296,11 @@ to 1 591.01 (same tree, pragmas disabled versus enabled). The final matrix run a
 tools/real-linux/bench.sh --skip-agent /tmp/bench-ubuntu.jsonl
 # Agent bench (needs real auditd): push to a real-linux-bench/** branch, or run on a VM:
 git push origin HEAD:refs/heads/real-linux-bench/<name>   # .github/workflows/real-linux-bench.yml
-tools/real-linux/bench.sh --agent-only /tmp/bench-agent.jsonl   # includes the fs loop
+tools/real-linux/bench.sh --agent-only /tmp/bench-agent.jsonl   # includes the fs loop and dns-send
 # The fs loop alone (OSIRIS_BPF_DIR must point at the built objects):
 $CARGO_TARGET_DIR/release/osiris-bench fs-loop --iterations 10000
+# The DNS send bench alone (OSIRIS_BPF_DIR as above; binds 127.0.0.1:53 and :5300; starts 15 agents):
+$CARGO_TARGET_DIR/release/osiris-bench dns-send --sends 10000
 # Single configurations:
 $CARGO_TARGET_DIR/release/osiris-bench ingest --rate 1000 --duration 30
 ```

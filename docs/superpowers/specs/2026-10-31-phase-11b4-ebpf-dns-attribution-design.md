@@ -211,7 +211,13 @@ source and are a non-goal here.
        can swap owners (§6);
      - a claim dropped at the cap no longer protects its entry, so a newer packet can take it;
      - when a captured packet is dropped, its sender's record has no claim, and a later packet on
-       the key within the 2 s lookback can take it.
+       the key within the 2 s lookback can take it;
+     - when a packet's own kernel record is lost (ring-buffer drop), its claim can take an entry
+       sent on the key within the 5 ms slack after the packet;
+     - a retransmit whose packet arrives before its own kernel record makes no claim, so its late
+       record can be taken by a newer packet on a reused port within the 2 s lookback;
+     - a tombstone can consume an older orphan entry in its lookback (an entry whose packet was
+       dropped, the limit above), leaving its own late record unclaimed for a newer packet.
    - **Limits:** entries expire after **10 s** *(call: two 11a tracker timeouts)*. The table holds
      at most **16,384** entries; on overflow the oldest entry is evicted and counted *(call)*.
    - **Local address:** matched when both sides have one, ignored when the send came from a

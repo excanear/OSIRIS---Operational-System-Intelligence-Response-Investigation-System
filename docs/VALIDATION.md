@@ -199,14 +199,16 @@ replayed by the host test suite (`cargo test` on Windows and in CI), not in run 
   127.0.0.53 stub (these alert), and A and AAAA from systemd-resolved upstream (no alert, its exe
   is not in the rule). glibc search-domain variants add more events that do not end in `.xyz`.
 - Attribution is racy for clients that close the socket before the query packet is processed;
-  such events carry no process and do not feed the `(exe, domain)` baseline.
+  such events carry no process and do not feed the `(exe, domain)` baseline. Since 11b-4 this
+  holds only for `/proc` attribution; kernel attribution removes the race (see the 11b-4 section).
 
 ### Known limitations
 
 - If the AF_PACKET socket cannot be opened at initialize (no `CAP_NET_RAW`, unknown interface),
   the sensor is reported unsupported or failed and is not retried. Socket errors after start are
   retried with backoff.
-- DNS over TCP, DoT, DoH and mDNS are not captured. The eBPF resolver uprobe is Phase 11b-4.
+- DNS over TCP, DoT, DoH and mDNS are not captured. Phase 11b-4 added kernel send attribution
+  (kprobes, not the resolver uprobe once planned); see "eBPF DNS attribution (Phase 11b-4)".
 
 ## eBPF process backend (Phase 11b-1)
 
@@ -378,6 +380,16 @@ None of these touch code changed in this phase except as noted.
   11b-3's extra agent load may widen the race; that is not proven. The fix is Phase 11b-4 (the
   DNS uprobe captures the pid in the kernel at query time, removing the race by design); carried
   as a debt in `docs/ROADMAP-REMAINING.md`.
+  **Update (Phase 11b-4): resolved under eBPF attribution.** The pre-phase A/B (run 41227648672)
+  ran the test alone 15 times with the filesystem sensor on and 15 times with it off on each
+  runner: 60/60 green, so the fs sensor does not cause it by itself. 11b-4 then moved attribution
+  into the kernel (kprobes on `udp_sendmsg`/`udpv6_sendmsg`, not the uprobe named above; see the
+  11b-4 section). With the sensor on kernel attribution the test passed on both runners in every
+  run from t11b4-3 on (runs 41321051436 and 41323245111), and the burst test that reproduces the
+  flake's shape (200 closed-socket queries from 20 concurrent clients under the full agent) stored
+  200/200 with 200/200 attributed to the right pid on both runners. Its last failure, in run
+  41239578423 (t11b4-1, 22.04), came before the sensor was switched to kernel attribution. The
+  `/proc` race still exists in the fallback (`procfs_attribution`).
 - `corrupted_object_falls_back_to_audit`: `PROCESS_EXEC` never matched in 45 s (1 occurrence,
   run 40775169390, ubuntu-22.04; rerun green).
 - `process_sensor_uses_ebpf`: the server failed with "cannot bind control listener ...: Address
@@ -403,6 +415,87 @@ None of these touch code changed in this phase except as noted.
   validation.
 - See `docs/operators-ebpf.md` for the full list.
 
+## eBPF DNS attribution (Phase 11b-4)
+
+The DNS sensor's kernel send attribution (`bpf/dns.bpf.c`, kprobes on `udp_sendmsg` and
+`udpv6_sendmsg`; `crates/osiris-ebpf` `dns_record.rs`; the send table and engine join in
+`crates/osiris-sensors/dns`) was validated over `real-linux/t11b4-<n>` runs on `ubuntu-22.04`
+(kernel `6.8.0-1070-azure`) and `ubuntu-24.04` (kernel `7.0.0-1017-azure`). Capture is still the
+11a `AF_PACKET` socket; only the owner of each query now comes from the kernel.
+
+| Run | Branch / commit | Outcome |
+|---|---|---|
+| 41227648672 | `t11b4-ab` @ `b267cc6` (pre-phase, temporary) | A/B of `dns_query_is_observed_and_alerts` alone, 15 times with the filesystem sensor on and 15 off, interleaved, on each runner: **60/60 green**. The fs sensor does not cause the flake by itself. |
+| 41239578423 | `t11b4-1` @ `aad0499` | `load_dns` passed on both: the verifier accepted `dns.bpf.o` (instructions `kp_udp_sendmsg` 238 and `kp_udpv6_sendmsg` 290 on 22.04, 237 and 295 on 24.04). 22.04 failed only the old `/proc` attribution flake, because the sensor was not switched yet. |
+| 41260534355 | `t11b4-2` @ `e15e468` | Real-Linux scenarios added. 24.04 green. 22.04 failed `dns_burst_attribution_is_near_complete`: one query was stored with **another sender's pid**. Root cause: a packet that missed its kernel send (the record had not arrived) left that send for a later packet on the reused port to take. Fixed with send-table claims (`94d1444`). |
+| 41321051436 | `t11b4-3` @ `94d1444` | Whole suite green on both runners on the first attempt. Burst: 200/200 stored, 200/200 attributed to the right pid, `events_dropped_total` 0, on both. |
+| 41323245111 | `t11b4-4` @ `d3355d7` | Tombstone round (a claim that gives up keeps reserving until the TTL). Whole suite green on both runners, same kernels and instruction counts (238/290, 237/295). Burst 200/200 right pid, 0 dropped. |
+| 41324827608 | `real-linux-bench/t11b4-1` @ `1748899` | First DNS send bench: one round, no variants. Superseded. |
+| 41326077476 | `real-linux-bench/t11b4-2` @ `696698f` | DNS send bench, 4 configurations x 5 interleaved rounds. Numbers in `PERFORMANCE.md`. |
+
+Scenarios that passed on both runners (runs 41321051436 and 41323245111):
+
+- (a) `dns_sensor_uses_ebpf_attribution`: `dns` `HEALTHY` with `ebpf_attribution`, without
+  `procfs_attribution`, and `AGENT_HEALTH` stays `HEALTHY` throughout.
+- (b) `dns_query_is_observed_and_alerts`, unchanged, now on kernel attribution.
+- (c) `dns_closed_socket_client_is_attributed`: a `python3` client sends one raw-socket query to a
+  fake resolver on `127.0.0.1:53` (it answers after 300 ms) and closes the socket at once. Exactly
+  one attributed `DNS_QUERY`, with the client's pid and the python `exe_path`. The 11a backend cannot
+  do this. The client never calls `getaddrinfo`, so a non-glibc sender is covered too.
+- (d) `dns_exited_client_keeps_its_pid`: as (c), but the client exits right after the send. The
+  event carries its pid, and `exe_path` is the python path or empty, never another process's.
+- (e) `dns_missing_object_falls_back_to_procfs`: with `dns.bpf.o` missing from the object dir,
+  `dns` is `DEGRADED` with `procfs_attribution` and a `last_error` naming `dns.bpf.o`, the process
+  sensor stays `HEALTHY` on eBPF, and the curl query is still stored.
+- (f) `dns_burst_attribution_is_near_complete`: 200 closed-socket queries from 20 concurrent clients
+  under the full agent (process, network, filesystem on eBPF). Any query attributed to a pid other
+  than its sender's fails the test. Result: 200/200 right pid, 0 dropped, both runners.
+
+### Bench run
+
+Run 41326077476 measured the send path in four configurations (no agent; full agent; full agent
+without `dns.bpf.o`; full agent without the DNS sensor), 5 interleaved rounds each. The kprobes
+alone cost +4.50 % (+0.17 us per send) on sends to a port other than 53, below the spec's 5 %
+warning threshold but close to it, and +4.58 % on port 53. The loops last 40-90 ms on a shared
+runner and are noisy: one pair came out negative. Details and the full table are in
+`PERFORMANCE.md`.
+
+Each agent run ended with an unanswered 10 000-query flood on `lo`:
+
+- **Ring-buffer loss under a burst.** With kernel attribution, 4 574-5 368 of the 10 000 send
+  records were lost in each round. The ring buffer is 256 KiB (about 2 340 records), and the reader
+  resolves each sender's exe through `/proc` before taking the next record. The loss is counted in
+  `events_dropped_total` (the BPF `DROPS` counter), and the queries whose record was lost are
+  emitted unattributed. Debts: ring-buffer size, and the reader's per-record cost.
+- **Uncounted capture loss (pre-existing, 11a).** Only about 3 000 query events (kernel
+  attribution) and about 850 (`/proc` fallback) came out of each flood. The others are not counted
+  anywhere. The likely cause is the `AF_PACKET` receive queue overflowing while the capture loop
+  falls behind, which is worse when every query costs a `/proc` lookup. The sensor does not read
+  `PACKET_STATISTICS` (`tp_drops`), an 11a debt that this bench makes visible.
+- **Health under a flood.** With kernel attribution the sensor stayed `HEALTHY` in 5/5 rounds of
+  run 41326077476. The first bench run (41324827608) ended `DEGRADED` after its flood. A flood
+  degrades the sensor only through the 11a parse/eviction window (60 s after a parse error or a
+  tracker overflow eviction at 4 096 pending), so `DEGRADED` is possible, not guaranteed.
+
+### Known limitations
+
+- Not covered: kernels other than the two runner kernels, a kernel-version VM matrix. The 5.15
+  floor is reasoned (the hooks and CO-RE reads exist there), not run.
+- The `dns` object is x86_64-only. Elsewhere the reason is `dns eBPF object is x86_64-only` and the
+  sensor uses `/proc` attribution.
+- Only sends from the agent's own network namespace are attributed; others are counted as
+  `foreign_netns` and their queries stay unattributed, as in 11a.
+- PID-namespace-aware pids are not handled (all 11b objects): in WSL the pid assertions cannot
+  pass, so the suite runs only on GitHub Actions.
+- Wrong attribution is still possible in the cases listed in the spec (§3.3 item 8, "Known
+  limits") and `docs/operators-dns-sensor.md`: `SO_REUSEPORT` or two sends on one key within 5 ms,
+  a claim dropped at the 16 384 cap, a captured-packet drop, a lost kernel record whose claim takes
+  an entry sent within 5 ms after the packet, a retransmit whose packet arrives before its own
+  record, and a tombstone that consumes an older orphan entry. None was provoked in validation.
+- `timestamp_fallbacks`, `send_table_evictions` and `foreign_netns` are readable only through
+  `DnsSensor::attribution_metrics`; `claims_dropped` and `tombstone_consumed` only in the send
+  table's counters. None is in `/status`.
+
 ## Findings
 
 | Finding | Distro | Fix commit |
@@ -421,6 +514,7 @@ None of these touch code changed in this phase except as noted.
 | Scenario shell actions had no bound (`systemd-run --wait`, `sudo`) and the CI suite step had no timeout | Ubuntu 22.04, 24.04 | ef7171d |
 | `setup.sh` omitted `libssl-dev`, so the release build failed on a bare Debian | Debian 13 (WSL) | 564f50a |
 | F1: server ingest committed baseline frequencies (two commits per exec event) and risk scores (one per event) before the ack, with the default rollback journal and synchronous=FULL; about 100-140 eps stored at a 1000 eps target, most markers lost | Ubuntu 24.04 (WSL, ingest bench) | 3f4fe59, 5c73537, 3a22003 |
+| DNS kernel attribution gave a query to another sender's pid under port reuse: a packet that missed its kernel send left it for a later packet on the same port (run 41260534355); the re-review then found that a claim that gave up still let its late record go to a newer packet | Ubuntu 22.04 (first), code review (second) | 94d1444, d3355d7 |
 | F2: every correlation edge lookup materialised all of the host's stored event ids (tenant host filter) and read every edge an entity ever had (key-only indexes), so lookup cost grew with the database: 35 ms at 5k events, 2.8 s at 200k | any (storage) | 4b450e1 |
 
 Each product fix has a fixture-based or unit regression test that runs in normal CI on any OS, for
@@ -429,7 +523,8 @@ example `the_shipped_web_root_rule_fires_on_merged_usr_shell_spellings`,
 `a_batch_is_observed_in_one_commit_with_the_same_counts_as_one_by_one`,
 `opens_in_wal_mode_with_normal_sync`, `a_windowed_host_scoped_edge_lookup_is_bounded_by_its_indexes`,
 `send_returns_only_after_the_whole_line_is_written`,
-`the_enriched_gs_separator_is_a_field_boundary`, `tests/real_audit_fixtures.rs` and
+`the_enriched_gs_separator_is_a_field_boundary`, `tests/real_audit_fixtures.rs`,
+`claim_keeps_older_entry_from_newer_packet`, `abandoned_claim_keeps_late_record_from_newer_packet` and
 `ids_containing_ties_an_alert_back_to_its_marker_event`.
 
 ## Deferred
@@ -511,4 +606,5 @@ was not repeated on the final binaries.
 - DNS over TCP, DoT, DoH and mDNS are not captured (see "DNS sensor (Phase 11a)").
 - No container or Kubernetes scenarios.
 - RHEL-like distributions (auditd paths, SELinux) are not covered.
-- eBPF covers process exec/exit (11b-1) and TCP network (11b-2); filesystem and the DNS uprobe are pending (11b-3, 11b-4).
+- eBPF covers process exec/exit (11b-1), TCP network (11b-2), filesystem (11b-3) and DNS send
+  attribution (11b-4). The kprobe objects (fs, dns) are x86_64-only.

@@ -163,3 +163,42 @@ stays at 0.14.0. Validation runs are listed in `docs/VALIDATION.md`.
   inode-only matching on btrfs/overlayfs, 64 watch keys (more makes the whole sensor fall back
   instead of capping), the `exe_path` fallback index not working on btrfs/overlayfs, `PENDING`
   overflow.
+
+## Update (Phase 11b-4): DNS object, fourth record
+
+Phase 11b-4 adds a fourth object, `dns.bpf.o` (schema 1), with two required kprobes,
+`udp_sendmsg` and `udpv6_sendmsg`. `aya` stays at 0.14.0, and the loader needed nothing new: the
+kprobe and required/optional support from 11b-3 covers it. Validation runs are listed in
+`docs/VALIDATION.md`.
+
+- **Kprobes on the UDP send path, not uprobes on resolver libraries.** ARCHITECTURE §4.3 planned
+  "eBPF uprobe on resolver libs". A uprobe would miss every client that does not resolve through
+  glibc (Go, musl, static binaries, `dig`, raw-UDP malware), would bind to one libc inode per mount
+  namespace and silently miss new processes after a libc upgrade, and would still not see the
+  answers. A kprobe on `udp_sendmsg`/`udpv6_sendmsg` sees every sender, in its own task context, at
+  send time; the 11a `AF_PACKET` capture keeps providing the content. So aya's uprobe support is
+  not needed, and the "Revisit if aya cannot load a program type" trigger does not fire. Uprobes
+  stay possible later as an additional source.
+- **Side information, not events.** The program emits a record only for a send to port 53 and
+  returns after the port check otherwise. It reads no payload. The record carries the sender
+  (pid, tid, uid, comm, exe identity), the 5-tuple, a kernel timestamp and the socket's network
+  namespace inode. User space joins it with the captured packet. Events keep source `PACKET`.
+- **`SELF_TGID` is set but not read.** The loader sets the map on every object (shared contract).
+  This program ignores it, so the agent's own lookups stay attributed; reading the ring buffer
+  causes no UDP traffic, so there is no feedback loop.
+- **Verifier.** The program has no loops: about 240 and 290 instructions (`kp_udp_sendmsg` 238
+  and 237, `kp_udpv6_sendmsg` 290 and 295 on the 22.04 and 24.04 runner kernels). Ring buffer
+  256 KiB (records are 104 bytes).
+- **x86_64 only**, like the fs object (kprobe argument access is architecture-specific). Per-arch
+  objects remain Phase 13 packaging work.
+- **Layouts: hand-mirrored layouts kept, again.** The 11b-3 update said to revisit codegen when a
+  fourth record was added. Decision: keep the mirror. `dns_record.rs` follows `net_record.rs` and
+  `fs_record.rs`: `_Static_assert`s in `bpf/dns.h`, `#[repr(C)]` with size and offset tests, the
+  C-header text test in `tests/c_header.rs`, the `schema_version` check at load, and a decoder that
+  rejects every malformed record with a `DecodeError`. The record is small and fixed-size, and the
+  combination caught every mismatch during the phase. Codegen would still make a C toolchain a
+  build requirement of the workspace. Revisit if a layout test misses a real mismatch.
+- **Debts this adds** (also in `docs/ROADMAP-REMAINING.md`): x86_64-only kprobe objects,
+  pid-namespace-aware pids for all 11b objects, foreign-netns attribution, the `SO_REUSEPORT` 5 ms
+  ambiguity, ring-buffer size and reader cost under a burst, and uprobes as an optional future
+  source.
