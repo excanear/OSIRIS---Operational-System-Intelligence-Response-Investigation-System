@@ -19,6 +19,7 @@ tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+osiris-storage-clickhouse = { path = "../osiris-storage-clickhouse" }
 osiris-api = { path = "../osiris-api" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }
 osiris-fileutil = { path = "../osiris-fileutil" }

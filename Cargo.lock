@@ -1966,6 +1966,7 @@ dependencies = [
  "osiris-schema",
  "osiris-selftelemetry",
  "osiris-storage",
+ "osiris-storage-clickhouse",
  "osiris-storage-sqlite",
  "osiris-tenancy",
  "osiris-transport",

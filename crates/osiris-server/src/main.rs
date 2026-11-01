@@ -18,9 +18,8 @@ use osiris_correlate::CorrelationEngine;
 use osiris_detect::DetectionEngine;
 use osiris_evidence::{SqliteEvidenceIncidentLinks, SqliteEvidenceStore, SqliteIncidentStore};
 use osiris_risk::RiskEngine;
-use osiris_server::{run_ingestion_context_loop, ServerConfig};
+use osiris_server::{open_storage, run_ingestion_context_loop, ServerConfig};
 use osiris_storage::Storage;
-use osiris_storage_sqlite::SqliteStorage;
 use tokio_util::sync::CancellationToken;
 
 /// The Correlation Engine's bounded graph-walk parameters (ARCHITECTURE.md
@@ -49,10 +48,10 @@ async fn main() {
         }
     };
 
-    let storage: Arc<dyn Storage> = match SqliteStorage::open(&config.db_path) {
-        Ok(s) => Arc::new(s),
+    let storage: Arc<dyn Storage> = match open_storage(&config) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to open storage at {}: {}", config.db_path, e);
+            eprintln!("failed to open storage: {}", e);
             std::process::exit(1);
         }
     };

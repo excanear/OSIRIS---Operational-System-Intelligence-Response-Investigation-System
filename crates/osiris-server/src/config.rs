@@ -79,6 +79,61 @@ pub struct ServerConfig {
     /// Phase 9c-1: server-to-agent command channel. Absent = commands disabled.
     #[serde(default)]
     pub control: Option<ControlServerConfig>,
+    /// Phase 11c: which backend holds events/alerts/relationships/risk
+    /// scores. SQLite (`db_path`) is the default.
+    #[serde(default)]
+    pub storage_backend: StorageBackend,
+    /// ClickHouse connection; required when `storage_backend: clickhouse`,
+    /// ignored otherwise.
+    #[serde(default)]
+    pub clickhouse: Option<ClickHouseConfig>,
+}
+
+/// The telemetry storage backend.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    #[default]
+    Sqlite,
+    Clickhouse,
+}
+
+/// ClickHouse connection settings (see docs/operators-clickhouse.md).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClickHouseConfig {
+    pub url: String,
+    #[serde(default = "default_ch_database")]
+    pub database: String,
+    #[serde(default = "default_ch_user")]
+    pub user: String,
+    /// Path of a file holding the password; never an inline password.
+    #[serde(default)]
+    pub password_file: Option<String>,
+    /// Per-request timeout, 1..=600 seconds.
+    #[serde(default = "default_ch_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_ch_database() -> String {
+    "osiris".to_string()
+}
+fn default_ch_user() -> String {
+    "default".to_string()
+}
+fn default_ch_timeout_secs() -> u64 {
+    30
+}
+
+impl ClickHouseConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=600).contains(&self.timeout_secs) {
+            return Err(ConfigError::Invalid(format!(
+                "clickhouse.timeout_secs must be between 1 and 600, got {}",
+                self.timeout_secs
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Command channel listener (mTLS) and the key commands are signed with.
@@ -227,6 +282,14 @@ impl ServerConfig {
         if let Some(c) = &config.control {
             c.validate()?;
         }
+        if let Some(c) = &config.clickhouse {
+            c.validate()?;
+        }
+        if config.storage_backend == StorageBackend::Clickhouse && config.clickhouse.is_none() {
+            return Err(ConfigError::Invalid(
+                "storage_backend clickhouse requires a clickhouse section".to_string(),
+            ));
+        }
         Ok(config)
     }
 }
@@ -300,6 +363,65 @@ mod tests {
         .unwrap();
         let config = ServerConfig::load(&path).unwrap();
         assert!(config.incidents_db_path.is_none());
+    }
+
+    const BASE_YAML: &str =
+        "db_path: /tmp/e.db\nspool_path: /tmp/s\nlisten_addr: 127.0.0.1:8080\nrules_dir: /r\n";
+
+    fn load_yaml(yaml: &str) -> Result<ServerConfig, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        ServerConfig::load(&path)
+    }
+
+    #[test]
+    fn storage_backend_defaults_to_sqlite() {
+        let config = load_yaml(BASE_YAML).unwrap();
+        assert_eq!(config.storage_backend, StorageBackend::Sqlite);
+        assert!(config.clickhouse.is_none());
+    }
+
+    #[test]
+    fn clickhouse_backend_parses_with_defaults() {
+        let config = load_yaml(&format!(
+            "{BASE_YAML}storage_backend: clickhouse\nclickhouse:\n  url: http://ch:8123\n"
+        ))
+        .unwrap();
+        assert_eq!(config.storage_backend, StorageBackend::Clickhouse);
+        let ch = config.clickhouse.unwrap();
+        assert_eq!(ch.url, "http://ch:8123");
+        assert_eq!(ch.database, "osiris");
+        assert_eq!(ch.user, "default");
+        assert_eq!(ch.timeout_secs, 30);
+        assert!(ch.password_file.is_none());
+    }
+
+    #[test]
+    fn clickhouse_backend_without_section_is_invalid() {
+        let err = load_yaml(&format!("{BASE_YAML}storage_backend: clickhouse\n")).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m) if m.contains("requires a clickhouse section")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_section_with_sqlite_backend_is_allowed() {
+        let config =
+            load_yaml(&format!("{BASE_YAML}clickhouse:\n  url: http://ch:8123\n")).unwrap();
+        assert_eq!(config.storage_backend, StorageBackend::Sqlite);
+    }
+
+    #[test]
+    fn clickhouse_timeout_out_of_range_is_invalid() {
+        for t in [0, 601] {
+            let err = load_yaml(&format!(
+                "{BASE_YAML}storage_backend: clickhouse\nclickhouse:\n  url: http://ch:8123\n  timeout_secs: {t}\n"
+            ))
+            .unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid(_)), "{t}: {err}");
+        }
     }
 
     #[test]

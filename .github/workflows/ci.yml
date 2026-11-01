@@ -74,3 +74,5 @@ jobs:
           exit 1
       - name: Test (including ClickHouse-only tests)
         run: cargo test -p osiris-storage-clickhouse -- --include-ignored
+      - name: Server end-to-end on ClickHouse
+        run: cargo test -p osiris-e2e-tests --test clickhouse_backend -- --include-ignored
