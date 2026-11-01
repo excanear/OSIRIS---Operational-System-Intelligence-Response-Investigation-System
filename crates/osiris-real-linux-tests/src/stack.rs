@@ -31,6 +31,9 @@ pub struct AgentOptions {
     pub ebpf_object_dir: Option<PathBuf>,
     /// Watched trees beyond `BASE_FS_WATCH`; created before the agent starts.
     pub extra_fs_watch: Vec<PathBuf>,
+    /// Leave `dns_capture` out of agent.yaml, so the agent runs no DNS
+    /// sensor (the DNS send bench's baseline). False everywhere else.
+    pub no_dns_capture: bool,
 }
 
 /// The trees the global audit rules also watch. Every agent stack renders
@@ -203,6 +206,7 @@ impl Stack {
                 status_port,
                 ebpf_object_dir: a.ebpf_object_dir,
                 fs_watch_paths,
+                dns_capture: !a.no_dns_capture,
             };
             std::fs::write(d.join("agent.yaml"), agent_yaml.render()).unwrap();
             // Owned by the Stack before the wait so a panic there still reaps it in Drop.

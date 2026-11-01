@@ -68,6 +68,7 @@ fn stack_with_fs(
             persistence_dirs: vec![persist.to_path_buf()],
             ebpf_object_dir,
             extra_fs_watch,
+            no_dns_capture: false,
         }),
         ..Default::default()
     })

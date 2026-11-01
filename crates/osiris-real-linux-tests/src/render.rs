@@ -74,6 +74,9 @@ pub struct AgentYaml {
     /// `fs_watch_paths:`; empty renders nothing, so the sensor uses its
     /// default list.
     pub fs_watch_paths: Vec<PathBuf>,
+    /// Renders `dns_capture: {}` (the DNS sensor on all interfaces);
+    /// false leaves the key out, so the agent runs no DNS sensor.
+    pub dns_capture: bool,
 }
 
 /// `$OSIRIS_BPF_DIR` (set by the real-Linux workflow, built by
@@ -90,13 +93,18 @@ impl AgentYaml {
         let mut s = format!(
             "spool_path: {spool}\nstatus_addr: '127.0.0.1:{status}'\nenable_synthetic: false\n\
              proc_root: '/proc'\nnetwork_proc_root: '/proc'\n\
-             dns_capture: {{}}\n\
+             {dns}\
              cloud_metadata:\n  enabled: false\n\
              fleet:\n  health_interval_secs: {hb}\n\
              forward:\n  server_addr: '127.0.0.1:{agent}'\n  server_name: 'localhost'\n  ca: {ca}\n  cert: {acert}\n  key: {akey}\n\
              control:\n  server_addr: '127.0.0.1:{control}'\n  server_name: 'localhost'\n  ca: {ca}\n  cert: {acert}\n  key: {akey}\n  command_public_key: {pubk}\n  vault_dir: {vault}\n",
             spool = f(d, "agent-spool.ndjson"),
             status = self.status_port,
+            dns = if self.dns_capture {
+                "dns_capture: {}\n"
+            } else {
+                ""
+            },
             hb = self.health_interval_secs,
             agent = self.agent_port,
             control = self.control_port,
@@ -173,6 +181,7 @@ mod tests {
             status_port: 0,
             ebpf_object_dir: None,
             fs_watch_paths: vec![],
+            dns_capture: true,
         };
         let path = dir.path().join("agent.yaml");
         std::fs::write(&path, y.render()).unwrap();
@@ -219,6 +228,7 @@ mod tests {
             status_port: 18083,
             ebpf_object_dir: Some(bpf.clone()),
             fs_watch_paths: vec![dir.path().join("watched dir"), "/var/www".into()],
+            dns_capture: true,
         };
         let path = dir.path().join("agent.yaml");
         std::fs::write(&path, y.render()).unwrap();
@@ -247,6 +257,7 @@ mod tests {
             status_port: 0,
             ebpf_object_dir: None,
             fs_watch_paths: vec![],
+            dns_capture: true,
         };
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a.yaml");
@@ -256,5 +267,26 @@ mod tests {
             cfg.spool_path,
             r"C:\Program Files\osiris dir/agent-spool.ndjson"
         );
+    }
+
+    #[test]
+    fn dns_capture_off_renders_no_dns_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let y = AgentYaml {
+            dir: dir.path().to_path_buf(),
+            agent_port: 1,
+            control_port: 2,
+            audit_log: None,
+            persistence_dirs: vec![],
+            health_interval_secs: 5,
+            status_port: 0,
+            ebpf_object_dir: None,
+            fs_watch_paths: vec![],
+            dns_capture: false,
+        };
+        let p = dir.path().join("a.yaml");
+        std::fs::write(&p, y.render()).unwrap();
+        let cfg = osiris_agent::AgentConfig::load(&p).unwrap();
+        assert!(cfg.dns_capture.is_none());
     }
 }

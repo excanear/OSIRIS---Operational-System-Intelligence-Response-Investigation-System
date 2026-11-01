@@ -67,6 +67,7 @@ pub fn run(iterations: u64) -> Record {
             persistence_dirs: vec![persist.path().to_path_buf()],
             ebpf_object_dir: osiris_real_linux_tests::render::bpf_dir_from_env(),
             extra_fs_watch: vec![watched.clone()],
+            no_dns_capture: false,
         }),
         ..Default::default()
     });
