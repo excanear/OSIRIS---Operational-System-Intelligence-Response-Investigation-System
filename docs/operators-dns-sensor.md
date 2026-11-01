@@ -56,10 +56,10 @@ captured-packet drop is not, under load.**
   under a flood, wrong owners become likely. An attacker can cause it on purpose by flooding port
   53 from a decoy process and then reusing the decoy's ports. The drops show in
   `events_dropped_total` and the sensor reports `DEGRADED` for 60 s after them, so treat owners
-  seen while the DNS sensor is `DEGRADED` with suspicion. The same holds for a retransmitted query whose packet arrives before its own
-  kernel record, and for a query the sensor gave up on: the reservation it leaves behind (a
-  tombstone) can consume an older orphaned record instead of its own, and its own late record can
-  then go to a newer query.
+  seen while the DNS sensor is `DEGRADED` with suspicion. The same holds for a retransmitted
+  query whose packet arrives before its own kernel record, and for a query the sensor gave up
+  on: the reservation it leaves behind (a tombstone) can consume an older orphaned record instead
+  of its own, and its own late record can then go to a newer query.
 - More than 16 384 queries waiting at once for their kernel record: the oldest lose their
   protection.
 
@@ -112,6 +112,12 @@ Other behaviour with kernel attribution:
 
   It is a loss signal, not an exact count of lost queries. In a 10 000-query flood on `lo`, measured
   before capture-socket drops were counted, only about 3 000 queries (kernel attribution) or 850
-  (`/proc` attribution) came out and the loss did not show (`PERFORMANCE.md`). It now does.
+  (`/proc` attribution) came out and the loss did not show. It now does: in the post-counter bench
+  the counter rose by about 15 000 per flood (more than the 10 000 queries, because both `lo`
+  copies and the ring-buffer records count) and the sensor was `DEGRADED` within 1 s
+  (`PERFORMANCE.md`).
+- One loss is still not counted: on `lo`, when the kernel's `netdev_max_backlog` queue overflows,
+  the incoming (`PACKET_HOST`) copy is dropped before the capture tap sees it, so neither
+  `tp_drops` nor any sensor counter records it.
 - Health under a flood: `DEGRADED` is reported for 60 s after parse errors, after more than 4 096
   queries are pending at once, or after the capture socket drops packets.

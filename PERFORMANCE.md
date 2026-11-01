@@ -174,33 +174,75 @@ Overhead pairs, computed from the median rates (time per send), with the p50 dif
 | D vs A | the rest of the agent | +34.3 % (+0.402 us), noisy | +0.34 % (+0.012 us) |
 | B vs A | the whole agent | +13.8 % (+0.435 us) | +16.0 % (+2.018 us) |
 
-- **The 11b-4 cost on a send to a port other than 53 is +4.50 %, about 0.17 us per send.** That is
-  within noise of the spec's 5 % threshold (see "Noise" below), not a measured pass: the bench
-  cannot tell 4.5 % from 5 %. A
-  kprobe has a fixed entry cost even when the program returns at once, so this is the price of
-  seeing every UDP sender in the kernel.
+- **The 11b-4 cost on a send to a port other than 53 was +4.50 %, about 0.17 us per send, in this
+  run.** The rerun below measured −15.4 % for the same pair. The kprobe cost is below what this
+  runner can resolve. It is not a measured pass of the spec's 5 % threshold. A kprobe has a fixed
+  entry cost even when the program returns at once, so some cost is certain; the bench only bounds
+  it inside the noise.
 - On port 53 the kprobes cost +4.58 % (+0.65 us per send): the program also reserves and submits a
   ring-buffer record.
 - **Noise.** One loop of 10 000 sends lasts about 40-90 ms on a shared hosted runner. The C vs D
   port-5300 figure is negative, and D's port-5300 rate (201 624/s, p99 12.2 us) is below both C and
   A, which no agent configuration can explain. It is noise, and it also inflates D vs A on port
-  5300. Read the pairs as about ±10 %, and trust B vs C most: B and C differ only in the kprobes and
-  ran interleaved.
+  5300. Read the pairs as about ±15 % (see the rerun below). B vs C is the cleanest pair, since B
+  and C differ only in the kprobes and ran interleaved, but it is inside that band too.
 - A first run (41324827608, `t11b4-1` @ `1748899`) had one round and no variants and showed
   +51.8 % on port 5300 for the whole agent. That figure is superseded: a single short loop with no
   variants could not attribute the cost to anything.
 - The agent used 0.14-0.17 s of CPU over the three loops (warm-up, port 5300, port 53) in B, and
   0.17-0.19 s in C.
 
-**The unanswered port-53 flood.** The `dns` status, sampled 1-10 s after each flood. These numbers
-were measured before the sensor counted capture-socket drops (`PACKET_STATISTICS`): today's
-`events_dropped_total` would be higher by those drops, and the capture drops would also report
-`DEGRADED`.
+**Second measurement: the noise envelope.** Run 41331461832 (branch `real-linux-bench/t11b4-3`,
+code `f1b557b`, same runner image and kernel, same 5 interleaved rounds) repeated the bench after
+the final fix wave. Run 41326077476 above stays the reference for the overhead pairs; this run
+shows how far the same bench moves between runs.
+
+| Config | Port 5300 sends/s | p50 | p99 | Port 53 sends/s | p50 | p99 |
+|---|---|---|---|---|---|---|
+| A no agent | 175 958 | 4.958 us | 8.072 us | 85 613 | 10.315 us | 22.213 us |
+| B full agent | 151 817 | 6.820 us | 9.353 us | 76 063 | 10.887 us | 25.938 us |
+| C no `dns.bpf.o` | 128 392 | 6.709 us | 12.419 us | 71 662 | 13.920 us | 23.275 us |
+| D no DNS sensor | 146 010 | 6.259 us | 11.947 us | 87 039 | 9.965 us | 21.982 us |
+
+| Pair | Port 5300 | Port 53 |
+|---|---|---|
+| B vs C (the 11b-4 kprobes) | −15.4 % (+0.111 us) | −5.8 % (−3.033 us) |
+| C vs D | +13.7 % (+0.450 us) | +21.5 % (+3.955 us) |
+| D vs A | +20.5 % (+1.301 us) | −1.6 % (−0.350 us) |
+| B vs A | +15.9 % (+1.862 us) | +12.6 % (+0.572 us) |
+
+- The no-agent baseline A swung from 270 862 to 175 958 sends/s on port 5300 between the two runs,
+  with nothing changed in A. The runner's own speed varies by more than a third.
+- The kprobe pair B vs C on port 5300 ranged from −15.4 % to +4.50 % across the runs. A negative
+  cost is impossible, so the spread is noise. **The 11b-4 kprobe cost is below what this runner can
+  resolve. The bench does not show it under 5 %; it shows it is lost in a noise band of about
+  ±15 %.**
+- The whole agent (B vs A) cost +13.8 % then +15.9 % on port 5300: the most stable pair, since it
+  sums every cost.
+
+**The unanswered port-53 flood.** The `dns` status, sampled 1-10 s after each flood.
+
+Pre-counter, run 41326077476 (before the sensor counted capture-socket drops):
 
 | Config | State | `events_dropped_total` after the flood | `events_emitted_total` |
 |---|---|---|---|
 | B, 5/5 rounds | `HEALTHY` throughout | 5 317 / 4 574 / 5 056 / 4 672 / 5 368, final already at 1 s | 0 until about 5 s, then 3 245 / 2 843 / 3 320 / 2 894 / 3 193 |
 | C, 5/5 rounds | `DEGRADED` before and after (the missing `dns.bpf.o` fallback, by design) | 0 | 0 until about 5 s, then 859 / 845 / 777 / 864 / 878 |
+
+Post-counter, run 41331461832 (`PACKET_STATISTICS` drops counted):
+
+| Config | State | `events_dropped_total` after the flood | `events_emitted_total` | Agent CPU |
+|---|---|---|---|---|
+| B, 5/5 rounds | `DEGRADED` already at t = 1 s in every round | 15 489 / 14 928 / 15 170 / 15 758 / 15 396 | 4 181 / 4 301 / 4 239 / 3 917 / 4 196 | 0.21-0.33 s |
+| C, 5/5 rounds | `DEGRADED` | 17 238 / 17 363 / 17 244 / 17 550 / 17 440 | 1 259 / 1 176 / 1 261 / 1 111 / 1 157 | 0.19-0.21 s |
+
+- **The loss is now counted, and a flood reports `DEGRADED` within 1 s.** Before the counter, B
+  stayed `HEALTHY` and about 70 % of the queries vanished uncounted.
+- `events_dropped_total` exceeds the 10 000 queries sent. That is the documented mix of units: on
+  `lo` both copies of a packet are queued and either can be dropped, and in B the lost ring-buffer
+  records count as well. Read it as "the flood lost a lot", not as a query count.
+- C has no ring-buffer records, so its count is capture drops alone; it emits fewer events and
+  drops more packets, because every query costs a `/proc` lookup.
 
 - Emission waits about 5 s because an unanswered query is emitted when the 11a tracker times it
   out (`TX_TIMEOUT` 5 s).
@@ -212,18 +254,19 @@ were measured before the sensor counted capture-socket drops (`PACKET_STATISTICS
   unattributed. The bench sends from one socket, so every send also lands on one send-table key,
   whose queue holds 8 entries: the bench is a worst case for attribution, and only the drop count is
   read from it.
-- **Far fewer than 10 000 query events come out.** B emitted about 3 000 and C about 850. The
-  likely cause is the `AF_PACKET` socket's receive queue overflowing while the capture loop falls
-  behind. This is pre-existing from 11a. It is worse in C, where every query costs a `/proc`
-  lookup. In this run the loss was silent. Since the 11b-4 final fix the sensor reads the kernel's
-  `PACKET_STATISTICS` (`tp_drops`, accumulated, read at most once a second and before the socket
-  is closed) and adds it to `events_dropped_total`.
+- **Far fewer than 10 000 query events come out.** B emitted about 3 000 and C about 850 in the
+  pre-counter run, and about 4 200 and 1 200 in the rerun. The likely cause is the `AF_PACKET`
+  socket's receive queue overflowing while the capture loop falls behind. This is pre-existing
+  from 11a. It is worse in C, where every query costs a `/proc` lookup. In the pre-counter run the
+  loss was silent. Since the 11b-4 final fix the sensor reads the kernel's `PACKET_STATISTICS`
+  (`tp_drops`, accumulated, read at most once a second and before the socket is closed) and adds
+  it to `events_dropped_total`.
 - **`events_dropped_total` mixes units.** It now adds ring-buffer records (lost or undecodable),
   capture packets (on `lo` the socket queues both copies of each packet, so one lost query can
   count twice) and failed channel sends. It shows that something was lost, not how many queries.
 - **A flood now degrades the sensor when the capture socket drops.** `DEGRADED` from the capture
   side is reported for 60 s after parse errors, tracker overflow evictions (more than 4 096
-  pending transactions) or capture-socket drops. In the run above, before capture drops counted,
+  pending transactions) or capture-socket drops. In run 41326077476, before capture drops counted,
   nothing was emitted before the 5 s timeout and an overflow eviction is emitted at once, so the
   tracker evicted nothing: the capture saw fewer than 4 096 queries, and B stayed `HEALTHY` in 5/5
   rounds. The first run (41324827608) ended `DEGRADED` after its flood.

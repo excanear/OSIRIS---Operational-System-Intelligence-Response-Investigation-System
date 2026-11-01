@@ -215,10 +215,13 @@ revisão final independente → merge → push.
   tombstones no sensor `dns`; o conteúdo segue vindo do AF_PACKET da 11a; fallback para atribuição
   por `/proc`, `DEGRADED` com `procfs_attribution`). Uprobes nas bibliotecas de resolução foram
   descartados (não veem Go, musl, binários estáticos nem UDP cru; ver ARCHITECTURE §4.3 e ADR-010).
-  Validado em Linux real (rodadas `real-linux/t11b4-1` a `-4`, Ubuntu 22.04 com kernel
+  Validado em Linux real (rodadas `real-linux/t11b4-1` a `-5`, Ubuntu 22.04 com kernel
   6.8.0-1070-azure e 24.04 com 7.0.0-1017-azure; t11b4-3 @ `94d1444` verde nos dois na primeira
-  tentativa e t11b4-4 @ `d3355d7` verde nos dois, rajada 200/200 com o pid certo) e medido em `PERFORMANCE.md`
-  (kprobes: +4,50 % num envio para porta diferente de 53, dentro do ruído do limite de 5 %, não uma aprovação medida). Ver
+  tentativa, t11b4-4 @ `d3355d7` e t11b4-5 @ `f1b557b` verdes nos dois, rajada 200/200 com o pid
+  certo; na t11b4-5 a enxurrada de 10 000 consultas subiu `events_dropped_total` em ~15 000) e
+  medido em `PERFORMANCE.md` (kprobes: de −15,4 % a +4,50 % num envio para porta diferente de 53
+  em duas rodadas do bench; o custo fica abaixo do que o runner resolve, não é uma aprovação
+  medida do limite de 5 %). Ver
   `docs/operators-ebpf.md`, `docs/operators-dns-sensor.md`, `docs/adr/ADR-010-ebpf-loader-aya.md` e
   `docs/VALIDATION.md`. **Com a 11b-4 a Fase 11b está encerrada.**
   Dívidas da 11b-4:
@@ -266,6 +269,9 @@ revisão final independente → merge → push.
   - Perda silenciosa do socket AF_PACKET sob enxurrada (ver a dívida `tp_drops` da 11a acima), agora
     observada no bench. (RESOLVIDA na revisão final da 11b-4: a perda é contada em
     `events_dropped_total` e deixa o sensor `DEGRADED`.)
+  - Perda ainda não contada: em `lo`, quando a fila `netdev_max_backlog` do kernel estoura, a cópia
+    de entrada (`PACKET_HOST`) é descartada antes do tap da captura, e nem `tp_drops` nem contador
+    algum do sensor a registra.
   - O piso de kernel 5.15 segue raciocinado, não executado.
 - **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
 

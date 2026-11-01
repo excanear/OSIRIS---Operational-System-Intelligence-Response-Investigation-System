@@ -164,9 +164,9 @@ source and are a non-goal here.
      close (best-effort). Capture still works, so the sensor is not `Failed`.
    - **Health rule** *(call)*: the reported state is the worse of the backend state and the
      existing parse/eviction window, which *(amended, final fix wave)* also opens on capture-socket
-     drops, so a lossy flood reports `Degraded`. A backend `Degraded` (fallback at start or the latch) stays
-     `Degraded` for the whole run. The capture loop must stop overwriting it, which it does today
-     (`h.state = window.observe(..)`).
+     drops, so a lossy flood reports `Degraded`. A backend `Degraded` (fallback at start or the
+     latch) stays `Degraded` for the whole run. The capture loop must stop overwriting it, which
+     it does today (`h.state = window.observe(..)`).
    - **procfs fallback** (eBPF configured but unusable): today's `Attributor`, `Degraded`, flag
      `procfs_attribution`, reason in `last_error`.
    - **procfs only** (no `ebpf` key): today's behaviour exactly, `Healthy`, flag

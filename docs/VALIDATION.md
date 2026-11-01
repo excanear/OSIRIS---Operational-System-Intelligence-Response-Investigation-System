@@ -432,8 +432,11 @@ The DNS sensor's kernel send attribution (`bpf/dns.bpf.c`, kprobes on `udp_sendm
 | 41323245111 | `t11b4-4` @ `d3355d7` | Tombstone round (a claim that gives up keeps reserving until the TTL). Whole suite green on both runners, same kernels and instruction counts (238/290, 237/295). Burst 200/200 right pid, 0 dropped. |
 | 41324827608 | `real-linux-bench/t11b4-1` @ `1748899` | First DNS send bench: one round, no variants. Superseded. |
 | 41326077476 | `real-linux-bench/t11b4-2` @ `696698f` | DNS send bench, 4 configurations x 5 interleaved rounds. Numbers in `PERFORMANCE.md`. |
+| 41331459633 | `t11b4-5` @ `f1b557b` | Final fix wave (capture drops counted, held re-check throttle). Whole suite green, 32/32 on both runners, same kernels and instruction counts (238/290, 237/295). Burst 200/200 right pid, 0 dropped. Flood (g): 10 000 sent in 119 / 108 ms, 3 532 / 3 993 emitted, `events_dropped_total` +15 176 / +15 702 (22.04 / 24.04). |
+| 41331461832 | `real-linux-bench/t11b4-3` @ `f1b557b` | DNS send bench rerun with the capture-drop counter, same shape as t11b4-2. Shows the noise envelope and the counted flood; numbers in `PERFORMANCE.md`. |
 
-Scenarios that passed on both runners (runs 41321051436 and 41323245111):
+Scenarios that passed on both runners (runs 41321051436, 41323245111 and 41331459633; (g) only in
+the last):
 
 - (a) `dns_sensor_uses_ebpf_attribution`: `dns` `HEALTHY` with `ebpf_attribution`, without
   `procfs_attribution`, and `AGENT_HEALTH` stays `HEALTHY` throughout.
@@ -452,20 +455,26 @@ Scenarios that passed on both runners (runs 41321051436 and 41323245111):
   than its sender's fails the test. Result: 200/200 right pid, 0 dropped, both runners.
 - (g) `dns_flood_loss_is_counted` (final fix wave): 10 000 unanswered queries from one socket on
   `lo` as fast as `sendto` goes. After every transaction has closed, if the sensor emitted fewer
-  events than queries were sent, `events_dropped_total` must have risen. Not yet run on the
-  runners when this was written.
+  events than queries were sent, `events_dropped_total` must have risen. Run 41331459633, both
+  runners: 3 532 / 3 993 of 10 000 emitted and the counter up by 15 176 / 15 702 (22.04 / 24.04),
+  so the check is exercised, not vacuous.
 
 ### Bench run
 
 Run 41326077476 measured the send path in four configurations (no agent; full agent; full agent
 without `dns.bpf.o`; full agent without the DNS sensor), 5 interleaved rounds each. The kprobes
-alone cost +4.50 % (+0.17 us per send) on sends to a port other than 53, within noise of the
-spec's 5 % warning threshold (not a measured pass), and +4.58 % on port 53. The loops last 40-90 ms on a shared
-runner and are noisy: one pair came out negative. Details and the full table are in
-`PERFORMANCE.md`.
+alone measured +4.50 % (+0.17 us per send) on sends to a port other than 53, and +4.58 % on port
+53. The loops last 40-90 ms on a shared runner and are noisy: one pair came out negative.
 
-Each agent run ended with an unanswered 10 000-query flood on `lo`. These flood numbers were
-measured before the sensor counted capture-socket drops:
+The rerun 41331461832 (`real-linux-bench/t11b4-3` @ `f1b557b`) gives the noise envelope. The
+no-agent baseline swung from 270 862 to 175 958 sends/s on port 5300 between the two runs, and the
+kprobe pair ranged from −15.4 % to +4.50 %. So the kprobe cost is below what this runner can
+resolve. It is not a measured pass of the spec's 5 % threshold. Run 41326077476 stays the
+reference for the pairs; both tables are in `PERFORMANCE.md`.
+
+Each agent run ended with an unanswered 10 000-query flood on `lo`. The bullets below are from run
+41326077476, measured before the sensor counted capture-socket drops; the post-counter result
+follows them:
 
 - **Ring-buffer loss under a burst.** With kernel attribution, 4 574-5 368 of the 10 000 send
   records were lost in each round. The ring buffer is 256 KiB (about 2 340 records), and the reader
@@ -485,6 +494,12 @@ measured before the sensor counted capture-socket drops:
   after its flood. Capture-socket drops now also open the 60 s `DEGRADED` window, next to parse
   errors and tracker overflow evictions at 4 096 pending, so a flood that loses packets reports
   `DEGRADED`.
+- **Post-counter (run 41331461832).** The loss is now counted, and the flood reports `DEGRADED`
+  within 1 s. With kernel attribution, all 5 rounds were `DEGRADED` at t = 1 s, with
+  `events_dropped_total` 14 928-15 758 and 3 917-4 301 events emitted. On the `/proc` fallback
+  the counter was 17 238-17 550, with 1 111-1 261 emitted. The counter exceeds the 10 000 queries
+  because of the documented mixed units: both `lo` copies of a packet can be dropped, and in
+  kernel mode the lost ring-buffer records count too.
 
 ### Known limitations
 
