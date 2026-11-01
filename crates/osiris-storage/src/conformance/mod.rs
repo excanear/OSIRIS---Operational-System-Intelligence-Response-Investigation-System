@@ -430,7 +430,8 @@ macro_rules! __conformance_risk_cases {
     };
 }
 
-/// Runs all five groups against `make_fn`.
+/// Runs all five groups against `make_fn`; `ignore = "reason"` marks every
+/// test `#[ignore]` (for backends that need an external server).
 #[macro_export]
 macro_rules! conformance_tests {
     ($make:path) => {
@@ -439,5 +440,12 @@ macro_rules! conformance_tests {
         $crate::conformance_alerts_tests!($make);
         $crate::conformance_graph_tests!($make);
         $crate::conformance_risk_tests!($make);
+    };
+    ($make:path, ignore = $reason:literal) => {
+        $crate::conformance_events_tests!($make, ignore = $reason);
+        $crate::conformance_query_tests!($make, ignore = $reason);
+        $crate::conformance_alerts_tests!($make, ignore = $reason);
+        $crate::conformance_graph_tests!($make, ignore = $reason);
+        $crate::conformance_risk_tests!($make, ignore = $reason);
     };
 }

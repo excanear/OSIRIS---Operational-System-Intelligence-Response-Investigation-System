@@ -14,6 +14,7 @@ use osiris_schema::CanonicalEvent;
 use osiris_storage::{QueryPlan, StorageError, MAX_TENANT_HOSTS};
 use serde_json::Value as Json;
 
+use crate::events::{backend, serde_str};
 use crate::transport::ExternalTable;
 use crate::ClickHouseStorage;
 
@@ -24,11 +25,7 @@ pub(crate) const SCAN_BATCH_SIZE: u64 = 20_000;
 /// little of the filter.
 pub(crate) const MAX_SCAN_ROWS: u64 = 1_000_000;
 
-fn backend(msg: impl Into<String>) -> StorageError {
-    StorageError::Backend(msg.into())
-}
-
-fn host_set_too_large() -> StorageError {
+pub(crate) fn host_set_too_large() -> StorageError {
     backend(format!(
         "tenant host set too large (limit {MAX_TENANT_HOSTS})"
     ))
@@ -37,34 +34,48 @@ fn host_set_too_large() -> StorageError {
 /// A WHERE clause under construction: typed parameter placeholders plus
 /// the tenant host table.
 #[derive(Default)]
-struct Filter {
-    sql: String,
+pub(crate) struct Filter {
+    pub(crate) sql: String,
     params: Vec<(String, String)>,
-    hosts: Option<Vec<String>>,
+    tables: Vec<ExternalTable<'static>>,
 }
 
 impl Filter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sql: "WHERE 1=1".to_string(),
             ..Self::default()
         }
     }
 
+    /// Attaches a one-column external table.
+    pub(crate) fn add_table(
+        &mut self,
+        name: &'static str,
+        structure: &'static str,
+        rows: Vec<String>,
+    ) {
+        self.tables.push(ExternalTable {
+            name,
+            structure,
+            rows,
+        });
+    }
+
     /// Registers a parameter and returns its `{pN:Type}` placeholder.
-    fn bind(&mut self, ty: &str, value: String) -> String {
+    pub(crate) fn bind(&mut self, ty: &str, value: String) -> String {
         let name = format!("p{}", self.params.len());
         let placeholder = format!("{{{name}:{ty}}}");
         self.params.push((name, value));
         placeholder
     }
 
-    fn and(&mut self, condition: &str) {
+    pub(crate) fn and(&mut self, condition: &str) {
         self.sql.push_str(" AND ");
         self.sql.push_str(condition);
     }
 
-    fn eq_str(&mut self, column: &str, value: &str) {
+    pub(crate) fn eq_str(&mut self, column: &str, value: &str) {
         let p = self.bind("String", value.to_string());
         self.and(&format!("{column} = {p}"));
     }
@@ -76,7 +87,20 @@ impl Filter {
 
     /// Tenant restriction. `Ok(false)` means the set is empty and the
     /// query must return nothing without any I/O.
-    fn host_ids(&mut self, host_ids: &Option<Vec<String>>) -> Result<bool, StorageError> {
+    pub(crate) fn host_ids(
+        &mut self,
+        host_ids: &Option<Vec<String>>,
+    ) -> Result<bool, StorageError> {
+        self.host_ids_on("host_id IN (SELECT h FROM hosts)", host_ids)
+    }
+
+    /// Like [`Filter::host_ids`], with the membership test spelled by
+    /// `condition` (it reads the external table `hosts`).
+    pub(crate) fn host_ids_on(
+        &mut self,
+        condition: &str,
+        host_ids: &Option<Vec<String>>,
+    ) -> Result<bool, StorageError> {
         let Some(ids) = host_ids else { return Ok(true) };
         if ids.len() > MAX_TENANT_HOSTS {
             return Err(host_set_too_large());
@@ -84,12 +108,12 @@ impl Filter {
         if ids.is_empty() {
             return Ok(false);
         }
-        self.and("host_id IN (SELECT h FROM hosts)");
-        self.hosts = Some(ids.clone());
+        self.and(condition);
+        self.add_table("hosts", "h String", ids.clone());
         Ok(true)
     }
 
-    fn window(&mut self, since: Option<u64>, until: Option<u64>) {
+    pub(crate) fn window(&mut self, since: Option<u64>, until: Option<u64>) {
         if let Some(since) = since {
             let p = self.bind("UInt64", since.to_string());
             self.and(&format!("timestamp >= {p}"));
@@ -119,14 +143,6 @@ fn exact_u32(n: f64) -> Option<u64> {
     (n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n)).then_some(n as u64)
 }
 
-fn serde_str(value: Result<Json, serde_json::Error>) -> Result<String, StorageError> {
-    let value = value.map_err(|e| StorageError::Serialize(e.to_string()))?;
-    Ok(match value {
-        Json::String(s) => s,
-        other => other.to_string().trim_matches('"').to_string(),
-    })
-}
-
 /// Decodes the `raw_json` column of one `JSONEachRow` line.
 fn decode_row(line: &str) -> Result<(CanonicalEvent, Json), StorageError> {
     let row: Json =
@@ -145,15 +161,17 @@ fn in_hosts(event: &CanonicalEvent, hosts: &Option<HashSet<&str>>) -> bool {
 }
 
 impl ClickHouseStorage {
-    /// Runs `SELECT <select> FROM events <filter> <tail> FORMAT JSONEachRow`.
-    fn select_events(
+    /// Runs `SELECT <select> FROM <table> <filter> <tail> FORMAT JSONEachRow`.
+    /// `table` is a fixed table name, never caller input.
+    pub(crate) fn select_from(
         &self,
+        table: &str,
         select: &str,
         filter: &Filter,
         tail: &str,
     ) -> Result<String, StorageError> {
         let sql = format!(
-            "SELECT {select} FROM events {} {tail} FORMAT JSONEachRow",
+            "SELECT {select} FROM {table} {} {tail} FORMAT JSONEachRow",
             filter.sql
         );
         let params: Vec<(&str, String)> = filter
@@ -162,15 +180,24 @@ impl ClickHouseStorage {
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
         let tables: Vec<ExternalTable> = filter
-            .hosts
+            .tables
             .iter()
-            .map(|rows| ExternalTable {
-                name: "hosts",
-                structure: "h String",
-                rows: rows.clone(),
+            .map(|t| ExternalTable {
+                name: t.name,
+                structure: t.structure,
+                rows: t.rows.clone(),
             })
             .collect();
         self.transport.execute(&sql, &params, &tables, None)
+    }
+
+    fn select_events(
+        &self,
+        select: &str,
+        filter: &Filter,
+        tail: &str,
+    ) -> Result<String, StorageError> {
+        self.select_from("events", select, filter, tail)
     }
 
     pub(crate) fn events_query(

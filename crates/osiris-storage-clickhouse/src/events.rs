@@ -15,14 +15,14 @@ use osiris_storage::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::transport::ExternalTable;
+use crate::transport::{ExternalTable, Transport};
 use crate::ClickHouseStorage;
 
-fn backend(msg: impl Into<String>) -> StorageError {
+pub(crate) fn backend(msg: impl Into<String>) -> StorageError {
     StorageError::Backend(msg.into())
 }
 
-fn serde_str(value: Result<Value, serde_json::Error>) -> Result<String, StorageError> {
+pub(crate) fn serde_str(value: Result<Value, serde_json::Error>) -> Result<String, StorageError> {
     let value = value.map_err(|e| StorageError::Serialize(e.to_string()))?;
     Ok(match value {
         Value::String(s) => s,
@@ -57,6 +57,26 @@ fn event_row(event: &CanonicalEvent) -> Result<Value, StorageError> {
     }))
 }
 
+/// Runs a `FORMAT TSV` query that selects one id column filtered by the
+/// external table `ids`, and returns the ids found.
+pub(crate) fn id_set(
+    transport: &Transport,
+    sql: &str,
+    ids: Vec<String>,
+) -> Result<HashSet<String>, StorageError> {
+    let text = transport.execute(
+        sql,
+        &[],
+        &[ExternalTable {
+            name: "ids",
+            structure: "id String",
+            rows: ids,
+        }],
+        None,
+    )?;
+    Ok(text.lines().map(str::to_string).collect())
+}
+
 fn parse_u64(text: &str, what: &str) -> Result<u64, StorageError> {
     text.trim().parse::<u64>().map_err(|e| {
         backend(format!(
@@ -67,7 +87,7 @@ fn parse_u64(text: &str, what: &str) -> Result<u64, StorageError> {
 }
 
 impl ClickHouseStorage {
-    fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, ()>, StorageError> {
+    pub(crate) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, ()>, StorageError> {
         self.writer.lock().map_err(|_| backend("poisoned lock"))
     }
 

@@ -10,8 +10,11 @@
 //! constraint, so write-once semantics on ids are enforced under a
 //! process-local writer mutex (design §5.4).
 
+mod alerts;
 mod events;
+mod graph;
 mod query;
+mod risk;
 mod schema;
 mod transport;
 
@@ -169,10 +172,6 @@ impl ClickHouseStorage {
     }
 }
 
-fn not_implemented() -> StorageError {
-    StorageError::Backend("not implemented".into())
-}
-
 impl Storage for ClickHouseStorage {
     fn write(&self, event: &CanonicalEvent) -> Result<(), StorageError> {
         self.events_write(event)
@@ -213,37 +212,37 @@ impl Storage for ClickHouseStorage {
         self.events_health()
     }
 
-    fn write_alerts(&self, _alerts: &[Alert]) -> Result<WriteReport, StorageError> {
-        Err(not_implemented())
+    fn write_alerts(&self, alerts: &[Alert]) -> Result<WriteReport, StorageError> {
+        self.alerts_write(alerts)
     }
 
-    fn query_alerts(&self, _plan: &AlertQueryPlan) -> Result<Vec<Alert>, StorageError> {
-        Err(not_implemented())
+    fn query_alerts(&self, plan: &AlertQueryPlan) -> Result<Vec<Alert>, StorageError> {
+        self.alerts_query(plan)
     }
 
     fn write_relationships(
         &self,
-        _edges: &[EntityRelationship],
+        edges: &[EntityRelationship],
     ) -> Result<WriteReport, StorageError> {
-        Err(not_implemented())
+        self.relationships_write(edges)
     }
 
     fn query_relationships(
         &self,
-        _plan: &RelationshipQueryPlan,
+        plan: &RelationshipQueryPlan,
     ) -> Result<Vec<EntityRelationship>, StorageError> {
-        Err(not_implemented())
+        self.relationships_query(plan)
     }
 
-    fn write_risk_scores(&self, _scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError> {
-        Err(not_implemented())
+    fn write_risk_scores(&self, scores: &[RiskScoreRecord]) -> Result<WriteReport, StorageError> {
+        self.risk_write(scores)
     }
 
     fn query_risk_scores(
         &self,
-        _plan: &RiskQueryPlan,
+        plan: &RiskQueryPlan,
     ) -> Result<Vec<RiskScoreRecord>, StorageError> {
-        Err(not_implemented())
+        self.risk_query(plan)
     }
 }
 
