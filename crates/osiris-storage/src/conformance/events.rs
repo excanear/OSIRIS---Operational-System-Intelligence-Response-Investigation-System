@@ -6,15 +6,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::{event_on, sample_event};
-use crate::{DeleteCriteria, QueryPlan, RetentionPolicy, Storage};
+use crate::{DeleteCriteria, RetentionPolicy, Storage};
 
-pub fn write_and_query_round_trips(s: &dyn Storage) {
+// Rule: nothing in this group may call `query` or `query_events` (a backend
+// implements those after the events table); verify through `get_event`,
+// `event_owner` and `health()` only.
+
+fn present(s: &dyn Storage, e: &osiris_schema::CanonicalEvent) -> bool {
+    s.get_event(e.event_id).unwrap().is_some()
+}
+
+pub fn write_and_get_event_round_trips(s: &dyn Storage) {
     let event = sample_event(100, 1000);
     s.write(&event).unwrap();
 
-    let results = s.query(&QueryPlan::new()).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].event_id, event.event_id);
+    let got = s.get_event(event.event_id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&got).unwrap(),
+        serde_json::to_value(&event).unwrap()
+    );
 }
 
 pub fn batch_write_reports_counts(s: &dyn Storage) {
@@ -25,8 +35,8 @@ pub fn batch_write_reports_counts(s: &dyn Storage) {
 }
 
 pub fn delete_removes_events_before_cutoff(s: &dyn Storage) {
-    s.batch_write(&[sample_event(100, 1000), sample_event(200, 9000)])
-        .unwrap();
+    let (old, new) = (sample_event(100, 1000), sample_event(200, 9000));
+    s.batch_write(&[old.clone(), new.clone()]).unwrap();
 
     let deleted = s
         .delete(&DeleteCriteria {
@@ -34,7 +44,9 @@ pub fn delete_removes_events_before_cutoff(s: &dyn Storage) {
         })
         .unwrap();
     assert_eq!(deleted, 1);
-    assert_eq!(s.query(&QueryPlan::new()).unwrap().len(), 1);
+    assert!(!present(s, &old));
+    assert!(present(s, &new));
+    assert_eq!(s.health().event_count, 1);
 }
 
 pub fn health_reports_event_count_and_last_write(s: &dyn Storage) {
@@ -55,8 +67,7 @@ pub fn duplicate_event_id_is_ignored_and_reported_as_failed(s: &dyn Storage) {
     assert_eq!(report.written_count, 0);
     assert_eq!(report.failed_count, 1);
 
-    let results = s.query(&QueryPlan::new()).unwrap();
-    assert_eq!(results.len(), 1);
+    assert!(present(s, &event));
     assert_eq!(s.health().event_count, 1);
 }
 
@@ -145,23 +156,23 @@ pub fn event_owner_reports_the_host_and_none_after_delete(s: &dyn Storage) {
 }
 
 pub fn delete_counts_exactly_and_rows_vanish(s: &dyn Storage) {
-    s.batch_write(&[
+    let (a, b, c) = (
         sample_event(1, 10),
         sample_event(2, 20),
         sample_event(3, 30),
-    ])
-    .unwrap();
+    );
+    s.batch_write(&[a.clone(), b.clone(), c.clone()]).unwrap();
     let criteria = DeleteCriteria {
         before_timestamp: 25,
     };
     assert_eq!(s.delete(&criteria).unwrap(), 2);
 
-    let left = s
-        .query_events(&osiris_query::EventQueryPlan::new())
-        .unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].timestamp, 30);
-    assert_eq!(s.query(&QueryPlan::new()).unwrap().len(), 1);
+    assert!(!present(s, &a));
+    assert!(!present(s, &b));
+    assert!(present(s, &c));
+    assert_eq!(s.health().event_count, 1);
+    assert_eq!(s.event_owner(a.event_id).unwrap(), None);
+    assert_eq!(s.event_owner(c.event_id).unwrap(), Some(c.host_id));
 
     assert_eq!(s.delete(&criteria).unwrap(), 0);
 }
@@ -172,17 +183,17 @@ pub fn retention_apply_deletes_only_older_than_max_age(s: &dyn Storage) {
         .unwrap()
         .as_nanos() as u64;
     let two_hours_ns = 2 * 3600 * 1_000_000_000u64;
-    s.batch_write(&[
+    let (old, fresh) = (
         sample_event(1, now_ns - two_hours_ns),
         sample_event(2, now_ns),
-    ])
-    .unwrap();
+    );
+    s.batch_write(&[old.clone(), fresh.clone()]).unwrap();
 
     let report = s
         .retention_apply(&RetentionPolicy { max_age_secs: 3600 })
         .unwrap();
     assert_eq!(report.deleted_count, 1);
-    let left = s.query(&QueryPlan::new()).unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].timestamp, now_ns);
+    assert!(!present(s, &old));
+    assert!(present(s, &fresh));
+    assert_eq!(s.health().event_count, 1);
 }

@@ -555,3 +555,12 @@ pub fn query_events_residual_rejects_never_leak(s: &dyn Storage) {
     assert_eq!(got[0].process.as_ref().unwrap().pid, 7);
     assert_eq!(got[0].event_id, events[7].event_id);
 }
+
+pub fn write_and_query_round_trips(s: &dyn Storage) {
+    let event = sample_event(100, 1000);
+    s.write(&event).unwrap();
+
+    let results = s.query(&QueryPlan::new()).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].event_id, event.event_id);
+}

@@ -283,7 +283,7 @@ macro_rules! conformance_events_tests {
 macro_rules! __conformance_events_cases {
     ($make:path, $attr:tt) => {
         $crate::__conformance_group!(events, $make, $attr;
-            write_and_query_round_trips
+            write_and_get_event_round_trips
             batch_write_reports_counts
             delete_removes_events_before_cutoff
             health_reports_event_count_and_last_write
@@ -318,6 +318,7 @@ macro_rules! conformance_query_tests {
 macro_rules! __conformance_query_cases {
     ($make:path, $attr:tt) => {
         $crate::__conformance_group!(query, $make, $attr;
+            write_and_query_round_trips
             query_events_with_no_filter_returns_everything_within_the_default_cap
             query_events_pushes_down_an_exact_match_event_type_filter
             query_events_pushes_down_an_exact_match_category_filter
