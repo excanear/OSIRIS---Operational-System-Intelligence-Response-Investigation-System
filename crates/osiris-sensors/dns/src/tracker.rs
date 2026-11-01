@@ -474,11 +474,7 @@ mod tests {
             key: SendKey::new(key(1000, 1).client, "10.0.0.1:53".parse().unwrap()),
             laddr: "10.0.0.2".parse().unwrap(),
             packet_ts_ns: 9,
-            claim: crate::send_table::SendTable::new().claim(
-                SendKey::new(key(1000, 1).client, "10.0.0.1:53".parse().unwrap()),
-                "10.0.0.2".parse().unwrap(),
-                9,
-            ),
+            claim: ClaimId::for_test(1),
         }
     }
 

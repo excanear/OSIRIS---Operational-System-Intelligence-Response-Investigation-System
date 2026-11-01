@@ -195,12 +195,23 @@ source and are a non-goal here.
      oldest claim first, the oldest entries inside their own windows with compatible local
      addresses; the packet takes the oldest entry left. A claimed packet's retry (at close and on
      each hold tick) applies the same rule against claims older than itself and drops its claim on
-     a hit. Entries a live claim could still take are not discarded by a newer lookup. A claim is
-     released when the engine gives up (emitted unattributed) or resolves through `/proc` after the
-     latch; retransmits make none. Claims expire with the 10 s TTL and are capped at 16,384, oldest
-     dropped. A claim whose own record was lost blocks only entries inside its window
-     (`[packet_ts − 2 s, packet_ts + 5 ms]`), which B's later send normally is not, so the worst
-     case is a miss, never a wrong owner. Unit tests cover these interleavings.
+     a hit. Entries a claim could still take are not discarded by a newer lookup. When the engine
+     gives up on a transaction (hold deadline, timeout or eviction miss, held overflow, drain miss,
+     or a query the tracker did not keep) its claim becomes a **tombstone**: it keeps ranking and
+     reserving like a live claim until the 10 s TTL, and when a record it reserves arrives late it
+     consumes that entry silently (counted as `tombstone_consumed`), so a newer packet on the
+     reused port cannot take it. A claim is released only when its owner was settled another way:
+     a retry hit, a `/proc` resolve after the latch, or a retransmit that resolved the transaction
+     (which also consumes the original send's entry, or tombstones the claim when that entry has not
+     arrived). Retransmits make no claim of their own. Claims expire with the 10 s TTL and are
+     capped at 16,384, oldest dropped. A claim whose own record was lost blocks only entries inside
+     its window (`[packet_ts − 2 s, packet_ts + 5 ms]`), which B's later send normally is not.
+     Unit tests cover these interleavings. **Known limits**, where a wrong owner is still possible:
+     - two sockets sharing a port (`SO_REUSEPORT`), or two sends on one key within the 5 ms slack,
+       can swap owners (§6);
+     - a claim dropped at the cap no longer protects its entry, so a newer packet can take it;
+     - when a captured packet is dropped, its sender's record has no claim, and a later packet on
+       the key within the 2 s lookback can take it.
    - **Limits:** entries expire after **10 s** *(call: two 11a tracker timeouts)*. The table holds
      at most **16,384** entries; on overflow the oldest entry is evicted and counted *(call)*.
    - **Local address:** matched when both sides have one, ignored when the send came from a

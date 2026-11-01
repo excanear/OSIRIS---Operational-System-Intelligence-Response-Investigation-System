@@ -185,15 +185,29 @@ impl Engine {
         }
     }
 
-    /// Releases the send-table claim of a transaction whose kernel join is
-    /// no longer attempted, so it stops reserving entries.
-    fn release_claim(&self, claim: ClaimId) {
-        let table = match &self.mode {
+    /// The table holding claims: the kernel one, or the latched one.
+    fn claim_table(&self) -> Option<&SharedSendTable> {
+        match &self.mode {
             AttributionMode::Kernel(table) => Some(table),
             AttributionMode::Procfs => self.latched_table.as_ref(),
-        };
-        if let Some(table) = table {
+        }
+    }
+
+    /// Drops the claim of a transaction whose owner was settled another way
+    /// (a `/proc` lookup after the latch).
+    fn release_claim(&self, claim: ClaimId) {
+        if let Some(table) = self.claim_table() {
             lock_table(table).release(claim);
+        }
+    }
+
+    /// Gives up on a claim whose transaction is emitted unattributed (or
+    /// not tracked at all). Its send still happened, so the claim stays as a
+    /// tombstone that consumes the late record instead of letting a newer
+    /// packet on a reused port take it.
+    fn abandon_claim(&self, claim: ClaimId) {
+        if let Some(table) = self.claim_table() {
+            lock_table(table).abandon(claim);
         }
     }
 
@@ -257,10 +271,11 @@ impl Engine {
                 {
                     self.close(closed, now, &mut raw);
                 }
-                // A query the tracker did not keep (no question) owes no join.
+                // A query the tracker did not keep (no question) is never
+                // joined, but its send happened: tombstone its claim.
                 if let Some(claim) = claim {
                     if !self.tracker.contains(&key) {
-                        self.release_claim(claim);
+                        self.abandon_claim(claim);
                     }
                 }
             }
@@ -310,7 +325,13 @@ impl Engine {
             if let Some(a) = hit {
                 if let Some(owed) = self.tracker.resolve_pending(&key, a) {
                     self.attributed_kernel += 1;
-                    lock_table(table).release(owed.claim);
+                    // The original send's entry must not stay stealable:
+                    // consume it now, or tombstone the claim for it.
+                    let mut t = lock_table(table);
+                    let own = t.take_claimed(owed.claim, &owed.key, owed.laddr, owed.packet_ts_ns);
+                    if own.is_none() {
+                        t.abandon(owed.claim);
+                    }
                 }
             }
             return (Attribution::default(), None);
@@ -401,7 +422,7 @@ impl Engine {
             Resolved::Miss if kind == CloseKind::Response => {
                 if self.held.len() >= self.held_capacity {
                     if let Some(oldest) = self.held.pop_front() {
-                        self.release_claim(oldest.pending.claim);
+                        self.abandon_claim(oldest.pending.claim);
                         self.unattributed += 1;
                         out.push(oldest.event);
                     }
@@ -416,7 +437,7 @@ impl Engine {
             }
             Resolved::Miss => {
                 // Timeouts and evictions are re-checked once (GC 9).
-                self.release_claim(pending.claim);
+                self.abandon_claim(pending.claim);
                 self.unattributed += 1;
                 out.push(event);
             }
@@ -439,7 +460,7 @@ impl Engine {
                 }
                 Resolved::Miss if h.deadline > now => self.held.push_back(h),
                 Resolved::Miss => {
-                    self.release_claim(h.pending.claim);
+                    self.abandon_claim(h.pending.claim);
                     self.unattributed += 1;
                     raw.push(h.event);
                 }
@@ -478,7 +499,7 @@ impl Engine {
             match self.resolve(&h.pending, h.client, now) {
                 Resolved::Done(a) => apply(&mut h.event, a),
                 Resolved::Miss => {
-                    self.release_claim(h.pending.claim);
+                    self.abandon_claim(h.pending.claim);
                     self.unattributed += 1;
                 }
             }
@@ -913,49 +934,108 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn given_up_transactions_release_their_claims() {
+    fn given_up_transactions_tombstone_their_claims() {
         let (mut e, table, _d) = kernel_engine(false);
         let now = Instant::now();
         let base = wall_ns();
-        // Held response past its grace; timeout miss; drain miss.
+        // Held response past its grace; timeout miss; drain miss. Each
+        // give-up keeps its claim as a tombstone.
         e.on_packet(&kq(1), true, base, now);
         assert!(e.on_packet(&kr(1), true, base + MS, now).is_empty());
         e.on_packet(&kq(2), true, base + 2 * MS, now);
         assert_eq!(lock_table(&table).claims_len(), 2);
         assert_eq!(pids(&e.tick(now + Duration::from_millis(251))), vec![None]);
-        assert_eq!(lock_table(&table).claims_len(), 1);
         assert_eq!(
             pids(&e.tick(now + TX_TIMEOUT + Duration::from_millis(1))),
             vec![None]
         );
-        assert_eq!(lock_table(&table).claims_len(), 0);
         e.on_packet(&kq(3), true, base + 3 * MS, now);
         assert!(e.on_packet(&kr(3), true, base + 4 * MS, now).is_empty());
         e.on_packet(&kq(4), true, base + 5 * MS, now);
-        assert_eq!(lock_table(&table).claims_len(), 2);
         assert_eq!(e.drain(now).len(), 2);
-        assert_eq!(lock_table(&table).claims_len(), 0);
+        assert_eq!(lock_table(&table).claims_len(), 4);
+        // One late record: the oldest tombstone consumes it silently.
+        insert_send(&table, base);
+        assert!(lock_table(&table).is_empty());
+        assert_eq!(lock_table(&table).claims_len(), 3);
+        assert_eq!(lock_table(&table).counters().tombstone_consumed, 1);
     }
 
     #[test]
-    fn retransmit_and_latch_release_claims() {
+    fn late_record_after_give_up_is_not_stolen() {
+        // A's response is held 250 ms without A's record; the engine gives
+        // up. A's record then lands; B reuses the port within 2 s.
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        assert!(e.on_packet(&kr(1), true, base + 2 * MS, now).is_empty());
+        let a = only_dns(e.tick(now + Duration::from_millis(251)));
+        assert_eq!(a.pid, None);
+        insert_send(&table, base);
+        insert_send_as(&table, base + 300 * MS, other_owner());
+        e.on_packet(&kq(2), true, base + 301 * MS, now);
+        let b = only_dns(e.on_packet(&kr(2), true, base + 302 * MS, now));
+        assert_eq!(b.pid, Some(888));
+    }
+
+    #[test]
+    fn late_record_after_give_up_before_newer_record() {
+        // As above, but B's packet also beats B's record.
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        assert!(e.on_packet(&kr(1), true, base + 2 * MS, now).is_empty());
+        only_dns(e.tick(now + Duration::from_millis(251)));
+        insert_send(&table, base);
+        e.on_packet(&kq(2), true, base + 301 * MS, now);
+        assert!(e.on_packet(&kr(2), true, base + 302 * MS, now).is_empty());
+        let later = now + Duration::from_millis(260);
+        let b = only_dns(e.tick(later + Duration::from_millis(251)));
+        assert_ne!(b.pid, Some(777));
+        assert_eq!(b.pid, None);
+    }
+
+    #[test]
+    fn retransmit_consumes_original_entry() {
+        // Original packet missed; both records land; the retransmit takes
+        // its own and the original's entry is consumed too.
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        insert_send(&table, base);
+        insert_send(&table, base + 1000 * MS);
+        e.on_packet(&kq(1), true, base + 1001 * MS, now);
+        assert!(lock_table(&table).is_empty());
+        assert_eq!(lock_table(&table).claims_len(), 0);
+        let ev = only_dns(e.on_packet(&kr(1), true, base + 1002 * MS, now));
+        assert_eq!(ev.pid, Some(777));
+        assert_eq!(e.metrics().attributed_kernel, 1);
+    }
+
+    #[test]
+    fn retransmit_tombstones_and_latch_releases() {
         let (mut e, table, _d) = kernel_engine(true);
         let now = Instant::now();
         let base = wall_ns();
+        // Original record lost: the retransmit resolves the transaction and
+        // the original's claim stays as a tombstone for its late record.
         e.on_packet(&kq(1), true, base, now);
         insert_send(&table, base + 10 * MS);
         e.on_packet(&kq(1), true, base + 11 * MS, now);
-        assert_eq!(lock_table(&table).claims_len(), 0);
-        e.on_packet(&kq(2), true, base + 20 * MS, now);
         assert_eq!(lock_table(&table).claims_len(), 1);
+        e.on_packet(&kq(2), true, base + 20 * MS, now);
+        assert_eq!(lock_table(&table).claims_len(), 2);
         e.latch_procfs();
         let ev = only_dns(e.on_packet(&kr(2), true, base + 21 * MS, now));
         assert_eq!(ev.uid, 1000);
-        assert_eq!(lock_table(&table).claims_len(), 0);
+        assert_eq!(lock_table(&table).claims_len(), 1);
     }
 
     #[test]
-    fn held_overflow_releases_claim() {
+    fn held_overflow_tombstones_claim() {
         let dir = proc_fixture(false);
         let table: SharedSendTable = Arc::new(Mutex::new(SendTable::new()));
         let mut e = Engine::new(
@@ -970,7 +1050,8 @@ pub(crate) mod tests {
         assert!(e.on_packet(&kr(1), true, base, now).is_empty());
         e.on_packet(&kq(2), true, base, now);
         assert_eq!(e.on_packet(&kr(2), true, base, now).len(), 1);
-        assert_eq!(lock_table(&table).claims_len(), 1);
+        // The forced-out claim is a tombstone; the held one is live.
+        assert_eq!(lock_table(&table).claims_len(), 2);
     }
 
     pub(crate) fn kq(id: u16) -> Vec<u8> {

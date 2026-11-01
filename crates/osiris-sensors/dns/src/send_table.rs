@@ -48,6 +48,8 @@ pub struct SendTableCounters {
     pub expired: u64,
     /// Claims dropped because the claim table was full.
     pub claims_dropped: u64,
+    /// Entries silently consumed by a tombstoned claim.
+    pub tombstone_consumed: u64,
 }
 
 #[derive(Debug)]
@@ -67,7 +69,7 @@ pub struct SendTable {
     counters: SendTableCounters,
     /// Packets that missed and still wait for their entry, per key.
     claims: HashMap<SendKey, Vec<Claim>>,
-    /// Live claims in creation order: id -> key.
+    /// Claims (live and tombstoned) in creation order: id -> key.
     claim_keys: BTreeMap<u64, SendKey>,
     next_claim: u64,
 }
@@ -76,11 +78,51 @@ pub struct SendTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClaimId(u64);
 
+impl ClaimId {
+    #[cfg(test)]
+    pub(crate) fn for_test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Claim {
     id: u64,
     laddr: IpAddr,
     packet_wall_ns: u64,
+    /// Given up by the engine: still ranks and reserves, and silently
+    /// consumes the entry it reserves (its owner was already emitted).
+    tomb: bool,
+}
+
+impl Claim {
+    fn rank(&self) -> (u64, u64) {
+        (self.packet_wall_ns, self.id)
+    }
+}
+
+/// Gives each claim ranked before `limit` (claims sorted by rank), in rank
+/// order, the oldest unreserved entry it could take. Returns which entries
+/// are reserved and the `(claim index, entry index)` assignments.
+fn reserve(
+    queue: &VecDeque<Entry>,
+    claims: &[Claim],
+    limit: (u64, u64),
+) -> (Vec<bool>, Vec<(usize, usize)>) {
+    let mut reserved = vec![false; queue.len()];
+    let mut assigned = Vec::new();
+    for (ci, c) in claims.iter().enumerate() {
+        if c.rank() >= limit {
+            break;
+        }
+        let slot = (0..queue.len())
+            .find(|&i| !reserved[i] && eligible(&queue[i], c.laddr, c.packet_wall_ns));
+        if let Some(i) = slot {
+            reserved[i] = true;
+            assigned.push((ci, i));
+        }
+    }
+    (reserved, assigned)
 }
 
 fn locals_compatible(entry: IpAddr, packet: IpAddr) -> bool {
@@ -118,6 +160,7 @@ impl SendTable {
         self.order.push_back((seq, send.key));
         self.len += 1;
         self.counters.inserted += 1;
+        self.settle_tombstones(&send.key);
         while self.len > CAPACITY {
             if !self.evict_oldest() {
                 break;
@@ -180,33 +223,27 @@ impl SendTable {
         packet_wall_ns: u64,
         rank: (u64, u64),
     ) -> Option<Attribution> {
-        let claims: &[Claim] = self.claims.get(key).map_or(&[], Vec::as_slice);
-        // Keep what any live claim on the key could still take.
-        let cutoff = claims
-            .iter()
-            .map(|c| c.packet_wall_ns.saturating_sub(LOOKBACK_NS))
-            .fold(packet_wall_ns.saturating_sub(LOOKBACK_NS), u64::min);
         let queue = self.map.get_mut(key)?;
+        let claims: &[Claim] = self.claims.get(key).map_or(&[], Vec::as_slice);
+        // Keep what any claim on the key could still take; claims are
+        // sorted by rank, so the first has the earliest window.
+        let lo = packet_wall_ns.saturating_sub(LOOKBACK_NS);
+        let cutoff = claims
+            .first()
+            .map_or(lo, |c| lo.min(c.packet_wall_ns.saturating_sub(LOOKBACK_NS)));
         let before = queue.len();
         queue.retain(|e| e.sent_wall_ns >= cutoff);
         let dropped = before - queue.len();
         self.len = self.len.saturating_sub(dropped);
         self.counters.expired += dropped as u64;
-        let mut older: Vec<&Claim> = claims
-            .iter()
-            .filter(|c| (c.packet_wall_ns, c.id) < rank)
-            .collect();
-        older.sort_by_key(|c| (c.packet_wall_ns, c.id));
-        let mut reserved = vec![false; queue.len()];
-        for c in older {
-            let slot = (0..queue.len())
-                .find(|&i| !reserved[i] && eligible(&queue[i], c.laddr, c.packet_wall_ns));
-            if let Some(i) = slot {
-                reserved[i] = true;
-            }
-        }
-        let pos =
-            (0..queue.len()).find(|&i| !reserved[i] && eligible(&queue[i], laddr, packet_wall_ns));
+        let pos = if claims.is_empty() {
+            queue
+                .iter()
+                .position(|e| eligible(e, laddr, packet_wall_ns))
+        } else {
+            let (reserved, _) = reserve(queue, claims, rank);
+            (0..queue.len()).find(|&i| !reserved[i] && eligible(&queue[i], laddr, packet_wall_ns))
+        };
         let taken = pos.and_then(|p| queue.remove(p));
         if queue.is_empty() {
             self.map.remove(key);
@@ -229,16 +266,67 @@ impl SendTable {
         self.len = self.len.saturating_sub(removed);
         self.counters.expired += removed as u64;
         self.compact_order();
+        // Linear in the number of claims: collect expired ids while
+        // filtering, then drop them from the index.
+        let mut gone = Vec::new();
         self.claims.retain(|_, list| {
-            list.retain(|c| c.packet_wall_ns >= cutoff);
+            list.retain(|c| {
+                let keep = c.packet_wall_ns >= cutoff;
+                if !keep {
+                    gone.push(c.id);
+                }
+                keep
+            });
             !list.is_empty()
         });
-        let claims = &self.claims;
-        self.claim_keys.retain(|id, key| {
-            claims
-                .get(key)
-                .is_some_and(|list| list.iter().any(|c| c.id == *id))
-        });
+        for id in gone {
+            self.claim_keys.remove(&id);
+        }
+    }
+
+    /// Lets tombstoned claims on `key` consume the entries they reserve
+    /// (ranked against every claim on the key), discarding them silently.
+    /// Runs when an entry arrives and when a claim is abandoned.
+    fn settle_tombstones(&mut self, key: &SendKey) {
+        let Some(claims) = self.claims.get_mut(key) else {
+            return;
+        };
+        if !claims.iter().any(|c| c.tomb) {
+            return;
+        }
+        let Some(queue) = self.map.get_mut(key) else {
+            return;
+        };
+        let (_, assigned) = reserve(queue, claims, (u64::MAX, u64::MAX));
+        let mut entries = Vec::new();
+        let mut dead = Vec::new();
+        for (ci, ei) in assigned {
+            if claims[ci].tomb {
+                entries.push(ei);
+                dead.push(claims[ci].id);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        entries.sort_unstable();
+        for &ei in entries.iter().rev() {
+            queue.remove(ei);
+        }
+        let queue_empty = queue.is_empty();
+        claims.retain(|c| !dead.contains(&c.id));
+        let claims_empty = claims.is_empty();
+        if queue_empty {
+            self.map.remove(key);
+        }
+        if claims_empty {
+            self.claims.remove(key);
+        }
+        for id in &dead {
+            self.claim_keys.remove(id);
+        }
+        self.len = self.len.saturating_sub(entries.len());
+        self.counters.tombstone_consumed += entries.len() as u64;
     }
 
     /// Registers a packet that found no entry, so newer packets on the same
@@ -246,11 +334,16 @@ impl SendTable {
     pub fn claim(&mut self, key: SendKey, laddr: IpAddr, packet_wall_ns: u64) -> ClaimId {
         let id = self.next_claim;
         self.next_claim += 1;
-        self.claims.entry(key).or_default().push(Claim {
+        let claim = Claim {
             id,
             laddr,
             packet_wall_ns,
-        });
+            tomb: false,
+        };
+        // Kept sorted by rank so reservation needs no sort.
+        let list = self.claims.entry(key).or_default();
+        let at = list.partition_point(|c| c.rank() < claim.rank());
+        list.insert(at, claim);
         self.claim_keys.insert(id, key);
         while self.claim_keys.len() > CAPACITY {
             let Some((old, k)) = self.claim_keys.pop_first() else {
@@ -278,6 +371,23 @@ impl SendTable {
         hit
     }
 
+    /// Gives up on a claim whose packet was emitted unattributed. The claim
+    /// becomes a tombstone that keeps ranking and reserving until the TTL,
+    /// so a late record is consumed by it instead of a newer packet.
+    pub fn abandon(&mut self, claim: ClaimId) {
+        let Some(&key) = self.claim_keys.get(&claim.0) else {
+            return;
+        };
+        if let Some(c) = self
+            .claims
+            .get_mut(&key)
+            .and_then(|list| list.iter_mut().find(|c| c.id == claim.0))
+        {
+            c.tomb = true;
+        }
+        self.settle_tombstones(&key);
+    }
+
     /// Drops a claim whose packet will no longer be joined.
     pub fn release(&mut self, claim: ClaimId) {
         if let Some(key) = self.claim_keys.remove(&claim.0) {
@@ -294,7 +404,7 @@ impl SendTable {
         }
     }
 
-    /// Number of live claims.
+    /// Number of claims, live and tombstoned.
     pub fn claims_len(&self) -> usize {
         self.claim_keys.len()
     }
@@ -566,6 +676,96 @@ mod tests {
         t.insert(send(key(), "10.0.0.5", T, 1));
         assert!(t.take(&key(), l, T + 3 * S).is_none());
         assert_eq!(pid_of(t.take_claimed(a, &key(), l, T + MS)), Some(1));
+    }
+
+    // ---- tombstones: a given-up claim still owns its late record ----
+
+    #[test]
+    fn abandoned_claim_keeps_late_record_from_newer_packet() {
+        // A gives up, then A's record lands late; B reuses the port.
+        let l = ip("10.0.0.5");
+        let (ta, tb) = (T, T + 300 * MS);
+        let mut t = SendTable::new();
+        let a = t.claim(key(), l, ta + MS);
+        t.abandon(a);
+        t.insert(send(key(), "10.0.0.5", ta, 1));
+        t.insert(send(key(), "10.0.0.5", tb, 2));
+        assert_eq!(pid_of(t.take(&key(), l, tb + MS)), Some(2));
+        assert!(t.is_empty());
+        assert_eq!(t.counters().tombstone_consumed, 1);
+        assert_eq!(t.claims_len(), 0);
+    }
+
+    #[test]
+    fn abandoned_claim_late_record_before_newer_record() {
+        // As above, but B's packet beats B's record: B gets nothing.
+        let l = ip("10.0.0.5");
+        let (ta, tb) = (T, T + 300 * MS);
+        let mut t = SendTable::new();
+        let a = t.claim(key(), l, ta + MS);
+        t.abandon(a);
+        t.insert(send(key(), "10.0.0.5", ta, 1));
+        assert!(t.take(&key(), l, tb + MS).is_none());
+    }
+
+    #[test]
+    fn abandon_consumes_entry_already_present() {
+        // The record landed between the last retry and the give-up.
+        let l = ip("10.0.0.5");
+        let mut t = SendTable::new();
+        let a = t.claim(key(), l, T + MS);
+        t.insert(send(key(), "10.0.0.5", T, 1));
+        t.abandon(a);
+        assert!(t.is_empty());
+        assert_eq!(t.claims_len(), 0);
+        assert_eq!(t.counters().tombstone_consumed, 1);
+        assert_eq!(t.counters().consumed, 0);
+    }
+
+    #[test]
+    fn tombstone_yields_to_older_live_claim() {
+        let l = ip("10.0.0.5");
+        let mut t = SendTable::new();
+        let x = t.claim(key(), l, T + MS);
+        let y = t.claim(key(), l, T + 2 * MS);
+        t.abandon(y);
+        t.insert(send(key(), "10.0.0.5", T, 1));
+        // X, the older live claim, owns the only entry.
+        assert_eq!(t.len(), 1);
+        assert_eq!(pid_of(t.take_claimed(x, &key(), l, T + MS)), Some(1));
+        // Y's tombstone lives on, still guarding its window.
+        assert_eq!(t.claims_len(), 1);
+        t.insert(send(key(), "10.0.0.5", T + 2 * MS, 2));
+        assert!(t.is_empty());
+        assert_eq!(t.claims_len(), 0);
+    }
+
+    #[test]
+    fn tombstone_expires_with_ttl() {
+        let l = ip("10.0.0.5");
+        let mut t = SendTable::new();
+        let a = t.claim(key(), l, T + MS);
+        t.abandon(a);
+        assert_eq!(t.claims_len(), 1);
+        t.expire(T + MS + 10 * S + 1);
+        assert_eq!(t.claims_len(), 0);
+    }
+
+    #[test]
+    fn expire_many_claims_on_one_key() {
+        // Half of a full claim table on one key expires; the rest stays
+        // indexed and releasable.
+        let l = ip("10.0.0.5");
+        let mut t = SendTable::new();
+        let ids: Vec<ClaimId> = (0..CAPACITY as u64)
+            .map(|i| t.claim(key(), l, T + i))
+            .collect();
+        t.expire(T + 10 * S + (CAPACITY as u64) / 2);
+        assert_eq!(t.claims_len(), CAPACITY / 2);
+        t.release(ids[CAPACITY - 1]);
+        assert_eq!(t.claims_len(), CAPACITY / 2 - 1);
+        t.release(ids[0]);
+        assert_eq!(t.claims_len(), CAPACITY / 2 - 1);
     }
 
     #[test]
