@@ -154,6 +154,14 @@ impl ClickHouseStorage {
         Ok(())
     }
 
+    /// Merges all parts (`OPTIMIZE TABLE events FINAL`), so `disk_bytes`
+    /// measures the settled footprint. For benchmarks.
+    pub fn optimize(&self) -> Result<(), StorageError> {
+        self.transport
+            .execute("OPTIMIZE TABLE events FINAL", &[], &[], None)?;
+        Ok(())
+    }
+
     /// Bytes on disk of the database's active parts.
     pub fn disk_bytes(&self) -> Result<u64, StorageError> {
         let text = self.transport.execute(

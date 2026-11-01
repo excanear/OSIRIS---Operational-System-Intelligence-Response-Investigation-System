@@ -1,0 +1,72 @@
+name: storage-bench
+
+# Not a CI gate: runs only on manual dispatch, or when a branch named storage-bench/** is pushed.
+# SQLite vs ClickHouse storage comparison (Phase 11c) against the pinned ClickHouse server.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['storage-bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  storage-bench:
+    name: storage-bench (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.3.60.2
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Wait for ClickHouse
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8123/ping; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Record runner facts
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          {
+            echo "nproc: $(nproc)"
+            echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "kernel: $(uname -r)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "clickhouse image: clickhouse/clickhouse-server:26.3.60.2"
+            echo "clickhouse version: $(curl -s 'http://127.0.0.1:8123/?query=SELECT%20version()')"
+            echo "--- free -h ---"
+            free -h
+            echo "--- lscpu ---"
+            lscpu
+          } > "$RUNNER_TEMP/artifacts/runner-facts.txt"
+      - name: Build the benchmark
+        run: cargo build --release -p osiris-bench
+      - name: Compare at 100 000 events
+        timeout-minutes: 30
+        run: |
+          cargo run --release -p osiris-bench -- storage-compare \
+            --clickhouse-url http://127.0.0.1:8123 --events 100000 \
+            > "$RUNNER_TEMP/artifacts/storage-100k.jsonl"
+      - name: Compare at 1 000 000 events
+        timeout-minutes: 50
+        run: |
+          cargo run --release -p osiris-bench -- storage-compare \
+            --clickhouse-url http://127.0.0.1:8123 --events 1000000 \
+            > "$RUNNER_TEMP/artifacts/storage-1m.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-bench
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn

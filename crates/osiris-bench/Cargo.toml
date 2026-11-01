@@ -18,6 +18,8 @@ osiris-schema = { path = "../osiris-schema" }
 osiris-sensor-api = { path = "../osiris-sensor-api" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
+osiris-storage-clickhouse = { path = "../osiris-storage-clickhouse" }
+osiris-query = { path = "../osiris-query" }
 osiris-transport = { path = "../osiris-transport" }
 osiris-generator = { path = "../../generator" }
 osiris-real-linux-tests = { path = "../osiris-real-linux-tests" }

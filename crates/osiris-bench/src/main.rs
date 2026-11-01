@@ -7,6 +7,7 @@ mod ingest;
 mod pipeline;
 mod query;
 mod stats;
+mod storage_compare;
 
 #[derive(Parser)]
 #[command(about = "OSIRIS benchmarks (ARCHITECTURE.md §19.2) — results go to PERFORMANCE.md")]
@@ -47,6 +48,18 @@ enum Cmd {
         #[arg(long, default_value_t = 10_000)]
         sends: u64,
     },
+    /// SQLite vs ClickHouse storage comparison (not part of `all`).
+    StorageCompare {
+        #[arg(long, default_value_t = 100_000)]
+        events: u64,
+        #[arg(long, default_value_t = 5)]
+        rounds: usize,
+        #[arg(long, default_value_t = 1_000)]
+        batch: usize,
+        /// Without it only SQLite is measured.
+        #[arg(long)]
+        clickhouse_url: Option<String>,
+    },
     /// The full matrix. Agent benches need real auditd, so they can be split off.
     All {
         /// Everything except the agent bench (hosts without auditd, e.g. WSL2).
@@ -66,6 +79,17 @@ fn main() {
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
         Cmd::FsLoop { iterations } => vec![fsloop::run(iterations)],
         Cmd::DnsSend { sends } => vec![dnsloop::run(sends)],
+        Cmd::StorageCompare {
+            events,
+            rounds,
+            batch,
+            clickhouse_url,
+        } => storage_compare::run(storage_compare::Args {
+            events,
+            rounds,
+            batch,
+            clickhouse_url,
+        }),
         Cmd::All {
             skip_agent,
             agent_only,
