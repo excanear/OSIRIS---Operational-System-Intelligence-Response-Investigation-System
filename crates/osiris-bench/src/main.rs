@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod agent;
+mod dnsloop;
 mod fsloop;
 mod ingest;
 mod pipeline;
@@ -41,6 +42,11 @@ enum Cmd {
         #[arg(long, default_value_t = 10_000)]
         iterations: u64,
     },
+    /// UDP sends on lo to port 5300 and to port 53, with and without the agent.
+    DnsSend {
+        #[arg(long, default_value_t = 10_000)]
+        sends: u64,
+    },
     /// The full matrix. Agent benches need real auditd, so they can be split off.
     All {
         /// Everything except the agent bench (hosts without auditd, e.g. WSL2).
@@ -59,6 +65,7 @@ fn main() {
         Cmd::Ingest { rate, duration } => vec![ingest::run(rate, duration)],
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
         Cmd::FsLoop { iterations } => vec![fsloop::run(iterations)],
+        Cmd::DnsSend { sends } => vec![dnsloop::run(sends)],
         Cmd::All {
             skip_agent,
             agent_only,
@@ -78,6 +85,7 @@ fn main() {
                     v.push(agent::run(r, 30));
                 }
                 v.push(fsloop::run(10_000));
+                v.push(dnsloop::run(10_000));
             }
             v
         }
