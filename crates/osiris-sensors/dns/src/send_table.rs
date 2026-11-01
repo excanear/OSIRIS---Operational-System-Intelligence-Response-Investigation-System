@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tracker::Attribution;
@@ -72,6 +73,20 @@ pub struct SendTable {
     /// Claims (live and tombstoned) in creation order: id -> key.
     claim_keys: BTreeMap<u64, SendKey>,
     next_claim: u64,
+    /// `counters.inserted`, readable without the table lock.
+    inserted_watch: InsertWatch,
+}
+
+/// Lock-free view of how many entries a [`SendTable`] has received, so a
+/// reader can tell whether anything new arrived without taking the lock.
+#[derive(Debug, Clone, Default)]
+pub struct InsertWatch(Arc<AtomicU64>);
+
+impl InsertWatch {
+    /// Entries inserted so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Opaque handle for a packet that missed its kernel send.
@@ -102,15 +117,16 @@ impl Claim {
 }
 
 /// Gives each claim ranked before `limit` (claims sorted by rank), in rank
-/// order, the oldest unreserved entry it could take. Returns which entries
-/// are reserved and the `(claim index, entry index)` assignments.
+/// order, the oldest unreserved entry it could take, reporting each
+/// `(claim index, entry index)` assignment to `on_assign`. Returns which
+/// entries are reserved.
 fn reserve(
     queue: &VecDeque<Entry>,
     claims: &[Claim],
     limit: (u64, u64),
-) -> (Vec<bool>, Vec<(usize, usize)>) {
+    mut on_assign: impl FnMut(usize, usize),
+) -> Vec<bool> {
     let mut reserved = vec![false; queue.len()];
-    let mut assigned = Vec::new();
     for (ci, c) in claims.iter().enumerate() {
         if c.rank() >= limit {
             break;
@@ -119,10 +135,10 @@ fn reserve(
             .find(|&i| !reserved[i] && eligible(&queue[i], c.laddr, c.packet_wall_ns));
         if let Some(i) = slot {
             reserved[i] = true;
-            assigned.push((ci, i));
+            on_assign(ci, i);
         }
     }
-    (reserved, assigned)
+    reserved
 }
 
 fn locals_compatible(entry: IpAddr, packet: IpAddr) -> bool {
@@ -161,6 +177,10 @@ impl SendTable {
         self.len += 1;
         self.counters.inserted += 1;
         self.settle_tombstones(&send.key);
+        // Published once the entry is in place (and any tombstone settled).
+        self.inserted_watch
+            .0
+            .store(self.counters.inserted, Ordering::Release);
         while self.len > CAPACITY {
             if !self.evict_oldest() {
                 break;
@@ -241,7 +261,7 @@ impl SendTable {
                 .iter()
                 .position(|e| eligible(e, laddr, packet_wall_ns))
         } else {
-            let (reserved, _) = reserve(queue, claims, rank);
+            let reserved = reserve(queue, claims, rank, |_, _| {});
             (0..queue.len()).find(|&i| !reserved[i] && eligible(&queue[i], laddr, packet_wall_ns))
         };
         let taken = pos.and_then(|p| queue.remove(p));
@@ -297,15 +317,14 @@ impl SendTable {
         let Some(queue) = self.map.get_mut(key) else {
             return;
         };
-        let (_, assigned) = reserve(queue, claims, (u64::MAX, u64::MAX));
         let mut entries = Vec::new();
         let mut dead = Vec::new();
-        for (ci, ei) in assigned {
+        reserve(queue, claims, (u64::MAX, u64::MAX), |ci, ei| {
             if claims[ci].tomb {
                 entries.push(ei);
                 dead.push(claims[ci].id);
             }
-        }
+        });
         if dead.is_empty() {
             return;
         }
@@ -411,6 +430,11 @@ impl SendTable {
 
     pub fn counters(&self) -> SendTableCounters {
         self.counters
+    }
+
+    /// A lock-free handle on `counters().inserted`.
+    pub fn insert_watch(&self) -> InsertWatch {
+        self.inserted_watch.clone()
     }
 
     pub fn len(&self) -> usize {

@@ -224,6 +224,8 @@ fn dns_c_header_matches_rust_constants() {
         ("netns_ino", offset_of!(DnsRecord, netns_ino)),
         ("exe_ino", offset_of!(DnsRecord, exe_ino)),
         ("rport", offset_of!(DnsRecord, rport)),
+        ("_pad", offset_of!(DnsRecord, _pad)),
+        ("_pad2", offset_of!(DnsRecord, _pad2)),
         ("laddr", offset_of!(DnsRecord, laddr)),
         ("raddr", offset_of!(DnsRecord, raddr)),
     ];

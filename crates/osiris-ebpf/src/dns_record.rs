@@ -11,7 +11,7 @@ use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::exe::{dev_to_user, ExeIdentity};
-pub use crate::net_record::{AF_INET, AF_INET6};
+use crate::net_record::{AF_INET, AF_INET6};
 use crate::record::{c_string, read, DecodeError, RecordHeader, COMM_LEN};
 
 pub const DNS_SCHEMA_VERSION: u32 = 1;

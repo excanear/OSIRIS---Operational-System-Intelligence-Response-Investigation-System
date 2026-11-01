@@ -11,8 +11,11 @@
 //! record race, so a miss at query time claims its place in the table (newer
 //! packets on the key cannot take what it may still join) and is retried
 //! when the transaction closes, and a response that still misses is held for
-//! [`ATTRIBUTION_GRACE`], re-checked on every tick, before it is emitted
-//! unattributed. [`Engine::latch_procfs`] switches to `/proc` for good.
+//! [`ATTRIBUTION_GRACE`] before it is emitted unattributed. Held responses
+//! are re-checked on a tick only when the table received a new entry since
+//! the last re-check or [`HELD_RECHECK_INTERVAL`] has passed, and once more
+//! when their grace ends. [`Engine::latch_procfs`] switches to `/proc` for
+//! good.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -22,7 +25,7 @@ use osiris_sensor_api::{DnsEventRaw, RawEvent};
 
 use crate::attribution::Attributor;
 use crate::frame::{classify, decode_l3, Direction};
-use crate::send_table::{lock_table, ClaimId, SendKey, SharedSendTable};
+use crate::send_table::{lock_table, ClaimId, InsertWatch, SendKey, SharedSendTable};
 use crate::tracker::{
     Attribution, CloseKind, Closed, PendingAttribution, Tracker, TrackerCounters, TxKey,
 };
@@ -37,6 +40,9 @@ pub const MAX_PENDING: usize = 4096;
 pub const ATTRIBUTION_GRACE: Duration = Duration::from_millis(250);
 /// Minimum spacing between expiry scans of the kernel send table.
 pub const SEND_EXPIRE_INTERVAL: Duration = Duration::from_secs(1);
+/// Held responses are re-checked at least this often even when the table
+/// received nothing new (a released claim can free an entry).
+pub const HELD_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Current wall-clock time in ns since the Unix epoch.
 pub fn wall_ns() -> u64 {
@@ -102,6 +108,10 @@ pub struct Engine {
     held_capacity: usize,
     /// When old kernel sends were last expired.
     last_expire: Option<Instant>,
+    /// The kernel table's insert count, read without its lock.
+    insert_watch: Option<InsertWatch>,
+    /// The insert count and time of the last held re-check.
+    last_recheck: Option<(u64, Instant)>,
     /// The kernel table kept after [`Engine::latch_procfs`], only so claims
     /// of transactions still pending can be released.
     latched_table: Option<SharedSendTable>,
@@ -131,6 +141,10 @@ impl Engine {
         timeout: Duration,
         capacity: usize,
     ) -> Self {
+        let insert_watch = match &mode {
+            AttributionMode::Kernel(table) => Some(lock_table(table).insert_watch()),
+            AttributionMode::Procfs => None,
+        };
         Self {
             attributor,
             mode,
@@ -138,6 +152,8 @@ impl Engine {
             held: VecDeque::new(),
             held_capacity: capacity.max(1),
             last_expire: None,
+            insert_watch,
+            last_recheck: None,
             latched_table: None,
             packets: 0,
             parse_errors: 0,
@@ -428,11 +444,16 @@ impl Engine {
                     }
                 }
                 self.held_total += 1;
+                // Never earlier than the newest hold's: deadlines stay
+                // monotonic in push order, so expiry pops from the front.
+                let deadline = self.held.back().map_or(now + ATTRIBUTION_GRACE, |b| {
+                    b.deadline.max(now + ATTRIBUTION_GRACE)
+                });
                 self.held.push_back(Held {
                     event,
                     client,
                     pending,
-                    deadline: now + ATTRIBUTION_GRACE,
+                    deadline,
                 });
             }
             Resolved::Miss => {
@@ -444,30 +465,71 @@ impl Engine {
         }
     }
 
-    /// Emit timeouts, re-check held responses (emitting them on a hit or
-    /// once their grace has passed) and expire old kernel sends.
+    /// Emit timeouts, emit held responses whose grace has passed (after one
+    /// last re-check), re-check the others when due (emitting hits) and
+    /// expire old kernel sends.
     pub fn tick(&mut self, now: Instant) -> Vec<RawEvent> {
         let mut raw = Vec::new();
         for closed in self.tracker.expire(now) {
             self.close(closed, now, &mut raw);
         }
-        let held = std::mem::take(&mut self.held);
-        for mut h in held {
+        self.emit_expired_holds(now, &mut raw);
+        self.recheck_held(now, &mut raw);
+        self.expire_sends(now);
+        self.wrap(raw)
+    }
+
+    /// Emits, from the front, every held response whose deadline has
+    /// passed: attributed if a last re-check hits, else unattributed.
+    fn emit_expired_holds(&mut self, now: Instant, out: &mut Vec<DnsEventRaw>) {
+        while self.held.front().is_some_and(|h| h.deadline <= now) {
+            let Some(mut h) = self.held.pop_front() else {
+                break;
+            };
             match self.resolve(&h.pending, h.client, now) {
-                Resolved::Done(a) => {
-                    apply(&mut h.event, a);
-                    raw.push(h.event);
-                }
-                Resolved::Miss if h.deadline > now => self.held.push_back(h),
+                Resolved::Done(a) => apply(&mut h.event, a),
                 Resolved::Miss => {
                     self.abandon_claim(h.pending.claim);
                     self.unattributed += 1;
-                    raw.push(h.event);
+                }
+            }
+            out.push(h.event);
+        }
+    }
+
+    /// Re-checks every held response, but only when the kernel table got a
+    /// new entry since the last re-check, [`HELD_RECHECK_INTERVAL`] has
+    /// passed, or the engine has latched to `/proc`. Hits are emitted;
+    /// misses stay, in order, in place.
+    fn recheck_held(&mut self, now: Instant, out: &mut Vec<DnsEventRaw>) {
+        if self.held.is_empty() {
+            return;
+        }
+        let inserted = self.insert_watch.as_ref().map_or(0, InsertWatch::get);
+        let due = match (&self.mode, self.last_recheck) {
+            (AttributionMode::Procfs, _) | (_, None) => true,
+            (_, Some((seen, at))) => {
+                seen != inserted || now.saturating_duration_since(at) >= HELD_RECHECK_INTERVAL
+            }
+        };
+        if !due {
+            return;
+        }
+        self.last_recheck = Some((inserted, now));
+        // Stable partition in place: misses move down to `keep`, in order;
+        // hits (attribution applied) end up after it.
+        let mut keep = 0;
+        for i in 0..self.held.len() {
+            let (pending, client) = (self.held[i].pending, self.held[i].client);
+            match self.resolve(&pending, client, now) {
+                Resolved::Done(a) => apply(&mut self.held[i].event, a),
+                Resolved::Miss => {
+                    self.held.swap(keep, i);
+                    keep += 1;
                 }
             }
         }
-        self.expire_sends(now);
-        self.wrap(raw)
+        out.extend(self.held.drain(keep..).map(|h| h.event));
     }
 
     /// Expires old kernel sends at most once per [`SEND_EXPIRE_INTERVAL`]:
@@ -1283,6 +1345,78 @@ pub(crate) mod tests {
         e.tick(now + Duration::from_millis(1000));
         assert!(lock_table(&table).is_empty());
         assert_eq!(lock_table(&table).counters().expired, 2);
+    }
+
+    /// One response held without its record, then a first tick (which
+    /// re-checks it once and expires the table).
+    fn engine_with_one_hold() -> (Engine, SharedSendTable, tempfile::TempDir, Instant, u64) {
+        let (mut e, table, d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        e.on_packet(&kq(1), true, base + MS, now);
+        assert!(e.on_packet(&kr(1), true, base + 2 * MS, now).is_empty());
+        assert!(e.tick(now).is_empty());
+        (e, table, d, now, base)
+    }
+
+    #[test]
+    fn held_recheck_skips_the_table_when_nothing_changed() {
+        let (mut e, table, _d, now, _) = engine_with_one_hold();
+        // The test holds the table lock: a tick that locked it would block.
+        let guard = lock_table(&table);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let n = e.tick(now + Duration::from_millis(5)).len();
+            let _ = tx.send(n);
+            e
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        let e = worker.join().unwrap();
+        assert_eq!(got, Ok(0), "tick took the table lock with nothing new");
+        assert_eq!(e.metrics().held, 1);
+    }
+
+    #[test]
+    fn held_recheck_resolves_a_hit_after_an_insert() {
+        let (mut e, table, _d, now, base) = engine_with_one_hold();
+        insert_send(&table, base);
+        // Well inside the time throttle: the insert alone triggers it.
+        let ev = only_dns(e.tick(now + Duration::from_millis(1)));
+        assert_eq!(ev.pid, Some(777));
+        assert_eq!(e.metrics().attribution_late, 1);
+    }
+
+    #[test]
+    fn held_deadline_is_honoured_between_rechecks() {
+        let (mut e, _table, _d, now, _) = engine_with_one_hold();
+        assert!(e.tick(now + Duration::from_millis(245)).is_empty());
+        // 6 ms later, nothing inserted: the deadline still emits it.
+        let ev = only_dns(e.tick(now + Duration::from_millis(251)));
+        assert_eq!(ev.pid, None);
+        assert_eq!(e.metrics().unattributed, 1);
+    }
+
+    #[test]
+    fn held_recheck_keeps_misses_in_deadline_order() {
+        let (mut e, table, _d) = kernel_engine(false);
+        let now = Instant::now();
+        let base = wall_ns();
+        // Three holds; only the middle one's record lands. The two misses
+        // keep their order, so both still expire from the front.
+        for (i, id) in [1u16, 2, 3].into_iter().enumerate() {
+            let t = now + Duration::from_millis(i as u64 * 10);
+            let ts = base + (i as u64 * 10 + 1) * MS;
+            e.on_packet(&kq(id), true, ts, t);
+            assert!(e.on_packet(&kr(id), true, ts + MS, t).is_empty());
+        }
+        insert_send(&table, base + 10 * MS);
+        let hit = only_dns(e.tick(now + Duration::from_millis(30)));
+        assert_eq!(hit.pid, Some(777));
+        assert_eq!(e.metrics().held, 3);
+        assert_eq!(pids(&e.tick(now + Duration::from_millis(250))), vec![None]);
+        assert!(e.tick(now + Duration::from_millis(255)).is_empty());
+        assert_eq!(pids(&e.tick(now + Duration::from_millis(270))), vec![None]);
     }
 
     #[test]

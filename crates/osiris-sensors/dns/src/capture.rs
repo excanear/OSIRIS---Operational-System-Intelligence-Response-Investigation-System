@@ -189,6 +189,31 @@ impl Capture {
         })
     }
 
+    /// Packets the kernel dropped for this socket (receive queue full)
+    /// since the previous call: `PACKET_STATISTICS` `tp_drops`, which the
+    /// kernel resets on every read, so the caller accumulates it. On `lo`
+    /// both copies of a packet are queued, so either copy's drop counts.
+    /// `None` when the statistics cannot be read.
+    pub(crate) fn take_drops(&self) -> Option<u64> {
+        let mut stats = libc::tpacket_stats {
+            tp_packets: 0,
+            tp_drops: 0,
+        };
+        let mut len = mem::size_of::<libc::tpacket_stats>() as libc::socklen_t;
+        // SAFETY: `stats` is a valid, writable `tpacket_stats` and `len` is
+        // its exact size; the kernel writes at most `len` bytes.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_STATISTICS,
+                (&mut stats as *mut libc::tpacket_stats).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(u64::from(stats.tp_drops))
+    }
+
     /// Receive one packet into `buf`, blocking at most [`RECV_TIMEOUT`].
     pub(crate) fn recv(&self, buf: &mut [u8]) -> Recv {
         // SAFETY: `sockaddr_ll` is a plain C struct for which all-zero is valid.

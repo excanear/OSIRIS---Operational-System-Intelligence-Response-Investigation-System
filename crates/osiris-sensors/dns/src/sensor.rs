@@ -20,8 +20,11 @@
 //!   `procfs_attribution` without an `ebpf` key; `Degraded` with the reason
 //!   in `last_error` when eBPF was configured but cannot be used.
 //!
-//! The reported state is the worse of the backend's and the parse/eviction
-//! window's, so the capture loop never hides a backend `Degraded`.
+//! The reported state is the worse of the backend's and the window's (parse
+//! errors, overflow evictions and capture-socket drops in the last minute),
+//! so the capture loop never hides a backend `Degraded`. Capture-socket
+//! drops (`PACKET_STATISTICS`, read at most once a second and before the
+//! socket is closed) are also added to `events_dropped_total`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +90,10 @@ struct HealthState {
     engine: EngineMetrics,
     /// Kernel sends from another network namespace, never inserted (GC 8).
     foreign_netns: u64,
+    /// Packets the kernel dropped before the capture socket read them
+    /// (`PACKET_STATISTICS` `tp_drops`, accumulated across reads and
+    /// sockets). Part of `events_dropped_total`.
+    capture_drops: u64,
 }
 
 impl Default for HealthState {
@@ -102,6 +109,7 @@ impl Default for HealthState {
             capability_flags: vec![],
             engine: EngineMetrics::default(),
             foreign_netns: 0,
+            capture_drops: 0,
         }
     }
 }
@@ -149,7 +157,64 @@ fn set_backend(
     }
 }
 
-/// Tracks whether parse errors or overflow evictions rose recently.
+/// Adds packets the capture socket's kernel queue dropped to the running
+/// total, saturating. The kernel resets its counter on every read, so each
+/// read's value is added once.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn add_capture_drops(health: &Mutex<HealthState>, drops: u64) {
+    let mut h = lock_health(health);
+    h.capture_drops = h.capture_drops.saturating_add(drops);
+}
+
+/// How often the capture loop reads the socket's drop counter.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const CAPTURE_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Rate limit for reading the capture socket's statistics.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct StatsPoll {
+    last: Option<Instant>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl StatsPoll {
+    /// True (and the read is recorded) when the last read is at least
+    /// [`CAPTURE_STATS_INTERVAL`] old.
+    fn due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last
+            .is_none_or(|t| now.saturating_duration_since(t) >= CAPTURE_STATS_INTERVAL);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+/// Sends `events` in order. On the first failed send, that event and every
+/// one after it are counted as dropped and no further send is tried.
+/// Returns false on a failure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn send_all<E>(
+    events: Vec<E>,
+    health: &Mutex<HealthState>,
+    mut send: impl FnMut(E) -> bool,
+) -> bool {
+    let total = events.len();
+    for (i, event) in events.into_iter().enumerate() {
+        if !send(event) {
+            let lost = (total - i) as u64;
+            let mut h = lock_health(health);
+            h.events_dropped_total = h.events_dropped_total.saturating_add(lost);
+            return false;
+        }
+    }
+    true
+}
+
+/// Tracks whether parse errors, overflow evictions or capture drops rose
+/// recently.
 #[derive(Debug, Default)]
 struct DegradeWindow {
     last_bad_total: u64,
@@ -157,8 +222,11 @@ struct DegradeWindow {
 }
 
 impl DegradeWindow {
-    fn observe(&mut self, m: &EngineMetrics, now: Instant) -> SensorState {
-        let bad = m.parse_errors + m.tracker.overflow_evictions;
+    fn observe(&mut self, m: &EngineMetrics, capture_drops: u64, now: Instant) -> SensorState {
+        let bad = m
+            .parse_errors
+            .saturating_add(m.tracker.overflow_evictions)
+            .saturating_add(capture_drops);
         if bad > self.last_bad_total {
             self.last_bad_total = bad;
             self.last_bad_at = Some(now);
@@ -181,7 +249,8 @@ fn apply_latch(engine: &mut Engine, latch: &AtomicBool, latched: &mut bool) {
 }
 
 /// Capture-loop step: publish the engine counters and the reported state,
-/// never overwriting a backend `Degraded` (GC 10).
+/// never overwriting a backend `Degraded` (GC 10). Capture drops count in
+/// the window like parse errors.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn publish_engine(
     health: &Mutex<HealthState>,
@@ -189,8 +258,8 @@ fn publish_engine(
     window: &mut DegradeWindow,
     now: Instant,
 ) {
-    let window_state = window.observe(&metrics, now);
     let mut h = lock_health(health);
+    let window_state = window.observe(&metrics, h.capture_drops, now);
     h.engine = metrics;
     h.window_state = window_state;
     h.state = reported_state(h.backend_state, window_state);
@@ -380,10 +449,14 @@ impl DnsSensor {
         }
     }
 
-    /// Sensor-side drops plus the BPF program's ring-buffer drops.
+    /// Everything lost, in mixed units: sensor-side drops (undecodable
+    /// ring-buffer records and events whose channel send failed), packets
+    /// the capture socket dropped, and the BPF program's ring-buffer drops.
     fn dropped_total(&self, h: &HealthState) -> u64 {
         let bpf = self.drop_counter.as_ref().map_or(0, DropCounter::get);
-        h.events_dropped_total.saturating_add(bpf)
+        h.events_dropped_total
+            .saturating_add(h.capture_drops)
+            .saturating_add(bpf)
     }
 
     /// Choose and start the attribution backend (GC 10), recording it in
@@ -660,15 +733,20 @@ mod linux {
             }
             if !channel_closed {
                 // Cancelled: flush held and pending transactions once.
-                // Best effort: stop at the first failed send.
+                // Best effort: after the first failed send, every
+                // remaining event is counted as dropped.
                 apply_latch(&mut self.engine, &self.latch, &mut latched);
-                for event in self.engine.drain(Instant::now()) {
-                    if !self.send(event) {
-                        break;
-                    }
-                }
+                let events = self.engine.drain(Instant::now());
+                send_all(events, &self.health, |e| self.send(e));
             }
             lock_health(&self.health).state = SensorState::Stopped;
+        }
+
+        /// Adds the socket's kernel-side drops since the last read.
+        fn read_capture_drops(&self, cap: &Capture) {
+            if let Some(drops) = cap.take_drops() {
+                add_capture_drops(&self.health, drops);
+            }
         }
 
         fn capture(
@@ -679,12 +757,30 @@ mod linux {
             latched: &mut bool,
             backoff: &mut Duration,
         ) -> Exit {
+            let exit = self.capture_until_exit(cap, buf, window, latched, backoff);
+            // The socket is dropped after this: read its last drops.
+            self.read_capture_drops(cap);
+            exit
+        }
+
+        fn capture_until_exit(
+            &mut self,
+            cap: &Capture,
+            buf: &mut [u8],
+            window: &mut DegradeWindow,
+            latched: &mut bool,
+            backoff: &mut Duration,
+        ) -> Exit {
+            let mut stats = StatsPoll::default();
             loop {
                 if self.cancellation.is_cancelled() {
                     return Exit::Cancelled;
                 }
                 let recv = cap.recv(buf);
                 let now = Instant::now();
+                if stats.due(now) {
+                    self.read_capture_drops(cap);
+                }
                 apply_latch(&mut self.engine, &self.latch, latched);
                 let mut events = match recv {
                     Recv::Packet {
@@ -705,14 +801,13 @@ mod linux {
                 *backoff = BACKOFF_INITIAL;
                 events.extend(self.engine.tick(now));
                 publish_engine(&self.health, self.engine.metrics(), window, now);
-                for event in events {
-                    if !self.send(event) {
-                        return Exit::ChannelClosed;
-                    }
+                if !send_all(events, &self.health, |e| self.send(e)) {
+                    return Exit::ChannelClosed;
                 }
             }
         }
 
+        /// One `blocking_send`; a failure is counted by [`send_all`].
         fn send(&self, event: RawEvent) -> bool {
             let timestamp = match &event {
                 RawEvent::Dns(d) => Some(d.timestamp_ns),
@@ -724,7 +819,6 @@ mod linux {
                 h.last_event_at = timestamp.or(h.last_event_at);
                 true
             } else {
-                lock_health(&self.health).events_dropped_total += 1;
                 false
             }
         }
@@ -812,22 +906,115 @@ mod tests {
         let mut w = DegradeWindow::default();
         let t0 = Instant::now();
         let mut m = EngineMetrics::default();
-        assert_eq!(w.observe(&m, t0), SensorState::Healthy);
+        assert_eq!(w.observe(&m, 0, t0), SensorState::Healthy);
         m.parse_errors = 1;
-        assert_eq!(w.observe(&m, t0), SensorState::Degraded);
+        assert_eq!(w.observe(&m, 0, t0), SensorState::Degraded);
         assert_eq!(
-            w.observe(&m, t0 + Duration::from_secs(59)),
+            w.observe(&m, 0, t0 + Duration::from_secs(59)),
             SensorState::Degraded
         );
         assert_eq!(
-            w.observe(&m, t0 + Duration::from_secs(61)),
+            w.observe(&m, 0, t0 + Duration::from_secs(61)),
             SensorState::Healthy
         );
         m.tracker.overflow_evictions = 1;
         assert_eq!(
-            w.observe(&m, t0 + Duration::from_secs(62)),
+            w.observe(&m, 0, t0 + Duration::from_secs(62)),
             SensorState::Degraded
         );
+    }
+
+    #[test]
+    fn capture_drops_degrade_for_a_minute() {
+        let mut w = DegradeWindow::default();
+        let t0 = Instant::now();
+        let m = EngineMetrics::default();
+        assert_eq!(w.observe(&m, 0, t0), SensorState::Healthy);
+        assert_eq!(w.observe(&m, 3, t0), SensorState::Degraded);
+        assert_eq!(
+            w.observe(&m, 3, t0 + Duration::from_secs(61)),
+            SensorState::Healthy
+        );
+        assert_eq!(
+            w.observe(&m, 4, t0 + Duration::from_secs(62)),
+            SensorState::Degraded
+        );
+        // Every term saturates instead of overflowing.
+        let big = EngineMetrics {
+            parse_errors: u64::MAX,
+            ..EngineMetrics::default()
+        };
+        assert_eq!(w.observe(&big, u64::MAX, t0), SensorState::Degraded);
+    }
+
+    #[test]
+    fn capture_drops_accumulate_and_saturate() {
+        let s = DnsSensor::new(PathBuf::from("/proc"), None, None);
+        add_capture_drops(&s.health, 5);
+        add_capture_drops(&s.health, 7);
+        assert_eq!(lock_health(&s.health).capture_drops, 12);
+        lock_health(&s.health).events_dropped_total = 3;
+        assert_eq!(s.health().events_dropped_total, 15);
+        assert_eq!(s.metrics().events_dropped_total, 15);
+        add_capture_drops(&s.health, u64::MAX);
+        assert_eq!(lock_health(&s.health).capture_drops, u64::MAX);
+        assert_eq!(s.health().events_dropped_total, u64::MAX);
+    }
+
+    #[test]
+    fn capture_drops_are_published_into_the_window() {
+        let health = Mutex::new(HealthState::default());
+        let mut window = DegradeWindow::default();
+        let now = Instant::now();
+        publish_engine(&health, EngineMetrics::default(), &mut window, now);
+        assert_eq!(lock_health(&health).state, SensorState::Healthy);
+        add_capture_drops(&health, 1);
+        publish_engine(&health, EngineMetrics::default(), &mut window, now);
+        assert_eq!(lock_health(&health).state, SensorState::Degraded);
+    }
+
+    #[test]
+    fn capture_stats_are_read_at_most_once_a_second() {
+        let mut poll = StatsPoll::default();
+        let t0 = Instant::now();
+        assert!(poll.due(t0));
+        assert!(!poll.due(t0 + Duration::from_millis(999)));
+        assert!(poll.due(t0 + Duration::from_secs(1)));
+        assert!(!poll.due(t0 + Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn a_failed_send_counts_every_remaining_event() {
+        use osiris_sensor_api::RawEvent;
+        let health = Mutex::new(HealthState::default());
+        let events: Vec<RawEvent> = (0..5).map(|_| RawEvent::Dns(sample_event())).collect();
+        let mut sent = 0;
+        let ok = send_all(events, &health, |_| {
+            sent += 1;
+            sent <= 2
+        });
+        assert!(!ok);
+        assert_eq!(sent, 3, "no send is attempted after the first failure");
+        assert_eq!(lock_health(&health).events_dropped_total, 3);
+
+        let ok = send_all(vec![RawEvent::Dns(sample_event())], &health, |_| true);
+        assert!(ok);
+        assert_eq!(lock_health(&health).events_dropped_total, 3);
+    }
+
+    fn sample_event() -> osiris_sensor_api::DnsEventRaw {
+        osiris_sensor_api::DnsEventRaw {
+            query: "example.com".into(),
+            qtype: "A".into(),
+            response_ips: vec![],
+            ttl: None,
+            pid: None,
+            uid: 0,
+            exe_path: String::new(),
+            comm: String::new(),
+            timestamp_ns: 1,
+            source: osiris_sensor_api::RawEventSource::Packet,
+        }
     }
 
     fn ebpf_settings(dir: &std::path::Path) -> EbpfSettings {

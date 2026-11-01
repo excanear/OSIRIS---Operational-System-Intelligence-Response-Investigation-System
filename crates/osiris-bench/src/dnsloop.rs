@@ -278,6 +278,12 @@ pub fn run(sends: u64) -> Record {
     }
 
     let bpf = osiris_real_linux_tests::render::bpf_dir_from_env();
+    if bpf.is_none() {
+        eprintln!(
+            "osiris-bench: dns_send: OSIRIS_BPF_DIR is unset, so B and C both run \
+             without eBPF; the B-vs-C (11b-4 kprobe) pair is skipped"
+        );
+    }
     // Declared before any stack so it outlives every agent reading it.
     let no_dns_dir = tempfile::Builder::new()
         .prefix("osiris-bpf-nodns-")
@@ -357,9 +363,15 @@ pub fn run(sends: u64) -> Record {
         }
         Value::Object(out)
     };
+    // Without objects B and C are the same configuration.
+    let kprobes = if bpf.is_some() {
+        pair(Config::Full, Config::NoDnsObject)
+    } else {
+        json!({"skipped": "OSIRIS_BPF_DIR unset: B and C both run without eBPF"})
+    };
     let pairs = json!({
         "agent_total_B_vs_A": pair(Config::Full, Config::NoAgent),
-        "dns_kprobes_11b4_B_vs_C": pair(Config::Full, Config::NoDnsObject),
+        "dns_kprobes_11b4_B_vs_C": kprobes,
         "dns_af_packet_11a_C_vs_D": pair(Config::NoDnsObject, Config::NoDnsSensor),
         "rest_of_agent_D_vs_A": pair(Config::NoDnsSensor, Config::NoAgent),
     });

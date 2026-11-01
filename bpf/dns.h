@@ -63,6 +63,8 @@ _Static_assert(__builtin_offsetof(struct dns_record, exe_dev) == 48, "dns exe_de
 _Static_assert(__builtin_offsetof(struct dns_record, netns_ino) == 52, "dns netns_ino");
 _Static_assert(__builtin_offsetof(struct dns_record, exe_ino) == 56, "dns exe_ino");
 _Static_assert(__builtin_offsetof(struct dns_record, rport) == 64, "dns rport");
+_Static_assert(__builtin_offsetof(struct dns_record, _pad) == 66, "dns _pad");
+_Static_assert(__builtin_offsetof(struct dns_record, _pad2) == 68, "dns _pad2");
 _Static_assert(__builtin_offsetof(struct dns_record, laddr) == 72, "dns laddr");
 _Static_assert(__builtin_offsetof(struct dns_record, raddr) == 88, "dns raddr");
 

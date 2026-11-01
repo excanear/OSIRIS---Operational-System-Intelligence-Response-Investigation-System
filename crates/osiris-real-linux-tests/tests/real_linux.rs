@@ -1730,3 +1730,131 @@ fn dns_burst_attribution_is_near_complete() {
         );
     }
 }
+
+/// Unanswered queries in the flood (g).
+const FLOOD_QUERIES: u64 = 10_000;
+/// Bound on the flood's transactions closing (5 s timeout) and counting.
+const FLOOD_SETTLE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Drains `127.0.0.1:53` without answering until dropped, so the flood
+/// never hits a closed port (ICMP unreachable). Joined on drop.
+struct SilentPort53 {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl SilentPort53 {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sock = std::net::UdpSocket::bind(("127.0.0.1", 53)).expect("bind 127.0.0.1:53");
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while !s.load(Ordering::Relaxed) {
+                let _ = sock.recv_from(&mut buf);
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for SilentPort53 {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One well-formed A query for `<label>.osiris-flood.xyz`.
+fn flood_query(id: u16, label: &str) -> Vec<u8> {
+    let mut q = Vec::with_capacity(64);
+    for w in [id, 0x0100, 1, 0, 0, 0] {
+        q.extend_from_slice(&w.to_be_bytes());
+    }
+    for l in [label, "osiris-flood", "xyz"] {
+        q.push(u8::try_from(l.len()).unwrap());
+        q.extend_from_slice(l.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&[0, 1, 0, 1]);
+    q
+}
+
+/// The `dns` entry's (`events_emitted_total`, `events_dropped_total`).
+fn dns_counts(s: &Stack) -> (u64, u64) {
+    let st = sensor_status(s, "dns");
+    (
+        st["events_emitted_total"].as_u64().unwrap_or(0),
+        st["events_dropped_total"].as_u64().unwrap_or(0),
+    )
+}
+
+/// (g) A fast flood of 10 000 unanswered queries on `lo` from one socket,
+/// as fast as `sendto` goes, while the full agent runs. Once every
+/// transaction has closed (the 5 s timeout) and the counters are still, if
+/// the DNS sensor emitted fewer events than queries were sent, the loss
+/// must show in its `events_dropped_total` (capture-socket drops are
+/// counted there since 11b-4's final fix). The sensor's emitted count is
+/// the measure: what the pipeline stores later is not the sensor's to
+/// count, and other DNS traffic on the host can only raise it.
+#[test]
+#[ignore]
+fn dns_flood_loss_is_counted() {
+    let m = marker();
+    let s = stack_with_bpf(&Path::new(WATCH_ROOT).join(&m), Some(required_bpf_dir()));
+    let status = sensor_status(&s, "dns");
+    assert!(
+        has_flag(&status, DNS_FLAG_EBPF),
+        "the flood needs kernel attribution: {status}"
+    );
+    let _port53 = SilentPort53::start();
+    let (emitted0, dropped0) = dns_counts(&s);
+
+    let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let mut send_errors = 0u64;
+    let start = Instant::now();
+    for i in 0..FLOOD_QUERIES {
+        let q = flood_query((i & 0xffff) as u16, &format!("f{i}"));
+        if sock.send_to(&q, ("127.0.0.1", 53)).is_err() {
+            send_errors += 1;
+        }
+    }
+    let flood_ms = start.elapsed().as_millis();
+    let sent = FLOOD_QUERIES - send_errors;
+
+    // Past the transaction timeout, then until the counters stop moving.
+    std::thread::sleep(Duration::from_secs(7));
+    let end = Instant::now() + FLOOD_SETTLE_DEADLINE;
+    let mut last = dns_counts(&s);
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let now = dns_counts(&s);
+        if now == last || Instant::now() >= end {
+            last = now;
+            break;
+        }
+        last = now;
+    }
+    let (emitted, dropped) = last;
+    let emitted_delta = emitted.saturating_sub(emitted0);
+    let dropped_delta = dropped.saturating_sub(dropped0);
+    let dns = sensor_status(&s, "dns");
+    eprintln!(
+        "osiris-ebpf: dns flood: {sent} sent in {flood_ms} ms ({send_errors} send errors), \
+         {emitted_delta} emitted, events_dropped_total +{dropped_delta}, state {}",
+        dns["state"]
+    );
+    if emitted_delta < sent {
+        assert!(
+            dropped_delta > 0,
+            "{emitted_delta} of {sent} flood queries emitted but `events_dropped_total` \
+             did not rise: {dns}"
+        );
+    }
+}

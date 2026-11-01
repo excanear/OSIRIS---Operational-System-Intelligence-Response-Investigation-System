@@ -24,6 +24,14 @@
  * AF_INET msg_name to udp_sendmsg, so the v6 program returns for both and
  * such a send is reported once, as AF_INET, by the v4 program.
  *
+ * Corked sends (UDP_CORK or MSG_MORE, so several sendmsg calls build one
+ * datagram): each call is a separate kprobe hit. A continuation call has
+ * no name, so its destination comes from the socket: on a socket connected
+ * to port 53 it emits one extra record for the same datagram; on an
+ * unconnected socket it emits nothing. The extra record names the same
+ * socket's sender; user space joins it with a later packet on the same key
+ * or lets it age out. Corked DNS sends are rare.
+ *
  * Every send is emitted, the agent's own included: SELF_TGID exists only
  * because the loader sets it on every object; this program never reads it.
  * A failed ring-buffer reservation increments DROPS[0].

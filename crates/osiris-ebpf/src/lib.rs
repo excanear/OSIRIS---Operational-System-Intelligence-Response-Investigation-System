@@ -2,7 +2,8 @@
 //!
 //! OS-neutral pieces: the `#[repr(C)]` record ABIs shared with the C BPF
 //! programs (`record` for process, `net_record` for TCP, `fs_record` for
-//! filesystem create/write/delete/rename, `dns_record` for UDP port-53 sends), BPF object integrity checking
+//! filesystem create/write/delete/rename, `dns_record` for UDP port-53
+//! sends), BPF object integrity checking
 //! (`integrity`), the kernel exe identity and `exe_path` resolver (`exe`),
 //! the capability probe's parsing and kernel-symbol check (`probe`), the
 //! object specs (tracepoint and kprobe attach points; the fs object has
