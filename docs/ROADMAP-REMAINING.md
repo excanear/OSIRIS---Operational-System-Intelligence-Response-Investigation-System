@@ -295,6 +295,12 @@ revisão final independente → merge → push.
     insert, limite de partições (30 dias) com agentes de relógio errado, escrita parcial em lotes
     acima de `max_insert_block_size`, fan-out da checagem de arestas existentes, `health()` na
     fila da thread única.
+  - Razões de risco órfãs: se o insert de um score falhar depois das razões gravadas, um retry com
+    razões de conteúdo diferente pode deixar linhas a mais ou não determinísticas. Correção:
+    apagar antes de regravar ou um id de tentativa.
+  - Filtro de tenant das relações: `event_id IN (SELECT event_id FROM events WHERE host_id IN
+    hosts)` (`graph.rs`) monta o conjunto inteiro de event ids do tenant a cada chamada — mesma
+    classe da F2 da Fase 10. Correção: limitar pela janela de tempo ou usar semi-join.
 
 ## Fase 12 — Extensibilidade e integração (§20)
 - **Exporters** (§20.3): NDJSON/CSV, Syslog/CEF, OpenTelemetry (OTLP); Kafka/webhook opcionais.

@@ -103,7 +103,9 @@ backend and size, `noise_pct` = (max - min) / median). Details and caveats are i
 
 - `osiris-server` has `storage_backend: sqlite | clickhouse` (default `sqlite`) and a
   `clickhouse:` section (`url`, `database`, `user`, `password_file`, `timeout_secs`). The password
-  comes from a file, never inline, and error text never contains it. Only the telemetry tables
+  comes from a file, never inline, and error text never contains it. The `url` may not carry
+  userinfo, a query string or a fragment (startup rejects it), and errors show only its
+  `scheme://host:port`. Only the telemetry tables
   (events, alerts, relationships, risk scores) move; the control-plane stores stay on SQLite.
 - The backend runs the shared conformance suite and a server end-to-end test, but only when
   `OSIRIS_CLICKHOUSE_URL` is set. CI has a Linux job with the pinned service container. Default
@@ -123,8 +125,13 @@ backend and size, `noise_pct` = (max - min) / median). Details and caveats are i
   months) is rejected with an error and nothing is written. An agent with a wrong clock could make
   a batch fail.
 - **Large batches split into blocks.** A batch larger than `max_insert_block_size` (about 1 000 000
-  rows) is split into several blocks, so a failure part-way can leave a partial write. The server's
-  batches are far smaller (the bench uses 1 000).
+  rows) is split into several blocks, so a failure part-way can leave a partial write. A retry
+  repairs it, because event writes deduplicate on id. The server's batches are far smaller (the
+  bench uses 1 000).
+- **Relationship tenant filter builds the tenant's whole event-id set.** `query_relationships`
+  restricts a tenant with `event_id IN (SELECT event_id FROM events WHERE host_id IN hosts)`, which
+  materialises every event id of the tenant's hosts on each call — the same class as Phase 10's
+  F2. Fix: bound the subquery by the query's time window, or use a semi-join.
 - **Alert evidence orphans.** If the same `alert_id` were retried with different evidence after a
   failed insert, orphaned `alert_evidence` rows could be attributed to it. Alert ids are per-alert
   UUIDs and retries resend the same alert, so this is not expected in practice.
