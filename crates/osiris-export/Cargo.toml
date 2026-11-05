@@ -1,0 +1,15 @@
+[package]
+name = "osiris-export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osiris-schema = { path = "../osiris-schema" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

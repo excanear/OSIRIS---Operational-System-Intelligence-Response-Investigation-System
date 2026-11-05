@@ -44,3 +44,6 @@ x509-parser = "0.16"
 zstd = "0.13"
 time = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+hmac = "0.12"
+base64 = "0.22"
+rustls-native-certs = "0.8"
