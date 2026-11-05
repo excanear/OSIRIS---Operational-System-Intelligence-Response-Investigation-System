@@ -273,7 +273,28 @@ revisão final independente → merge → push.
     de entrada (`PACKET_HOST`) é descartada antes do tap da captura, e nem `tp_drops` nem contador
     algum do sensor a registra.
   - O piso de kernel 5.15 segue raciocinado, não executado.
-- **ClickHouse** (§10.2): implementação do trait `Storage`, migração/benchmark vs. SQLite.
+- **ClickHouse** (§10.2) — FEITO (Fase 11c): backend opt-in completo do trait `Storage`
+  (`crates/osiris-storage-clickhouse`, HTTP, ClickHouse 26.3.60.2 LTS), suíte de conformidade
+  compartilhada com o SQLite, teste e2e do servidor e benchmark vs. SQLite (run 41362219110; números
+  em `PERFORMANCE.md`, decisões em `docs/adr/ADR-011-clickhouse-storage.md`). O padrão continua
+  SQLite: os números foram registrados, não acionados. Dívidas:
+  - Segurança com vários escritores: o dedupe de ids vale só com um processo servidor por banco
+    (mutex de escrita local ao processo).
+  - Ferramenta de cópia SQLite → ClickHouse (hoje trocar de backend começa com o banco vazio).
+  - Clustering, replicação e sharding (`ON CLUSTER`).
+  - RowBinary no lugar de JSONEachRow, se a ingestão mostrar o formato como gargalo.
+  - Resultados em streaming (o trait devolve `Vec`; `wait_end_of_query=1` armazena o resultado todo
+    no servidor).
+  - Índices de salto ou projeções para `event_type` e para a chave de processo (consultas filtradas
+    ficaram 32x a 66x mais lentas que o SQLite no bench).
+  - Verificar keep-alive/reuso de conexão do cliente HTTP e a latência de `get_event` (4,44 ms a
+    5,35 ms contra 0,006 ms no SQLite).
+  - Bench sem teto de limite (varredura completa, agregações) e com leitores concorrentes; segunda
+    rodada ou segundo runner para ter envelope de ruído entre execuções.
+  - Fraquezas conhecidas adiadas (ADR-011): razões de risco órfãs não determinísticas após falha de
+    insert, limite de partições (30 dias) com agentes de relógio errado, escrita parcial em lotes
+    acima de `max_insert_block_size`, fan-out da checagem de arestas existentes, `health()` na
+    fila da thread única.
 
 ## Fase 12 — Extensibilidade e integração (§20)
 - **Exporters** (§20.3): NDJSON/CSV, Syslog/CEF, OpenTelemetry (OTLP); Kafka/webhook opcionais.

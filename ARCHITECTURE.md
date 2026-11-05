@@ -532,6 +532,8 @@ All of Core, API, and CLI query through this trait — never through a database-
 
 Per master prompt §34/§79: this decision is made on documented workload reasoning here, but the actual benchmark numbers (§23) must be produced before the ClickHouse migration is executed, not assumed.
 
+**ClickHouse status (Phase 11c).** The ClickHouse backend is implemented (`crates/osiris-storage-clickhouse`) as an opt-in, complete `Storage` implementation over the HTTP interface, selected by `storage_backend: clickhouse` in the server config; SQLite remains the default. It is pinned to ClickHouse 26.3.60.2 (LTS), validated by the shared conformance suite and a server end-to-end test in CI, and measured against SQLite in `PERFORMANCE.md` (run 41362219110). The numbers are recorded, not acted on: ClickHouse is about 14x smaller on disk and ingests faster at 1 000 000 events, but is one to three orders of magnitude slower on the measured query shapes (limit-capped, single runner), so the default stays SQLite. See `docs/adr/ADR-011-clickhouse-storage.md` and `docs/operators-clickhouse.md`.
+
 ### 10.3 Two-database split: telemetry store vs. control-plane store
 
 ```text
@@ -1184,6 +1186,7 @@ ADR-008  Agent/Server process split and privilege boundary enforcement
 ADR-009  Response Engine: dispatch-to-agent execution model, v1 scope limited
          to non-destructive actions
 ADR-010  eBPF user-space loader is aya; kernel programs stay clang-built C CO-RE
+ADR-011  ClickHouse is an opt-in telemetry backend over HTTP; SQLite stays the default
          (docs/adr/ADR-010-ebpf-loader-aya.md; supersedes ADR-003 for the loader)
 ```
 

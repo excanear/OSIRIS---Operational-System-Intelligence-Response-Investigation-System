@@ -523,6 +523,38 @@ follows them:
   `DnsSensor::attribution_metrics`; `claims_dropped` and `tombstone_consumed` only in the send
   table's counters. None is in `/status`.
 
+## ClickHouse storage backend (Phase 11c)
+
+The ClickHouse backend is validated by the shared `Storage` conformance suite and by a server
+end-to-end test, both run against the pinned image `clickhouse/clickhouse-server:26.3.60.2` in a
+CI service container. They run only when `OSIRIS_CLICKHOUSE_URL` is set, so the default Windows
+and Linux `cargo test` runs do not need ClickHouse. How to run them locally is in
+`docs/operators-clickhouse.md`. The comparison with SQLite is in `PERFORMANCE.md`, "Storage
+comparison".
+
+| Run | Branch @ commit | What it covered | Result |
+|---|---|---|---|
+| 41356079440 | `ci/t11c-1` @ `09962fd` | build-test, console, clickhouse (transport, schema, events) | green |
+| 41359191075 | `ci/t11c-2` @ `c2402a1` | full conformance on ClickHouse 26.3.60.2 (events, alerts, relationships, risk scores) | green |
+| 41360547283 | `ci/t11c-3` @ `f117fe8` | the above plus the server end-to-end test on `storage_backend: clickhouse` | green |
+| 41362219110 | `storage-bench/t11c-1` @ `ade5a60` | `storage-bench.yml`: SQLite vs ClickHouse at 100 000 and 1 000 000 events | success; numbers in `PERFORMANCE.md` |
+
+The bench run is not a CI gate. It ran on `ubuntu-24.04`, kernel 7.0.0-1017-azure, 4 vCPU Intel
+Xeon Platinum 8573C, 15 GiB, ClickHouse 26.3.60.2. After that run the bench was changed (commit
+`8da1742`) so that it fails when a query shape returns no rows; the reported numbers are from the
+run before that change.
+
+### Known limitations
+
+- ClickHouse 26.3.60.2 is the only version tested. 26.8 was not used because its binary raises
+  SIGILL on the pre-AVX2 development CPU.
+- The ClickHouse tests are `#[ignore]`d without `OSIRIS_CLICKHOUSE_URL`; a default `cargo test`
+  does not exercise the backend.
+- Single-writer only: two servers on one database can store duplicate rows (ADR-011).
+- Deferred weaknesses (orphan risk reasons on retry, 30-day partition limit with bad-clock agents,
+  partial writes for batches above `max_insert_block_size`) are listed in
+  `docs/adr/ADR-011-clickhouse-storage.md`.
+
 ## Findings
 
 | Finding | Distro | Fix commit |

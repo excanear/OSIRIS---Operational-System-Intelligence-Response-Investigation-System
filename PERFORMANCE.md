@@ -318,6 +318,115 @@ to 1 591.01 (same tree, pragmas disabled versus enabled). The final matrix run a
 - **Agent.** About 6 % of one core when idle and about 33 % at 1 000 exec/s. RSS is 50-57 MiB
   at p50 and at most 72 MiB. Thirty-second runs are too short to rule out slow growth.
 
+## Storage comparison: SQLite vs ClickHouse (Phase 11c)
+
+Evidence for the ARCHITECTURE.md §10.2 / §79 requirement that the ClickHouse numbers are measured
+before the backend is adopted. It is recorded, not acted on: the default stays SQLite (ADR-011).
+This section is a different environment from the baseline above (GitHub Actions only, code
+`ade5a60`), so its numbers are not comparable with the WSL tables. Every number comes from the
+JSON lines in the `storage-bench` artifact (`storage-100k.jsonl`, `storage-1m.jsonl`,
+`runner-facts.txt`). Latencies are in ms and rounded to two decimals; values under 0.1 ms are shown
+to three decimals so they do not collapse to 0.01.
+
+### Method
+
+`osiris-bench` `storage_compare` (`crates/osiris-bench/src/storage_compare.rs`). Per backend and
+size it runs 5 rounds. Each round fills a fresh store through `batch_write` in batches of 1 000
+events, then times five query shapes, 20 samples each. The same pre-generated events feed both
+backends and every round, so generation cost is outside the ingest timing and both backends see
+identical data. Reported values are medians across the rounds. A warm-up call of each shape before
+sampling hard-fails the run if the shape returns no rows (commit `8da1742`, after the measured
+run's code `ade5a60`), so the bench now guarantees that every latency is for a query that found
+data. The run reported here predates that check.
+
+| Shape | What it runs |
+|---|---|
+| `host_window` | `query_events` with one `host_id` and a `since`/`until` window |
+| `event_type` | `query_events` with `event_type = "PROCESS_EXEC"` |
+| `process_key` | `query` with a `process_key` |
+| `residual` | `query_events` with `event_type = "PROCESS_EXEC" AND process.pid = <n>` (the pid part is a residual predicate, re-checked in Rust) |
+| `get_event` | `get_event` by id |
+
+`noise_pct` is (max - min) / median of the per-round values over the 5 rounds. It is the noise
+envelope. A difference smaller than the envelope of either side is reported as "no measurable
+difference".
+
+### Environment
+
+| Item | Value |
+|---|---|
+| Run | GitHub Actions run 41362219110, workflow `storage-bench.yml`, branch `storage-bench/t11c-1` @ `ade5a60` |
+| Runner | `ubuntu-24.04` hosted runner, Ubuntu 24.04.5 LTS, kernel 7.0.0-1017-azure |
+| CPU / RAM | INTEL(R) XEON(R) PLATINUM 8573C, 4 vCPU / 15 GiB |
+| ClickHouse | `clickhouse/clickhouse-server:26.3.60.2`, version 26.3.60.2, a service container on the same runner (loopback only, no network hop) |
+
+### Results, 100 000 events
+
+| Metric | SQLite | ClickHouse | SQLite noise | ClickHouse noise |
+|---|---|---|---|---|
+| Ingest (events/s) | 12 203.53 | 12 079.05 | 3.51 % | 1.05 % |
+| Footprint (bytes/event) | 2 076.41 | 126.35 | n/a | n/a |
+| `host_window` p50 / p95 (ms) | 2.27 / 2.57 | 21.92 / 25.13 | 1.23 % | 5.12 % |
+| `event_type` p50 / p95 (ms) | 4.46 / 4.61 | 202.30 / 238.93 | 1.84 % | 15.02 % |
+| `process_key` p50 / p95 (ms) | 0.019 / 0.030 | 8.18 / 9.27 | 7.40 % | 8.60 % |
+| `residual` p50 / p95 (ms) | 6.42 / 6.62 | 205.66 / 242.40 | 0.75 % | 12.64 % |
+| `get_event` p50 / p95 (ms) | 0.006 / 0.009 | 5.35 / 5.89 | 3.24 % | 11.58 % |
+
+The ingest difference is 1.0 % (12 203.53 vs 12 079.05), inside both noise envelopes: no
+measurable difference at 100 000 events. Footprint has no noise figure (one value per size).
+
+### Results, 1 000 000 events
+
+| Metric | SQLite | ClickHouse | SQLite noise | ClickHouse noise |
+|---|---|---|---|---|
+| Ingest (events/s) | 8 781.99 | 10 968.06 | 1.94 % | 0.48 % |
+| Footprint (bytes/event) | 2 004.45 | 138.98 | n/a | n/a |
+| `host_window` p50 / p95 (ms) | 2.28 / 2.48 | 133.18 / 163.29 | 3.93 % | 6.57 % |
+| `event_type` p50 / p95 (ms) | 4.46 / 4.65 | 294.23 / 320.10 | 2.00 % | 2.10 % |
+| `process_key` p50 / p95 (ms) | 0.011 / 0.017 | 5.63 / 6.49 | 1.91 % | 7.04 % |
+| `residual` p50 / p95 (ms) | 6.43 / 6.58 | 298.38 / 317.49 | 1.15 % | 1.06 % |
+| `get_event` p50 / p95 (ms) | 0.006 / 0.012 | 4.44 / 5.08 | 2.81 % | 8.70 % |
+
+### What the numbers say
+
+- **Footprint.** ClickHouse stores an event in 126.35 bytes at 100 000 events and 138.98 bytes at
+  1 000 000; SQLite needs 2 076.41 and 2 004.45. That is 16.43 times smaller at 100 000 events and
+  14.42 times smaller at 1 000 000 (ratios computed from the table values).
+- **Ingest.** At 100 000 events there is no measurable difference (above). At 1 000 000 events
+  ClickHouse ingests 10 968.06 events/s against 8 781.99 for SQLite, 24.9 % more, which is far
+  outside both envelopes (1.94 % and 0.48 %). SQLite's rate fell from 12 203.53 to 8 781.99 between
+  the two sizes; ClickHouse's from 12 079.05 to 10 968.06.
+- **Queries.** At both sizes every shape is slower on ClickHouse. ClickHouse p50 divided by SQLite
+  p50 is 9.7 (`host_window`), 45.4 (`event_type`), 422 (`process_key`), 32.0 (`residual`) and 902
+  (`get_event`) at 100 000 events, and 58.3, 66.0, 533, 46.4 and 730 at 1 000 000. Every gap is far
+  larger than the noise envelopes. The two ClickHouse shapes that filter with a scan
+  (`event_type`, `residual`) went from about 200 ms to about 300 ms between the sizes, and
+  `host_window` from 21.92 ms to 133.18 ms. SQLite's `host_window`, `event_type` and `residual`
+  p50 did not change between sizes (2.27 to 2.28, 4.46 to 4.46, 6.42 to 6.43 ms).
+
+### Caveats
+
+- **`host_window` and `event_type` measure limit-capped scans, not full scans.** Both go through
+  `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). A query stops after
+  500 rows, so its cost does not grow with the table. That is why SQLite's `host_window` is flat
+  from 2.27 ms to 2.28 ms between 100 000 and 1 000 000 events. These shapes say nothing about a
+  query that has to read the whole table or a large part of it, which is where a column store is
+  expected to do better.
+- **Footprint is measured differently per backend.** SQLite's number is the main database file
+  plus its `-wal` file, measured without a checkpoint, so it includes WAL pages not yet merged.
+  ClickHouse's number is `disk_bytes()` after `OPTIMIZE TABLE events FINAL`, so parts are merged.
+  Each is the bench's best number for that side, not an identical procedure.
+- **One runner, one run of 5 rounds.** There is no run-to-run comparison, and the noise envelope
+  covers only the rounds inside this run. ClickHouse ran as a local service container, so the
+  figures contain no network latency beyond loopback.
+- **Single worker thread.** The ClickHouse backend serialises all requests on one worker thread,
+  the same model as SQLite's `Mutex<Connection>`. The bench issues one request at a time, so this
+  run does not measure queueing under concurrent readers.
+- **Shapes are checked for rows, not compared for equality.** Result equality between the two
+  backends is proven by the conformance suite, not by the bench.
+- SQLite's `process_key` p50 is 0.019 ms at 100 000 events and 0.011 ms at 1 000 000. That is
+  outside its own noise envelopes (7.40 % and 1.91 %), and this run does not explain it.
+
 ## Known limits
 
 - **F2, correlation fan-out (deferred).** Finding F2 had two parts. The first was a per-lookup cost
@@ -351,6 +460,8 @@ tools/real-linux/bench.sh --agent-only /tmp/bench-agent.jsonl   # includes the f
 $CARGO_TARGET_DIR/release/osiris-bench fs-loop --iterations 10000
 # The DNS send bench alone (OSIRIS_BPF_DIR as above; binds 127.0.0.1:53 and :5300; starts 15 agents):
 $CARGO_TARGET_DIR/release/osiris-bench dns-send --sends 10000
+# Storage comparison, SQLite vs ClickHouse (push a storage-bench/** branch; the workflow starts ClickHouse):
+git push origin HEAD:refs/heads/storage-bench/<name>   # .github/workflows/storage-bench.yml
 # Single configurations:
 $CARGO_TARGET_DIR/release/osiris-bench ingest --rate 1000 --duration 30
 ```
