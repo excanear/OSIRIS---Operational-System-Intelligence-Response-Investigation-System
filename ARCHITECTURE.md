@@ -1186,8 +1186,8 @@ ADR-008  Agent/Server process split and privilege boundary enforcement
 ADR-009  Response Engine: dispatch-to-agent execution model, v1 scope limited
          to non-destructive actions
 ADR-010  eBPF user-space loader is aya; kernel programs stay clang-built C CO-RE
-ADR-011  ClickHouse is an opt-in telemetry backend over HTTP; SQLite stays the default
          (docs/adr/ADR-010-ebpf-loader-aya.md; supersedes ADR-003 for the loader)
+ADR-011  ClickHouse is an opt-in telemetry backend over HTTP; SQLite stays the default
 ```
 
 Each ADR follows the master prompt's required structure: Context, Decision, Alternatives, Consequences. These are written at implementation time for each area as it is built, using this ARCHITECTURE.md as the pre-agreed context — they should not re-litigate decisions already justified here, only record any refinement made during implementation.

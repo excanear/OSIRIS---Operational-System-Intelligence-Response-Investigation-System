@@ -285,8 +285,8 @@ revisão final independente → merge → push.
   - RowBinary no lugar de JSONEachRow, se a ingestão mostrar o formato como gargalo.
   - Resultados em streaming (o trait devolve `Vec`; `wait_end_of_query=1` armazena o resultado todo
     no servidor).
-  - Índices de salto ou projeções para `event_type` e para a chave de processo (consultas filtradas
-    ficaram 32x a 66x mais lentas que o SQLite no bench).
+  - Índices de salto ou projeções para `event_type` e para a chave de processo (no bench, `event_type` ficou 45,4x e 66,0x mais lento que o
+    SQLite a 100 mil e 1 milhão de eventos, e `residual` 32,0x e 46,4x).
   - Verificar keep-alive/reuso de conexão do cliente HTTP e a latência de `get_event` (4,44 ms a
     5,35 ms contra 0,006 ms no SQLite).
   - Bench sem teto de limite (varredura completa, agregações) e com leitores concorrentes; segunda

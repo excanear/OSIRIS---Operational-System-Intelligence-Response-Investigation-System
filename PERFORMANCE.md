@@ -407,11 +407,14 @@ measurable difference at 100 000 events. Footprint has no noise figure (one valu
 ### Caveats
 
 - **`host_window` and `event_type` measure limit-capped scans, not full scans.** Both go through
-  `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). A query stops after
-  500 rows, so its cost does not grow with the table. That is why SQLite's `host_window` is flat
-  from 2.27 ms to 2.28 ms between 100 000 and 1 000 000 events. These shapes say nothing about a
-  query that has to read the whole table or a large part of it, which is where a column store is
-  expected to do better.
+  `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). On SQLite the query
+  stops after 500 rows, so its cost does not grow with the table; that is why SQLite's
+  `host_window` is flat from 2.27 ms to 2.28 ms between 100 000 and 1 000 000 events. The limit
+  does not bound the scan cost on ClickHouse: its `host_window` grew from 21.92 ms to 133.18 ms
+  and its `event_type` from 202.30 ms to 294.23 ms across the same sizes. This bench does not
+  explain that growth (the cause was not isolated). These shapes say nothing about a query that
+  has to read the whole table or a large part of it, which is where a column store is expected
+  to do better.
 - **Footprint is measured differently per backend.** SQLite's number is the main database file
   plus its `-wal` file, measured without a checkpoint, so it includes WAL pages not yet merged.
   ClickHouse's number is `disk_bytes()` after `OPTIMIZE TABLE events FINAL`, so parts are merged.
