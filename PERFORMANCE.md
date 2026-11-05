@@ -408,11 +408,11 @@ measurable difference at 100 000 events. Footprint has no noise figure (one valu
   (`get_event`) at 100 000 events, and 4.6, 5.6, 423, 4.2 and 514 at 1 000 000. Every gap is far
   larger than the noise envelopes.
 - **Growth across sizes.** On ClickHouse, `host_window` p50 went from 11.88 ms to 11.10 ms
-  (-6.6 %, inside the envelopes of 5.01 % and 8.96 %: no measurable difference), `event_type` from
-  22.91 ms to 24.94 ms (+8.9 %, inside the 6.52 % envelope at 1 000 000 events only) and `residual`
-  from 24.99 ms to 26.55 ms (+6.3 %, above both envelopes of 3.91 % and 2.53 %). So the two
-  scan-filtered shapes grow a little with table size and `host_window` does not; the cause of the
-  growth was not isolated. SQLite's `host_window`, `event_type` and `residual` p50 did not change
+  (-6.6 %, inside the 1 000 000 event envelope of 8.96 % but not the 100 000 event one of 5.01 %;
+  no growth), `event_type` from 22.91 ms to 24.94 ms (+8.9 %, above both envelopes of 2.02 % and
+  6.52 %) and `residual` from 24.99 ms to 26.55 ms (+6.3 %, above both envelopes of 3.91 % and
+  2.53 %). So the two scan-filtered shapes grew about 6 % to 9 % with table size and
+  `host_window` did not; the cause of the growth was not isolated. SQLite's `host_window`, `event_type` and `residual` p50 did not change
   between sizes beyond 1.1 % (2.43 to 2.42, 4.48 to 4.43, 6.45 to 6.38 ms).
 - **Point lookups.** `get_event` on ClickHouse is 4.30 ms at 100 000 events and 3.67 ms at
   1 000 000, against 0.007 ms on SQLite. `process_key` fell on both backends between the sizes
@@ -433,10 +433,10 @@ inflated by the over-fetch. ClickHouse p50 at 1 000 000 events, before and after
 | `residual` | 298.38 | 26.55 | 11.2x lower |
 
 At 100 000 events the same shapes went from 21.92, 202.30 and 205.66 ms to 11.88, 22.91 and
-24.99 ms. The shapes that do not go through `query_events` moved little (`get_event` 4.44 to
-3.67 ms and `process_key` 5.63 to 4.78 ms at 1 000 000 events). The runs are on different CPUs, so
-the table is not a controlled before/after; SQLite's `query_events` shapes moved by at most 5.8 %
-between the runs (`host_window` 2.28 to 2.42 ms), which is the only available hint about the
+24.99 ms. The shapes that do not go through `query_events` moved less (`get_event` 4.44 to
+3.67 ms, -17 %, and `process_key` 5.63 to 4.78 ms, -15 %, at 1 000 000 events). The runs are on different CPUs, so
+the table is not a controlled before/after; SQLite's `query_events` shapes moved by at most 7.3 %
+between the runs (`host_window` 2.27 to 2.43 ms at 100 000 events), which is the only available hint about the
 hardware effect. Footprint in the pre-fix run was in line with this run (ClickHouse 126.35 and
 138.98 bytes per event, SQLite 2 076.41 and 2 004.45). A second pre-fix-code run, 42062517877
 (`storage-bench/t11c-2` @ `0b7b8ff`), was the first with the non-empty shape checks and passed; its
@@ -448,7 +448,7 @@ artifact is not used here.
   `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). When every filter is
   pushed down, both backends now fetch only what `query_events` can return, so on SQLite the cost
   does not grow with the table (`host_window` 2.43 ms to 2.42 ms between 100 000 and 1 000 000
-  events) and on ClickHouse it grows little or not at all (above). The shapes say nothing about a
+  events) and on ClickHouse `host_window` did not grow and the other two shapes grew about 6 % to 9 % (above). The shapes say nothing about a
   query that has to read the whole table or a large part of it, which is where a column store is
   expected to do better.
 - **Footprint is measured differently per backend.** SQLite's number is the main database file

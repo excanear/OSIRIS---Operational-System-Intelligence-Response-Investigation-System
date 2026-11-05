@@ -85,7 +85,7 @@ then found that `query_events` over-fetched on ClickHouse (each scan batch asked
 when 500 were needed). After the fix (17b488e) the same shapes measure 11.10, 24.94 and 26.55 ms,
 about 11 to 12 times lower. The runs are on different CPUs, so this is not a controlled
 before/after. The earlier attribution of the query latency gap to HTTP round trips and MergeTree
-granule reads did not hold: most of that run's scan-shape latency was the over-fetch.
+granule reads did not hold: that run's scan-shape latencies were inflated by the over-fetch.
 
 - **ClickHouse wins on space and, at the larger size, on ingest.** It stores an event in about
   one fourteenth to one sixteenth of the space. At 100 000 events the ingest difference is inside
@@ -96,10 +96,11 @@ granule reads did not hold: most of that run's scan-shape latency was the over-f
   (`host_window`, `event_type`, `residual`) are 3.9x to 5.6x slower on ClickHouse; the point and
   key lookups (`get_event`, `process_key`) are two to three orders of magnitude slower in ratio
   because SQLite answers them in microseconds.
-- **Scan shapes grow little with table size.** On ClickHouse `host_window` went from 11.88 ms to
-  11.10 ms (inside the envelopes), `event_type` from 22.91 ms to 24.94 ms (inside the 1 000 000
-  event envelope of 6.52 %) and `residual` from 24.99 ms to 26.55 ms (above both envelopes).
-  This is stated as observed; the cause of the small growth was not isolated.
+- **Two scan shapes grew about 6 % to 9 % with table size.** On ClickHouse `host_window` went
+  from 11.88 ms to 11.10 ms (inside the 1 000 000 event envelope of 8.96 %; no growth),
+  `event_type` from 22.91 ms to 24.94 ms (+8.9 %, above both envelopes of 2.02 % and 6.52 %) and
+  `residual` from 24.99 ms to 26.55 ms (+6.3 %, above both envelopes of 3.91 % and 2.53 %). This
+  is stated as observed; the cause of the growth was not isolated.
 - **The per-request floor.** `get_event` on ClickHouse takes 4.30 ms and 3.67 ms (p50) at the two
   sizes. That is consistent with a per-request HTTP overhead on loopback, but it is a reading: no
   profile of the ClickHouse path was taken and the bench did not isolate it.
