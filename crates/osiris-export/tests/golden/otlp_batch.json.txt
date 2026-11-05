@@ -1,0 +1,157 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "host.id",
+            "value": {
+              "stringValue": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "web-01"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "osiris"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "attributes": [
+                {
+                  "key": "osiris.record_type",
+                  "value": {
+                    "stringValue": "event"
+                  }
+                },
+                {
+                  "key": "osiris.event_type",
+                  "value": {
+                    "stringValue": "PROCESS_EXEC"
+                  }
+                },
+                {
+                  "key": "osiris.event_id",
+                  "value": {
+                    "stringValue": "aaaaaaaa-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "body": {
+                "stringValue": "{\"boot_id\":\"boot-1\",\"category\":\"PROCESS\",\"cgroup\":null,\"container\":null,\"device\":null,\"dns\":null,\"event_data\":{},\"event_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"event_type\":\"PROCESS_EXEC\",\"file\":null,\"host\":{\"cloud\":null,\"distro\":\"ubuntu-24.04\",\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"hostname\":\"web-01\",\"kernel_version\":\"6.8.0\"},\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"kernel\":null,\"monotonic_timestamp\":5000,\"namespace\":null,\"network\":null,\"parent_process\":null,\"process\":{\"cmdline\":[\"/usr/bin/curl\",\"-l\"],\"exe_hash\":null,\"exe_path\":\"/usr/bin/curl\",\"pid\":4242,\"process_key\":\"a9651b7f8d981ae4a67caaf1666dfed1\",\"start_time_mono\":5000},\"provider\":\"test\",\"record_type\":\"event\",\"relationships\":[],\"risk\":null,\"schema_version\":\"1.0\",\"service\":null,\"session\":null,\"severity\":\"HIGH\",\"source\":\"EBPF\",\"tags\":[\"suspicious\",\"net\"],\"thread\":null,\"timestamp\":1762300800123456789,\"user\":{\"egid\":1000,\"euid\":1000,\"gid\":1000,\"loginuid\":null,\"uid\":1000,\"username\":\"alice\"}}"
+              },
+              "observedTimeUnixNano": "1762300801000000000",
+              "severityNumber": 17,
+              "severityText": "HIGH",
+              "timeUnixNano": "1762300800123456789"
+            },
+            {
+              "attributes": [
+                {
+                  "key": "osiris.record_type",
+                  "value": {
+                    "stringValue": "alert"
+                  }
+                },
+                {
+                  "key": "osiris.rule_id",
+                  "value": {
+                    "stringValue": "R-100"
+                  }
+                },
+                {
+                  "key": "osiris.alert_id",
+                  "value": {
+                    "stringValue": "bbbbbbbb-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "body": {
+                "stringValue": "{\"alert_id\":\"bbbbbbbb-0000-4000-8000-000000000001\",\"evidence\":[\"aaaaaaaa-0000-4000-8000-000000000001\",\"aaaaaaaa-0000-4000-8000-000000000002\"],\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"reasons\":[\"curl spawned by nginx\",\"outbound to rare ip\"],\"record_type\":\"alert\",\"rule_content_hash\":\"abc123\",\"rule_id\":\"R-100\",\"rule_version\":3,\"severity\":\"CRITICAL\",\"status\":\"OPEN\",\"timestamp\":1762300800123456789}"
+              },
+              "observedTimeUnixNano": "1762300801000000000",
+              "severityNumber": 21,
+              "severityText": "CRITICAL",
+              "timeUnixNano": "1762300800123456789"
+            }
+          ],
+          "scope": {
+            "name": "osiris-export"
+          }
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "host.id",
+            "value": {
+              "stringValue": "22222222-2222-4222-8222-222222222222"
+            }
+          },
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "db-01"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "osiris"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "attributes": [
+                {
+                  "key": "osiris.record_type",
+                  "value": {
+                    "stringValue": "event"
+                  }
+                },
+                {
+                  "key": "osiris.event_type",
+                  "value": {
+                    "stringValue": "PROCESS_EXEC"
+                  }
+                },
+                {
+                  "key": "osiris.event_id",
+                  "value": {
+                    "stringValue": "aaaaaaaa-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "body": {
+                "stringValue": "{\"boot_id\":\"boot-1\",\"category\":\"PROCESS\",\"cgroup\":null,\"container\":null,\"device\":null,\"dns\":null,\"event_data\":{},\"event_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"event_type\":\"PROCESS_EXEC\",\"file\":null,\"host\":{\"cloud\":null,\"distro\":\"ubuntu-24.04\",\"host_id\":\"22222222-2222-4222-8222-222222222222\",\"hostname\":\"db-01\",\"kernel_version\":\"6.8.0\"},\"host_id\":\"22222222-2222-4222-8222-222222222222\",\"kernel\":null,\"monotonic_timestamp\":5000,\"namespace\":null,\"network\":null,\"parent_process\":null,\"process\":{\"cmdline\":[\"/usr/bin/curl\",\"-l\"],\"exe_hash\":null,\"exe_path\":\"/usr/bin/curl\",\"pid\":4242,\"process_key\":\"a9651b7f8d981ae4a67caaf1666dfed1\",\"start_time_mono\":5000},\"provider\":\"test\",\"record_type\":\"event\",\"relationships\":[],\"risk\":null,\"schema_version\":\"1.0\",\"service\":null,\"session\":null,\"severity\":\"HIGH\",\"source\":\"EBPF\",\"tags\":[\"suspicious\",\"net\"],\"thread\":null,\"timestamp\":1762300800123456789,\"user\":{\"egid\":1000,\"euid\":1000,\"gid\":1000,\"loginuid\":null,\"uid\":1000,\"username\":\"alice\"}}"
+              },
+              "observedTimeUnixNano": "1762300801000000000",
+              "severityNumber": 17,
+              "severityText": "HIGH",
+              "timeUnixNano": "1762300800123456789"
+            }
+          ],
+          "scope": {
+            "name": "osiris-export"
+          }
+        }
+      ]
+    }
+  ]
+}

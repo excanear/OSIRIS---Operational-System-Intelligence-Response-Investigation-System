@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod exporter;
+pub mod format;
 pub mod record;
 
 pub use config::{
@@ -11,4 +12,8 @@ pub use config::{
 };
 pub use error::{ConfigError, ExportError};
 pub use exporter::{ExportOutcome, Exporter};
+pub use format::{
+    cef, cef_severity, csv_header, csv_row, ndjson_line, ndjson_value, otlp_logs_body, rfc5424,
+    severity_number_otlp, syslog_severity,
+};
 pub use record::{ExportRecord, Stream};

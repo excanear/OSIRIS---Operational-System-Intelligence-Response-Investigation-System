@@ -1635,11 +1635,13 @@ name = "osiris-export"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "osiris-schema",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
+ "time",
  "uuid",
 ]
 

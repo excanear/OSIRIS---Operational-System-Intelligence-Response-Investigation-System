@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use osiris_schema::{EventType, Severity};
 use serde::de::Error as _;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping, Value};
 use uuid::Uuid;
 
@@ -140,7 +140,7 @@ pub enum SyslogFormat {
     Cef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Facility {
     Kern,
