@@ -323,10 +323,13 @@ to 1 591.01 (same tree, pragmas disabled versus enabled). The final matrix run a
 Evidence for the ARCHITECTURE.md §10.2 / §79 requirement that the ClickHouse numbers are measured
 before the backend is adopted. It is recorded, not acted on: the default stays SQLite (ADR-011).
 This section is a different environment from the baseline above (GitHub Actions only, code
-`ade5a60`), so its numbers are not comparable with the WSL tables. Every number comes from the
+`b237563`), so its numbers are not comparable with the WSL tables. Every number comes from the
 JSON lines in the `storage-bench` artifact (`storage-100k.jsonl`, `storage-1m.jsonl`,
 `runner-facts.txt`). Latencies are in ms and rounded to two decimals; values under 0.1 ms are shown
 to three decimals so they do not collapse to 0.01.
+
+The tables are the run taken after a fix to `query_events` (commit `17b488e`). An earlier run on
+the unfixed code is kept as history in "Pre-fix run" below.
 
 ### Method
 
@@ -335,9 +338,8 @@ size it runs 5 rounds. Each round fills a fresh store through `batch_write` in b
 events, then times five query shapes, 20 samples each. The same pre-generated events feed both
 backends and every round, so generation cost is outside the ingest timing and both backends see
 identical data. Reported values are medians across the rounds. A warm-up call of each shape before
-sampling hard-fails the run if the shape returns no rows (commit `8da1742`, after the measured
-run's code `ade5a60`), so the bench now guarantees that every latency is for a query that found
-data. The run reported here predates that check.
+sampling hard-fails the run if the shape returns no rows (commit `8da1742`), so every latency is
+for a query that found data. The run reported here includes that check.
 
 | Shape | What it runs |
 |---|---|
@@ -355,80 +357,115 @@ difference".
 
 | Item | Value |
 |---|---|
-| Run | GitHub Actions run 41362219110, workflow `storage-bench.yml`, branch `storage-bench/t11c-1` @ `ade5a60` |
+| Run | GitHub Actions run 42066442818, workflow `storage-bench.yml`, branch `storage-bench/t11c-3` @ `b237563` |
 | Runner | `ubuntu-24.04` hosted runner, Ubuntu 24.04.5 LTS, kernel 7.0.0-1017-azure |
-| CPU / RAM | INTEL(R) XEON(R) PLATINUM 8573C, 4 vCPU / 15 GiB |
+| CPU / RAM | AMD EPYC 9V74 80-Core Processor, 4 vCPU / 15 GiB |
 | ClickHouse | `clickhouse/clickhouse-server:26.3.60.2`, version 26.3.60.2, a service container on the same runner (loopback only, no network hop) |
+
+The runner's CPU differs from the pre-fix run (Intel Xeon Platinum 8573C there), so the two runs
+are not on the same hardware.
 
 ### Results, 100 000 events
 
 | Metric | SQLite | ClickHouse | SQLite noise | ClickHouse noise |
 |---|---|---|---|---|
-| Ingest (events/s) | 12 203.53 | 12 079.05 | 3.51 % | 1.05 % |
-| Footprint (bytes/event) | 2 076.41 | 126.35 | n/a | n/a |
-| `host_window` p50 / p95 (ms) | 2.27 / 2.57 | 21.92 / 25.13 | 1.23 % | 5.12 % |
-| `event_type` p50 / p95 (ms) | 4.46 / 4.61 | 202.30 / 238.93 | 1.84 % | 15.02 % |
-| `process_key` p50 / p95 (ms) | 0.019 / 0.030 | 8.18 / 9.27 | 7.40 % | 8.60 % |
-| `residual` p50 / p95 (ms) | 6.42 / 6.62 | 205.66 / 242.40 | 0.75 % | 12.64 % |
-| `get_event` p50 / p95 (ms) | 0.006 / 0.009 | 5.35 / 5.89 | 3.24 % | 11.58 % |
+| Ingest (events/s) | 11 492.28 | 12 345.59 | 27.27 % | 0.36 % |
+| Footprint (bytes/event) | 2 077.19 | 126.83 | n/a | n/a |
+| `host_window` p50 / p95 (ms) | 2.43 / 2.61 | 11.88 / 13.29 | 1.99 % | 5.01 % |
+| `event_type` p50 / p95 (ms) | 4.48 / 4.57 | 22.91 / 24.94 | 1.86 % | 2.02 % |
+| `process_key` p50 / p95 (ms) | 0.020 / 0.031 | 8.76 / 9.24 | 3.41 % | 4.53 % |
+| `residual` p50 / p95 (ms) | 6.45 / 6.60 | 24.99 / 26.16 | 2.19 % | 3.91 % |
+| `get_event` p50 / p95 (ms) | 0.007 / 0.010 | 4.30 / 4.81 | 5.32 % | 13.48 % |
 
-The ingest difference is 1.0 % (12 203.53 vs 12 079.05), inside both noise envelopes: no
+The ingest difference is 7.4 % (11 492.28 vs 12 345.59), inside SQLite's 27.27 % envelope: no
 measurable difference at 100 000 events. Footprint has no noise figure (one value per size).
 
 ### Results, 1 000 000 events
 
 | Metric | SQLite | ClickHouse | SQLite noise | ClickHouse noise |
 |---|---|---|---|---|
-| Ingest (events/s) | 8 781.99 | 10 968.06 | 1.94 % | 0.48 % |
-| Footprint (bytes/event) | 2 004.45 | 138.98 | n/a | n/a |
-| `host_window` p50 / p95 (ms) | 2.28 / 2.48 | 133.18 / 163.29 | 3.93 % | 6.57 % |
-| `event_type` p50 / p95 (ms) | 4.46 / 4.65 | 294.23 / 320.10 | 2.00 % | 2.10 % |
-| `process_key` p50 / p95 (ms) | 0.011 / 0.017 | 5.63 / 6.49 | 1.91 % | 7.04 % |
-| `residual` p50 / p95 (ms) | 6.43 / 6.58 | 298.38 / 317.49 | 1.15 % | 1.06 % |
-| `get_event` p50 / p95 (ms) | 0.006 / 0.012 | 4.44 / 5.08 | 2.81 % | 8.70 % |
+| Ingest (events/s) | 6 759.50 | 11 882.25 | 23.40 % | 1.07 % |
+| Footprint (bytes/event) | 2 004.32 | 139.53 | n/a | n/a |
+| `host_window` p50 / p95 (ms) | 2.42 / 2.59 | 11.10 / 12.65 | 5.78 % | 8.96 % |
+| `event_type` p50 / p95 (ms) | 4.43 / 4.63 | 24.94 / 28.78 | 4.32 % | 6.52 % |
+| `process_key` p50 / p95 (ms) | 0.011 / 0.017 | 4.78 / 5.51 | 4.87 % | 16.35 % |
+| `residual` p50 / p95 (ms) | 6.38 / 6.66 | 26.55 / 28.86 | 6.62 % | 2.53 % |
+| `get_event` p50 / p95 (ms) | 0.007 / 0.010 | 3.67 / 4.38 | 2.25 % | 14.91 % |
 
 ### What the numbers say
 
-- **Footprint.** ClickHouse stores an event in 126.35 bytes at 100 000 events and 138.98 bytes at
-  1 000 000; SQLite needs 2 076.41 and 2 004.45. That is 16.43 times smaller at 100 000 events and
-  14.42 times smaller at 1 000 000 (ratios computed from the table values).
+- **Footprint.** ClickHouse stores an event in 126.83 bytes at 100 000 events and 139.53 bytes at
+  1 000 000; SQLite needs 2 077.19 and 2 004.32. That is 16.38 times smaller at 100 000 events and
+  14.37 times smaller at 1 000 000 (ratios computed from the table values).
 - **Ingest.** At 100 000 events there is no measurable difference (above). At 1 000 000 events
-  ClickHouse ingests 10 968.06 events/s against 8 781.99 for SQLite, 24.9 % more, which is far
-  outside both envelopes (1.94 % and 0.48 %). SQLite's rate fell from 12 203.53 to 8 781.99 between
-  the two sizes; ClickHouse's from 12 079.05 to 10 968.06.
+  ClickHouse ingests 11 882.25 events/s against 6 759.50 for SQLite, 75.8 % more, which is outside
+  both envelopes (23.40 % and 1.07 %). SQLite's ingest envelopes are wide in this run (27.27 % and
+  23.40 %, against 3.51 % and 1.94 % in the pre-fix run), so its ingest rate is the least stable
+  number here. SQLite's rate fell from 11 492.28 to 6 759.50 between the two sizes; ClickHouse's
+  from 12 345.59 to 11 882.25.
 - **Queries.** At both sizes every shape is slower on ClickHouse. ClickHouse p50 divided by SQLite
-  p50 is 9.7 (`host_window`), 45.4 (`event_type`), 422 (`process_key`), 32.0 (`residual`) and 902
-  (`get_event`) at 100 000 events, and 58.3, 66.0, 533, 46.4 and 730 at 1 000 000. Every gap is far
-  larger than the noise envelopes. The two ClickHouse shapes that filter with a scan
-  (`event_type`, `residual`) went from about 200 ms to about 300 ms between the sizes, and
-  `host_window` from 21.92 ms to 133.18 ms. SQLite's `host_window`, `event_type` and `residual`
-  p50 did not change between sizes (2.27 to 2.28, 4.46 to 4.46, 6.42 to 6.43 ms).
+  p50 is 4.9 (`host_window`), 5.1 (`event_type`), 445 (`process_key`), 3.9 (`residual`) and 615
+  (`get_event`) at 100 000 events, and 4.6, 5.6, 423, 4.2 and 514 at 1 000 000. Every gap is far
+  larger than the noise envelopes.
+- **Growth across sizes.** On ClickHouse, `host_window` p50 went from 11.88 ms to 11.10 ms
+  (-6.6 %, inside the envelopes of 5.01 % and 8.96 %: no measurable difference), `event_type` from
+  22.91 ms to 24.94 ms (+8.9 %, inside the 6.52 % envelope at 1 000 000 events only) and `residual`
+  from 24.99 ms to 26.55 ms (+6.3 %, above both envelopes of 3.91 % and 2.53 %). So the two
+  scan-filtered shapes grow a little with table size and `host_window` does not; the cause of the
+  growth was not isolated. SQLite's `host_window`, `event_type` and `residual` p50 did not change
+  between sizes beyond 1.1 % (2.43 to 2.42, 4.48 to 4.43, 6.45 to 6.38 ms).
+- **Point lookups.** `get_event` on ClickHouse is 4.30 ms at 100 000 events and 3.67 ms at
+  1 000 000, against 0.007 ms on SQLite. `process_key` fell on both backends between the sizes
+  (ClickHouse 8.76 to 4.78 ms, SQLite 0.020 to 0.011 ms); this run does not explain it.
+
+### Pre-fix run
+
+Run 41362219110 (branch `storage-bench/t11c-1` @ `ade5a60`, Intel Xeon Platinum 8573C) was taken
+before a review found that `query_events` over-fetched. On ClickHouse each scan batch asked for
+20 000 rows even when 500 were needed. Commit `17b488e` made it fetch only what the query can
+return. That run's ClickHouse latencies for the shapes that go through `query_events` were
+inflated by the over-fetch. ClickHouse p50 at 1 000 000 events, before and after:
+
+| Shape | Pre-fix (ms) | Post-fix (ms) | Ratio |
+|---|---|---|---|
+| `host_window` | 133.18 | 11.10 | 12.0x lower |
+| `event_type` | 294.23 | 24.94 | 11.8x lower |
+| `residual` | 298.38 | 26.55 | 11.2x lower |
+
+At 100 000 events the same shapes went from 21.92, 202.30 and 205.66 ms to 11.88, 22.91 and
+24.99 ms. The shapes that do not go through `query_events` moved little (`get_event` 4.44 to
+3.67 ms and `process_key` 5.63 to 4.78 ms at 1 000 000 events). The runs are on different CPUs, so
+the table is not a controlled before/after; SQLite's `query_events` shapes moved by at most 5.8 %
+between the runs (`host_window` 2.28 to 2.42 ms), which is the only available hint about the
+hardware effect. Footprint in the pre-fix run was in line with this run (ClickHouse 126.35 and
+138.98 bytes per event, SQLite 2 076.41 and 2 004.45). A second pre-fix-code run, 42062517877
+(`storage-bench/t11c-2` @ `0b7b8ff`), was the first with the non-empty shape checks and passed; its
+artifact is not used here.
 
 ### Caveats
 
 - **`host_window` and `event_type` measure limit-capped scans, not full scans.** Both go through
-  `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). On SQLite the query
-  stops after 500 rows, so its cost does not grow with the table; that is why SQLite's
-  `host_window` is flat from 2.27 ms to 2.28 ms between 100 000 and 1 000 000 events. The limit
-  does not bound the scan cost on ClickHouse: its `host_window` grew from 21.92 ms to 133.18 ms
-  and its `event_type` from 202.30 ms to 294.23 ms across the same sizes. This bench does not
-  explain that growth (the cause was not isolated). These shapes say nothing about a query that
-  has to read the whole table or a large part of it, which is where a column store is expected
-  to do better.
+  `query_events`, which applies the plan limit (`DEFAULT_EVENT_LIMIT`, 500). When every filter is
+  pushed down, both backends now fetch only what `query_events` can return, so on SQLite the cost
+  does not grow with the table (`host_window` 2.43 ms to 2.42 ms between 100 000 and 1 000 000
+  events) and on ClickHouse it grows little or not at all (above). The shapes say nothing about a
+  query that has to read the whole table or a large part of it, which is where a column store is
+  expected to do better.
 - **Footprint is measured differently per backend.** SQLite's number is the main database file
   plus its `-wal` file, measured without a checkpoint, so it includes WAL pages not yet merged.
   ClickHouse's number is `disk_bytes()` after `OPTIMIZE TABLE events FINAL`, so parts are merged.
   Each is the bench's best number for that side, not an identical procedure.
 - **One runner, one run of 5 rounds.** There is no run-to-run comparison, and the noise envelope
-  covers only the rounds inside this run. ClickHouse ran as a local service container, so the
-  figures contain no network latency beyond loopback.
+  covers only the rounds inside this run. The two runs in this section used different CPUs.
+  ClickHouse ran as a local service container, so the figures contain no network latency beyond
+  loopback.
 - **Single worker thread.** The ClickHouse backend serialises all requests on one worker thread,
   the same model as SQLite's `Mutex<Connection>`. The bench issues one request at a time, so this
   run does not measure queueing under concurrent readers.
 - **Shapes are checked for rows, not compared for equality.** Result equality between the two
   backends is proven by the conformance suite, not by the bench.
-- SQLite's `process_key` p50 is 0.019 ms at 100 000 events and 0.011 ms at 1 000 000. That is
-  outside its own noise envelopes (7.40 % and 1.91 %), and this run does not explain it.
+- SQLite's `process_key` p50 is 0.020 ms at 100 000 events and 0.011 ms at 1 000 000. That is
+  outside its own noise envelopes (3.41 % and 4.87 %), and this run does not explain it.
 
 ## Known limits
 

@@ -537,12 +537,17 @@ comparison".
 | 41356079440 | `ci/t11c-1` @ `09962fd` | build-test, console, clickhouse (transport, schema, events) | green |
 | 41359191075 | `ci/t11c-2` @ `c2402a1` | full conformance on ClickHouse 26.3.60.2 (events, alerts, relationships, risk scores) | green |
 | 41360547283 | `ci/t11c-3` @ `f117fe8` | the above plus the server end-to-end test on `storage_backend: clickhouse` | green |
-| 41362219110 | `storage-bench/t11c-1` @ `ade5a60` | `storage-bench.yml`: SQLite vs ClickHouse at 100 000 and 1 000 000 events | success; numbers in `PERFORMANCE.md` |
+| 41362219110 | `storage-bench/t11c-1` @ `ade5a60` | `storage-bench.yml`: SQLite vs ClickHouse at 100 000 and 1 000 000 events, before the `query_events` fetch fix | success; kept as the pre-fix run in `PERFORMANCE.md` |
+| 42062517877 | `storage-bench/t11c-2` @ `0b7b8ff` | `storage-bench.yml` with the non-empty shape checks, still before the fetch fix | success; artifact not used |
+| 42066442375 | `ci/t11c-4` @ `b237563` | build-test, console, clickhouse after the `query_events` fetch fix (`17b488e`) | green |
+| 42066442818 | `storage-bench/t11c-3` @ `b237563` | `storage-bench.yml`: SQLite vs ClickHouse at 100 000 and 1 000 000 events, after the fetch fix | success; current numbers in `PERFORMANCE.md` |
 
-The bench run is not a CI gate. It ran on `ubuntu-24.04`, kernel 7.0.0-1017-azure, 4 vCPU Intel
-Xeon Platinum 8573C, 15 GiB, ClickHouse 26.3.60.2. After that run the bench was changed (commit
-`8da1742`) so that it fails when a query shape returns no rows; the reported numbers are from the
-run before that change.
+The bench runs are not a CI gate. The current one (42066442818) ran on `ubuntu-24.04`, kernel
+7.0.0-1017-azure, 4 vCPU AMD EPYC 9V74, 15 GiB, ClickHouse 26.3.60.2; the first (41362219110) ran
+on an Intel Xeon Platinum 8573C of the same size. A review found that `query_events` over-fetched
+on ClickHouse, which inflated the first run's scan-shape latencies; the fix is `17b488e`. The bench
+fails when a query shape returns no rows (commit `8da1742`); the first run predates that check and
+the two later runs include it.
 
 ### Known limitations
 

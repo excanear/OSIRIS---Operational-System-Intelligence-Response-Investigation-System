@@ -275,8 +275,8 @@ revisão final independente → merge → push.
   - O piso de kernel 5.15 segue raciocinado, não executado.
 - **ClickHouse** (§10.2) — FEITO (Fase 11c): backend opt-in completo do trait `Storage`
   (`crates/osiris-storage-clickhouse`, HTTP, ClickHouse 26.3.60.2 LTS), suíte de conformidade
-  compartilhada com o SQLite, teste e2e do servidor e benchmark vs. SQLite (run 41362219110; números
-  em `PERFORMANCE.md`, decisões em `docs/adr/ADR-011-clickhouse-storage.md`). O padrão continua
+  compartilhada com o SQLite, teste e2e do servidor e benchmark vs. SQLite (run 42066442818, após a correção do fetch de
+  `query_events`; números em `PERFORMANCE.md`, decisões em `docs/adr/ADR-011-clickhouse-storage.md`). O padrão continua
   SQLite: os números foram registrados, não acionados. Dívidas:
   - Segurança com vários escritores: o dedupe de ids vale só com um processo servidor por banco
     (mutex de escrita local ao processo).
@@ -285,10 +285,17 @@ revisão final independente → merge → push.
   - RowBinary no lugar de JSONEachRow, se a ingestão mostrar o formato como gargalo.
   - Resultados em streaming (o trait devolve `Vec`; `wait_end_of_query=1` armazena o resultado todo
     no servidor).
-  - Índices de salto ou projeções para `event_type` e para a chave de processo (no bench, `event_type` ficou 45,4x e 66,0x mais lento que o
-    SQLite a 100 mil e 1 milhão de eventos, e `residual` 32,0x e 46,4x).
-  - Verificar keep-alive/reuso de conexão do cliente HTTP e a latência de `get_event` (4,44 ms a
-    5,35 ms contra 0,006 ms no SQLite).
+  - Índices de salto ou projeções para `event_type` e para a chave de processo, se esses filtros
+    precisarem chegar mais perto do SQLite (no bench, `event_type` ficou 5,1x e 5,6x mais lento que
+    o SQLite a 100 mil e 1 milhão de eventos, e `residual` 3,9x e 4,2x).
+  - Verificar keep-alive/reuso de conexão do cliente HTTP e a latência de `get_event` (3,67 ms a
+    4,30 ms contra 0,007 ms no SQLite; compatível com um custo fixo por requisição, leitura não
+    medida).
+  - `ClickHouseConfig` deriva `Debug` com a url crua (`config.rs:102`); nada a imprime hoje e
+    credenciais na URL já são rejeitadas no início, mas um `{:?}` futuro imprimiria a URL —
+    implementar `Debug` com `redacted_url`.
+  - `Transport::start` não rejeita um caminho na URL (o caminho é descartado das mensagens; só
+    falta rigor).
   - Bench sem teto de limite (varredura completa, agregações) e com leitores concorrentes; segunda
     rodada ou segundo runner para ter envelope de ruído entre execuções.
   - Fraquezas conhecidas adiadas (ADR-011): razões de risco órfãs não determinísticas após falha de
