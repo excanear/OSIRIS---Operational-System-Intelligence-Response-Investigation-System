@@ -13,6 +13,7 @@ use osiris_query::{eval_ast, Ast, EventQueryPlan, Op, Value};
 use osiris_schema::CanonicalEvent;
 use osiris_storage::{QueryPlan, StorageError, MAX_TENANT_HOSTS};
 use serde_json::Value as Json;
+use uuid::Uuid;
 
 use crate::events::{backend, serde_str};
 use crate::transport::ExternalTable;
@@ -154,10 +155,87 @@ fn decode_row(line: &str) -> Result<(CanonicalEvent, Json), StorageError> {
     Ok((event, row))
 }
 
-fn in_hosts(event: &CanonicalEvent, hosts: &Option<HashSet<&str>>) -> bool {
-    hosts
-        .as_ref()
-        .is_none_or(|h| h.contains(event.host_id.to_string().as_str()))
+/// One `Op::Eq` leaf as it is pushed into SQL.
+enum Pushed<'a> {
+    Str(&'static str, &'a str),
+    Uid(u64),
+}
+
+/// How a leaf is pushed down, or `None` when only the residual
+/// `eval_ast` pass checks it. A leaf whose value type does not fit the
+/// column stays residual: pushdown may only ever over-fetch.
+fn pushed_leaf<'a>(field: &str, op: Op, value: &'a Value) -> Option<Pushed<'a>> {
+    if op != Op::Eq {
+        return None;
+    }
+    let column = match field {
+        "event_type" => "event_type",
+        "category" => "category",
+        "process.process_key" => "process_key",
+        "file.path" => "file_path",
+        "dns.query" => "dns_domain",
+        "session.session_id" => "session_id",
+        "user.uid" => "user_uid",
+        "service.unit_name" => "unit_name",
+        "container.container_id" => "container_id",
+        _ => return None,
+    };
+    match (column, value) {
+        ("user_uid", Value::Num(n)) => exact_u32(*n).map(Pushed::Uid),
+        ("user_uid", _) | (_, Value::Num(_)) | (_, Value::List(_)) => None,
+        (_, Value::Str(s)) => Some(Pushed::Str(column, s)),
+    }
+}
+
+/// `true` when SQL already applies the whole filter, so (barring a
+/// pushdown over-fetch, which the scan detects) every fetched row is
+/// returned.
+fn pushdown_is_exact(filter: Option<&Ast>) -> bool {
+    filter.is_none_or(|ast| {
+        conjunction_leaves(ast).is_some_and(|leaves| {
+            leaves
+                .iter()
+                .all(|(field, op, value)| pushed_leaf(field, *op, value).is_some())
+        })
+    })
+}
+
+/// Rows the next `query_events` scan batch asks for.
+///
+/// - `exact` (no residual filter): only the `remaining` rows still wanted.
+/// - otherwise: `remaining` for the first batch, then four times the
+///   previous batch, never less than `remaining`.
+///
+/// Always capped by `cap` (one round-trip) and by `scan_left`, the rows
+/// left before `MAX_SCAN_ROWS`, so the scan stops on exactly the same row
+/// as with fixed-size batches. Never `0`.
+fn next_batch_limit(
+    exact: bool,
+    remaining: u64,
+    previous: Option<u64>,
+    cap: u64,
+    scan_left: u64,
+) -> u64 {
+    let want = match (exact, previous) {
+        (false, Some(prev)) => prev.saturating_mul(4).max(remaining),
+        _ => remaining,
+    };
+    want.min(cap).min(scan_left).max(1)
+}
+
+/// The tenant host set, parsed once per call. Only an id in its canonical
+/// (lowercase hyphenated) spelling is kept: the old string comparison
+/// against `host_id.to_string()` matched nothing else either.
+fn host_set(host_ids: &Option<Vec<String>>) -> Option<HashSet<Uuid>> {
+    host_ids.as_ref().map(|ids| {
+        ids.iter()
+            .filter_map(|s| Uuid::parse_str(s).ok().filter(|u| u.to_string() == *s))
+            .collect()
+    })
+}
+
+fn in_hosts(host_id: Uuid, hosts: &Option<HashSet<Uuid>>) -> bool {
+    hosts.as_ref().is_none_or(|h| h.contains(&host_id))
 }
 
 impl ClickHouseStorage {
@@ -249,14 +327,11 @@ impl ClickHouseStorage {
             &format!("ORDER BY timestamp ASC, event_id ASC LIMIT {l}"),
         )?;
 
-        let hosts: Option<HashSet<&str>> = plan
-            .host_ids
-            .as_ref()
-            .map(|ids| ids.iter().map(String::as_str).collect());
+        let hosts = host_set(&plan.host_ids);
         let mut events = Vec::new();
         for line in text.lines() {
             let (event, _) = decode_row(line)?;
-            if in_hosts(&event, &hosts) {
+            if in_hosts(event.host_id, &hosts) {
                 events.push(event);
             }
         }
@@ -285,31 +360,10 @@ impl ClickHouseStorage {
         let mut f = Filter::new();
         if let Some(leaves) = plan.filter.as_ref().and_then(conjunction_leaves) {
             for (field, op, value) in leaves {
-                if op != Op::Eq {
-                    continue;
-                }
-                let column = match field {
-                    "event_type" => "event_type",
-                    "category" => "category",
-                    "process.process_key" => "process_key",
-                    "file.path" => "file_path",
-                    "dns.query" => "dns_domain",
-                    "session.session_id" => "session_id",
-                    "user.uid" => "user_uid",
-                    "service.unit_name" => "unit_name",
-                    "container.container_id" => "container_id",
-                    _ => continue,
-                };
-                // A leaf whose value type does not fit the column is left to
-                // the residual pass: pushdown may only ever over-fetch.
-                match (column, value) {
-                    ("user_uid", Value::Num(n)) => {
-                        if let Some(uid) = exact_u32(*n) {
-                            f.eq_u64("user_uid", "UInt32", uid);
-                        }
-                    }
-                    ("user_uid", _) | (_, Value::Num(_)) | (_, Value::List(_)) => {}
-                    (_, Value::Str(s)) => f.eq_str(column, s),
+                match pushed_leaf(field, op, value) {
+                    Some(Pushed::Str(column, s)) => f.eq_str(column, s),
+                    Some(Pushed::Uid(uid)) => f.eq_u64("user_uid", "UInt32", uid),
+                    None => {}
                 }
             }
         }
@@ -318,12 +372,14 @@ impl ClickHouseStorage {
         }
         f.window(plan.since, plan.until);
 
-        let hosts: Option<HashSet<&str>> = plan
-            .host_ids
-            .as_ref()
-            .map(|ids| ids.iter().map(String::as_str).collect());
+        let hosts = host_set(&plan.host_ids);
         let base_len = f.sql.len();
         let base_params = f.params.len();
+        // Batch sizing only changes how many rows each request asks for;
+        // the rows scanned, in order, and the rows returned are the same as
+        // with fixed `batch_size` batches.
+        let mut exact = pushdown_is_exact(plan.filter.as_ref());
+        let mut previous: Option<u64> = None;
 
         let mut events = Vec::new();
         let mut cursor: Option<(u64, String)> = None;
@@ -338,7 +394,16 @@ impl ClickHouseStorage {
                     "(timestamp > {t} OR (timestamp = {t} AND event_id > {i}))"
                 ));
             }
-            let l = f.bind("UInt64", batch_size.to_string());
+            let remaining = (effective_limit - events.len()) as u64;
+            let limit = next_batch_limit(
+                exact,
+                remaining,
+                previous,
+                batch_size,
+                MAX_SCAN_ROWS - scanned,
+            );
+            previous = Some(limit);
+            let l = f.bind("UInt64", limit.to_string());
             let text = self.select_events(
                 "raw_json, timestamp, event_id",
                 &f,
@@ -361,7 +426,7 @@ impl ClickHouseStorage {
                     .ok_or_else(|| backend("clickhouse: event_id missing from row"))?
                     .to_string();
                 last_seen = Some((timestamp, event_id));
-                if in_hosts(&event, &hosts)
+                if in_hosts(event.host_id, &hosts)
                     && plan.filter.as_ref().is_none_or(|ast| eval_ast(&event, ast))
                 {
                     events.push(event);
@@ -369,13 +434,19 @@ impl ClickHouseStorage {
                         reached_limit = true;
                         break;
                     }
+                } else {
+                    // Defensive: should pushdown ever over-fetch, stop
+                    // assuming every row is kept and grow the batches from
+                    // here on rather than paging a few rows at a time.
+                    exact = false;
                 }
             }
             if reached_limit {
                 break;
             }
             scanned += batch_rows;
-            if batch_rows < batch_size || scanned >= MAX_SCAN_ROWS {
+            // A short batch means the range is exhausted.
+            if batch_rows < limit || scanned >= MAX_SCAN_ROWS {
                 break;
             }
             match last_seen {
@@ -424,6 +495,75 @@ mod tests {
         })
         .expect("open fresh database");
         DropGuard(storage)
+    }
+
+    use super::{host_set, in_hosts, next_batch_limit, pushdown_is_exact};
+
+    const CAP: u64 = super::SCAN_BATCH_SIZE;
+    const BUDGET: u64 = super::MAX_SCAN_ROWS;
+
+    #[test]
+    fn exact_pushdown_fetches_only_what_is_still_wanted() {
+        assert_eq!(next_batch_limit(true, 500, None, CAP, BUDGET), 500);
+        // Later batches still ask only for the remainder.
+        assert_eq!(next_batch_limit(true, 120, Some(500), CAP, BUDGET), 120);
+        // The cap still bounds one round-trip.
+        assert_eq!(next_batch_limit(true, 1_000_000, None, CAP, BUDGET), CAP);
+    }
+
+    #[test]
+    fn residual_scan_starts_at_the_limit_and_grows_fourfold_to_the_cap() {
+        assert_eq!(next_batch_limit(false, 500, None, CAP, BUDGET), 500);
+        assert_eq!(next_batch_limit(false, 499, Some(500), CAP, BUDGET), 2_000);
+        assert_eq!(
+            next_batch_limit(false, 499, Some(2_000), CAP, BUDGET),
+            8_000
+        );
+        assert_eq!(next_batch_limit(false, 499, Some(8_000), CAP, BUDGET), CAP);
+        assert_eq!(next_batch_limit(false, 499, Some(CAP), CAP, BUDGET), CAP);
+        // Growth never asks for fewer rows than are still wanted.
+        assert_eq!(next_batch_limit(false, 400, Some(3), CAP, BUDGET), 400);
+        // A tiny test cap is honoured from the first batch.
+        assert_eq!(next_batch_limit(false, 500, None, 5, BUDGET), 5);
+    }
+
+    #[test]
+    fn batch_never_scans_past_the_row_budget() {
+        // Same rows scanned in total as fixed-size batches: the cut-off
+        // lands exactly on MAX_SCAN_ROWS.
+        assert_eq!(next_batch_limit(false, 500, Some(CAP), CAP, 1_234), 1_234);
+        assert_eq!(next_batch_limit(true, 500, None, CAP, 7), 7);
+    }
+
+    #[test]
+    fn pushdown_is_exact_only_when_every_leaf_is_pushed() {
+        let exact =
+            |q: &str| pushdown_is_exact(EventQueryPlan::with_filter(q).unwrap().filter.as_ref());
+        assert!(pushdown_is_exact(None));
+        assert!(exact("event_type = \"process_start\""));
+        assert!(exact("category = \"process\" AND user.uid = 0"));
+        assert!(!exact("process.pid = 12"));
+        assert!(!exact("user.uid = \"0\""));
+        assert!(!exact("user.uid = 1.5"));
+        assert!(!exact("event_type = \"a\" OR event_type = \"b\""));
+        assert!(!exact("NOT event_type = \"a\""));
+        assert!(!exact("file.path CONTAINS \"tmp\""));
+        assert!(!exact("event_type = \"a\" AND process.pid = 1"));
+    }
+
+    #[test]
+    fn host_set_matches_only_canonical_ids() {
+        let id = uuid::Uuid::new_v4();
+        let canonical = id.to_string();
+        let upper = canonical.to_uppercase();
+        let set = host_set(&Some(vec![canonical.clone(), "not-a-uuid".to_string()]));
+        assert!(in_hosts(id, &set));
+        assert!(!in_hosts(uuid::Uuid::new_v4(), &set));
+        // A non-canonical spelling never matched a `to_string()` host id,
+        // and still does not.
+        assert!(!in_hosts(id, &host_set(&Some(vec![upper]))));
+        assert!(!in_hosts(id, &host_set(&Some(vec![]))));
+        assert!(in_hosts(id, &host_set(&None)));
     }
 
     #[test]

@@ -139,6 +139,10 @@ impl ClickHouseStorage {
             inserted += 1;
         }
         if inserted > 0 {
+            // ClickHouse splits a body larger than `max_insert_block_size`
+            // into several blocks, so a failure partway through can leave a
+            // partial write. A retry repairs it: step 2 skips the ids that
+            // did land, so writes deduplicate.
             self.transport.execute(
                 &format!("INSERT INTO {}.events FORMAT JSONEachRow", self.database),
                 &[],
