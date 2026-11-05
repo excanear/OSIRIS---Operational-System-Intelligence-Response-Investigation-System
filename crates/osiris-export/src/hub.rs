@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use osiris_schema::{Alert, CanonicalEvent};
@@ -35,6 +35,11 @@ use crate::record::ExportRecord;
 
 /// How long workers get to flush on shutdown (spec §5.2).
 const SHUTDOWN_FLUSH: Duration = Duration::from_secs(5);
+/// A worker stops this much before the 5 s budget so it can count what it
+/// could not flush before `shutdown()` aborts it.
+const SHUTDOWN_MARGIN: Duration = Duration::from_millis(50);
+/// Upper bound on one `hosts_of` call; on timeout the previous set is kept.
+const TENANT_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tenant host-set refresh period (spec §5.5).
 const TENANT_REFRESH: Duration = Duration::from_secs(10);
 /// At most one drop warning per exporter per this period.
@@ -137,6 +142,9 @@ struct Shared {
     name: String,
     kind: &'static str,
     c: Counters,
+    /// Records the worker holds or has in flight, not yet counted anywhere.
+    /// Read by `shutdown()` if it has to abort the worker.
+    in_hand: AtomicU64,
     health: Mutex<Health>,
     last_warn: Mutex<Option<std::time::Instant>>,
 }
@@ -199,12 +207,18 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn push(&self, rec: Rec) {
+    /// Returns `true` if the record was dropped (and counted).
+    fn push(&self, rec: Rec) -> bool {
         // `Closed` only happens after shutdown; still counted, never silent.
         if self.tx.try_send(rec).is_err() {
             add(&self.shared.c.dropped_queue_full, 1);
-            self.shared.warn_drops();
+            return true;
         }
+        false
+    }
+
+    fn depth(&self) -> u64 {
+        (self.tx.max_capacity() - self.tx.capacity()) as u64
     }
 }
 
@@ -229,7 +243,10 @@ impl TenantCache {
 pub struct ExportHub {
     workers: Vec<WorkerHandle>,
     tenants: Arc<TenantCache>,
+    /// Any worker tenant-scoped? If not, `offer` skips the tenant lock.
+    any_tenant: bool,
     cancel: CancellationToken,
+    /// Worker tasks in `workers` order, then the refresher (if any).
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -252,6 +269,7 @@ impl ExportHub {
                 name: s.name.clone(),
                 kind: s.kind,
                 c: Counters::default(),
+                in_hand: AtomicU64::new(0),
                 health: Mutex::new(Health {
                     state: ExporterState::Ok,
                     last_success_at: None,
@@ -271,6 +289,7 @@ impl ExportHub {
                 flush_interval: s.flush_interval,
                 max_retries: s.max_retries,
                 cancel: cancel.clone(),
+                stop_at: OnceLock::new(),
             };
             tasks.push(tokio::spawn(worker.run(rx)));
             workers.push(WorkerHandle {
@@ -281,7 +300,8 @@ impl ExportHub {
             });
         }
 
-        if !tenant_ids.is_empty() {
+        let any_tenant = !tenant_ids.is_empty();
+        if any_tenant {
             match tenants {
                 Some(store) => tasks.push(tokio::spawn(run_refresher(
                     store,
@@ -299,6 +319,7 @@ impl ExportHub {
         Arc::new(ExportHub {
             workers,
             tenants: cache,
+            any_tenant,
             cancel,
             tasks: Mutex::new(tasks),
         })
@@ -309,28 +330,44 @@ impl ExportHub {
         if self.workers.is_empty() {
             return;
         }
-        let sets = self.tenants.sets.read().unwrap_or_else(|p| p.into_inner());
-        let allowed = |w: &WorkerHandle, host: Uuid| match w.tenant_id {
-            None => true,
-            Some(t) => sets.get(&t).is_some_and(|hosts| hosts.contains(&host)),
-        };
-        for e in events {
-            let mut rec: Option<Rec> = None;
-            for w in &self.workers {
-                if w.filter.accepts_event(e) && allowed(w, e.host_id) {
-                    let r = rec.get_or_insert_with(|| Arc::new(ExportRecord::Event(e.clone())));
-                    w.push(r.clone());
+        // Indices of workers that dropped something; warned after the tenant
+        // guard is released. Allocates only when a drop happens.
+        let mut dropped: Vec<usize> = Vec::new();
+        {
+            let sets = self
+                .any_tenant
+                .then(|| self.tenants.sets.read().unwrap_or_else(|p| p.into_inner()));
+            let allowed = |w: &WorkerHandle, host: Uuid| match (w.tenant_id, &sets) {
+                (None, _) => true,
+                (Some(t), Some(sets)) => sets.get(&t).is_some_and(|hosts| hosts.contains(&host)),
+                (Some(_), None) => false,
+            };
+            let mut push = |i: usize, w: &WorkerHandle, r: &Rec| {
+                if w.push(r.clone()) && !dropped.contains(&i) {
+                    dropped.push(i);
+                }
+            };
+            for e in events {
+                let mut rec: Option<Rec> = None;
+                for (i, w) in self.workers.iter().enumerate() {
+                    if w.filter.accepts_event(e) && allowed(w, e.host_id) {
+                        let r = rec.get_or_insert_with(|| Arc::new(ExportRecord::Event(e.clone())));
+                        push(i, w, r);
+                    }
+                }
+            }
+            for a in alerts {
+                let mut rec: Option<Rec> = None;
+                for (i, w) in self.workers.iter().enumerate() {
+                    if w.filter.accepts_alert(a) && allowed(w, a.host_id()) {
+                        let r = rec.get_or_insert_with(|| Arc::new(ExportRecord::Alert(a.clone())));
+                        push(i, w, r);
+                    }
                 }
             }
         }
-        for a in alerts {
-            let mut rec: Option<Rec> = None;
-            for w in &self.workers {
-                if w.filter.accepts_alert(a) && allowed(w, a.host_id()) {
-                    let r = rec.get_or_insert_with(|| Arc::new(ExportRecord::Alert(a.clone())));
-                    w.push(r.clone());
-                }
-            }
+        for i in dropped {
+            self.workers[i].shared.warn_drops();
         }
     }
 
@@ -344,7 +381,7 @@ impl ExportHub {
                     name: w.shared.name.clone(),
                     kind: w.shared.kind,
                     state: h.state,
-                    queued: (w.tx.max_capacity() - w.tx.capacity()) as u64,
+                    queued: w.depth(),
                     sent_records: get(&c.sent_records),
                     sent_batches: get(&c.sent_batches),
                     send_errors: get(&c.send_errors),
@@ -361,8 +398,10 @@ impl ExportHub {
     }
 
     /// Cancels (idempotent) and waits up to 5 s in total for the workers to
-    /// flush; whatever is still running then is aborted. All exporters end
-    /// `STOPPED`.
+    /// flush; whatever is still running then is aborted. Workers stop and
+    /// count their own losses just before the deadline; for a worker that
+    /// still has to be aborted, its queue depth and in-hand records are
+    /// counted here as `dropped_after_retries`. All exporters end `STOPPED`.
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|p| p.into_inner()));
@@ -376,8 +415,18 @@ impl ExportHub {
         .await;
         if joined.is_err() {
             tracing::warn!("exporters did not flush within 5 s; aborting");
-            for a in aborts {
+            for (i, a) in aborts.iter().enumerate() {
+                if a.is_finished() {
+                    continue;
+                }
                 a.abort();
+                if let Some(w) = self.workers.get(i) {
+                    let lost = w.depth() + w.shared.in_hand.swap(0, Ordering::Relaxed);
+                    if lost > 0 {
+                        add(&w.shared.c.dropped_after_retries, lost);
+                        w.shared.warn_drops();
+                    }
+                }
             }
         }
         for w in &self.workers {
@@ -410,23 +459,36 @@ async fn run_refresher(
         }
         for &tenant in &tenant_ids {
             let s = store.clone();
-            match tokio::task::spawn_blocking(move || s.hosts_of(tenant)).await {
-                Ok(Ok(hosts)) => {
-                    cache
+            let load = tokio::task::spawn_blocking(move || s.hosts_of(tenant));
+            // A hung store must not stall shutdown or later rounds; the
+            // blocking call itself cannot be cancelled and is left to finish.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                r = tokio::time::timeout(TENANT_LOAD_TIMEOUT, load) => r,
+            };
+            match result {
+                Ok(Ok(Ok(hosts))) => {
+                    // The replaced set is dropped after the guard is released.
+                    let _old = cache
                         .sets
                         .write()
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(tenant, hosts);
                 }
-                Ok(Err(e)) => tracing::error!(
+                Ok(Ok(Err(e))) => tracing::error!(
                     tenant_id = %tenant,
                     error = %e,
                     "exporter tenant host-set refresh failed; keeping the previous set"
                 ),
-                Err(e) => tracing::error!(
+                Ok(Err(e)) => tracing::error!(
                     tenant_id = %tenant,
                     error = %e,
                     "exporter tenant host-set refresh task failed; keeping the previous set"
+                ),
+                Err(_) => tracing::error!(
+                    tenant_id = %tenant,
+                    "exporter tenant host-set refresh timed out; keeping the previous set"
                 ),
             }
         }
@@ -456,6 +518,9 @@ enum Delivery {
     Done,
     /// Cancelled during a backoff sleep; the batch is handed back uncounted.
     Interrupted(Vec<Rec>),
+    /// The shutdown deadline passed while the export was in flight; the
+    /// export was aborted and these records are not counted yet.
+    Expired(u64),
 }
 
 struct Worker {
@@ -465,11 +530,33 @@ struct Worker {
     flush_interval: Duration,
     max_retries: u32,
     cancel: CancellationToken,
+    /// Fixed the first time this worker observes cancellation.
+    stop_at: OnceLock<Instant>,
 }
 
 impl Worker {
+    /// The worker's own shutdown deadline: 5 s (minus a margin, so it can
+    /// count its losses before `shutdown()` aborts it) after it first saw
+    /// cancellation.
+    fn stop_at(&self) -> Instant {
+        *self
+            .stop_at
+            .get_or_init(|| Instant::now() + SHUTDOWN_FLUSH - SHUTDOWN_MARGIN)
+    }
+
+    /// Resolves once cancellation has fired and the stop deadline has passed.
+    async fn expired(&self) {
+        self.cancel.cancelled().await;
+        sleep_until(self.stop_at()).await;
+    }
+
+    fn set_in_hand(&self, n: usize) {
+        self.shared.in_hand.store(n as u64, Ordering::Relaxed);
+    }
+
     async fn run(self, mut rx: mpsc::Receiver<Rec>) {
         let mut held: Vec<Rec> = Vec::with_capacity(self.batch_max);
+        let mut lost = 0u64;
         'run: loop {
             tokio::select! {
                 biased;
@@ -479,6 +566,7 @@ impl Worker {
                     None => break 'run,
                 },
             }
+            self.set_in_hand(held.len());
             let deadline = Instant::now() + self.flush_interval;
             while held.len() < self.batch_max {
                 tokio::select! {
@@ -490,42 +578,61 @@ impl Worker {
                     },
                     _ = sleep_until(deadline) => break,
                 }
+                self.set_in_hand(held.len());
             }
             let batch = std::mem::replace(&mut held, Vec::with_capacity(self.batch_max));
-            if let Delivery::Interrupted(b) = self.deliver(batch, self.max_retries).await {
-                held = b;
-                break 'run;
+            match self.deliver(batch, self.max_retries).await {
+                Delivery::Done => self.set_in_hand(0),
+                Delivery::Interrupted(b) => {
+                    held = b;
+                    break 'run;
+                }
+                Delivery::Expired(n) => {
+                    lost = n;
+                    break 'run;
+                }
             }
             if self.cancel.is_cancelled() {
                 break 'run;
             }
         }
-        self.final_flush(held, rx).await;
+        self.final_flush(held, lost, rx).await;
         self.shared.set_stopped();
     }
 
     /// One attempt at everything held plus everything queued, bounded by the
-    /// shutdown budget. Records not attempted in time are counted as dropped.
-    async fn final_flush(&self, mut held: Vec<Rec>, mut rx: mpsc::Receiver<Rec>) {
+    /// same stop deadline. Whatever is not delivered in time (including
+    /// `lost`, an export aborted in flight) is counted `dropped_after_retries`.
+    async fn final_flush(&self, mut held: Vec<Rec>, lost: u64, mut rx: mpsc::Receiver<Rec>) {
         rx.close();
         while let Ok(r) = rx.try_recv() {
             held.push(r);
         }
-        let mut remaining = held.len() as u64;
-        let deadline = Instant::now() + SHUTDOWN_FLUSH;
-        let flushed = timeout_at(deadline, async {
-            for chunk in held.chunks(self.batch_max) {
-                self.deliver(chunk.to_vec(), 0).await;
-                remaining -= chunk.len() as u64;
-            }
-        })
-        .await;
-        if flushed.is_err() && remaining > 0 {
+        let mut remaining = lost + held.len() as u64;
+        self.shared.in_hand.store(remaining, Ordering::Relaxed);
+        let deadline = self.stop_at();
+        if Instant::now() < deadline {
+            let _ = timeout_at(deadline, async {
+                for chunk in held.chunks(self.batch_max) {
+                    match self.deliver(chunk.to_vec(), 0).await {
+                        // Retries are 0, so `Interrupted` cannot happen.
+                        Delivery::Done | Delivery::Interrupted(_) => {
+                            remaining -= chunk.len() as u64;
+                            self.shared.in_hand.store(remaining, Ordering::Relaxed);
+                        }
+                        Delivery::Expired(_) => break,
+                    }
+                }
+            })
+            .await;
+        }
+        if remaining > 0 {
             add(&self.shared.c.dropped_after_retries, remaining);
             self.shared
                 .failed("shutdown flush did not finish within 5 s".into());
             self.shared.warn_drops();
         }
+        self.shared.in_hand.store(0, Ordering::Relaxed);
     }
 
     async fn deliver(&self, mut batch: Vec<Rec>, max_retries: u32) -> Delivery {
@@ -534,12 +641,18 @@ impl Worker {
         loop {
             let len = batch.len() as u64;
             let exporter = self.exporter.clone();
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 let r = exporter.export(&batch).await;
                 (batch, r)
             });
+            // Aborts the export if the deadline passes or the worker is aborted.
             let _guard = AbortOnDrop(task.abort_handle());
-            match task.await {
+            let joined = tokio::select! {
+                biased;
+                j = &mut task => j,
+                _ = self.expired() => return Delivery::Expired(len),
+            };
+            match joined {
                 Err(join) => {
                     let what = if join.is_panic() {
                         add(&c.panics, 1);
@@ -1209,17 +1322,51 @@ mod tests {
     async fn shutdown_gives_up_on_a_hung_exporter_after_5s() {
         let exp = FakeExporter::new(vec![Step::Block], Step::Ok(ExportOutcome::default()));
         let (hub, cancel) = start_one(settings("a", 1, 100, 100, 5), exp.clone());
-        hub.offer(&events(1), &[]);
+        // 1 in flight (stuck) + 2 queued.
+        hub.offer(&events(3), &[]);
         exp.entered.notified().await;
+        assert_eq!(st(&hub).queued, 2);
         let t0 = Instant::now();
         cancel.cancel();
         hub.shutdown().await;
         let took = t0.elapsed();
         assert!(
-            took >= Duration::from_secs(5) && took < Duration::from_millis(5100),
+            took >= Duration::from_millis(4800) && took <= Duration::from_secs(5),
             "{took:?}"
         );
-        assert_eq!(st(&hub).state, ExporterState::Stopped);
+        let s = st(&hub);
+        assert_eq!(s.state, ExporterState::Stopped);
+        assert_eq!(s.dropped_after_retries, 3, "in-flight + queued are counted");
+        assert_eq!(s.sent_records, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_bounds_its_own_flush_when_cancelled_without_shutdown() {
+        let exp = FakeExporter::new(vec![Step::Block], Step::Ok(ExportOutcome::default()));
+        let (hub, cancel) = start_one(settings("a", 1, 100, 100, 5), exp.clone());
+        hub.offer(&events(3), &[]);
+        exp.entered.notified().await;
+        cancel.cancel();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let s = st(&hub);
+        assert_eq!(s.state, ExporterState::Stopped);
+        assert_eq!(s.dropped_after_retries, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_not_stalled_by_a_hung_tenant_store() {
+        let tenant = Uuid::new_v4();
+        let store = FakeTenants::new(tenant, &[]);
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        *store.gate.lock().unwrap() = Some(gate_rx);
+        let hub = start_tenant(tenant, store, FakeExporter::ok());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let t0 = std::time::Instant::now();
+        hub.shutdown().await;
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        gate_tx.send(()).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
