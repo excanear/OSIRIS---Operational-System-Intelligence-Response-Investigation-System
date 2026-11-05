@@ -36,18 +36,28 @@ fn log_record(rec: &ExportRecord, include_raw: bool, observed_ns: u64) -> Value 
 
 /// Group `batch` by host (first-seen order) into one `ResourceLogs` each.
 pub fn otlp_logs_body(batch: &[Arc<ExportRecord>], include_raw: bool, observed_ns: u64) -> Value {
-    let mut groups: Vec<(Uuid, String, Vec<Value>)> = vec![];
+    // (host_id, name, name_is_from_event, records); index keeps first-seen order.
+    let mut groups: Vec<(Uuid, String, bool, Vec<Value>)> = vec![];
+    let mut index: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
     for rec in batch {
         let host_id = rec.host_id();
         let lr = log_record(rec, include_raw, observed_ns);
-        match groups.iter_mut().find(|g| g.0 == host_id) {
-            Some(g) => g.2.push(lr),
-            None => groups.push((host_id, hostname(rec), vec![lr])),
+        let from_event = matches!(rec.as_ref(), ExportRecord::Event(_));
+        let i = *index.entry(host_id).or_insert_with(|| {
+            groups.push((host_id, hostname(rec), from_event, vec![]));
+            groups.len() - 1
+        });
+        let g = &mut groups[i];
+        if from_event && !g.2 {
+            // Alerts only know host_id; prefer the first event's hostname.
+            g.1 = hostname(rec);
+            g.2 = true;
         }
+        g.3.push(lr);
     }
     let resource_logs: Vec<Value> = groups
         .into_iter()
-        .map(|(host_id, name, records)| {
+        .map(|(host_id, name, _, records)| {
             json!({
                 "resource": { "attributes": [
                     attr("host.id", &host_id.to_string()),

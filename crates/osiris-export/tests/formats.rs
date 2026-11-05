@@ -368,3 +368,31 @@ fn facility_codes_follow_rfc5424() {
     assert_eq!(Facility::Local0.code(), 16);
     assert_eq!(Facility::Local7.code(), 23);
 }
+
+#[test]
+fn otlp_host_name_prefers_event_hostname_even_when_alert_comes_first() {
+    let batch = vec![
+        Arc::new(ExportRecord::Alert(alert())),
+        Arc::new(ExportRecord::Event(exec_event())),
+    ];
+    let body = otlp_logs_body(&batch, false, 1);
+    let rl = body["resourceLogs"].as_array().unwrap();
+    assert_eq!(rl.len(), 1);
+    let attrs = rl[0]["resource"]["attributes"].as_array().unwrap();
+    let name = attrs.iter().find(|a| a["key"] == "host.name").unwrap();
+    assert_eq!(name["value"]["stringValue"], "web-01");
+}
+
+#[test]
+fn include_raw_carries_base64_through_rfc5424_and_otlp() {
+    let mut e = exec_event();
+    e.raw_event = Some(vec![0, 1, 2, 255]);
+    let r = ExportRecord::Event(e);
+    let s = rfc5424(&r, Facility::Local0, "osiris", true);
+    assert!(s.contains("\"raw_event\":\"AAEC/w==\""), "{s}");
+    let body = otlp_logs_body(&[Arc::new(r)], true, 1);
+    let b = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["body"]["stringValue"]
+        .as_str()
+        .unwrap();
+    assert!(b.contains("\"raw_event\":\"AAEC/w==\""), "{b}");
+}
