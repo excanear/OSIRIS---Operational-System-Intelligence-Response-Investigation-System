@@ -116,13 +116,22 @@ fn targets(events: &[CanonicalEvent]) -> Targets {
     }
 }
 
+/// A shape that finds nothing would still yield a "valid" latency record, so
+/// an empty result is a hard error of the bench run.
+fn check_nonempty(backend: &str, shape: &str, rows: usize) {
+    assert!(
+        rows > 0,
+        "storage-compare: shape `{shape}` returned no rows on {backend}"
+    );
+}
+
 fn time_ms(f: &dyn Fn()) -> f64 {
     let t = Instant::now();
     f();
     t.elapsed().as_secs_f64() * 1000.0
 }
 
-fn measure(store: &dyn Storage, t: &Targets) -> Vec<Vec<f64>> {
+fn measure(backend: &str, store: &dyn Storage, t: &Targets) -> Vec<Vec<f64>> {
     let window = EventQueryPlan {
         host_ids: Some(vec![t.host_id.to_string()]),
         since: Some(t.since),
@@ -140,28 +149,30 @@ fn measure(store: &dyn Storage, t: &Targets) -> Vec<Vec<f64>> {
     ))
     .expect("oql");
 
-    let shapes: [Box<dyn Fn() + '_>; 5] = [
+    let shapes: [Box<dyn Fn() -> usize + '_>; 5] = [
+        Box::new(|| std::hint::black_box(store.query_events(&window).expect("host_window")).len()),
+        Box::new(|| std::hint::black_box(store.query_events(&by_type).expect("event_type")).len()),
+        Box::new(|| std::hint::black_box(store.query(&by_key).expect("process_key")).len()),
+        Box::new(|| std::hint::black_box(store.query_events(&residual).expect("residual")).len()),
         Box::new(|| {
-            std::hint::black_box(store.query_events(&window).expect("host_window"));
-        }),
-        Box::new(|| {
-            std::hint::black_box(store.query_events(&by_type).expect("event_type"));
-        }),
-        Box::new(|| {
-            std::hint::black_box(store.query(&by_key).expect("process_key"));
-        }),
-        Box::new(|| {
-            std::hint::black_box(store.query_events(&residual).expect("residual"));
-        }),
-        Box::new(|| {
-            std::hint::black_box(store.get_event(t.event_id).expect("get_event"));
+            usize::from(
+                std::hint::black_box(store.get_event(t.event_id).expect("get_event")).is_some(),
+            )
         }),
     ];
     shapes
         .iter()
-        .map(|f| {
-            f(); // warm-up, not sampled
-            (0..SAMPLES).map(|_| time_ms(f.as_ref())).collect()
+        .zip(SHAPES)
+        .map(|(f, shape)| {
+            // Warm-up, not sampled: doubles as the correctness check.
+            check_nonempty(backend, shape, f());
+            (0..SAMPLES)
+                .map(|_| {
+                    time_ms(&|| {
+                        f();
+                    })
+                })
+                .collect()
         })
         .collect()
 }
@@ -192,7 +203,7 @@ fn sqlite_round(events: &[CanonicalEvent], t: &Targets, batch: usize) -> RoundRe
     let store = SqliteStorage::open(&path).expect("open sqlite");
     let ingest_eps = fill(&store, events, batch);
     let bytes_per_event = sqlite_footprint(&path) as f64 / events.len() as f64;
-    let samples = measure(&store, t);
+    let samples = measure("sqlite", &store, t);
     RoundResult {
         ingest_eps,
         samples,
@@ -215,7 +226,7 @@ fn clickhouse_round(
     let ingest_eps = fill(&store, events, batch);
     store.optimize().expect("optimize");
     let bytes_per_event = store.disk_bytes().expect("disk_bytes") as f64 / events.len() as f64;
-    let samples = measure(&store, t);
+    let samples = measure("clickhouse", &store, t);
     store.drop_database().expect("drop database");
     RoundResult {
         ingest_eps,
@@ -305,6 +316,24 @@ mod tests {
         }
         assert!(r.metrics["noise_pct"]["ingest_eps"].as_f64().is_some());
         assert!(r.metrics["bytes_per_event"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn measure_finds_rows_for_every_shape() {
+        let events = generate(2_000);
+        let t = targets(&events);
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStorage::open(dir.path().join("events.db")).unwrap();
+        fill(&store, &events, 500);
+        // Panics (via check_nonempty) if any shape returns nothing.
+        let samples = measure("sqlite", &store, &t);
+        assert_eq!(samples.len(), SHAPES.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "returned no rows on clickhouse")]
+    fn empty_result_is_a_hard_error() {
+        check_nonempty("clickhouse", "host_window", 0);
     }
 
     #[test]
