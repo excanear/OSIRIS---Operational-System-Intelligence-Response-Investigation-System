@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osiris_storage::Storage;
-use osiris_storage_clickhouse::{ClickHouseOptions, ClickHouseStorage};
+use osiris_storage_clickhouse::{redacted_url, ClickHouseOptions, ClickHouseStorage};
 use osiris_storage_sqlite::SqliteStorage;
 
 use crate::config::{ServerConfig, StorageBackend};
@@ -42,7 +42,8 @@ pub fn open_storage(config: &ServerConfig) -> Result<Arc<dyn Storage>, String> {
             };
             ClickHouseStorage::open(opts)
                 .map(|s| Arc::new(s) as Arc<dyn Storage>)
-                .map_err(|e| format!("clickhouse storage at {}: {e}", ch.url))
+                // Only scheme://host:port: the raw url may carry credentials.
+                .map_err(|e| format!("clickhouse storage at {}: {e}", redacted_url(&ch.url)))
         }
     }
 }
@@ -77,6 +78,24 @@ mod tests {
         let err = open_storage(&cfg).err().expect("must fail");
         assert!(err.to_lowercase().contains("clickhouse"), "{err}");
         assert!(!db.exists(), "must not fall back to SQLite");
+    }
+
+    #[test]
+    fn open_errors_never_contain_url_credentials() {
+        for url in [
+            "http://u:s3cr3t@127.0.0.1:1",
+            "http://127.0.0.1:1/?user=u&password=s3cr3t",
+        ] {
+            let cfg = config(
+                &format!(
+                    "storage_backend: clickhouse\nclickhouse:\n  url: \"{url}\"\n  timeout_secs: 1\n"
+                ),
+                "/tmp/e.db",
+            );
+            let err = open_storage(&cfg).err().expect("must fail");
+            assert!(!err.contains("s3cr3t"), "{url}: {err}");
+            assert!(err.contains("127.0.0.1:1"), "{url}: {err}");
+        }
     }
 
     #[test]

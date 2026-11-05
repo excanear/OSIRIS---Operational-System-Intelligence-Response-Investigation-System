@@ -28,6 +28,7 @@ use osiris_storage::{
 };
 use uuid::Uuid;
 
+pub use crate::transport::redacted_url;
 use crate::transport::Transport;
 
 /// The schema version this build writes and understands. `open` refuses a
@@ -37,7 +38,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Connection settings for [`ClickHouseStorage::open`].
 #[derive(Clone)]
 pub struct ClickHouseOptions {
-    /// `http(s)://host:port`, without credentials.
+    /// `http(s)://host:port`, without credentials, query string or
+    /// fragment (any of them is rejected by `open`).
     pub url: String,
     /// Database name; must match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`.
     pub database: String,

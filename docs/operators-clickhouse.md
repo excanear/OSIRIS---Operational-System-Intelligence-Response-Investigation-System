@@ -23,6 +23,10 @@ clickhouse:
   timeout_secs: 30                       # default 30, valid 1..=600
 ```
 
+- `url` is `http(s)://host:port` only. A url with userinfo
+  (`http://user:pass@host`), a query string (`?user=...&password=...`) or a
+  fragment is rejected at startup: credentials go in `user` and
+  `password_file`. Error messages show only the url's `scheme://host:port`.
 - `storage_backend` defaults to `sqlite`. A `clickhouse:` section is ignored
   unless `storage_backend: clickhouse`.
 - `storage_backend: clickhouse` without a `clickhouse:` section is a config

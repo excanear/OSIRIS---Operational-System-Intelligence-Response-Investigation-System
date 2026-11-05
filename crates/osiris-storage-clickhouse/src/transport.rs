@@ -71,6 +71,16 @@ impl Transport {
                     .to_string(),
             ));
         }
+        // A query string can carry `user=`/`password=` (and a fragment
+        // anything); the transport adds its own parameters, so the
+        // configured url must have neither.
+        if base.query().is_some() || base.fragment().is_some() {
+            return Err(StorageError::Backend(
+                "clickhouse: the url must not contain a query string or fragment; \
+                 use user/password_file"
+                    .to_string(),
+            ));
+        }
 
         let (jobs, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
@@ -229,12 +239,26 @@ impl Transport {
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transport")
-            .field("url", &self.base.as_str())
+            .field("url", &redacted_url(self.base.as_str()))
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .field("timeout", &self.timeout)
             .finish()
+    }
+}
+
+/// `scheme://host[:port]` of `url`: all of a configured ClickHouse url an
+/// error message or log may show. Userinfo, path, query string and
+/// fragment are dropped, so no credential can ride along.
+pub fn redacted_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
+            (Some(host), None) => format!("{}://{host}", u.scheme()),
+            (None, _) => format!("{}://", u.scheme()),
+        },
+        Err(_) => "<invalid url>".to_string(),
     }
 }
 
@@ -436,6 +460,52 @@ mod tests {
         assert_eq!(exception_trailer(body, Some("othertagxxxxxxxx")), None);
         assert_eq!(exception_trailer(body, None), None);
         assert_eq!(exception_trailer("1\n2\n", Some("oeaqwyeogsepvaad")), None);
+    }
+
+    fn start_err(url: &str) -> String {
+        match Transport::start(url, "db", "u", None, Duration::from_secs(1)) {
+            Ok(_) => panic!("{url} must be rejected"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn credentials_in_userinfo_are_rejected_without_echoing_them() {
+        let err = start_err("http://u:s3cr3t@127.0.0.1:1");
+        assert!(!err.contains("s3cr3t"), "{err}");
+    }
+
+    #[test]
+    fn a_query_string_or_fragment_in_the_url_is_rejected_without_echoing_it() {
+        let err = start_err("http://127.0.0.1:1/?user=u&password=s3cr3t");
+        assert!(!err.contains("s3cr3t"), "{err}");
+        let err = start_err("http://127.0.0.1:1/#s3cr3t");
+        assert!(!err.contains("s3cr3t"), "{err}");
+    }
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let t = Transport::start(
+            "http://127.0.0.1:1/",
+            "db",
+            "u",
+            Some("s3cr3t".to_string()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let shown = format!("{t:?}");
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+        assert!(shown.contains("http://127.0.0.1:1"), "{shown}");
+    }
+
+    #[test]
+    fn redacted_url_keeps_only_scheme_host_and_port() {
+        assert_eq!(
+            redacted_url("http://u:s3cr3t@ch.example:8123/x?password=s3cr3t#f"),
+            "http://ch.example:8123"
+        );
+        assert_eq!(redacted_url("https://ch.example"), "https://ch.example");
+        assert_eq!(redacted_url("not a url s3cr3t"), "<invalid url>");
     }
 
     #[test]
