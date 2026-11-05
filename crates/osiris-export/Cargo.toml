@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 osiris-schema = { path = "../osiris-schema" }
+osiris-tenancy = { path = "../osiris-tenancy" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 uuid = { workspace = true }
@@ -13,4 +14,11 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 time = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 

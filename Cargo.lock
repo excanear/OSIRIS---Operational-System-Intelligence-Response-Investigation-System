@@ -1637,11 +1637,16 @@ dependencies = [
  "async-trait",
  "base64",
  "osiris-schema",
+ "osiris-tenancy",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
  "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use osiris_schema::{EventType, Severity};
+use osiris_schema::{Alert, CanonicalEvent, EventType, Severity};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping, Value};
@@ -506,19 +506,26 @@ impl Filter {
     }
 
     pub fn accepts(&self, rec: &ExportRecord) -> bool {
-        if severity_rank(rec.severity()) < self.min_rank {
-            return false;
-        }
         match rec {
-            ExportRecord::Event(e) => {
-                self.events
-                    && self
-                        .event_types
-                        .as_ref()
-                        .is_none_or(|allow| allow.contains(&e.event_type))
-            }
-            ExportRecord::Alert(_) => self.alerts,
+            ExportRecord::Event(e) => self.accepts_event(e),
+            ExportRecord::Alert(a) => self.accepts_alert(a),
         }
+    }
+
+    /// [`Filter::accepts`] on a borrowed event, so the hub can filter before
+    /// cloning the event into an `ExportRecord`.
+    pub fn accepts_event(&self, e: &CanonicalEvent) -> bool {
+        self.events
+            && severity_rank(e.severity) >= self.min_rank
+            && self
+                .event_types
+                .as_ref()
+                .is_none_or(|allow| allow.contains(&e.event_type))
+    }
+
+    /// [`Filter::accepts`] on a borrowed alert.
+    pub fn accepts_alert(&self, a: &Alert) -> bool {
+        self.alerts && severity_rank(a.severity()) >= self.min_rank
     }
 }
 
