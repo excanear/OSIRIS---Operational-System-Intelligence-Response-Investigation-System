@@ -15,7 +15,7 @@ use crate::format::{csv_header, csv_row, ndjson_line};
 use crate::record::{ExportRecord, Stream};
 
 struct State {
-    file: File,
+    file: Option<File>,
     size: u64,
 }
 
@@ -25,6 +25,8 @@ struct Params {
     max_bytes: u64,
     max_files: u32,
     csv_stream: Stream,
+    #[cfg(test)]
+    fail_open: std::sync::atomic::AtomicBool,
 }
 
 pub struct FileExporter {
@@ -76,44 +78,54 @@ fn rotate(path: &Path, max_files: u32) -> std::io::Result<()> {
 }
 
 impl Params {
+    fn open_file(&self) -> std::io::Result<File> {
+        #[cfg(test)]
+        if self.fail_open.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        open(&self.path)
+    }
+
+    /// Reopen the file if a previous rotation left it closed. A fresh (empty)
+    /// file gets the CSV header.
+    fn ensure_open<'a>(&self, st: &'a mut State) -> std::io::Result<&'a mut File> {
+        if st.file.is_none() {
+            let mut f = self.open_file()?;
+            let mut size = f.metadata()?.len();
+            if size == 0 && self.format == FileFormat::Csv {
+                let h = csv_header(self.csv_stream);
+                f.write_all(h.as_bytes())?;
+                size = h.len() as u64;
+            }
+            st.file = Some(f);
+            st.size = size;
+        }
+        Ok(st.file.as_mut().expect("file just opened"))
+    }
+
     fn write_batch(&self, st: &mut State, lines: &[String]) -> std::io::Result<()> {
+        self.ensure_open(st)?;
         let mut buf: Vec<u8> = Vec::new();
         for line in lines {
             let len = line.len() as u64;
             if st.size + buf.len() as u64 > 0 && st.size + buf.len() as u64 + len > self.max_bytes {
-                st.file.write_all(&buf)?;
+                self.ensure_open(st)?.write_all(&buf)?;
                 buf.clear();
-                // Release the handle before renaming (required on Windows).
-                st.file = open_placeholder()?;
-                if let Err(e) = rotate(&self.path, self.max_files) {
-                    // Keep appending to the unrotated file rather than to the
-                    // placeholder.
-                    if let Ok(f) = open(&self.path) {
-                        st.size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        st.file = f;
-                    }
-                    return Err(e);
-                }
-                st.file = open(&self.path)?;
-                st.size = 0;
-                if self.format == FileFormat::Csv {
-                    let h = csv_header(self.csv_stream);
-                    st.file.write_all(h.as_bytes())?;
-                    st.size = h.len() as u64;
-                }
+                // Close the handle before renaming (required on Windows). If
+                // anything below fails the exporter stays closed and the next
+                // export retries the reopen (and reports Transient until it works).
+                st.file = None;
+                rotate(&self.path, self.max_files)?;
+                self.ensure_open(st)?;
             }
             buf.extend_from_slice(line.as_bytes());
         }
-        st.file.write_all(&buf)?;
+        let file = self.ensure_open(st)?;
+        file.write_all(&buf)?;
+        file.flush()?;
         st.size += buf.len() as u64;
-        st.file.flush()
+        Ok(())
     }
-}
-
-/// A throwaway handle on the null device, used to drop the real file handle.
-fn open_placeholder() -> std::io::Result<File> {
-    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    OpenOptions::new().write(true).open(null)
 }
 
 impl FileExporter {
@@ -152,8 +164,13 @@ impl FileExporter {
                 max_bytes: cfg.max_bytes,
                 max_files: cfg.max_files,
                 csv_stream,
+                #[cfg(test)]
+                fail_open: std::sync::atomic::AtomicBool::new(false),
             }),
-            state: Arc::new(Mutex::new(State { file, size })),
+            state: Arc::new(Mutex::new(State {
+                file: Some(file),
+                size,
+            })),
         })
     }
 }
@@ -301,6 +318,32 @@ mod tests {
         ex.export(&[event(1)]).await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn failed_reopen_after_rotation_is_transient_until_the_path_is_writable() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile_dir("reopen");
+        let path = dir.join("out.ndjson");
+        let ex = FileExporter::new(
+            "f",
+            &cfg(path.clone(), FileFormat::Ndjson, 200, 2),
+            false,
+            None,
+        )
+        .unwrap();
+        ex.export(&[event(1)]).await.unwrap();
+        ex.params.fail_open.store(true, Ordering::SeqCst);
+        // The next write rotates, then the reopen fails.
+        let e = ex.export(&[event(2)]).await.unwrap_err();
+        assert!(matches!(e, ExportError::Transient(_)), "{e}");
+        // Still failing, never silently Ok.
+        let e = ex.export(&[event(3)]).await.unwrap_err();
+        assert!(matches!(e, ExportError::Transient(_)), "{e}");
+        ex.params.fail_open.store(false, Ordering::SeqCst);
+        ex.export(&[event(4)]).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("000000000004"), "{text}");
     }
 
     fn tempfile_dir(tag: &str) -> PathBuf {

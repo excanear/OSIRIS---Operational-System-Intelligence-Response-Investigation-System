@@ -65,6 +65,11 @@ pub fn client_tls_config(
             })?;
         }
     }
+    if roots.is_empty() {
+        return Err(err(
+            "no trusted CA certificates available (OS store empty and no ca_file)",
+        ));
+    }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

@@ -150,11 +150,15 @@ impl SyslogExporter {
 
     async fn export_udp(&self, msgs: &[String]) -> Result<ExportOutcome, ExportError> {
         let fail = |e: io::Error| self.transient("udp send to", e.kind());
-        let addr = tokio::net::lookup_host(self.address.as_str())
-            .await
-            .map_err(fail)?
-            .next()
-            .ok_or_else(|| self.transient("udp resolve of", "no address"))?;
+        let addr = tokio::time::timeout(
+            self.io_timeout,
+            tokio::net::lookup_host(self.address.as_str()),
+        )
+        .await
+        .map_err(|_| self.transient("udp resolve of", "timed out"))?
+        .map_err(fail)?
+        .next()
+        .ok_or_else(|| self.transient("udp resolve of", "no address"))?;
         let bind = if addr.is_ipv6() {
             "[::]:0"
         } else {
@@ -186,7 +190,12 @@ impl SyslogExporter {
                 let tls = connector
                     .connect(server_name.clone(), tcp)
                     .await
-                    .map_err(|e| self.transient("tls handshake with", e.kind()))?;
+                    .map_err(|e| {
+                        let reason = e
+                            .get_ref()
+                            .map_or_else(|| e.kind().to_string(), |inner| inner.to_string());
+                        self.transient("tls handshake with", reason)
+                    })?;
                 Ok(Conn::Tls(Box::new(tls)))
             }
         }
@@ -437,31 +446,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_with_wrong_ca_fails_and_never_sends_plaintext() {
+    async fn tls_with_wrong_ca_fails_with_a_reason() {
         let server_pki = make_pki("server ca", "localhost");
         let other_pki = make_pki("other ca", "localhost");
         let ca = temp_file("wrongca", &other_pki.ca_pem);
         let acc = acceptor(&server_pki);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (s, _) = listener.accept().await.unwrap();
-            match acc.accept(s).await {
-                Ok(mut tls) => {
-                    let mut got = Vec::new();
-                    let _ =
-                        tokio::time::timeout(Duration::from_millis(500), tls.read_to_end(&mut got))
-                            .await;
-                    got
-                }
-                Err(_) => Vec::new(),
-            }
+            let _ = acc.accept(s).await;
         });
         let ex = exporter(&tls_cfg(format!("localhost:{port}"), &ca));
         let err = ex.export(&[event(1)]).await.unwrap_err();
         assert!(matches!(err, ExportError::Transient(_)), "{err}");
-        let received = server.await.unwrap();
-        assert!(received.is_empty(), "payload reached the server");
+        let msg = err.to_string();
+        assert!(msg.contains("UnknownIssuer"), "{msg}");
+        assert!(msg.contains(&format!("localhost:{port}")), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tls_never_sends_plaintext_to_a_server_that_does_not_speak_tls() {
+        // A plain TCP listener captures the raw bytes the client puts on the
+        // wire; the client attempts TLS against it and must fail.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut got)).await;
+            got
+        });
+        let pki = make_pki("test ca", "localhost");
+        let ca = temp_file("plainca", &pki.ca_pem);
+        let mut c = tls_cfg(format!("127.0.0.1:{port}"), &ca);
+        c.server_name = Some("localhost".to_string());
+        let ex = SyslogExporter::new_with_timeout(
+            "syslog-test",
+            &c,
+            false,
+            "0.0.0-test",
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let err = ex.export(&[event(1)]).await.unwrap_err();
+        assert!(matches!(err, ExportError::Transient(_)), "{err}");
+        let got = server.await.unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            !text.contains("osiris") && !text.contains("<134>1"),
+            "plaintext leaked"
+        );
+        assert!(
+            got.is_empty() || got[0] == 0x16,
+            "first byte {:#x} is not a TLS handshake record",
+            got[0]
+        );
     }
 
     #[tokio::test]
