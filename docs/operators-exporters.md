@@ -56,7 +56,7 @@ kind side by side. Unknown keys are rejected. Names are unique and match `[a-z0-
 | `min_severity` | string | `info` | Drop records below this: `info`, `low`, `medium`, `high`, `critical` (any case). Applies to events and alerts. |
 | `event_types` | list | all | Allow-list of event types (for example `PROCESS_EXEC`). Applies to events only; alerts ignore it. |
 | `tenant_id` | UUID | none (all hosts) | Send only records of hosts that belong to this tenant (see "Tenant filter"). |
-| `include_raw` | bool | `false` | Include the event's `raw_event` bytes, base64-encoded, in NDJSON-based output. |
+| `include_raw` | bool | `false` | Include the event's `raw_event` bytes, base64-encoded, in NDJSON-based output. An event that has no raw event yields `"raw_event": null`. |
 | `queue_capacity` | integer | `10000` | Records the exporter's in-memory queue holds. Must be greater than 0. |
 | `batch_max` | integer | `500` | Records per send. Must be greater than 0. |
 | `flush_interval_ms` | integer | `1000` | Send a partial batch after this long. Must be greater than 0. |
@@ -140,7 +140,8 @@ All formats are deterministic. The same record always renders the same bytes (go
 One JSON object per line: the record's own JSON (the same shape the API returns) plus
 `record_type`. The object is also the message of RFC 5424 output, the body string of OTLP records
 and the line of webhook bodies. `raw_event` is removed unless `include_raw` is true; when included
-it is a standard, padded base64 string, not the API's array of numbers. CEF and CSV never carry
+it is a standard, padded base64 string, not the API's array of numbers; an event that has no raw event
+keeps `"raw_event": null` (the field is present, not omitted). CEF and CSV never carry
 `raw_event`.
 
 ```
