@@ -468,6 +468,11 @@ async fn main() {
                 policies: policy_store.clone(),
                 notifier: policy_notifier.clone(),
             }))
+            .merge(osiris_api::build_exporters_router(
+                osiris_api::ExportersState {
+                    hub: export_hub.clone(),
+                },
+            ))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),
                 registry: fleet_registry.clone(),

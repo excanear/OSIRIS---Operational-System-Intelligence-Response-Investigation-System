@@ -100,6 +100,40 @@ pub fn format_events_table(events: &[CanonicalEvent]) -> String {
     out
 }
 
+/// Renders the `GET /api/v1/exporters` body as a tab-separated table.
+/// `DROPPED` is the sum of the three drop counters. Control characters in
+/// `last_error` are replaced so one exporter is always one line.
+pub fn format_exporters_table(body: &serde_json::Value) -> String {
+    let mut out = String::from("NAME\tKIND\tSTATE\tQUEUED\tSENT\tDROPPED\tLAST_ERROR\n");
+    let text = |row: &serde_json::Value, key: &str| {
+        row[key]
+            .as_str()
+            .map(|s| {
+                s.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            })
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let num = |row: &serde_json::Value, key: &str| row[key].as_u64().unwrap_or(0);
+    for row in body["exporters"].as_array().into_iter().flatten() {
+        let dropped = num(row, "dropped_queue_full")
+            + num(row, "dropped_after_retries")
+            + num(row, "dropped_permanent");
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            text(row, "name"),
+            text(row, "kind"),
+            text(row, "state"),
+            num(row, "queued"),
+            num(row, "sent_records"),
+            dropped,
+            text(row, "last_error"),
+        ));
+    }
+    out
+}
+
 /// Minimal percent-encoding for the one context this CLI needs it in: an
 /// OQL string placed into a `?q=` query parameter. Unreserved characters
 /// (letters, digits, `-`, `_`, `.`, `~`) pass through unescaped per RFC
@@ -242,6 +276,32 @@ mod tests {
         Category, EventType, HostRef, ProcessKey, ProcessRef, Severity, Source, SCHEMA_VERSION,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn format_exporters_table_sums_drops() {
+        let body = serde_json::json!({ "exporters": [
+            { "name": "siem", "kind": "syslog", "state": "DEGRADED", "queued": 3,
+              "sent_records": 10, "dropped_queue_full": 1, "dropped_after_retries": 2,
+              "dropped_permanent": 4, "last_error": "refused\nby peer" },
+            { "name": "file", "kind": "file", "state": "OK", "queued": 0,
+              "sent_records": 7, "dropped_queue_full": 0, "dropped_after_retries": 0,
+              "dropped_permanent": 0, "last_error": null },
+        ]});
+        let t = format_exporters_table(&body);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(
+            lines[0],
+            "NAME\tKIND\tSTATE\tQUEUED\tSENT\tDROPPED\tLAST_ERROR"
+        );
+        assert_eq!(
+            lines[1],
+            "siem\tsyslog\tDEGRADED\t3\t10\t7\trefused by peer"
+        );
+        assert_eq!(lines[2], "file\tfile\tOK\t0\t7\t0\t-");
+        assert_eq!(lines.len(), 3);
+        let empty = format_exporters_table(&serde_json::json!({ "exporters": [] }));
+        assert_eq!(empty.lines().count(), 1);
+    }
 
     #[test]
     fn response_bodies_have_the_api_shape() {

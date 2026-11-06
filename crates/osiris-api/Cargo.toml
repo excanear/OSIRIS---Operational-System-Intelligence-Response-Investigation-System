@@ -21,6 +21,7 @@ osiris-response = { path = "../osiris-response" }
 osiris-command = { path = "../osiris-command" }
 async-trait = { workspace = true }
 osiris-tenancy = { path = "../osiris-tenancy" }
+osiris-export = { path = "../osiris-export" }
 osiris-fleet = { path = "../osiris-fleet" }
 osiris-health = { path = "../osiris-health" }
 osiris-policy = { path = "../osiris-policy" }
@@ -34,3 +35,4 @@ uuid = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 tower = { workspace = true }
+serde_yaml = { workspace = true }

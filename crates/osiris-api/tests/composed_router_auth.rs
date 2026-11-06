@@ -99,6 +99,9 @@ fn harness() -> Harness {
         .merge(build_stream_router(Arc::new(LiveEventBroadcaster::new())))
         .merge(build_auth_router(auth_state.clone()))
         .merge(build_fleet_router(fleet_state))
+        .merge(osiris_api::build_exporters_router(
+            osiris_api::ExportersState { hub: None },
+        ))
         .merge(build_groups_router(GroupsState {
             groups: fleet_db.clone(),
             registry: fleet_db.clone(),
@@ -459,6 +462,41 @@ async fn group_policy_reads_need_viewer_and_writes_need_admin_on_the_composed_ro
         .await
         .unwrap()
         .status(),
+        StatusCode::OK
+    );
+}
+
+// --- Phase 12a: GET /api/v1/exporters is platform-admin only ---
+
+async fn get_exporters(app: &axum::Router, token: Option<&str>) -> StatusCode {
+    let mut b = Request::builder().uri("/api/v1/exporters");
+    if let Some(t) = token {
+        b = b.header("Authorization", format!("Bearer {t}"));
+    }
+    app.clone()
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn exporters_endpoint_requires_platform_admin() {
+    let h = harness();
+    let viewer = session_for_role(&h.auth_state, "exp-viewer", Role::Viewer);
+    let analyst = session_for_role(&h.auth_state, "exp-analyst", Role::Analyst);
+
+    assert_eq!(get_exporters(&h.app, None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get_exporters(&h.app, Some(&viewer)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_exporters(&h.app, Some(&analyst)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_exporters(&h.app, Some(&h.admin_token)).await,
         StatusCode::OK
     );
 }
