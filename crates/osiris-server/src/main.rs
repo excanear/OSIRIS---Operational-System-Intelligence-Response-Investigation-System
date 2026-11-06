@@ -150,6 +150,49 @@ async fn main() {
     // means heartbeats trigger no policy reconciliation.
     let policy_reconciler_slot = Arc::new(std::sync::OnceLock::new());
 
+    // Opened ahead of ingestion: tenant-scoped exporters resolve their host
+    // sets through it.
+    let tenants_db_path = config
+        .tenants_db_path
+        .clone()
+        .unwrap_or_else(|| "/var/lib/osiris/tenants.db".to_string());
+    let tenant_store: Arc<dyn osiris_tenancy::TenantStore> = Arc::new(open_or_exit(
+        osiris_tenancy::SqliteTenantStore::open(&tenants_db_path),
+        &tenants_db_path,
+        "tenants_db_path",
+    ));
+
+    // Phase 12a: no exporters configured = no hub and no worker tasks.
+    let export_hub: Option<Arc<osiris_export::ExportHub>> = if config.exporters.is_empty() {
+        None
+    } else {
+        let built =
+            match osiris_export::build_exporters(&config.exporters, env!("CARGO_PKG_VERSION")) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("invalid exporter configuration: {e}");
+                    std::process::exit(1);
+                }
+            };
+        // Host only: never a URL path or query, a header or a key.
+        for ((settings, _), cfg) in built.iter().zip(&config.exporters) {
+            tracing::info!(
+                name = %settings.name,
+                kind = %settings.kind,
+                destination = %osiris_server::exporter_destination(cfg),
+                "exporter enabled"
+            );
+        }
+        // Its own token, not the server's: the workers keep draining while
+        // ingestion winds down, and only `hub.shutdown()` at the end of
+        // `main` starts their 5 s flush.
+        Some(osiris_export::ExportHub::start(
+            built,
+            Some(tenant_store.clone()),
+            CancellationToken::new(),
+        ))
+    };
+
     let spool_path = config.spool_path.clone();
     let ingest_context = osiris_server::IngestContext {
         storage: storage.clone(),
@@ -160,13 +203,14 @@ async fn main() {
         broadcaster: live_event_broadcaster.clone(),
         fleet_registry: fleet_registry.clone(),
         policy_reconciler: policy_reconciler_slot.clone(),
+        exporters: export_hub.clone(),
     };
-    tokio::spawn(run_ingestion_context_loop(
+    let mut ingestion_tasks = vec![tokio::spawn(run_ingestion_context_loop(
         spool_path,
         ingest_context.clone(),
         Duration::from_millis(200),
         cancellation.clone(),
-    ));
+    ))];
 
     if let Some(listener_cfg) = &config.agent_listener {
         let tls = match osiris_transport::tls::server_config(
@@ -200,7 +244,9 @@ async fn main() {
              a co-located agent must use one path only, or events are ingested twice"
         );
         tracing::info!(addr = %listener_cfg.listen_addr, "agent mTLS listener started");
-        tokio::spawn(listener.run(Arc::new(ingest_context), cancellation.clone()));
+        ingestion_tasks.push(tokio::spawn(
+            listener.run(Arc::new(ingest_context), cancellation.clone()),
+        ));
     }
 
     // Command channel: fail closed on unusable TLS or signing key.
@@ -391,15 +437,6 @@ async fn main() {
         );
     }
     let session_ttl_seconds = config.session_ttl_seconds.unwrap_or(28800);
-    let tenants_db_path = config
-        .tenants_db_path
-        .clone()
-        .unwrap_or_else(|| "/var/lib/osiris/tenants.db".to_string());
-    let tenant_store: Arc<dyn osiris_tenancy::TenantStore> = Arc::new(open_or_exit(
-        osiris_tenancy::SqliteTenantStore::open(&tenants_db_path),
-        &tenants_db_path,
-        "tenants_db_path",
-    ));
     let auth_state = AuthState {
         users: Arc::new(user_store),
         audit_log: audit_log.clone(),
@@ -431,6 +468,11 @@ async fn main() {
                 policies: policy_store.clone(),
                 notifier: policy_notifier.clone(),
             }))
+            .merge(osiris_api::build_exporters_router(
+                osiris_api::ExportersState {
+                    hub: export_hub.clone(),
+                },
+            ))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),
                 registry: fleet_registry.clone(),
@@ -468,7 +510,7 @@ async fn main() {
                 listener,
                 acceptor.clone(),
                 app,
-                cancellation,
+                cancellation.clone(),
                 limits,
             )
             .await;
@@ -492,5 +534,20 @@ async fn main() {
                 } => tracing::warn!("plain HTTP shutdown drain timed out after 10s; exiting"),
             }
         }
+    }
+
+    // Stop ingestion first so nothing is offered after the exporters flush,
+    // then give them their bounded flush (this also counts what is lost).
+    cancellation.cancel();
+    for task in ingestion_tasks {
+        if tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("an ingestion loop did not stop within 5 s");
+        }
+    }
+    if let Some(hub) = &export_hub {
+        hub.shutdown().await;
     }
 }

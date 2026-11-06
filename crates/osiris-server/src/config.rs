@@ -87,6 +87,10 @@ pub struct ServerConfig {
     /// ignored otherwise.
     #[serde(default)]
     pub clickhouse: Option<ClickHouseConfig>,
+    /// Phase 12a: outbound SIEM/log exporters. Empty (the default) = no
+    /// export hub and no worker tasks.
+    #[serde(default)]
+    pub exporters: Vec<osiris_export::ExporterConfig>,
 }
 
 /// The telemetry storage backend.
@@ -290,7 +294,32 @@ impl ServerConfig {
                 "storage_backend clickhouse requires a clickhouse section".to_string(),
             ));
         }
+        osiris_export::validate_exporters(&config.exporters)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         Ok(config)
+    }
+}
+
+/// The host an exporter sends to, for startup logging: never a URL path,
+/// query, port, header or key. A file exporter's destination is its path.
+pub fn exporter_destination(cfg: &osiris_export::ExporterConfig) -> String {
+    use osiris_export::KindConfig;
+    fn authority_host(authority: &str) -> String {
+        match authority.strip_prefix('[') {
+            Some(inner) => inner.split(']').next().unwrap_or(""),
+            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+        }
+        .to_string()
+    }
+    fn url_host(url: &str) -> String {
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        authority_host(rest.split(['/', '?', '#']).next().unwrap_or(""))
+    }
+    match &cfg.kind {
+        KindConfig::File(f) => f.path.display().to_string(),
+        KindConfig::Syslog(s) => authority_host(&s.address),
+        KindConfig::Otlp(o) => url_host(&o.endpoint),
+        KindConfig::Webhook(w) => url_host(&w.url),
     }
 }
 
@@ -373,6 +402,55 @@ mod tests {
         let path = dir.path().join("server.yaml");
         std::fs::write(&path, yaml).unwrap();
         ServerConfig::load(&path)
+    }
+
+    #[test]
+    fn loads_a_config_with_exporters() {
+        assert!(load_yaml(BASE_YAML).unwrap().exporters.is_empty());
+        let config = load_yaml(&format!(
+            "{BASE_YAML}exporters:\n  - name: siem\n    kind: syslog\n    address: 'siem.example.com:6514'\n    transport: tls\n  - name: local\n    kind: file\n    path: /var/log/osiris/export.ndjson\n"
+        ))
+        .unwrap();
+        let names: Vec<_> = config.exporters.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["siem", "local"]);
+    }
+
+    #[test]
+    fn rejects_an_invalid_exporter_at_load() {
+        let err = load_yaml(&format!(
+            "{BASE_YAML}exporters:\n  - name: hook\n    kind: webhook\n    url: 'http://example.com/in?token=s3cret'\n"
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Invalid(_)), "{msg}");
+        assert!(msg.contains("exporter 'hook'"), "{msg}");
+        assert!(!msg.contains("s3cret"), "the url query leaked: {msg}");
+    }
+
+    #[test]
+    fn exporter_destination_is_the_host_only() {
+        let parse =
+            |y: &str| -> Vec<osiris_export::ExporterConfig> { serde_yaml::from_str(y).unwrap() };
+        let cfgs = parse(
+            "
+- {name: a, kind: webhook, url: 'https://hooks.example.com:8443/p/secret?token=x'}
+- {name: b, kind: otlp, endpoint: 'https://[::1]:4318/v1/logs'}
+- {name: c, kind: syslog, address: 'siem.example.com:6514', transport: tls}
+- {name: d, kind: syslog, address: '[2001:db8::1]:514', transport: udp}
+- {name: e, kind: otlp, endpoint: 'http://localhost?k=v'}
+",
+        );
+        let got: Vec<_> = cfgs.iter().map(exporter_destination).collect();
+        assert_eq!(
+            got,
+            [
+                "hooks.example.com",
+                "::1",
+                "siem.example.com",
+                "2001:db8::1",
+                "localhost"
+            ]
+        );
     }
 
     #[test]

@@ -488,6 +488,42 @@ artifact is not used here.
 - The forwarder is stop-and-wait (one 500-event batch in flight), which caps throughput per agent
   connection at the server's per-batch latency.
 
+## Phase 12a - exporter overhead
+
+`osiris-bench ingest --rate 1000 --duration 30` run without and with `--exporters`. The flag starts
+three local sinks and configures the real `osiris-server` with a `file` (ndjson), a `syslog` (tcp,
+rfc5424) and a `webhook` (http to a local axum receiver returning 200) exporter, all with default
+queue/batch settings. The sinks (a TCP drain, an HTTP 200 receiver) cost almost nothing, so this
+measures the server-side cost of fan-out, formatting and the three workers, not a real SIEM.
+
+| Item | Value |
+|---|---|
+| Host | **Windows 10 Pro 10.0.19045** (native, not WSL), local dev machine; release build of `osiris-server`, `osiris-bench` |
+| Code | branch `phase-12a-exporters`, same binary for both rows |
+| Load | exec-chain events, 1 000 eps target, 30 s, then up to 30 s drain; two runs per configuration, alternating |
+
+| Run | Exporters | Achieved (driver) eps | Stored eps over run | Markers lost | Delivered p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|---|
+| 1 | off | 999.79 | 998.59 | 0 / 300 | 18.36 ms | 72.19 ms | 119.68 ms | 245.49 ms |
+| 1 | 3 exporters | 999.79 | 989.73 | 0 / 300 | 24.16 ms | 388.69 ms | 515.39 ms | 570.24 ms |
+| 2 | off | 999.78 | 999.58 | 0 / 300 | 23.65 ms | 85.64 ms | 257.06 ms | 384.78 ms |
+| 2 | 3 exporters | 999.79 | 999.79 | 0 / 300 | 23.52 ms | 83.65 ms | 169.02 ms | 263.98 ms |
+
+Delta (exporters on minus off): throughput is unchanged at this rate (achieved 999.79 vs 999.78 eps;
+stored eps over the run 989.73 / 999.79 against 998.59 / 999.58). Latency p50 is 24.16 / 23.52 ms
+against 18.36 / 23.65 ms. Run 1 with exporters shows a worse tail (p95 388.69 ms, p99 515.39 ms)
+while run 2 with exporters is at the level of the baseline runs (p95 83.65 ms vs 72.19 / 85.64 ms).
+The off-runs differ from each other as much (p99 119.68 vs 257.06 ms), so two runs per
+configuration do not separate an exporter cost from run-to-run noise on this host. At the end of
+every run all three exporters were `OK` with zero drops, zero send errors and an empty queue (the
+`exporter_status` field of the JSON line; `sent_records` is read right after the drain, so it can
+trail the stored count by up to one flush interval of 1 s).
+
+What this does not show: rates above 1 000 eps (the 10 000 and 100 000 eps rows of the WSL table
+saturate the server without exporters, so they were not repeated), a slow or failing destination
+(the dedicated isolation test covers that the ingest call returns), or a Linux host. No target was
+set. Reproduce with `osiris-bench ingest --rate 1000 --duration 30 [--exporters]`.
+
 ## Reproduce
 
 ```
@@ -504,6 +540,7 @@ $CARGO_TARGET_DIR/release/osiris-bench dns-send --sends 10000
 git push origin HEAD:refs/heads/storage-bench/<name>   # .github/workflows/storage-bench.yml
 # Single configurations:
 $CARGO_TARGET_DIR/release/osiris-bench ingest --rate 1000 --duration 30
+$CARGO_TARGET_DIR/release/osiris-bench ingest --rate 1000 --duration 30 --exporters   # with 3 local-sink exporters
 ```
 
 `bench.sh` builds release binaries into `$CARGO_TARGET_DIR` (default `/root/osiris-target`) and

@@ -19,12 +19,14 @@ pub struct ServerYaml {
     pub rules_dir: PathBuf,
     pub risk_weights: PathBuf,
     pub dev_cors: bool,
+    /// Appended verbatim under an `exporters:` key; `None` renders no key.
+    pub exporters_yaml: Option<String>,
 }
 
 impl ServerYaml {
     pub fn render(&self) -> String {
         let d = &self.dir;
-        format!(
+        let mut s = format!(
             "db_path: {db}\nspool_path: {spool}\nlisten_addr: '127.0.0.1:{api}'\n\
              rules_dir: {rules}\nrisk_weights_path: {risk}\n\
              baseline_db_path: {baseline}\nincidents_db_path: {inc}\nevidence_db_path: {ev}\n\
@@ -53,7 +55,15 @@ impl ServerYaml {
             skey = f(d, "pki/server.key"),
             ca = f(d, "pki/ca.pem"),
             sign = f(d, "keys/command.key"),
-        )
+        );
+        if let Some(ex) = &self.exporters_yaml {
+            s.push_str("exporters:\n");
+            s.push_str(ex);
+            if !ex.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        s
     }
 }
 
@@ -158,10 +168,13 @@ mod tests {
             rules_dir: dir.path().join("rules"),
             risk_weights: dir.path().join("weights.yaml"),
             dev_cors: true,
+            exporters_yaml: Some("  - name: f\n    kind: file\n    path: /tmp/o.ndjson".into()),
         };
         let path = dir.path().join("server.yaml");
         std::fs::write(&path, y.render()).unwrap();
         let cfg = osiris_server::ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.exporters.len(), 1);
+        assert_eq!(cfg.exporters[0].name, "f");
         assert_eq!(cfg.listen_addr, "127.0.0.1:18080");
         assert_eq!(cfg.agent_listener.unwrap().listen_addr, "127.0.0.1:18081");
         assert_eq!(cfg.control.unwrap().listen_addr, "127.0.0.1:18082");

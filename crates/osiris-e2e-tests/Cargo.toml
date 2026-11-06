@@ -37,3 +37,8 @@ osiris-transport = { path = "../osiris-transport" }
 osiris-command = { path = "../osiris-command" }
 osiris-fleet = { path = "../osiris-fleet" }
 osiris-response = { path = "../osiris-response" }
+osiris-export = { path = "../osiris-export" }
+serde_yaml = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

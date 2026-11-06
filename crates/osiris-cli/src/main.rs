@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use osiris_cli::client::{
-    chain_url, container_story_url, events_url, format_events_table, hunt_url, percent_encode,
-    quarantine_body, response_url, restore_body, risk_url, terminate_body,
+    chain_url, container_story_url, events_url, format_events_table, format_exporters_table,
+    hunt_url, percent_encode, quarantine_body, response_url, restore_body, risk_url,
+    terminate_body,
 };
 use osiris_cli::hunts::template;
 use osiris_schema::CanonicalEvent;
@@ -111,6 +112,11 @@ enum Command {
     Groups {
         #[command(subcommand)]
         action: GroupsAction,
+    },
+    /// Outbound exporters (Phase 12a). Needs a platform Admin session.
+    Exporters {
+        #[command(subcommand)]
+        action: ExportersAction,
     },
     /// Host inspection (Phase 9d-3).
     Hosts {
@@ -334,6 +340,16 @@ enum GroupPolicyAction {
     },
     /// Remove a group's policy.
     Clear { group_id: String },
+}
+
+#[derive(Subcommand)]
+enum ExportersAction {
+    /// Show each exporter's state, queue depth and counters.
+    Status {
+        /// Print the API body (pretty-printed JSON) instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -812,6 +828,22 @@ fn main() {
                 },
             }
         }
+        Command::Exporters { action } => {
+            let base = cli.server.trim_end_matches('/').to_string();
+            match action {
+                ExportersAction::Status { json } => {
+                    get(&client, format!("{base}/api/v1/exporters"), true).and_then(|body| {
+                        let value: serde_json::Value = serde_json::from_str(&body)
+                            .map_err(|e| format!("unexpected exporters response: {e}"))?;
+                        if *json {
+                            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+                        } else {
+                            Ok(format_exporters_table(&value).trim_end().to_string())
+                        }
+                    })
+                }
+            }
+        }
         Command::Hosts { action } => {
             let base = cli.server.trim_end_matches('/').to_string();
             match action {
@@ -997,6 +1029,18 @@ mod groups_cli_tests {
                 action: GroupsAction::Policy {
                     action: GroupPolicyAction::Clear { .. }
                 }
+            }
+        ));
+        assert!(matches!(
+            parse(&["exporters", "status"]).command,
+            Command::Exporters {
+                action: ExportersAction::Status { json: false }
+            }
+        ));
+        assert!(matches!(
+            parse(&["exporters", "status", "--json"]).command,
+            Command::Exporters {
+                action: ExportersAction::Status { json: true }
             }
         ));
         assert!(matches!(

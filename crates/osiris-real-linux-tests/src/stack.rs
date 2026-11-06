@@ -21,6 +21,9 @@ pub struct StackOptions {
     pub dev_cors: bool,
     /// Issue an agent cert for this id without starting an agent (ingest bench).
     pub bench_agent: Option<Uuid>,
+    /// Appended verbatim under an `exporters:` key in the rendered
+    /// `server.yaml` (a YAML list, indented by the caller).
+    pub exporters_yaml: Option<String>,
 }
 
 pub struct AgentOptions {
@@ -139,6 +142,7 @@ impl Stack {
             rules_dir: root.join("config/rules"),
             risk_weights: root.join("config/risk/weights.yaml"),
             dev_cors: opts.dev_cors,
+            exporters_yaml: opts.exporters_yaml.clone(),
         };
         std::fs::write(d.join("server.yaml"), server_yaml.render()).unwrap();
 

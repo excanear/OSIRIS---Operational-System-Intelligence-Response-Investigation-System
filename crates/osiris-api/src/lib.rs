@@ -2655,6 +2655,8 @@ pub mod stream;
 pub use stream::{build_stream_router, ConnectionHold, LiveEventBroadcaster, ShutdownSignal};
 pub mod response;
 pub use response::{build_response_router, ResponseState};
+pub mod exporters;
+pub use exporters::{build_exporters_router, ExportersState};
 pub mod fleet;
 pub mod tenant_scope;
 pub use fleet::{build_fleet_router, FleetState};

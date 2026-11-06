@@ -31,6 +31,10 @@ enum Cmd {
         rate: u64,
         #[arg(long, default_value_t = 30)]
         duration: u64,
+        /// Run the server with three exporters (file ndjson, syslog tcp,
+        /// webhook) pointed at local sinks (Phase 12a overhead measurement).
+        #[arg(long)]
+        exporters: bool,
     },
     Agent {
         #[arg(long)]
@@ -75,7 +79,11 @@ fn main() {
     let records = match Cli::parse().cmd {
         Cmd::Pipeline { events } => vec![pipeline::run(events)],
         Cmd::Query { events } => vec![query::run(events)],
-        Cmd::Ingest { rate, duration } => vec![ingest::run(rate, duration)],
+        Cmd::Ingest {
+            rate,
+            duration,
+            exporters,
+        } => vec![ingest::run(rate, duration, exporters)],
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
         Cmd::FsLoop { iterations } => vec![fsloop::run(iterations)],
         Cmd::DnsSend { sends } => vec![dnsloop::run(sends)],
@@ -101,7 +109,7 @@ fn main() {
                     v.push(query::run(n));
                 }
                 for r in [1_000, 10_000, 100_000] {
-                    v.push(ingest::run(r, 30));
+                    v.push(ingest::run(r, 30, false));
                 }
             }
             if !skip_agent {

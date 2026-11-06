@@ -6,7 +6,9 @@ pub mod ingest;
 pub mod policy_reconcile;
 pub mod storage_backend;
 
-pub use config::{ApiTlsConfig, ClickHouseConfig, ConfigError, ServerConfig, StorageBackend};
+pub use config::{
+    exporter_destination, ApiTlsConfig, ClickHouseConfig, ConfigError, ServerConfig, StorageBackend,
+};
 pub use cors::apply_dev_cors;
 pub use ingest::{run_ingestion_context_loop, run_ingestion_loop, IngestContext};
 pub use storage_backend::open_storage;

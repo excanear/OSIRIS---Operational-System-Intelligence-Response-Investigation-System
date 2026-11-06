@@ -804,6 +804,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "hostname"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1382,6 +1391,7 @@ dependencies = [
  "osiris-command",
  "osiris-correlate",
  "osiris-evidence",
+ "osiris-export",
  "osiris-fleet",
  "osiris-health",
  "osiris-investigate",
@@ -1394,6 +1404,7 @@ dependencies = [
  "osiris-tenancy",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
@@ -1449,6 +1460,7 @@ dependencies = [
 name = "osiris-bench"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "osiris-generator",
  "osiris-pipeline",
@@ -1571,6 +1583,8 @@ name = "osiris-e2e-tests"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hex",
+ "hmac",
  "osiris-agent",
  "osiris-api",
  "osiris-audit",
@@ -1580,6 +1594,7 @@ dependencies = [
  "osiris-correlate",
  "osiris-detect",
  "osiris-evidence",
+ "osiris-export",
  "osiris-fleet",
  "osiris-generator",
  "osiris-investigate",
@@ -1596,6 +1611,8 @@ dependencies = [
  "osiris-transport",
  "reqwest",
  "serde_json",
+ "serde_yaml",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1627,6 +1644,36 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "osiris-export"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "hex",
+ "hmac",
+ "osiris-schema",
+ "osiris-tenancy",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -1958,6 +2005,7 @@ dependencies = [
  "osiris-correlate",
  "osiris-detect",
  "osiris-evidence",
+ "osiris-export",
  "osiris-fileutil",
  "osiris-fleet",
  "osiris-health",

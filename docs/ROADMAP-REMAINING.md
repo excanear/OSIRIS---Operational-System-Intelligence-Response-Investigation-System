@@ -310,9 +310,23 @@ revisão final independente → merge → push.
     classe da F2 da Fase 10. Correção: limitar pela janela de tempo ou usar semi-join.
 
 ## Fase 12 — Extensibilidade e integração (§20)
-- **Exporters** (§20.3): NDJSON/CSV, Syslog/CEF, OpenTelemetry (OTLP); Kafka/webhook opcionais.
-- **Plugins**: regras/enriquecimento em WASM sandboxed (bounded budget por evento); sensores como
-  subprocessos (futuro, §20.2).
+- **Fase 12a, exporters (feita, 2026-11-06)** (§20.3): arquivo NDJSON/CSV, Syslog RFC 5424/CEF sobre
+  UDP/TCP/TLS, OTLP logs (HTTP/JSON) e webhook, dentro do servidor (`osiris-export`), com
+  `GET /api/v1/exporters` e `osiris exporters status`. Ver `docs/operators-exporters.md`,
+  `docs/adr/ADR-012-exporters.md` e `PERFORMANCE.md` ("Phase 12a - exporter overhead").
+  Dívidas da 12a:
+  - Alertas duplicados num reenvio ainda são gravados (os exporters não os recebem): detecção roda
+    de novo com ids novos. Correção no caminho de ingest/detecção.
+  - Notificação push do armazém de tenants (hoje o conjunto de hosts do tenant é relido a cada 10 s;
+    um host movido para fora ainda pode ser exportado por até 10 s).
+  - Kafka e armazenamento de objetos como novos `impl Exporter`; spool em disco se alguém precisar
+    de at-least-once; OTLP de métricas (e traces).
+  - Ver também "Known gaps" do ADR-012: lote com falha parcial não é exportado, registros oferecidos
+    durante uma partida que falha podem se perder sem contagem, oferta após o shutdown conta como
+    `dropped_queue_full`, timeout fixo de 10 s no syslog TCP/TLS.
+- **Fase 12b, plugins**: regras/enriquecimento em WASM sandboxed (bounded budget por evento);
+  sensores como subprocessos (futuro, §20.2). Próximo ciclo (brainstorm → spec → plano), sem
+  dependência da 12a.
 
 ## Fase 13 — Produto e documentação
 - README, LICENSE, guia de instalação e operação, arquitetura resumida, Dockerfile(s), unit files
@@ -321,6 +335,7 @@ revisão final independente → merge → push.
 - Console: tela de Auditoria; paginação real nas listas; itens de UX pendentes.
 
 ## Dívidas técnicas menores (encaixar nas fases acima)
+- Exporters (12a): sonda de conexão no startup; hoje o estado é `OK` até a primeira tentativa de envio (desvio da spec §5.2, ver ADR-012).
 - `detect` de nuvem: com vários providers respondendo, o vencedor é o primeiro que chegar.
 - Listas rolled-up (`/processes`, `/files`, `/network`, `/containers`) trabalham sobre janela limitada
   de eventos; ideal: método de rollup/distinct no trait `Storage`.

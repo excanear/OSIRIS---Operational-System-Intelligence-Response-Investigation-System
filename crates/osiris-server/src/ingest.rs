@@ -127,11 +127,16 @@ pub struct IngestContext {
     /// Set once at startup when the command channel is configured; unset means
     /// heartbeats trigger no policy reconciliation.
     pub policy_reconciler: Arc<std::sync::OnceLock<Arc<crate::policy_reconcile::PolicyReconciler>>>,
+    /// Phase 12a: outbound exporters. `None` (no exporters configured) leaves
+    /// the ingest path exactly as before. `offer` never awaits or fails.
+    pub exporters: Option<Arc<osiris_export::ExportHub>>,
 }
 
 impl IngestContext {
-    /// Persists and analyses `events`, then publishes them to live-stream
-    /// subscribers. `Err` carries a human-readable cause; nothing is published on error.
+    /// Persists and analyses `events`, then publishes the kept ones to
+    /// live-stream subscribers and offers the new ones (and alerts citing
+    /// them) to the exporters. `Err` carries a human-readable cause; nothing
+    /// is published or exported on error.
     pub async fn ingest(&self, events: Vec<CanonicalEvent>) -> Result<(), String> {
         if events.is_empty() {
             return Ok(());
@@ -141,11 +146,7 @@ impl IngestContext {
         let baseline_engine = self.baseline_engine.clone();
         let risk_engine = self.risk_engine.clone();
         let correlation_engine = self.correlation_engine.clone();
-        let events_for_broadcast = if self.broadcaster.has_subscribers() {
-            Some(events.clone())
-        } else {
-            None
-        };
+        let export = self.exporters.is_some();
         let health_events: Vec<CanonicalEvent> = events
             .iter()
             .filter(|e| e.event_type == osiris_schema::EventType::AgentHealth)
@@ -158,10 +159,22 @@ impl IngestContext {
                 // and risk would otherwise be attributed to the victim host.
                 let total = events.len();
                 let mut kept = Vec::with_capacity(total);
+                // Exporters only (spec §5.4): `is_new[i]` says whether
+                // `kept[i]` is new — not stored before and the first of its
+                // id in this batch. A resent or repeated event is still kept
+                // for storage, as before, but is not exported again.
+                let mut is_new: Vec<bool> = Vec::new();
+                let mut seen: std::collections::HashSet<uuid::Uuid> =
+                    std::collections::HashSet::new();
                 for event in events {
                     match storage.event_owner(event.event_id)? {
                         Some(owner) if owner != event.host_id => {}
-                        _ => kept.push(event),
+                        owner => {
+                            if export {
+                                is_new.push(seen.insert(event.event_id) && owner.is_none());
+                            }
+                            kept.push(event);
+                        }
                     }
                 }
                 let events = kept;
@@ -220,14 +233,45 @@ impl IngestContext {
                     storage.write_risk_scores(&risk_records)?;
                 }
 
-                report
+                // Alerts are exported only when their evidence cites at
+                // least one new event, so a pure resend exports nothing.
+                let export_alerts: Vec<Alert> = if export {
+                    let new_ids: std::collections::HashSet<uuid::Uuid> = events
+                        .iter()
+                        .zip(&is_new)
+                        .filter(|(_, new)| **new)
+                        .map(|(e, _)| e.event_id)
+                        .collect();
+                    alerts
+                        .into_iter()
+                        .filter(|a| a.evidence().iter().any(|id| new_ids.contains(id)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                (report, events, is_new, export_alerts)
             })
         })
         .await;
         match outcome {
-            Ok(Ok(_report)) => {
-                if let Some(events) = events_for_broadcast {
-                    self.broadcaster.publish(&events);
+            Ok(Ok((_report, kept, is_new, export_alerts))) => {
+                // The kept set: never an event dropped for an owner collision.
+                if self.broadcaster.has_subscribers() {
+                    self.broadcaster.publish(&kept);
+                }
+                if let Some(hub) = &self.exporters {
+                    if is_new.iter().all(|new| *new) {
+                        hub.offer(&kept, &export_alerts);
+                    } else {
+                        let new_events: Vec<CanonicalEvent> = kept
+                            .iter()
+                            .zip(&is_new)
+                            .filter(|(_, new)| **new)
+                            .map(|(e, _)| e.clone())
+                            .collect();
+                        hub.offer(&new_events, &export_alerts);
+                    }
                 }
                 if !health_events.is_empty() {
                     let fleet_registry = self.fleet_registry.clone();
@@ -334,6 +378,7 @@ pub async fn run_ingestion_loop(
         broadcaster,
         fleet_registry,
         policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+        exporters: None,
     };
     run_ingestion_context_loop(spool_path, context, poll_interval, cancellation).await;
 }
@@ -524,6 +569,7 @@ mod tests {
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let server_now = server_now_ns();
@@ -587,6 +633,7 @@ mod tests {
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let base = server_now_ns() - 10_000_000_000;
@@ -662,6 +709,7 @@ mod tests {
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = uuid::Uuid::new_v4();
 
@@ -699,6 +747,7 @@ mod tests {
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let mut bad = agent_health_event(host_id, 1_000);
@@ -743,6 +792,7 @@ mod tests {
             broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         // `sample_event()` (this file's existing test-only helper, defined
         // above at the top of this test module) builds a plain ProcessExec
@@ -825,6 +875,7 @@ mod tests {
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let tls = osiris_transport::tls::server_config(
             &dir.path().join("server.pem"),
@@ -915,6 +966,7 @@ mod tests {
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let a = sample_event();
         context.ingest(vec![a.clone()]).await.unwrap();
@@ -1059,6 +1111,7 @@ mod tests {
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = Uuid::new_v4();
         let events: Vec<CanonicalEvent> = (0..20u32)
@@ -1114,6 +1167,7 @@ mod tests {
                 osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
         };
         let host_id = Uuid::new_v4();
         // Each event carries a process and a network block: one baseline pair each.
@@ -1504,5 +1558,252 @@ sequence:
             has_chain_bonus,
             "risk score must cite the chain-pattern bonus"
         );
+    }
+
+    // ---------- Phase 12a: exporters ----------
+
+    use osiris_export::{
+        CommonOptions, ExportError, ExportHub, ExportOutcome, ExportRecord, Exporter, Filter,
+        Stream, WorkerSettings,
+    };
+
+    /// Records what it is handed; `stuck` makes every export hang forever.
+    struct RecordingExporter {
+        stuck: bool,
+        delivered: std::sync::Mutex<Vec<(Stream, Uuid)>>,
+    }
+
+    impl RecordingExporter {
+        fn new(stuck: bool) -> Arc<Self> {
+            Arc::new(Self {
+                stuck,
+                delivered: std::sync::Mutex::new(vec![]),
+            })
+        }
+        fn ids(&self, stream: Stream) -> Vec<Uuid> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| *s == stream)
+                .map(|(_, id)| *id)
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Exporter for RecordingExporter {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        async fn export(&self, batch: &[Arc<ExportRecord>]) -> Result<ExportOutcome, ExportError> {
+            if self.stuck {
+                std::future::pending::<()>().await;
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .extend(batch.iter().map(|r| (r.stream(), r.id())));
+            Ok(ExportOutcome::default())
+        }
+    }
+
+    fn start_hub(exporter: Arc<RecordingExporter>, queue_capacity: usize) -> Arc<ExportHub> {
+        start_hub_with_batch(exporter, queue_capacity, 500)
+    }
+
+    fn start_hub_with_batch(
+        exporter: Arc<RecordingExporter>,
+        queue_capacity: usize,
+        batch_max: usize,
+    ) -> Arc<ExportHub> {
+        let common = CommonOptions {
+            streams: vec![Stream::Events, Stream::Alerts],
+            min_severity: Severity::Info,
+            event_types: None,
+            tenant_id: None,
+            include_raw: false,
+            queue_capacity,
+            batch_max,
+            flush_interval_ms: 20,
+            max_retries: 0,
+        };
+        let settings = WorkerSettings {
+            name: "rec".into(),
+            kind: "file",
+            filter: Filter::from_config(&common),
+            tenant_id: None,
+            queue_capacity,
+            batch_max,
+            flush_interval: Duration::from_millis(20),
+            max_retries: 0,
+        };
+        ExportHub::start(vec![(settings, exporter)], None, CancellationToken::new())
+    }
+
+    fn export_context(
+        dir: &std::path::Path,
+        rules: Vec<osiris_detect::Rule>,
+        exporters: Option<Arc<ExportHub>>,
+    ) -> IngestContext {
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir);
+        IngestContext {
+            storage: Arc::new(SqliteStorage::open(dir.join("events.db")).unwrap()),
+            detection_engine: Arc::new(DetectionEngine::new(rules)),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.join("hosts.db")).unwrap(),
+            ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters,
+        }
+    }
+
+    fn web_root_rule() -> osiris_detect::Rule {
+        osiris_detect::Rule::from_yaml_str(WEB_ROOT_RULE, "test.yaml").unwrap()
+    }
+
+    #[tokio::test]
+    async fn ingest_offers_new_events_and_their_alerts_to_the_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(false);
+        let hub = start_hub(rec.clone(), 100);
+        let context = export_context(dir.path(), vec![web_root_rule()], Some(hub.clone()));
+        let event = web_root_shell_event();
+        context.ingest(vec![event.clone()]).await.unwrap();
+        hub.shutdown().await;
+
+        assert_eq!(rec.ids(Stream::Events), vec![event.event_id]);
+        let alerts = context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(rec.ids(Stream::Alerts), vec![alerts[0].alert_id()]);
+    }
+
+    #[tokio::test]
+    async fn a_resent_batch_exports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(false);
+        let hub = start_hub(rec.clone(), 100);
+        let context = export_context(dir.path(), vec![web_root_rule()], Some(hub.clone()));
+        let batch = vec![web_root_shell_event(), sample_event()];
+        context.ingest(batch.clone()).await.unwrap();
+        context.ingest(batch.clone()).await.unwrap();
+        hub.shutdown().await;
+
+        let mut exported = rec.ids(Stream::Events);
+        exported.sort();
+        let mut expected: Vec<Uuid> = batch.iter().map(|e| e.event_id).collect();
+        expected.sort();
+        assert_eq!(exported, expected, "the resend exported events again");
+        assert_eq!(
+            rec.ids(Stream::Alerts).len(),
+            1,
+            "alerts of the resend cite no new event and must not be exported"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_id_repeated_inside_one_batch_is_exported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(false);
+        let hub = start_hub(rec.clone(), 100);
+        let context = export_context(dir.path(), vec![], Some(hub.clone()));
+        let event = sample_event();
+        let other = sample_event();
+        context
+            .ingest(vec![event.clone(), other.clone(), event.clone()])
+            .await
+            .unwrap();
+        hub.shutdown().await;
+
+        assert_eq!(
+            rec.ids(Stream::Events),
+            vec![event.event_id, other.event_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_collision_events_are_neither_exported_nor_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(false);
+        let hub = start_hub(rec.clone(), 100);
+        let context = export_context(dir.path(), vec![], Some(hub.clone()));
+        let original = sample_event();
+        context.ingest(vec![original.clone()]).await.unwrap();
+
+        let (_id, mut receiver, _dropped) = context.broadcaster.subscribe(None);
+        let mut forged = sample_event();
+        forged.event_id = original.event_id;
+        let fresh = sample_event();
+        context
+            .ingest(vec![forged.clone(), fresh.clone()])
+            .await
+            .unwrap();
+        hub.shutdown().await;
+
+        let mut broadcast = vec![];
+        while let Ok(e) = receiver.try_recv() {
+            broadcast.push((e.event_id, e.host_id));
+        }
+        assert_eq!(broadcast, vec![(fresh.event_id, fresh.host_id)]);
+        assert_eq!(
+            rec.ids(Stream::Events),
+            vec![original.event_id, fresh.event_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stuck_exporter_does_not_slow_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(true);
+        // batch_max 1: the worker is stuck holding one record, so the queue of 4
+        // must overflow whatever the scheduling order (with a large batch the
+        // worker could absorb every record into its in-hand batch first).
+        let hub = start_hub_with_batch(rec.clone(), 4, 1);
+        let context = export_context(dir.path(), vec![web_root_rule()], Some(hub.clone()));
+        for i in 0..20 {
+            let batch = vec![web_root_shell_event(), sample_event(), sample_event()];
+            let started = std::time::Instant::now();
+            context.ingest(batch).await.unwrap();
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_millis(500),
+                "ingest {i} took {took:?} behind a stuck exporter"
+            );
+        }
+        let status = hub.status();
+        assert!(
+            status[0].dropped_queue_full > 0,
+            "the stuck exporter's queue should have overflowed: {status:?}"
+        );
+        assert!(rec.ids(Stream::Events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_without_exporters_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = export_context(dir.path(), vec![web_root_rule()], None);
+        let (_id, mut receiver, _dropped) = context.broadcaster.subscribe(None);
+        let event = web_root_shell_event();
+        context.ingest(vec![event.clone()]).await.unwrap();
+        context.ingest(vec![event.clone()]).await.unwrap();
+
+        assert_eq!(context.storage.query(&QueryPlan::new()).unwrap().len(), 1);
+        let alerts = context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap();
+        assert!(!alerts.is_empty());
+        assert_eq!(alerts[0].rule_id(), "shell_wrote_file_to_web_root");
+        // The live stream still sees every kept event, a resend included.
+        assert_eq!(receiver.try_recv().unwrap().event_id, event.event_id);
+        assert_eq!(receiver.try_recv().unwrap().event_id, event.event_id);
+        assert!(receiver.try_recv().is_err());
     }
 }
