@@ -18,7 +18,12 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

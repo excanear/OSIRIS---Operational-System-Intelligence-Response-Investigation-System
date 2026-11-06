@@ -6,6 +6,7 @@ pub mod exporter;
 pub mod format;
 pub mod hub;
 pub mod record;
+pub mod transport;
 
 pub use config::{
     validate_exporters, CommonOptions, ExporterConfig, Facility, FileConfig, FileFormat, Filter,
@@ -19,3 +20,4 @@ pub use format::{
 };
 pub use hub::{ExportHub, ExporterState, ExporterStatus, WorkerSettings};
 pub use record::{ExportRecord, Stream};
+pub use transport::{client_tls_config, FileExporter, SyslogExporter};
