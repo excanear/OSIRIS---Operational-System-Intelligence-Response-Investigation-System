@@ -1997,6 +1997,7 @@ dependencies = [
  "osiris-correlate",
  "osiris-detect",
  "osiris-evidence",
+ "osiris-export",
  "osiris-fileutil",
  "osiris-fleet",
  "osiris-health",
