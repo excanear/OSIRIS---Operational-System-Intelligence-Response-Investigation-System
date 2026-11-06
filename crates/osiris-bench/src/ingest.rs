@@ -40,14 +40,79 @@ pub(crate) fn poll_markers(
     seen
 }
 
+/// Three local sinks for the `--exporters` run: a file exporter target, a TCP
+/// listener that drains and discards (syslog-tcp) and an HTTP receiver that
+/// answers every POST with 200 (webhook). They run on their own runtime,
+/// which is dropped (stopping them) with this value.
+struct Sinks {
+    _rt: tokio::runtime::Runtime,
+    _dir: tempfile::TempDir,
+    yaml: String,
+}
+
+fn start_sinks() -> Sinks {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("export.ndjson");
+    let (tcp_port, http_port) = rt.block_on(async {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = tcp.accept().await {
+                tokio::spawn(async move {
+                    let mut sink = tokio::io::sink();
+                    let _ = tokio::io::copy(&mut sock, &mut sink).await;
+                });
+            }
+        });
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(|body: axum::body::Bytes| async move {
+                drop(body);
+                axum::http::StatusCode::OK
+            }),
+        );
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(http, app).await;
+        });
+        (tcp_port, http_port)
+    });
+    // Forward slashes keep a Windows path valid in a single-quoted scalar.
+    let file = file.display().to_string().replace('\\', "/");
+    let yaml = format!(
+        "  - name: bench-file\n    kind: file\n    path: '{file}'\n\
+         \x20 - name: bench-syslog\n    kind: syslog\n    address: '127.0.0.1:{tcp_port}'\n    transport: tcp\n\
+         \x20 - name: bench-webhook\n    kind: webhook\n    url: 'http://127.0.0.1:{http_port}/hook'\n"
+    );
+    Sinks {
+        _rt: rt,
+        _dir: dir,
+        yaml,
+    }
+}
+
 /// Server-only stack; the bench itself plays the agent, shipping over the
-/// real mTLS listener with the real forwarder (`drive`).
-pub fn run(rate: u64, duration_s: u64) -> Record {
+/// real mTLS listener with the real forwarder (`drive`). With `exporters`
+/// the server also runs a file, a syslog-tcp and a webhook exporter pointed
+/// at local sinks.
+pub fn run(rate: u64, duration_s: u64, exporters: bool) -> Record {
+    let sinks = exporters.then(start_sinks);
     let stack = Stack::start(StackOptions {
         bench_agent: Some(Uuid::new_v4()),
+        exporters_yaml: sinks.as_ref().map(|s| s.yaml.clone()),
         ..Default::default()
     });
-    drive(&stack, rate, duration_s)
+    let mut rec = drive(&stack, rate, duration_s);
+    rec.params["exporters"] = serde_json::json!(exporters);
+    if exporters {
+        // Per-exporter counters at the end of the run (after the drain).
+        rec.metrics["exporter_status"] = stack.api_get("/api/v1/exporters")["exporters"].clone();
+    }
+    drop(stack);
+    drop(sinks);
+    rec
 }
 
 fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
