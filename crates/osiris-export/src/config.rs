@@ -9,6 +9,7 @@
 //! stray key lands in the kind struct's remainder and is rejected there.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -221,7 +222,7 @@ fn default_facility() -> Facility {
     Facility::Local0
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
     pub endpoint: String,
@@ -237,7 +238,7 @@ pub struct OtlpConfig {
     pub timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     pub url: String,
@@ -253,6 +254,42 @@ pub struct WebhookConfig {
     pub client_key: Option<PathBuf>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+/// `scheme://host[:port]/path` of a URL; the query (which may hold a token) is hidden.
+fn redact_url(url: &str) -> String {
+    let no_frag = url.split('#').next().unwrap_or("");
+    match no_frag.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => no_frag.to_string(),
+    }
+}
+
+impl fmt::Debug for OtlpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OtlpConfig")
+            .field("endpoint", &redact_url(&self.endpoint))
+            .field("headers_file", &self.headers_file)
+            .field("ca_file", &self.ca_file)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("url", &redact_url(&self.url))
+            .field("hmac_key_file", &self.hmac_key_file)
+            .field("headers_file", &self.headers_file)
+            .field("ca_file", &self.ca_file)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +357,9 @@ fn build_exporter(mut map: Mapping) -> Result<ExporterConfig, String> {
 }
 
 /// Validates every exporter and the set as a whole. Messages name the exporter.
+/// Upper bound on `queue_capacity` (memory guard).
+const MAX_QUEUE_CAPACITY: usize = 1_000_000;
+
 pub fn validate_exporters(cfgs: &[ExporterConfig]) -> Result<(), ConfigError> {
     let mut seen = HashSet::new();
     for cfg in cfgs {
@@ -352,8 +392,16 @@ fn validate_one(cfg: &ExporterConfig) -> Result<(), String> {
     if c.queue_capacity == 0 {
         return Err("queue_capacity must be greater than 0".into());
     }
+    if c.queue_capacity > MAX_QUEUE_CAPACITY {
+        return Err(format!(
+            "queue_capacity must not exceed {MAX_QUEUE_CAPACITY}"
+        ));
+    }
     if c.batch_max == 0 {
         return Err("batch_max must be greater than 0".into());
+    }
+    if c.batch_max > c.queue_capacity {
+        return Err("batch_max must not exceed queue_capacity".into());
     }
     if c.flush_interval_ms == 0 {
         return Err("flush_interval_ms must be greater than 0".into());
@@ -623,6 +671,20 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_prints_url_query() {
+        let cfgs = parse(
+            "- {name: o, kind: otlp, endpoint: 'https://c:4318/v1/logs?token=SECRET'}
+- {name: w, kind: webhook, url: 'https://h/x?key=SECRET'}",
+        )
+        .unwrap();
+        for c in &cfgs {
+            let d = format!("{c:?}");
+            assert!(!d.contains("SECRET"), "{d}");
+            assert!(d.contains("https://"), "{d}");
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_names() {
         rejected(
             "
@@ -692,6 +754,15 @@ mod tests {
     #[test]
     fn rejects_zero_batch_max() {
         rejected("- {name: b0, kind: file, path: /a, batch_max: 0}", "b0");
+        rejected(
+            "- {name: bq, kind: file, path: /a, queue_capacity: 10, batch_max: 11}",
+            "bq",
+        );
+        rejected(
+            "- {name: qbig, kind: file, path: /a, queue_capacity: 1000001}",
+            "qbig",
+        );
+        assert!(parse("- {name: ok, kind: file, path: /a, queue_capacity: 1000000}").is_ok());
     }
 
     #[test]

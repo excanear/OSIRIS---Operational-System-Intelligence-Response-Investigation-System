@@ -335,6 +335,7 @@ revisão final independente → merge → push.
 - Console: tela de Auditoria; paginação real nas listas; itens de UX pendentes.
 
 ## Dívidas técnicas menores (encaixar nas fases acima)
+- Exporters (12a): sonda de conexão no startup; hoje o estado é `OK` até a primeira tentativa de envio (desvio da spec §5.2, ver ADR-012).
 - `detect` de nuvem: com vários providers respondendo, o vencedor é o primeiro que chegar.
 - Listas rolled-up (`/processes`, `/files`, `/network`, `/containers`) trabalham sobre janela limitada
   de eventos; ideal: método de rollup/distinct no trait `Storage`.

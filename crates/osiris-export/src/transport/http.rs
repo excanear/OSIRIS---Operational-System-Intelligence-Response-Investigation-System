@@ -40,10 +40,17 @@ impl HttpSender {
     fn new(name: &str, p: HttpParams<'_>) -> Result<Self, ConfigError> {
         let url = Url::parse(p.url).map_err(|_| ConfigError::new(name, "invalid URL"))?;
         let host = url.host_str().unwrap_or_default().to_string();
-        let tls = client_tls_config(p.ca_file, p.client_cert, p.client_key)
-            .map_err(|e| ConfigError::new(name, e.message))?;
-        let client = Client::builder()
-            .use_preconfigured_tls((*tls).clone())
+        let mut builder = Client::builder();
+        // Plain http:// (loopback only) needs no TLS setup, so an empty OS root store
+        // must not stop it from starting.
+        if url.scheme() == "https" {
+            let tls = client_tls_config(p.ca_file, p.client_cert, p.client_key)
+                .map_err(|e| ConfigError::new(name, e.message))?;
+            builder = builder.use_preconfigured_tls((*tls).clone());
+        }
+        let client = builder
+            // Never route exporter traffic (and its headers) through an env proxy.
+            .no_proxy()
             .timeout(Duration::from_secs(p.timeout_secs))
             // A redirect could carry the configured headers to another host.
             .redirect(reqwest::redirect::Policy::none())
@@ -171,7 +178,11 @@ fn now_ns() -> u64 {
 }
 
 /// `partialSuccess.rejectedLogRecords` (a string or a number) of an OTLP reply.
-fn rejected_records(body: &[u8]) -> u64 {
+fn rejected_records(body: &[u8], batch_len: usize) -> u64 {
+    rejected_records_raw(body).min(batch_len as u64)
+}
+
+fn rejected_records_raw(body: &[u8]) -> u64 {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return 0;
     };
@@ -231,7 +242,7 @@ impl Exporter for OtlpExporter {
             .post("application/json", None, body.into_bytes())
             .await?;
         Ok(ExportOutcome {
-            dropped: rejected_records(&reply),
+            dropped: rejected_records(&reply, batch.len()),
             truncated: 0,
         })
     }
@@ -463,9 +474,24 @@ mod tests {
             assert!(v["resourceLogs"].is_array());
         }
         *rx.reply.lock().unwrap() = r#"{"partialSuccess":{"rejectedLogRecords":3}}"#.into();
-        assert_eq!(ex.export(&[event(1)]).await.unwrap().dropped, 3);
+        assert_eq!(ex.export(&[event(1)]).await.unwrap().dropped, 1);
         *rx.reply.lock().unwrap() = "{}".into();
         assert_eq!(ex.export(&[event(1)]).await.unwrap().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_count_is_clamped_to_batch_length() {
+        let (url, rx) = receiver().await;
+        *rx.reply.lock().unwrap() = r#"{"partialSuccess":{"rejectedLogRecords":"999"}}"#.into();
+        let ex = OtlpExporter::new("o", &otlp(&url), false).unwrap();
+        let out = ex.export(&[event(1), event(2)]).await.unwrap();
+        assert_eq!(out.dropped, 2);
+    }
+
+    #[test]
+    fn plain_http_loopback_builds_without_ca_file() {
+        assert!(OtlpExporter::new("o", &otlp("http://127.0.0.1:1/x"), false).is_ok());
+        assert!(WebhookExporter::new("w", &wh("http://127.0.0.1:1/x"), false).is_ok());
     }
 
     #[tokio::test]

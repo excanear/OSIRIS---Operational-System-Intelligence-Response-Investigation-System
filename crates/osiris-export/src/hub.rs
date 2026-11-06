@@ -555,7 +555,7 @@ impl Worker {
     }
 
     async fn run(self, mut rx: mpsc::Receiver<Rec>) {
-        let mut held: Vec<Rec> = Vec::with_capacity(self.batch_max);
+        let mut held: Vec<Rec> = Vec::with_capacity(self.batch_max.min(1024));
         let mut lost = 0u64;
         'run: loop {
             tokio::select! {
@@ -580,7 +580,7 @@ impl Worker {
                 }
                 self.set_in_hand(held.len());
             }
-            let batch = std::mem::replace(&mut held, Vec::with_capacity(self.batch_max));
+            let batch = std::mem::replace(&mut held, Vec::with_capacity(self.batch_max.min(1024)));
             match self.deliver(batch, self.max_retries).await {
                 Delivery::Done => self.set_in_hand(0),
                 Delivery::Interrupted(b) => {

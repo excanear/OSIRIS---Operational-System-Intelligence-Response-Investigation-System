@@ -32,7 +32,8 @@ exporters:
 Then restart the server. Exporters are read at startup; there is no runtime reconfiguration. A
 bad entry (unknown key, bad value, duplicate name) stops the server at startup with a message that
 names the exporter. A destination that is merely unreachable does **not** stop startup: that
-exporter starts and reports `DEGRADED` until it can send (see "Troubleshooting").
+exporter starts as `OK` and reports `DEGRADED` only after its first send fails (see
+"Troubleshooting").
 
 Check it:
 
@@ -57,8 +58,8 @@ kind side by side. Unknown keys are rejected. Names are unique and match `[a-z0-
 | `event_types` | list | all | Allow-list of event types (for example `PROCESS_EXEC`). Applies to events only; alerts ignore it. |
 | `tenant_id` | UUID | none (all hosts) | Send only records of hosts that belong to this tenant (see "Tenant filter"). |
 | `include_raw` | bool | `false` | Include the event's `raw_event` bytes, base64-encoded, in NDJSON-based output. An event that has no raw event yields `"raw_event": null`. |
-| `queue_capacity` | integer | `10000` | Records the exporter's in-memory queue holds. Must be greater than 0. |
-| `batch_max` | integer | `500` | Records per send. Must be greater than 0. |
+| `queue_capacity` | integer | `10000` | Records the exporter's in-memory queue holds. Must be greater than 0 and at most `1000000`. |
+| `batch_max` | integer | `500` | Records per send. Must be greater than 0 and not larger than `queue_capacity`. |
 | `flush_interval_ms` | integer | `1000` | Send a partial batch after this long. Must be greater than 0. |
 | `max_retries` | integer | `5` | Retries of one batch after a transient failure. Backoff is 0.5 s doubling to a 30 s cap, with about 20 % jitter. |
 
@@ -312,9 +313,8 @@ for platform admins only.
   `::1`, `localhost`), for example a local collector. Any other `http://` URL fails config load.
   `udp` and `tcp` syslog are plaintext by nature: use `tls` across networks.
 - `client_cert` and `client_key` enable mutual TLS and must be given together.
-- The HTTP exporters use `reqwest`, which honours the `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
-  environment variables of the server process. If those are set, exporter traffic goes through that
-  proxy. Set `NO_PROXY` for your destinations if that is not what you want.
+- The HTTP exporters never use a proxy: `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are ignored, so
+  exporter headers are never sent to a proxy. The destination must be reachable directly.
 
 ## Secrets
 

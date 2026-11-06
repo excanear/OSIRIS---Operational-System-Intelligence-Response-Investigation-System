@@ -65,8 +65,10 @@ the HTTP exporters have the same TLS options as syslog.
   the event or alert id.
 - A restart or crash loses whatever is queued. This is the price of having no disk spool, and it is
   documented for operators.
-- An unreachable destination at startup does not stop the server; the exporter reports `DEGRADED`
-  and retries. A malformed exporter entry does stop it.
+- An unreachable destination at startup does not stop the server. The exporter starts `OK` and goes
+  `DEGRADED` after its first failed send, then retries. This deviates from spec 5.2: state is `OK`
+  until the first send attempt, and a startup connect probe is a follow-up debt (see
+  ROADMAP-REMAINING). A malformed exporter entry does stop it.
 - Operators get one stable shape per format, a documented CEF map, and per-exporter counters.
 - The exporter overhead on ingest was measured (PERFORMANCE.md) rather than assumed.
 
@@ -78,6 +80,8 @@ the HTTP exporters have the same TLS options as syslog.
 - **Duplicate alerts on resend are still stored.** A resend exports nothing, but detection runs again
   and writes new alerts with new ids. Exporters are shielded; storage is not. Fixing it belongs in
   the ingest/detection path.
+- **Duplicate event id inside one batch.** It is exported once, but detection evaluates both copies,
+  so a rule-matching duplicate can produce two exported alerts (same class as the debt above).
 - **Tenant move window.** A host moved out of a tenant can be exported by that tenant's exporter for
   up to 10 s (the host-set refresh interval). A push notification from the tenant store would close
   it but needs a new `TenantStore` hook.
@@ -92,8 +96,6 @@ the HTTP exporters have the same TLS options as syslog.
 - **Partly written batch plus retry duplicates.** See Consequences; a transactional file or UDP
   sender is not possible, so this is accepted.
 - **Syslog TCP/TLS timeout is fixed at 10 s**, not configurable (the HTTP exporters use `timeout_secs`).
-- **reqwest honours `HTTP(S)_PROXY`.** Exporter traffic follows the proxy environment of the server
-  process; it is documented but not switched off.
 - **A `Content-Type` line in a `headers_file`** produces a duplicate header.
 - **Serialization failures render empty values** (an unserializable enum as `""`, a bad timestamp as
   the epoch) instead of failing the record; unreachable with the current schema.
