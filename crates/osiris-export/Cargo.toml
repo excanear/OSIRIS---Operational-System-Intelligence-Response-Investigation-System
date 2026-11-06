@@ -22,8 +22,13 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

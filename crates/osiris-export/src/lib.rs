@@ -1,5 +1,6 @@
 //! Server-side exporters (Phase 12a): record, trait and configuration.
 
+pub mod build;
 pub mod config;
 pub mod error;
 pub mod exporter;
@@ -8,6 +9,7 @@ pub mod hub;
 pub mod record;
 pub mod transport;
 
+pub use build::build_exporters;
 pub use config::{
     validate_exporters, CommonOptions, ExporterConfig, Facility, FileConfig, FileFormat, Filter,
     KindConfig, OtlpConfig, SyslogConfig, SyslogFormat, SyslogTransport, WebhookConfig,
@@ -20,4 +22,6 @@ pub use format::{
 };
 pub use hub::{ExportHub, ExporterState, ExporterStatus, WorkerSettings};
 pub use record::{ExportRecord, Stream};
-pub use transport::{client_tls_config, FileExporter, SyslogExporter};
+pub use transport::{
+    client_tls_config, FileExporter, OtlpExporter, SyslogExporter, WebhookExporter,
+};
