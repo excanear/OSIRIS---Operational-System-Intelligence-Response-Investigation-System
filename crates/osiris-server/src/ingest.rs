@@ -1609,6 +1609,14 @@ sequence:
     }
 
     fn start_hub(exporter: Arc<RecordingExporter>, queue_capacity: usize) -> Arc<ExportHub> {
+        start_hub_with_batch(exporter, queue_capacity, 500)
+    }
+
+    fn start_hub_with_batch(
+        exporter: Arc<RecordingExporter>,
+        queue_capacity: usize,
+        batch_max: usize,
+    ) -> Arc<ExportHub> {
         let common = CommonOptions {
             streams: vec![Stream::Events, Stream::Alerts],
             min_severity: Severity::Info,
@@ -1616,7 +1624,7 @@ sequence:
             tenant_id: None,
             include_raw: false,
             queue_capacity,
-            batch_max: 500,
+            batch_max,
             flush_interval_ms: 20,
             max_retries: 0,
         };
@@ -1626,7 +1634,7 @@ sequence:
             filter: Filter::from_config(&common),
             tenant_id: None,
             queue_capacity,
-            batch_max: 500,
+            batch_max,
             flush_interval: Duration::from_millis(20),
             max_retries: 0,
         };
@@ -1754,7 +1762,10 @@ sequence:
     async fn a_stuck_exporter_does_not_slow_ingest() {
         let dir = tempfile::tempdir().unwrap();
         let rec = RecordingExporter::new(true);
-        let hub = start_hub(rec.clone(), 4);
+        // batch_max 1: the worker is stuck holding one record, so the queue of 4
+        // must overflow whatever the scheduling order (with a large batch the
+        // worker could absorb every record into its in-hand batch first).
+        let hub = start_hub_with_batch(rec.clone(), 4, 1);
         let context = export_context(dir.path(), vec![web_root_rule()], Some(hub.clone()));
         for i in 0..20 {
             let batch = vec![web_root_shell_event(), sample_event(), sample_event()];
