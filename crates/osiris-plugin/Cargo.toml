@@ -1,0 +1,12 @@
+[package]
+name = "osiris-plugin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osiris-schema = { path = "../osiris-schema" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

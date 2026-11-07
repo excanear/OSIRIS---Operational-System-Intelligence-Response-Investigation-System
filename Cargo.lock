@@ -1767,6 +1767,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "osiris-plugin"
+version = "0.1.0"
+dependencies = [
+ "osiris-schema",
+ "serde",
+ "serde_yaml",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "osiris-policy"
 version = "0.1.0"
 dependencies = [

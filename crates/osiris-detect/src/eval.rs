@@ -37,6 +37,12 @@ pub fn matches(op: Operator, actual: &serde_json::Value, expected: &serde_json::
             .as_array()
             .map(|values| values.iter().any(|v| v == actual))
             .unwrap_or(false),
+        // Array membership (spec 5.3): lets YAML rules match plugin tags.
+        Operator::Contains if actual.is_array() => expected.as_str().is_some_and(|e| {
+            actual
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(e)))
+        }),
         Operator::Contains | Operator::StartsWith | Operator::EndsWith => {
             let (Some(actual), Some(expected)) = (actual.as_str(), expected.as_str()) else {
                 return false;
@@ -149,6 +155,14 @@ mod tests {
         assert!(matches(Operator::EndsWith, &path, &json!(".php")));
         assert!(matches(Operator::Contains, &path, &json!("/html/")));
         assert!(!matches(Operator::Contains, &path, &json!("/etc/")));
+    }
+
+    #[test]
+    fn contains_matches_a_member_of_a_string_array() {
+        let tags = json!(["a", 5, "plugin:x:y"]);
+        assert!(matches(Operator::Contains, &tags, &json!("plugin:x:y")));
+        assert!(!matches(Operator::Contains, &tags, &json!("plugin:x")));
+        assert!(!matches(Operator::Contains, &tags, &json!(5)));
     }
 
     #[test]
