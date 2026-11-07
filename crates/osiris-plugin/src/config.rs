@@ -55,7 +55,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(plugin: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(plugin: &str, message: impl Into<String>) -> Self {
         Self {
             plugin: plugin.to_string(),
             message: message.into(),

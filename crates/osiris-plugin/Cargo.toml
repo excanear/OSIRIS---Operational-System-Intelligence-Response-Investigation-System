@@ -3,10 +3,21 @@ name = "osiris-plugin"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes the WAT fixtures to other crates' tests. Enable only from [dev-dependencies].
+test-support = ["dep:wat"]
+
 [dependencies]
 osiris-schema = { path = "../osiris-schema" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+wasmtime = { workspace = true }
+wat = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }
+wat = { workspace = true }
+tempfile = { workspace = true }
