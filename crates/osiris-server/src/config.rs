@@ -91,6 +91,10 @@ pub struct ServerConfig {
     /// export hub and no worker tasks.
     #[serde(default)]
     pub exporters: Vec<osiris_export::ExporterConfig>,
+    /// Phase 12b: server-side WASM plugins. Empty (the default) = no
+    /// wasmtime engine and an unchanged ingest path.
+    #[serde(default)]
+    pub plugins: Vec<osiris_plugin::PluginConfig>,
 }
 
 /// The telemetry storage backend.
@@ -296,6 +300,8 @@ impl ServerConfig {
         }
         osiris_export::validate_exporters(&config.exporters)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        osiris_plugin::validate_plugins(&config.plugins)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         Ok(config)
     }
 }
@@ -413,6 +419,31 @@ mod tests {
         .unwrap();
         let names: Vec<_> = config.exporters.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["siem", "local"]);
+    }
+
+    #[test]
+    fn loads_a_config_with_plugins() {
+        assert!(load_yaml(BASE_YAML).unwrap().plugins.is_empty());
+        let sha = "a".repeat(64);
+        let config = load_yaml(&format!(
+            "{BASE_YAML}plugins:\n  - name: nc_hunter\n    kind: detection\n    path: /etc/osiris/plugins/nc.wasm\n    sha256: {sha}\n  - name: tagger\n    kind: enrichment\n    path: /etc/osiris/plugins/tag.wasm\n    sha256: {sha}\n    enabled: false\n    fuel_per_event: 5000\n"
+        ))
+        .unwrap();
+        let names: Vec<_> = config.plugins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["nc_hunter", "tagger"]);
+        assert_eq!(config.plugins[0].fuel_per_event, 10_000_000);
+        assert!(!config.plugins[1].enabled);
+    }
+
+    #[test]
+    fn rejects_an_invalid_plugin_at_load() {
+        let err = load_yaml(&format!(
+            "{BASE_YAML}plugins:\n  - name: BAD NAME\n    kind: detection\n    path: /x.wasm\n    sha256: nothex\n"
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Invalid(_)), "{msg}");
+        assert!(msg.contains("plugin"), "{msg}");
     }
 
     #[test]

@@ -41,6 +41,7 @@ osiris-fleet = { path = "../osiris-fleet" }
 osiris-health = { path = "../osiris-health" }
 osiris-policy = { path = "../osiris-policy" }
 osiris-export = { path = "../osiris-export" }
+osiris-plugin = { path = "../osiris-plugin" }
 rand = { workspace = true }
 async-trait = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -49,6 +50,8 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 
 [dev-dependencies]
+osiris-plugin = { path = "../osiris-plugin", features = ["test-support"] }
+sha2 = { workspace = true }
 osiris-baseline = { path = "../osiris-baseline", features = ["test-hooks"] }
 osiris-query = { path = "../osiris-query" }
 hex = { workspace = true }
