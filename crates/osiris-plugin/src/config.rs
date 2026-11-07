@@ -3,13 +3,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_NAME_LEN: usize = 64;
 pub const FUEL_RANGE: std::ops::RangeInclusive<u64> = 1..=1_000_000_000;
 pub const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 1..=256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {
     Detection,

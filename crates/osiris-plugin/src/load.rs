@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 use wasmtime::{
-    Config, Engine, ExternType, InstancePre, Linker, Module, Store, StoreLimits,
+    Config, Engine, ExternType, InstancePre, Linker, Module, ResourceLimiter, Store, StoreLimits,
     StoreLimitsBuilder, ValType,
 };
 
@@ -15,7 +15,79 @@ const PROBE_FUEL: u64 = 100_000;
 
 /// Per-store host state: just the resource limiter.
 pub struct HostState {
-    pub limits: StoreLimits,
+    pub limits: PluginLimits,
+}
+
+impl HostState {
+    pub fn new(limits: StoreLimits) -> Self {
+        Self {
+            limits: PluginLimits {
+                inner: limits,
+                memory_denied: false,
+            },
+        }
+    }
+}
+
+/// [`StoreLimits`] that also records whether a memory growth was refused, so a
+/// trap following a denied `memory.grow` is classified as a memory failure.
+pub struct PluginLimits {
+    inner: StoreLimits,
+    /// Set when a memory growth was denied (by the cap or the module maximum)
+    /// or failed in the host. Cleared by the caller before each call.
+    pub memory_denied: bool,
+}
+
+impl ResourceLimiter for PluginLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        if !allowed {
+            self.memory_denied = true;
+        }
+        Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_denied = true;
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
+/// A store for one plugin with its resource limiter installed.
+pub fn new_store(engine: &Engine, cfg: &PluginConfig) -> Store<HostState> {
+    let mut store = Store::new(engine, HostState::new(store_limits(cfg)));
+    store.limiter(|s| &mut s.limits);
+    store
 }
 
 /// Resource limits for a plugin's store (spec §5.1).
@@ -36,7 +108,6 @@ pub fn new_engine() -> Engine {
     Engine::new(&config).expect("wasmtime engine config is valid")
 }
 
-/// A verified, pre-instantiated plugin module.
 impl std::fmt::Debug for LoadedPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedPlugin")
@@ -45,6 +116,7 @@ impl std::fmt::Debug for LoadedPlugin {
     }
 }
 
+/// A verified, pre-instantiated plugin module.
 pub struct LoadedPlugin {
     pub config: PluginConfig,
     pub pre: InstancePre<HostState>,
@@ -91,6 +163,10 @@ pub fn load_plugin(engine: &Engine, cfg: &PluginConfig) -> Result<LoadedPlugin, 
         return Err(err("module declares imports; plugins may have none".into()));
     }
     match module.get_export("memory") {
+        // The ABI passes i32 pointers into a host-readable memory.
+        Some(ExternType::Memory(m)) if m.is_64() || m.is_shared() => {
+            return Err(err("export `memory` must be 32-bit and not shared".into()))
+        }
         Some(ExternType::Memory(_)) => {}
         Some(_) => return Err(err("export `memory` has the wrong type".into())),
         None => return Err(err("missing export `memory`".into())),
@@ -114,13 +190,7 @@ pub fn load_plugin(engine: &Engine, cfg: &PluginConfig) -> Result<LoadedPlugin, 
         .map_err(|_| err("module cannot be instantiated".into()))?;
 
     // Throwaway instance: check the ABI version with a small fuel budget.
-    let mut store = Store::new(
-        engine,
-        HostState {
-            limits: store_limits(cfg),
-        },
-    );
-    store.limiter(|s| &mut s.limits);
+    let mut store = new_store(engine, cfg);
     store
         .set_fuel(PROBE_FUEL)
         .map_err(|_| err("cannot set fuel".into()))?;
@@ -217,6 +287,47 @@ mod tests {
         let err = load_plugin(&new_engine(), &cfg).unwrap_err();
         assert_eq!(err.plugin, "p");
         assert!(err.message.contains("valid"), "{}", err.message);
+    }
+
+    fn abi_module_with_memory(memory: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            "(module
+               {memory}
+               (func (export \"osiris_abi_version\") (result i32) (i32.const 1))
+               (func (export \"osiris_alloc\") (param i32) (result i32) (i32.const 0))
+               (func (export \"osiris_on_event\") (param i32 i32) (result i64) (i64.const 0)))"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_64_bit_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = abi_module_with_memory("(memory (export \"memory\") i64 1)");
+        let cfg = cfg_for(dir.path(), "p", &bytes);
+        let err = load_plugin(&new_engine(), &cfg).unwrap_err();
+        assert_eq!(err.plugin, "p");
+        assert!(err.message.contains("memory"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_shared_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = abi_module_with_memory("(memory (export \"memory\") 1 1 shared)");
+        let cfg = cfg_for(dir.path(), "p", &bytes);
+        let err = load_plugin(&new_engine(), &cfg).unwrap_err();
+        assert_eq!(err.plugin, "p");
+        // This engine is built without the `threads` feature, so a shared memory
+        // does not even compile; the `is_shared()` export check is defence in depth.
+        assert!(err.message.contains("valid"), "{}", err.message);
+    }
+
+    #[test]
+    fn plain_32_bit_memory_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = abi_module_with_memory("(memory (export \"memory\") 1)");
+        let cfg = cfg_for(dir.path(), "p", &bytes);
+        load_plugin(&new_engine(), &cfg).unwrap();
     }
 
     #[test]

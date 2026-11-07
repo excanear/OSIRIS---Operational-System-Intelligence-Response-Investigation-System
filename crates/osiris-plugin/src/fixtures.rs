@@ -209,12 +209,8 @@ mod tests {
 
     fn run(engine: &wasmtime::Engine, module: &Module, input: &str) -> Vec<u8> {
         let linker: Linker<HostState> = Linker::new(engine);
-        let mut store = Store::new(
-            engine,
-            HostState {
-                limits: StoreLimitsBuilder::new().build(),
-            },
-        );
+        let mut store = Store::new(engine, HostState::new(StoreLimitsBuilder::new().build()));
+        store.limiter(|s| &mut s.limits);
         store.set_fuel(1_000_000).unwrap();
         let inst = linker.instantiate(&mut store, module).unwrap();
         call(&mut store, &inst, input)
@@ -274,12 +270,8 @@ mod tests {
         let engine = new_engine();
         let m = Module::new(&engine, wasm("counter")).unwrap();
         let linker: Linker<HostState> = Linker::new(&engine);
-        let mut store = Store::new(
-            &engine,
-            HostState {
-                limits: StoreLimitsBuilder::new().build(),
-            },
-        );
+        let mut store = Store::new(&engine, HostState::new(StoreLimitsBuilder::new().build()));
+        store.limiter(|s| &mut s.limits);
         store.set_fuel(10_000_000).unwrap();
         let inst = linker.instantiate(&mut store, &m).unwrap();
         for k in 1..=12 {
