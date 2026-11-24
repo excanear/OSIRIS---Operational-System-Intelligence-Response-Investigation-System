@@ -24,3 +24,10 @@ osiris-transport = { path = "../osiris-transport" }
 osiris-generator = { path = "../../generator" }
 osiris-real-linux-tests = { path = "../osiris-real-linux-tests" }
 axum = { workspace = true }
+wat = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+osiris-plugin = { path = "../osiris-plugin" }
+serde_yaml = { workspace = true }

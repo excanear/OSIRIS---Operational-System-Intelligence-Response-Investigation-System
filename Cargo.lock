@@ -1761,8 +1761,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "hex",
  "osiris-generator",
  "osiris-pipeline",
+ "osiris-plugin",
  "osiris-query",
  "osiris-real-linux-tests",
  "osiris-schema",
@@ -1774,10 +1776,13 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
  "uuid",
+ "wat",
 ]
 
 [[package]]

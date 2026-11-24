@@ -93,25 +93,56 @@ fn start_sinks() -> Sinks {
     }
 }
 
+const NOOP_PLUGIN_WAT: &str = include_str!("../assets/noop_plugin.wat");
+
+/// The no-op detection plugin of the `--plugins` run: the WAT asset compiled
+/// at bench start and written, with its `plugins:` entry, to a temp dir.
+struct NoopPlugin {
+    _dir: tempfile::TempDir,
+    yaml: String,
+}
+
+fn noop_plugin() -> NoopPlugin {
+    let wasm = wat::parse_str(NOOP_PLUGIN_WAT).expect("noop_plugin.wat is valid WAT");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("noop.wasm");
+    std::fs::write(&path, &wasm).unwrap();
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&wasm));
+    // Forward slashes keep a Windows path valid in a single-quoted scalar.
+    let path = path.display().to_string().replace('\\', "/");
+    let yaml = format!(
+        "  - name: bench-noop\n    kind: detection\n    path: '{path}'\n    sha256: {sha}\n"
+    );
+    NoopPlugin { _dir: dir, yaml }
+}
+
 /// Server-only stack; the bench itself plays the agent, shipping over the
 /// real mTLS listener with the real forwarder (`drive`). With `exporters`
 /// the server also runs a file, a syslog-tcp and a webhook exporter pointed
-/// at local sinks.
-pub fn run(rate: u64, duration_s: u64, exporters: bool) -> Record {
+/// at local sinks; with `plugins` it runs one no-op detection plugin.
+pub fn run(rate: u64, duration_s: u64, exporters: bool, plugins: bool) -> Record {
     let sinks = exporters.then(start_sinks);
+    let plugin = plugins.then(noop_plugin);
     let stack = Stack::start(StackOptions {
         bench_agent: Some(Uuid::new_v4()),
         exporters_yaml: sinks.as_ref().map(|s| s.yaml.clone()),
+        plugins_yaml: plugin.as_ref().map(|p| p.yaml.clone()),
         ..Default::default()
     });
     let mut rec = drive(&stack, rate, duration_s);
     rec.params["exporters"] = serde_json::json!(exporters);
+    rec.params["plugins"] = serde_json::json!(plugins);
+    if plugins {
+        // Per-plugin counters at the end of the run (after the drain).
+        rec.metrics["plugin_status"] = stack.api_get("/api/v1/plugins")["plugins"].clone();
+    }
     if exporters {
         // Per-exporter counters at the end of the run (after the drain).
         rec.metrics["exporter_status"] = stack.api_get("/api/v1/exporters")["exporters"].clone();
     }
     drop(stack);
     drop(sinks);
+    drop(plugin);
     rec
 }
 
@@ -225,6 +256,16 @@ fn drive(stack: &Stack, rate: u64, duration_s: u64) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noop_plugin_asset_is_a_valid_abi_v1_module_with_a_loadable_config() {
+        let p = noop_plugin();
+        let cfg: Vec<osiris_plugin::PluginConfig> =
+            serde_yaml::from_str(&p.yaml).expect("rendered entry parses");
+        let set = osiris_plugin::PluginSet::load(&cfg).expect("noop plugin loads");
+        assert!(!set.is_empty());
+        assert_eq!(set.status()[0].name, "bench-noop");
+    }
 
     #[test]
     fn marker_latency_is_measured_from_send_to_first_visibility() {

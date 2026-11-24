@@ -21,6 +21,8 @@ pub struct ServerYaml {
     pub dev_cors: bool,
     /// Appended verbatim under an `exporters:` key; `None` renders no key.
     pub exporters_yaml: Option<String>,
+    /// Appended verbatim under a `plugins:` key; `None` renders no key.
+    pub plugins_yaml: Option<String>,
 }
 
 impl ServerYaml {
@@ -60,6 +62,13 @@ impl ServerYaml {
             s.push_str("exporters:\n");
             s.push_str(ex);
             if !ex.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        if let Some(pl) = &self.plugins_yaml {
+            s.push_str("plugins:\n");
+            s.push_str(pl);
+            if !pl.ends_with('\n') {
                 s.push('\n');
             }
         }
@@ -169,12 +178,18 @@ mod tests {
             risk_weights: dir.path().join("weights.yaml"),
             dev_cors: true,
             exporters_yaml: Some("  - name: f\n    kind: file\n    path: /tmp/o.ndjson".into()),
+            plugins_yaml: Some(format!(
+                "  - name: p\n    kind: detection\n    path: /tmp/p.wasm\n    sha256: {}",
+                "0".repeat(64)
+            )),
         };
         let path = dir.path().join("server.yaml");
         std::fs::write(&path, y.render()).unwrap();
         let cfg = osiris_server::ServerConfig::load(&path).unwrap();
         assert_eq!(cfg.exporters.len(), 1);
         assert_eq!(cfg.exporters[0].name, "f");
+        assert_eq!(cfg.plugins.len(), 1);
+        assert_eq!(cfg.plugins[0].name, "p");
         assert_eq!(cfg.listen_addr, "127.0.0.1:18080");
         assert_eq!(cfg.agent_listener.unwrap().listen_addr, "127.0.0.1:18081");
         assert_eq!(cfg.control.unwrap().listen_addr, "127.0.0.1:18082");

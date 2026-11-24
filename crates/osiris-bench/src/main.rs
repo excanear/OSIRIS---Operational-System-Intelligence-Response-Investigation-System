@@ -35,6 +35,10 @@ enum Cmd {
         /// webhook) pointed at local sinks (Phase 12a overhead measurement).
         #[arg(long)]
         exporters: bool,
+        /// Run the server with one no-op detection plugin returning no
+        /// output (Phase 12b overhead measurement).
+        #[arg(long)]
+        plugins: bool,
     },
     Agent {
         #[arg(long)]
@@ -83,7 +87,8 @@ fn main() {
             rate,
             duration,
             exporters,
-        } => vec![ingest::run(rate, duration, exporters)],
+            plugins,
+        } => vec![ingest::run(rate, duration, exporters, plugins)],
         Cmd::Agent { rate, duration } => vec![agent::run(rate, duration)],
         Cmd::FsLoop { iterations } => vec![fsloop::run(iterations)],
         Cmd::DnsSend { sends } => vec![dnsloop::run(sends)],
@@ -109,7 +114,7 @@ fn main() {
                     v.push(query::run(n));
                 }
                 for r in [1_000, 10_000, 100_000] {
-                    v.push(ingest::run(r, 30, false));
+                    v.push(ingest::run(r, 30, false, false));
                 }
             }
             if !skip_agent {
