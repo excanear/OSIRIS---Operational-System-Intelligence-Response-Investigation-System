@@ -498,6 +498,9 @@ async fn main() {
                     hub: export_hub.clone(),
                 },
             ))
+            .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
+                plugins: plugin_set.clone(),
+            }))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),
                 registry: fleet_registry.clone(),

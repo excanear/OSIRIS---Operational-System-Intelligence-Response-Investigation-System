@@ -22,6 +22,7 @@ osiris-command = { path = "../osiris-command" }
 async-trait = { workspace = true }
 osiris-tenancy = { path = "../osiris-tenancy" }
 osiris-export = { path = "../osiris-export" }
+osiris-plugin = { path = "../osiris-plugin" }
 osiris-fleet = { path = "../osiris-fleet" }
 osiris-health = { path = "../osiris-health" }
 osiris-policy = { path = "../osiris-policy" }

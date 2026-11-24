@@ -2657,6 +2657,8 @@ pub mod response;
 pub use response::{build_response_router, ResponseState};
 pub mod exporters;
 pub use exporters::{build_exporters_router, ExportersState};
+pub mod plugins;
+pub use plugins::{build_plugins_router, PluginsState};
 pub mod fleet;
 pub mod tenant_scope;
 pub use fleet::{build_fleet_router, FleetState};

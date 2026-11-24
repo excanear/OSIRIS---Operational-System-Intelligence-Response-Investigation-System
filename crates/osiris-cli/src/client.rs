@@ -134,6 +134,41 @@ pub fn format_exporters_table(body: &serde_json::Value) -> String {
     out
 }
 
+/// Renders the `GET /api/v1/plugins` body as a tab-separated table.
+/// `FAILURES` is the sum of the four failure counters. Control characters in
+/// `last_failure` are replaced so one plugin is always one line.
+pub fn format_plugins_table(body: &serde_json::Value) -> String {
+    let mut out = String::from("NAME\tKIND\tCALLS\tALERTS\tTAGS\tFAILURES\tLAST_FAILURE\n");
+    let text = |row: &serde_json::Value, key: &str| {
+        row[key]
+            .as_str()
+            .map(|s| {
+                s.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            })
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let num = |row: &serde_json::Value, key: &str| row[key].as_u64().unwrap_or(0);
+    for row in body["plugins"].as_array().into_iter().flatten() {
+        let failures = num(row, "failures_trap")
+            + num(row, "failures_fuel")
+            + num(row, "failures_memory")
+            + num(row, "failures_output");
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            text(row, "name"),
+            text(row, "kind"),
+            num(row, "calls"),
+            num(row, "alerts"),
+            num(row, "tags"),
+            failures,
+            text(row, "last_failure"),
+        ));
+    }
+    out
+}
+
 /// Minimal percent-encoding for the one context this CLI needs it in: an
 /// OQL string placed into a `?q=` query parameter. Unreserved characters
 /// (letters, digits, `-`, `_`, `.`, `~`) pass through unescaped per RFC
@@ -300,6 +335,29 @@ mod tests {
         assert_eq!(lines[2], "file\tfile\tOK\t0\t7\t0\t-");
         assert_eq!(lines.len(), 3);
         let empty = format_exporters_table(&serde_json::json!({ "exporters": [] }));
+        assert_eq!(empty.lines().count(), 1);
+    }
+
+    #[test]
+    fn format_plugins_table_sums_failures() {
+        let body = serde_json::json!({ "plugins": [
+            { "name": "hunt", "kind": "detection", "calls": 9, "alerts": 2, "tags": 0,
+              "failures_trap": 1, "failures_fuel": 2, "failures_memory": 3,
+              "failures_output": 4, "last_failure": "fuel\nexhausted" },
+            { "name": "enrich", "kind": "enrichment", "calls": 5, "alerts": 0, "tags": 6,
+              "failures_trap": 0, "failures_fuel": 0, "failures_memory": 0,
+              "failures_output": 0, "last_failure": null },
+        ]});
+        let t = format_plugins_table(&body);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(
+            lines[0],
+            "NAME\tKIND\tCALLS\tALERTS\tTAGS\tFAILURES\tLAST_FAILURE"
+        );
+        assert_eq!(lines[1], "hunt\tdetection\t9\t2\t0\t10\tfuel exhausted");
+        assert_eq!(lines[2], "enrich\tenrichment\t5\t0\t6\t0\t-");
+        assert_eq!(lines.len(), 3);
+        let empty = format_plugins_table(&serde_json::json!({ "plugins": [] }));
         assert_eq!(empty.lines().count(), 1);
     }
 
