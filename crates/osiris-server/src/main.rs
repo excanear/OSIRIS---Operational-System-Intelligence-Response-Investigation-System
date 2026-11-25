@@ -484,44 +484,52 @@ async fn main() {
     );
     let _ = policy_reconciler_slot.set(policy_reconciler.clone());
     let policy_notifier: Arc<dyn osiris_api::PolicyNotifier> = policy_reconciler;
+    // The Console is attached after the auth gate layer, as the fallback:
+    // its static files are public, every registered API route stays gated
+    // and keeps precedence.
+    let api = build_router(storage)
+        .merge(build_incident_evidence_router(incident_evidence_state))
+        .merge(build_response_router(response_state))
+        .merge(build_stream_router(live_event_broadcaster))
+        .merge(build_auth_router(auth_state.clone()))
+        .merge(build_tenant_router(auth_state.clone()))
+        .merge(osiris_api::build_fleet_router(osiris_api::FleetState {
+            registry: fleet_registry.clone(),
+            tenants: tenant_store.clone(),
+            groups: group_store.clone(),
+            policies: policy_store.clone(),
+            notifier: policy_notifier.clone(),
+        }))
+        .merge(osiris_api::build_exporters_router(
+            osiris_api::ExportersState {
+                hub: export_hub.clone(),
+            },
+        ))
+        .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
+            plugins: plugin_set.clone(),
+        }))
+        .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
+            groups: group_store.clone(),
+            registry: fleet_registry.clone(),
+            tenants: tenant_store.clone(),
+            audit_log: audit_log.clone(),
+            notifier: policy_notifier.clone(),
+        }))
+        .merge(osiris_api::build_policy_router(osiris_api::PolicyState {
+            groups: group_store.clone(),
+            policies: policy_store.clone(),
+            registry: fleet_registry.clone(),
+            tenants: tenant_store.clone(),
+            audit_log: audit_log.clone(),
+            notifier: policy_notifier.clone(),
+        }))
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate));
     let app = osiris_server::apply_dev_cors(
-        build_router(storage)
-            .merge(build_incident_evidence_router(incident_evidence_state))
-            .merge(build_response_router(response_state))
-            .merge(build_stream_router(live_event_broadcaster))
-            .merge(build_auth_router(auth_state.clone()))
-            .merge(build_tenant_router(auth_state.clone()))
-            .merge(osiris_api::build_fleet_router(osiris_api::FleetState {
-                registry: fleet_registry.clone(),
-                tenants: tenant_store.clone(),
-                groups: group_store.clone(),
-                policies: policy_store.clone(),
-                notifier: policy_notifier.clone(),
-            }))
-            .merge(osiris_api::build_exporters_router(
-                osiris_api::ExportersState {
-                    hub: export_hub.clone(),
-                },
-            ))
-            .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
-                plugins: plugin_set.clone(),
-            }))
-            .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
-                groups: group_store.clone(),
-                registry: fleet_registry.clone(),
-                tenants: tenant_store.clone(),
-                audit_log: audit_log.clone(),
-                notifier: policy_notifier.clone(),
-            }))
-            .merge(osiris_api::build_policy_router(osiris_api::PolicyState {
-                groups: group_store.clone(),
-                policies: policy_store.clone(),
-                registry: fleet_registry.clone(),
-                tenants: tenant_store.clone(),
-                audit_log: audit_log.clone(),
-                notifier: policy_notifier.clone(),
-            }))
-            .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate)),
+        osiris_server::attach_console(
+            api,
+            config.console_dir.as_deref().map(Path::new),
+            config.api_tls.is_some(),
+        ),
         config.dev_cors,
     );
     let listener = match tokio::net::TcpListener::bind(addr).await {

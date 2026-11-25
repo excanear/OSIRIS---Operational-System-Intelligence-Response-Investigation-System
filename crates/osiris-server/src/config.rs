@@ -95,6 +95,10 @@ pub struct ServerConfig {
     /// wasmtime engine and an unchanged ingest path.
     #[serde(default)]
     pub plugins: Vec<osiris_plugin::PluginConfig>,
+    /// Phase 13a: the built Console (`console/dist`) served on every
+    /// non-API path. Absent = API only, exactly as before.
+    #[serde(default)]
+    pub console_dir: Option<String>,
 }
 
 /// The telemetry storage backend.
@@ -408,6 +412,19 @@ mod tests {
         let path = dir.path().join("server.yaml");
         std::fs::write(&path, yaml).unwrap();
         ServerConfig::load(&path)
+    }
+
+    #[test]
+    fn console_dir_is_optional_and_parses() {
+        assert!(load_yaml(BASE_YAML).unwrap().console_dir.is_none());
+        let config = load_yaml(&format!(
+            "{BASE_YAML}console_dir: /usr/share/osiris/console\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.console_dir.as_deref(),
+            Some("/usr/share/osiris/console")
+        );
     }
 
     #[test]
