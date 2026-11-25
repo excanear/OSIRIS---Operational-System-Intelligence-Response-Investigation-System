@@ -179,12 +179,19 @@ struct Live {
 }
 
 impl Live {
-    fn new(engine: &Engine, p: &LoadedPlugin) -> Result<Live, Failure> {
+    /// `init_fuel` receives the fuel consumed by instantiation (a start
+    /// function), whether or not instantiation succeeds.
+    fn new(engine: &Engine, p: &LoadedPlugin, init_fuel: &mut u64) -> Result<Live, Failure> {
         let mut store = new_store(engine, &p.config);
         store
             .set_fuel(p.config.fuel_per_event)
             .map_err(|_| Failure::new(FailureKind::Trap, "cannot set fuel"))?;
-        let instance = match p.pre.instantiate(&mut store) {
+        let result = p.pre.instantiate(&mut store);
+        *init_fuel = p
+            .config
+            .fuel_per_event
+            .saturating_sub(store.get_fuel().unwrap_or(0));
+        let instance = match result {
             Ok(i) => i,
             Err(e) => return Err(Failure::from_wasm(&e, store.data().limits.memory_denied)),
         };
@@ -338,7 +345,12 @@ impl PluginSet {
             let outcome = (|| {
                 let l = match live.as_mut() {
                     Some(l) => l,
-                    None => live.insert(Live::new(engine, loaded)?),
+                    None => {
+                        let mut init_fuel = 0;
+                        let created = Live::new(engine, loaded, &mut init_fuel);
+                        add(&plugin.counters.total_fuel_used, init_fuel);
+                        live.insert(created?)
+                    }
                 };
                 let (result, used) = l.call(fuel, input);
                 add(&plugin.counters.total_fuel_used, used);
@@ -366,14 +378,16 @@ impl PluginSet {
         for (plugin, loaded) in self.runnable(PluginKind::Enrichment) {
             let name = &plugin.config.name;
             self.run_plugin(plugin, loaded, &inputs, |i, out| {
-                add(&plugin.counters.tags, out.tags.len() as u64);
                 let tags = &mut events[i].tags;
+                let mut added = 0u64;
                 for t in out.tags {
                     let full = format!("plugin:{name}:{t}");
                     if !tags.contains(&full) {
                         tags.push(full);
+                        added += 1;
                     }
                 }
+                add(&plugin.counters.tags, added);
                 Ok(())
             });
         }
@@ -617,6 +631,19 @@ mod tests {
         set.enrich_batch(&mut events);
         assert_eq!(events[0].tags, vec!["existing", "plugin:tag:seen"]);
         assert_eq!(events[1].tags, vec!["plugin:tag:seen"]);
+        // Only tags actually added are counted: one per event, none on the repeat pass.
+        assert_eq!(status_of(&set, "tag").tags, 2);
+    }
+
+    #[test]
+    fn instantiation_fuel_is_counted() {
+        let mut p = det("burn", "start_burn");
+        p.fuel = 1_000; // the start function needs more; the load probe has 100k
+        let (_d, set) = load_set(vec![p]);
+        assert!(set.detect_batch(&[event("nc")]).is_empty());
+        let s = status_of(&set, "burn");
+        assert_eq!(s.failures_fuel, 1, "{s:?}");
+        assert!(s.total_fuel_used >= 1_000, "{s:?}");
     }
 
     #[test]

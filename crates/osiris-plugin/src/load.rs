@@ -94,6 +94,8 @@ pub fn new_store(engine: &Engine, cfg: &PluginConfig) -> Store<HostState> {
 pub fn store_limits(cfg: &PluginConfig) -> StoreLimits {
     StoreLimitsBuilder::new()
         .memory_size(cfg.memory_max_mib as usize * 1024 * 1024)
+        // memory_size applies to EACH memory; one memory makes it the module total.
+        .memories(1)
         .instances(1)
         .tables(1)
         .table_elements(10_000)
@@ -105,6 +107,8 @@ pub fn new_engine() -> Engine {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.max_wasm_stack(MAX_WASM_STACK);
+    // Defence in depth: the ABI uses a single memory (see `store_limits`).
+    config.wasm_multi_memory(false);
     Engine::new(&config).expect("wasmtime engine config is valid")
 }
 
@@ -328,6 +332,29 @@ mod tests {
         let bytes = abi_module_with_memory("(memory (export \"memory\") 1)");
         let cfg = cfg_for(dir.path(), "p", &bytes);
         load_plugin(&new_engine(), &cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_module_with_a_second_memory() {
+        let err = load_fixture("two_memories").unwrap_err();
+        assert_eq!(err.plugin, "p");
+        assert!(err.message.contains("valid"), "{}", err.message);
+    }
+
+    #[test]
+    fn store_limits_alone_deny_a_second_memory() {
+        // An engine WITH multi-memory, so only the store limits can refuse it.
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::new(&engine, fixtures::wasm("two_memories")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_for(dir.path(), "p", &fixtures::wasm("tagger"));
+        let mut store = new_store(&engine, &cfg);
+        store.set_fuel(PROBE_FUEL).unwrap();
+        let linker: Linker<HostState> = Linker::new(&engine);
+        assert!(linker.instantiate(&mut store, &module).is_err());
     }
 
     #[test]

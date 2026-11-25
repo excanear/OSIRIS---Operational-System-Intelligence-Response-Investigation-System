@@ -197,6 +197,23 @@ pub fn wasm(name: &str) -> Vec<u8> {
             );
             build(p)
         }
+        // Declares a second linear memory (multi-memory proposal).
+        "two_memories" => {
+            let mut p = base("(i64.const 0)");
+            p.extra = "(memory $second 1)".into();
+            build(p)
+        }
+        // A start function that burns ~2000 loop iterations of fuel at instantiation.
+        "start_burn" => {
+            let mut p = base("(i64.const 0)");
+            p.extra = "(func $burn (local $k i32)
+                 (loop $l
+                   (local.set $k (i32.add (local.get $k) (i32.const 1)))
+                   (br_if $l (i32.lt_u (local.get $k) (i32.const 2000)))))
+               (start $burn)"
+                .into();
+            build(p)
+        }
         other => panic!("unknown fixture `{other}`"),
     }
 }

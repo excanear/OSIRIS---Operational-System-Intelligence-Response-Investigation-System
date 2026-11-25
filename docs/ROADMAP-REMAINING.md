@@ -335,6 +335,11 @@ revisão final independente → merge → push.
   - Hot reload (hoje só no startup).
   - Plugins também rodam em eventos reenviados/duplicados (mesma dívida dos alertas duplicados de
     regra num reenvio, ver 12a); custo de serialização JSON por evento.
+  - Isolamento dentro do lote: uma instância e uma memória servem todos os eventos de um lote; um plugin
+    malicioso pode levar dados entre eventos, inclusive entre tenants no caminho do spool tailer. Dividir
+    o lote por tenant antes de rodar plugins.
+  - Limite de tempo de relógio por lote via interrupção por época do wasmtime (fuel até 1e9 × lotes
+    grandes pode prender uma thread bloqueante por minutos).
 - **Sensores como subprocessos (futuro, §20.2 opção b)**: continua adiado; precisa de protocolo de fio
   do Agent, seccomp e capabilities, e não compartilha nada com o host WASM.
 

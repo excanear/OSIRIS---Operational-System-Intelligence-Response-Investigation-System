@@ -31,8 +31,11 @@ the design:
 2. **No imports.** A module that declares any import is rejected at load. A plugin has no WASI, host
    function, clock, randomness or I/O, so there is no ambient authority to audit.
 3. **Fuel and store limits enforce the budget, not the plugin.** Per event: `fuel_per_event` (default
-   10 000 000, 1 to 1 000 000 000); linear memory `memory_max_mib` (default 16, 1 to 256); a 512 KiB
-   wasm stack; 1 instance, 1 table, 10 000 table elements. Output is capped at 64 KiB, 8 alerts and
+   10 000 000, 1 to 1 000 000 000); one linear memory of at most `memory_max_mib` (default 16, 1 to 256;
+   a module declaring more than one memory is rejected, and multi-memory is disabled in the engine); a 512 KiB
+   wasm stack; 1 instance, 1 table, 10 000 table elements. Spec §5.1 omitted the `memories(1)` store limit;
+   it was added in final review, because wasmtime applies `memory_size` to each memory and a module
+   with several memories could otherwise exceed the cap. Output is capped at 64 KiB, 8 alerts and
    16 tags per call. Any violation fails that one call and discards its whole output.
 4. **A JSON ABI (version 1).** Exports `memory`, `osiris_abi_version() -> i32`,
    `osiris_alloc(i32) -> i32` and `osiris_on_event(i32, i32) -> i64` (`(out_ptr << 32) | out_len`,
@@ -72,6 +75,18 @@ the design:
 
 ## Known gaps (deferred)
 
+- **Within-batch sharing.** One instance and one linear memory serve every event of a batch (spec
+  §5.5). A malicious or buggy plugin can carry data between events of the same batch, for example
+  by emitting an earlier event's fields in a later event's alert reasons or tags. On the spool-tailer
+  path (`run_ingestion_context_loop`) a batch is whatever one poll returned and may span hosts and
+  therefore tenants, so the leak can cross tenants; on the mTLS path a batch is one Agent's. The
+  mitigation is that plugins are operator-installed, SHA-256-pinned code. Per-tenant batch splitting
+  is future work (ROADMAP-REMAINING).
+- **No wall-clock bound.** Only fuel limits a call; with `fuel_per_event` up to 1e9 and large
+  batches, one batch can hold a blocking thread for minutes. A per-batch deadline via wasmtime epoch
+  interruption is future work.
+- **`plugin:` tags are not authenticated.** Ingest does not strip an agent-supplied tag starting with
+  `plugin:`; YAML rules keyed on plugin tags trust agent input like any other event field.
 - **Plugins also run on resent and duplicate events.** The Agent resends a batch until it is
   acknowledged, and ingest evaluates the repeats again, as it does for YAML rules. A detection
   plugin can raise the same alert again with a new alert id, and a duplicate event id inside one

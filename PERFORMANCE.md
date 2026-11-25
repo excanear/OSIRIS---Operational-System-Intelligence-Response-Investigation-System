@@ -564,9 +564,9 @@ What this does not show: a plugin that does real work (its cost is its fuel per 
 batch, the guest call is per plugin); rates above 1 000 eps (the 10 000 and 100 000 eps rows of the
 WSL table saturate the server without plugins, so they were not repeated); a Linux host; a
 microbenchmark of the host call in isolation. No target was set. Reproduce with
-`osiris-bench ingest --rate 1000 --duration 30 [--plugins]`; the documented ingest bench otherwise
-needs a Linux host, but the `ingest` subcommand runs the server and the mTLS forwarder on loopback
-and ran as is on this Windows machine.
+`osiris-bench ingest --rate 1000 --duration 30 [--plugins]`. The documented harness
+(`tools/real-linux/bench.sh`) needs a Linux host, but the `ingest` subcommand alone starts the server
+and the mTLS forwarder on loopback and ran as is on this Windows machine.
 
 ## Reproduce
 

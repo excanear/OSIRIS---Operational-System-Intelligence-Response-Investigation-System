@@ -50,7 +50,7 @@ A plugin entry is one flat YAML mapping. Unknown keys are rejected.
 | `sha256` | string | required | 64 lowercase hex characters | Digest of the module file. A mismatch refuses startup. |
 | `version` | integer | `1` | `u32` | Becomes `rule_version` of every alert the plugin raises. Bump it when you change the module. |
 | `fuel_per_event` | integer | `10000000` | `1..=1000000000` | Instruction budget (fuel) for one event. See "Budgets". |
-| `memory_max_mib` | integer | `16` | `1..=256` | Cap on the module's linear memory, in MiB. |
+| `memory_max_mib` | integer | `16` | `1..=256` | Cap on the module's single linear memory, in MiB. A module that declares more than one memory is rejected at load. |
 | `enabled` | bool | `true` | | `false` keeps the entry in status but never reads or runs the module. |
 
 Validation of every field (including those of disabled plugins) happens when the server config is
@@ -137,10 +137,14 @@ is counted as an output failure (see "Failure counters").
   taken from the event. The alert is stored and exported exactly like a YAML-rule alert and flows
   through risk, correlation and the 12a exporters.
 - **Tag.** Appended to the event's `tags` as `plugin:<plugin name>:<tag>`, skipping duplicates, so
-  a plugin tag can never be mistaken for a sensor or rule tag. YAML rules can match it.
+  a plugin-produced tag is distinguishable from a sensor or rule tag (but see the note below). YAML rules can match it.
 
 The `plugin:` prefix is reserved: the YAML rule loader rejects any rule id that contains `:`, so a
 YAML rule can never produce an alert id that collides with a plugin's.
+
+The prefix is reserved for alert rule ids only and is not authenticated on tags: ingest does not strip
+an agent-supplied tag that starts with `plugin:`, so an agent can send one. A YAML rule keyed on a
+plugin tag therefore trusts agent input as much as any other event field.
 
 ## A Rust guest example
 
@@ -240,7 +244,7 @@ have none`. Inspect the module (`wasm-tools print x.wasm | grep import`) and bui
 
 ## Ordering
 
-For each ingest call (the events of one Agent batch):
+For each ingest call (the events of one batch: on the mTLS path, one Agent batch from one host; on the spool-tailer path, whatever one poll returned, which may span several hosts and tenants):
 
 1. Events already owned by a different host are dropped (existing behaviour).
 2. **Enrichment plugins**, in config order, each over every kept event. Tags are added to the events.
@@ -276,7 +280,7 @@ failure resets it). If you need cross-event logic, express it as a YAML correlat
 | Budget | Value | Enforced by |
 |---|---|---|
 | Instructions per event | `fuel_per_event`, default 10 000 000, range 1 to 1 000 000 000 | Wasmtime fuel metering, reset before every event; covers `osiris_alloc` and `osiris_on_event`. |
-| Linear memory | `memory_max_mib`, default 16, range 1 to 256 | Wasmtime store limits. A module whose initial memory exceeds it refuses startup. |
+| Linear memory | `memory_max_mib`, default 16, range 1 to 256 | Wasmtime store limits (`memories` = 1). Caps the module's single linear memory; a module declaring more than one memory is rejected at load, and one whose initial memory exceeds the cap refuses startup. |
 | Wasm call stack | 512 KiB (not configurable) | Wasmtime. Unbounded recursion traps instead of crashing the host. |
 | Instances / tables | 1 instance, 1 table, 10 000 table elements | Wasmtime store limits. |
 | Output | 64 KiB, 8 alerts, 16 tags, per call | The host, before anything is applied. |
@@ -386,8 +390,12 @@ the digest and the fuel). `--json` prints the API body. The command uses the cac
 ## Security model
 
 - **No ambient authority.** The module may import nothing, so it has no file, network, clock,
-  environment, randomness or host-memory access. It sees one serialized event at a time and has no
-  channel to read another event, another tenant's data or the database.
+  environment, randomness or host-memory access. It is handed one serialized event per call and has no
+  channel to the database or to any data outside the batch. One instance and one linear memory serve
+  every event of a batch (see "Isolation"), so a plugin can retain earlier events of the batch and
+  emit them in a later event's alert reasons or tags. On the spool-tailer path a batch can span
+  tenants, so treat a plugin as trusted with every event in the batch. Plugins are operator-installed,
+  SHA-256-pinned code; per-tenant batch splitting is future work.
 - **Integrity pin.** Every plugin is pinned by the SHA-256 of its file in the server config. A
   changed file refuses startup. The pin protects against a swapped file, not against a malicious
   module you pinned on purpose: review what you deploy. There are no signatures and no plugin
