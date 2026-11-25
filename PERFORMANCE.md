@@ -524,6 +524,50 @@ saturate the server without exporters, so they were not repeated), a slow or fai
 (the dedicated isolation test covers that the ingest call returns), or a Linux host. No target was
 set. Reproduce with `osiris-bench ingest --rate 1000 --duration 30 [--exporters]`.
 
+## Phase 12b - plugin overhead
+
+`osiris-bench ingest --rate 1000 --duration 30` run without and with `--plugins`. The flag compiles
+`crates/osiris-bench/assets/noop_plugin.wat` at bench start and configures the real `osiris-server`
+with that one detection plugin (default fuel and memory limits). The plugin implements ABI v1 and
+returns `0` ("no output") for every event, so this measures the host cost of serializing each event
+to JSON, one `osiris_alloc` + `osiris_on_event` call per event and the bookkeeping, not any guest
+logic. A real plugin adds its own instructions on top (the status shows `total_fuel_used / calls`).
+
+| Item | Value |
+|---|---|
+| Host | **Windows 10 Pro 10.0.19045** (native, not WSL), local dev machine, shared with an editor and other background tools; release build of `osiris-server`, `osiris-bench` |
+| Code | branch `phase-12b-plugins`, same binaries for both rows (the flag only changes `server.yaml`) |
+| Load | exec-chain events, 1 000 eps target, 30 s, then up to 30 s drain; two runs per configuration, alternating off, on, off, on |
+
+| Run | Plugins | Achieved (driver) eps | Stored eps over run | Markers lost | Delivered p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|---|
+| 1 | off | 999.97 | 999.20 | 0 / 300 | 24.22 ms | 433.82 ms | 550.59 ms | 735.27 ms |
+| 1 | 1 no-op plugin | 999.80 | 999.36 | 0 / 300 | 20.95 ms | 79.67 ms | 241.63 ms | 475.78 ms |
+| 2 | off | 999.77 | 997.44 | 0 / 300 | 24.21 ms | 348.05 ms | 451.77 ms | 522.09 ms |
+| 2 | 1 no-op plugin | 999.79 | 999.19 | 0 / 300 | 24.18 ms | 281.80 ms | 393.42 ms | 592.70 ms |
+
+Run 2 without plugins reported `saturated: true` (the driver lagged by up to 236 events at some
+moment; its achieved rate was still 999.77 eps); the other three runs did not.
+
+Delta (plugin on minus off): throughput is unchanged at this rate (achieved 999.80 / 999.79 against
+999.97 / 999.77 eps; stored eps over the run 999.36 / 999.19 against 999.20 / 997.44). Latency p50 is
+20.95 / 24.18 ms against 24.22 / 24.21 ms. The with-plugin runs show no worse tail than the
+baseline: p95 79.67 / 281.80 ms against 433.82 / 348.05 ms. The off-runs differ from each other as
+much as from the on-runs, so two runs per configuration do not separate a plugin cost from
+run-to-run noise on this host; the honest reading is "no overhead measurable at 1 000 eps for a
+no-op plugin". At the end of both plugin runs the status showed 29 985 and 29 978 calls, zero alerts,
+zero failures of any kind and `total_fuel_used` 119 940 and 119 912, which is 4 fuel units per call
+(the instructions of the no-op guest).
+
+What this does not show: a plugin that does real work (its cost is its fuel per event, bounded by
+`fuel_per_event`); several plugins (the per-event JSON serialization is shared per kind within a
+batch, the guest call is per plugin); rates above 1 000 eps (the 10 000 and 100 000 eps rows of the
+WSL table saturate the server without plugins, so they were not repeated); a Linux host; a
+microbenchmark of the host call in isolation. No target was set. Reproduce with
+`osiris-bench ingest --rate 1000 --duration 30 [--plugins]`. The documented harness
+(`tools/real-linux/bench.sh`) needs a Linux host, but the `ingest` subcommand alone starts the server
+and the mTLS forwarder on loopback and ran as is on this Windows machine.
+
 ## Reproduce
 
 ```

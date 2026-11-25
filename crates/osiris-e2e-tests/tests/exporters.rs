@@ -168,6 +168,7 @@ async fn event_and_alert_reach_file_and_webhook_exporters() {
         ),
         policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         exporters: Some(hub.clone()),
+        plugins: None,
     };
 
     // Real auth-gated router serving the status endpoint.

@@ -80,6 +80,7 @@ pub(crate) fn min_role_for(method: &axum::http::Method, path: &str) -> Role {
 
     if path == "/api/v1/audit"
         || path == "/api/v1/exporters"
+        || path == "/api/v1/plugins"
         || path == "/api/v1/auth/users"
         || path == "/api/v1/tenants"
         || path.starts_with("/api/v1/tenants/")

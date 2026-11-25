@@ -47,3 +47,5 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 base64 = "0.22"
 rustls-native-certs = "0.8"
+wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wat = "1"

@@ -110,6 +110,8 @@ pub enum RuleError {
     },
     #[error("rule {origin} has a blank id")]
     BlankId { origin: String },
+    #[error("rule {id} (from {origin}) contains ':' — the ':' character is reserved for plugin-generated alert ids")]
+    ColonInId { origin: String, id: String },
     #[error("rule {id} has no match conditions — it would fire on everything")]
     NoConditions { id: String },
     #[error(
@@ -149,6 +151,12 @@ impl Rule {
         if parsed.id.trim().is_empty() {
             return Err(RuleError::BlankId {
                 origin: origin.to_string(),
+            });
+        }
+        if parsed.id.contains(':') {
+            return Err(RuleError::ColonInId {
+                origin: origin.to_string(),
+                id: parsed.id,
             });
         }
         // window/sequence pairing is checked first and independently of
@@ -289,6 +297,24 @@ match:
 "#;
         let err = Rule::from_yaml_str(yaml, "unexplained.yaml").unwrap_err();
         assert!(matches!(err, RuleError::EmptyReason { index: 0, .. }));
+    }
+
+    #[test]
+    fn rule_id_with_colon_is_rejected() {
+        let yaml = r#"
+id: plugin:x:y
+version: 1
+severity: LOW
+match:
+  - field: file.path
+    op: eq
+    value: "/x"
+    reason: "because"
+"#;
+        assert!(matches!(
+            Rule::from_yaml_str(yaml, "colon.yaml").unwrap_err(),
+            RuleError::ColonInId { .. }
+        ));
     }
 
     #[test]

@@ -2717,18 +2717,30 @@ fn urlencoding_lite(s: &str) -> String {
     s.replace('/', "%2F")
 }
 
-/// Locates the already-built `osiris` CLI binary next to this test
-/// binary's own build output, without depending on `assert_cmd`. Requires
+/// Locates the already-built `osiris` CLI binary in the profile directory
+/// (`target/debug`), without depending on `assert_cmd`. Requires
 /// Task 9's `cargo build -p osiris-cli` (or an earlier `cargo test -p
 /// osiris-cli`) to have run first in the same target directory — true both
 /// for the per-task build/test steps already done and for any subsequent
 /// `cargo test --workspace`.
+///
+/// The test binary's own location depends on Cargo's build-dir layout:
+/// `target/debug/deps/<test>` up to Rust 1.99, and
+/// `target/debug/build/<pkg>/<hash>/out/<test>` from Rust 1.100. Final
+/// binaries stay in `target/debug` in both, so walk up from the test
+/// binary until a directory holding the CLI is found.
 fn cli_binary_path() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // this test binary's own file name
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("osiris{}", std::env::consts::EXE_SUFFIX));
-    path
+    let name = format!("osiris{}", std::env::consts::EXE_SUFFIX);
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1) // the test binary itself
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no `{name}` CLI binary in any ancestor of {} — did \
+                 `cargo build -p osiris-cli` run first?",
+                exe.display()
+            )
+        })
 }

@@ -193,6 +193,30 @@ async fn main() {
         ))
     };
 
+    // Phase 12b: no plugins configured = no wasmtime engine. Any configured
+    // plugin (even a disabled one) is kept for the API; ingest only gets the
+    // set when something is enabled.
+    let plugin_set: Option<Arc<osiris_plugin::PluginSet>> = if config.plugins.is_empty() {
+        None
+    } else {
+        match osiris_plugin::PluginSet::load(&config.plugins) {
+            Ok(set) => Some(Arc::new(set)),
+            Err(e) => {
+                eprintln!("invalid plugin configuration: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    for status in plugin_set.iter().flat_map(|set| set.status()) {
+        tracing::info!(
+            name = %status.name,
+            kind = ?status.kind,
+            sha256 = %status.sha256.chars().take(12).collect::<String>(),
+            enabled = status.enabled,
+            "plugin configured"
+        );
+    }
+
     let spool_path = config.spool_path.clone();
     let ingest_context = osiris_server::IngestContext {
         storage: storage.clone(),
@@ -204,6 +228,7 @@ async fn main() {
         fleet_registry: fleet_registry.clone(),
         policy_reconciler: policy_reconciler_slot.clone(),
         exporters: export_hub.clone(),
+        plugins: plugin_set.clone().filter(|p| !p.is_empty()),
     };
     let mut ingestion_tasks = vec![tokio::spawn(run_ingestion_context_loop(
         spool_path,
@@ -473,6 +498,9 @@ async fn main() {
                     hub: export_hub.clone(),
                 },
             ))
+            .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
+                plugins: plugin_set.clone(),
+            }))
             .merge(osiris_api::build_groups_router(osiris_api::GroupsState {
                 groups: group_store.clone(),
                 registry: fleet_registry.clone(),

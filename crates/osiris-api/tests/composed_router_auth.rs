@@ -102,6 +102,9 @@ fn harness() -> Harness {
         .merge(osiris_api::build_exporters_router(
             osiris_api::ExportersState { hub: None },
         ))
+        .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
+            plugins: None,
+        }))
         .merge(build_groups_router(GroupsState {
             groups: fleet_db.clone(),
             registry: fleet_db.clone(),
@@ -497,6 +500,41 @@ async fn exporters_endpoint_requires_platform_admin() {
     );
     assert_eq!(
         get_exporters(&h.app, Some(&h.admin_token)).await,
+        StatusCode::OK
+    );
+}
+
+// --- Phase 12b: GET /api/v1/plugins is platform-admin only ---
+
+async fn get_plugins(app: &axum::Router, token: Option<&str>) -> StatusCode {
+    let mut b = Request::builder().uri("/api/v1/plugins");
+    if let Some(t) = token {
+        b = b.header("Authorization", format!("Bearer {t}"));
+    }
+    app.clone()
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn plugins_endpoint_requires_platform_admin() {
+    let h = harness();
+    let viewer = session_for_role(&h.auth_state, "plg-viewer", Role::Viewer);
+    let analyst = session_for_role(&h.auth_state, "plg-analyst", Role::Analyst);
+
+    assert_eq!(get_plugins(&h.app, None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get_plugins(&h.app, Some(&viewer)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_plugins(&h.app, Some(&analyst)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_plugins(&h.app, Some(&h.admin_token)).await,
         StatusCode::OK
     );
 }

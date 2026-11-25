@@ -120,6 +120,9 @@ fn build_app(
         .merge(osiris_api::build_exporters_router(
             osiris_api::ExportersState { hub: None },
         ))
+        .merge(osiris_api::build_plugins_router(osiris_api::PluginsState {
+            plugins: None,
+        }))
         .merge(build_groups_router(groups_state))
         .merge(osiris_api::build_policy_router(policy_state))
         .layer(axum::middleware::from_fn_with_state(auth_state, auth_gate))
@@ -1206,4 +1209,14 @@ async fn tenant_admin_cannot_read_exporters() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, serde_json::json!({ "exporters": [] }));
+}
+
+#[tokio::test]
+async fn tenant_admin_cannot_read_plugins() {
+    let t = tenancy();
+    let (status, _) = call(&t.app, "GET", "/api/v1/plugins", Some(&t.acme_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = call(&t.app, "GET", "/api/v1/plugins", Some(&t.admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({ "plugins": [] }));
 }

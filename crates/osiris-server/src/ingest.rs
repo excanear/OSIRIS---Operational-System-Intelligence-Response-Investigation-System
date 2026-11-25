@@ -130,6 +130,9 @@ pub struct IngestContext {
     /// Phase 12a: outbound exporters. `None` (no exporters configured) leaves
     /// the ingest path exactly as before. `offer` never awaits or fails.
     pub exporters: Option<Arc<osiris_export::ExportHub>>,
+    /// Phase 12b: WASM plugins. `None` (no plugin enabled) leaves the ingest
+    /// path exactly as before. A plugin never fails or drops an event.
+    pub plugins: Option<Arc<osiris_plugin::PluginSet>>,
 }
 
 impl IngestContext {
@@ -147,6 +150,7 @@ impl IngestContext {
         let risk_engine = self.risk_engine.clone();
         let correlation_engine = self.correlation_engine.clone();
         let export = self.exporters.is_some();
+        let plugins = self.plugins.clone();
         let health_events: Vec<CanonicalEvent> = events
             .iter()
             .filter(|e| e.event_type == osiris_schema::EventType::AgentHealth)
@@ -177,7 +181,7 @@ impl IngestContext {
                         }
                     }
                 }
-                let events = kept;
+                let mut events = kept;
                 if events.len() < total {
                     tracing::error!(
                         dropped = total - events.len(),
@@ -185,8 +189,15 @@ impl IngestContext {
                         "dropped events whose event_id is already owned by another host"
                     );
                 }
+                // Enrichment first, so stored events and YAML rules see the tags.
+                if let Some(plugins) = &plugins {
+                    plugins.enrich_batch(&mut events);
+                }
                 let report = storage.batch_write(&events)?;
-                let alerts = detection_engine.evaluate_batch(&events);
+                let mut alerts = detection_engine.evaluate_batch(&events);
+                if let Some(plugins) = &plugins {
+                    alerts.extend(plugins.detect_batch(&events));
+                }
                 if !alerts.is_empty() {
                     storage.write_alerts(&alerts)?;
                 }
@@ -379,6 +390,7 @@ pub async fn run_ingestion_loop(
         fleet_registry,
         policy_reconciler: Arc::new(std::sync::OnceLock::new()),
         exporters: None,
+        plugins: None,
     };
     run_ingestion_context_loop(spool_path, context, poll_interval, cancellation).await;
 }
@@ -570,6 +582,7 @@ mod tests {
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let server_now = server_now_ns();
@@ -634,6 +647,7 @@ mod tests {
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let base = server_now_ns() - 10_000_000_000;
@@ -710,6 +724,7 @@ mod tests {
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = uuid::Uuid::new_v4();
 
@@ -748,6 +763,7 @@ mod tests {
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = uuid::Uuid::new_v4();
         let mut bad = agent_health_event(host_id, 1_000);
@@ -793,6 +809,7 @@ mod tests {
             fleet_registry: fleet_registry.clone(),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         // `sample_event()` (this file's existing test-only helper, defined
         // above at the top of this test module) builds a plain ProcessExec
@@ -876,6 +893,7 @@ mod tests {
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let tls = osiris_transport::tls::server_config(
             &dir.path().join("server.pem"),
@@ -967,6 +985,7 @@ mod tests {
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let a = sample_event();
         context.ingest(vec![a.clone()]).await.unwrap();
@@ -1112,6 +1131,7 @@ mod tests {
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = Uuid::new_v4();
         let events: Vec<CanonicalEvent> = (0..20u32)
@@ -1168,6 +1188,7 @@ mod tests {
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters: None,
+            plugins: None,
         };
         let host_id = Uuid::new_v4();
         // Each event carries a process and a network block: one baseline pair each.
@@ -1659,6 +1680,7 @@ sequence:
             ),
             policy_reconciler: Arc::new(std::sync::OnceLock::new()),
             exporters,
+            plugins: None,
         }
     }
 
@@ -1805,5 +1827,174 @@ sequence:
         assert_eq!(receiver.try_recv().unwrap().event_id, event.event_id);
         assert_eq!(receiver.try_recv().unwrap().event_id, event.event_id);
         assert!(receiver.try_recv().is_err());
+    }
+
+    // ---------- Phase 12b: plugins ----------
+
+    use osiris_plugin::{fixtures, PluginConfig, PluginKind, PluginSet};
+    use sha2::{Digest, Sha256};
+
+    /// `(name, kind, fixture, fuel)`; modules are written under `dir`.
+    fn load_plugins(
+        dir: &std::path::Path,
+        specs: &[(&str, PluginKind, &str, u64)],
+    ) -> Arc<PluginSet> {
+        let cfgs: Vec<PluginConfig> = specs
+            .iter()
+            .map(|(name, kind, fixture, fuel)| {
+                let wasm = fixtures::wasm(fixture);
+                let path = dir.join(format!("{name}.wasm"));
+                std::fs::write(&path, &wasm).unwrap();
+                PluginConfig {
+                    name: (*name).into(),
+                    kind: *kind,
+                    path,
+                    sha256: hex::encode(Sha256::digest(&wasm)),
+                    version: 1,
+                    fuel_per_event: *fuel,
+                    memory_max_mib: 16,
+                    enabled: true,
+                }
+            })
+            .collect();
+        Arc::new(PluginSet::load(&cfgs).unwrap())
+    }
+
+    /// The `detect_nc` fixture matches `"name":"nc"` in the event JSON.
+    fn nc_event() -> CanonicalEvent {
+        let mut event = sample_event();
+        event.event_data = serde_json::json!({ "process": { "name": "nc" } });
+        event
+    }
+
+    fn plugin_context(
+        dir: &std::path::Path,
+        rules: Vec<osiris_detect::Rule>,
+        exporters: Option<Arc<ExportHub>>,
+        plugins: Option<Arc<PluginSet>>,
+    ) -> IngestContext {
+        let mut context = export_context(dir, rules, exporters);
+        context.plugins = plugins;
+        context
+    }
+
+    const TAG_RULE: &str = r#"
+id: tagged_by_plugin
+version: 1
+severity: LOW
+match:
+  - field: tags
+    op: contains
+    value: "plugin:tag:seen"
+    reason: "An enrichment plugin tagged the event"
+"#;
+
+    #[tokio::test]
+    async fn enrichment_tags_are_stored_and_visible_to_yaml_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = load_plugins(
+            dir.path(),
+            &[("tag", PluginKind::Enrichment, "tagger", 10_000_000)],
+        );
+        let rule = osiris_detect::Rule::from_yaml_str(TAG_RULE, "tag.yaml").unwrap();
+        let context = plugin_context(dir.path(), vec![rule], None, Some(plugins));
+        let event = sample_event();
+        context.ingest(vec![event.clone()]).await.unwrap();
+
+        let stored = context.storage.query(&QueryPlan::new()).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].tags, vec!["plugin:tag:seen"]);
+        let alerts = context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "tagged_by_plugin");
+        assert_eq!(alerts[0].evidence(), &[event.event_id]);
+    }
+
+    #[tokio::test]
+    async fn plugin_alert_is_stored_and_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = RecordingExporter::new(false);
+        let hub = start_hub(rec.clone(), 100);
+        let plugins = load_plugins(
+            dir.path(),
+            &[("hunt", PluginKind::Detection, "detect_nc", 10_000_000)],
+        );
+        let context = plugin_context(dir.path(), vec![], Some(hub.clone()), Some(plugins));
+        let nc = nc_event();
+        context
+            .ingest(vec![nc.clone(), sample_event()])
+            .await
+            .unwrap();
+        hub.shutdown().await;
+
+        let alerts = context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "plugin:hunt:nc_seen");
+        assert_eq!(alerts[0].evidence(), &[nc.event_id]);
+        assert_eq!(rec.ids(Stream::Alerts), vec![alerts[0].alert_id()]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_plugin_never_fails_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = load_plugins(
+            dir.path(),
+            &[("loop", PluginKind::Detection, "infinite_loop", 100_000)],
+        );
+        let context = plugin_context(dir.path(), vec![], None, Some(plugins.clone()));
+        let batch = vec![sample_event(), sample_event(), sample_event()];
+        context.ingest(batch).await.unwrap();
+
+        assert_eq!(context.storage.query(&QueryPlan::new()).unwrap().len(), 3);
+        assert!(context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap()
+            .is_empty());
+        assert_eq!(plugins.status()[0].failures_fuel, 3);
+    }
+
+    #[tokio::test]
+    async fn a_looping_plugin_on_a_100_event_batch_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default fuel: the worst case a misconfigured operator would ship.
+        let plugins = load_plugins(
+            dir.path(),
+            &[("loop", PluginKind::Detection, "infinite_loop", 10_000_000)],
+        );
+        let context = plugin_context(dir.path(), vec![], None, Some(plugins.clone()));
+        let batch: Vec<CanonicalEvent> = (0..100).map(|_| sample_event()).collect();
+        let started = std::time::Instant::now();
+        context.ingest(batch).await.unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("100-event looping-plugin ingest wall time: {elapsed:?}");
+
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+        assert_eq!(context.storage.query(&QueryPlan::new()).unwrap().len(), 100);
+        assert_eq!(plugins.status()[0].failures_fuel, 100);
+    }
+
+    #[tokio::test]
+    async fn ingest_without_plugins_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = plugin_context(dir.path(), vec![web_root_rule()], None, None);
+        let event = web_root_shell_event();
+        context.ingest(vec![event.clone()]).await.unwrap();
+
+        let stored = context.storage.query(&QueryPlan::new()).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].tags.is_empty());
+        let alerts = context
+            .storage
+            .query_alerts(&AlertQueryPlan::new())
+            .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].rule_id(), "shell_wrote_file_to_web_root");
     }
 }

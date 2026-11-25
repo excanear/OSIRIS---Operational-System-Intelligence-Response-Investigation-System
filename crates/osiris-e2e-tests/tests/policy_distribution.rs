@@ -124,6 +124,7 @@ async fn a_group_policy_reaches_a_real_agent_and_reports_in_sync() {
         fleet_registry: registry.clone(),
         policy_reconciler: slot.clone(),
         exporters: None,
+        plugins: None,
     };
     tokio::spawn(run_ingestion_context_loop(
         spool_path.clone(),

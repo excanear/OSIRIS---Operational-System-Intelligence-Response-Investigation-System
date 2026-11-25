@@ -24,6 +24,9 @@ pub struct StackOptions {
     /// Appended verbatim under an `exporters:` key in the rendered
     /// `server.yaml` (a YAML list, indented by the caller).
     pub exporters_yaml: Option<String>,
+    /// Appended verbatim under a `plugins:` key in the rendered
+    /// `server.yaml` (a YAML list, indented by the caller).
+    pub plugins_yaml: Option<String>,
 }
 
 pub struct AgentOptions {
@@ -143,6 +146,7 @@ impl Stack {
             risk_weights: root.join("config/risk/weights.yaml"),
             dev_cors: opts.dev_cors,
             exporters_yaml: opts.exporters_yaml.clone(),
+            plugins_yaml: opts.plugins_yaml.clone(),
         };
         std::fs::write(d.join("server.yaml"), server_yaml.render()).unwrap();
 

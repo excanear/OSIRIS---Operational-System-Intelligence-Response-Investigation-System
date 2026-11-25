@@ -92,9 +92,11 @@ check_forbidden osiris-investigate osiris-sensors osiris-agent osiris-ebpf osiri
 # Global Constraint #6: osiris-evidence must never reach osiris-storage.
 check_forbidden osiris-evidence osiris-storage osiris-sensors osiris-agent osiris-ebpf osiris-kernel
 check_forbidden osiris-api osiris-sensors osiris-ebpf osiris-kernel
-check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiris-risk osiris-baseline osiris-export
+check_forbidden osiris-agent osiris-storage osiris-detect osiris-correlate osiris-risk osiris-baseline osiris-export osiris-plugin
 # Phase 12a: exporters are server-side only and reach just schema and tenancy.
 check_only_internal_deps osiris-export osiris-schema osiris-tenancy
+# Phase 12b: WASM plugins are server-side only and reach just schema.
+check_only_internal_deps osiris-plugin osiris-schema
 check_forbidden osiris-sensors-fs osiris-server osiris-api
 check_forbidden osiris-sensors-process osiris-server osiris-api
 check_forbidden osiris-sensors-net osiris-server osiris-api

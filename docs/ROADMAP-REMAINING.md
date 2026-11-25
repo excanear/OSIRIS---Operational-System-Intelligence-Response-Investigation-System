@@ -324,9 +324,24 @@ revisão final independente → merge → push.
   - Ver também "Known gaps" do ADR-012: lote com falha parcial não é exportado, registros oferecidos
     durante uma partida que falha podem se perder sem contagem, oferta após o shutdown conta como
     `dropped_queue_full`, timeout fixo de 10 s no syslog TCP/TLS.
-- **Fase 12b, plugins**: regras/enriquecimento em WASM sandboxed (bounded budget por evento);
-  sensores como subprocessos (futuro, §20.2). Próximo ciclo (brainstorm → spec → plano), sem
-  dependência da 12a.
+- **Fase 12b, plugins WASM server-side (feita, 2026-11-06)** (§20.1): plugins de detecção e de
+  enriquecimento como módulos WASM core sem imports (Wasmtime), com fuel, limite de memória e de
+  saída por evento, pino SHA-256, `GET /api/v1/plugins` e `osiris plugins status`. Ver
+  `docs/operators-plugins.md`, `docs/adr/ADR-013-wasm-plugins.md` e `PERFORMANCE.md`
+  ("Phase 12b - plugin overhead"). Dívidas da 12b:
+  - Assinaturas de plugin (hoje só o pino SHA-256 no config) e um registro de plugins.
+  - Plugins por tenant (hoje globais, como as regras YAML), com status e orçamento por tenant.
+  - ABI por component model / WIT (a ABI v1 é JSON sobre módulos core).
+  - Hot reload (hoje só no startup).
+  - Plugins também rodam em eventos reenviados/duplicados (mesma dívida dos alertas duplicados de
+    regra num reenvio, ver 12a); custo de serialização JSON por evento.
+  - Isolamento dentro do lote: uma instância e uma memória servem todos os eventos de um lote; um plugin
+    malicioso pode levar dados entre eventos, inclusive entre tenants no caminho do spool tailer. Dividir
+    o lote por tenant antes de rodar plugins.
+  - Limite de tempo de relógio por lote via interrupção por época do wasmtime (fuel até 1e9 × lotes
+    grandes pode prender uma thread bloqueante por minutos).
+- **Sensores como subprocessos (futuro, §20.2 opção b)**: continua adiado; precisa de protocolo de fio
+  do Agent, seccomp e capabilities, e não compartilha nada com o host WASM.
 
 ## Fase 13 — Produto e documentação
 - README, LICENSE, guia de instalação e operação, arquitetura resumida, Dockerfile(s), unit files
