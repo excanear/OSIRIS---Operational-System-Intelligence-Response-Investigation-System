@@ -1,0 +1,5 @@
+OSIRIS - Operational System Intelligence Response Investigation System
+
+OSIRIS is licensed under the Apache License, Version 2.0 (see LICENSE). The
+eBPF programs under bpf/ are licensed "Dual BSD/GPL", because the Linux kernel
+requires a GPL-compatible license for programs that call GPL-only BPF helpers.

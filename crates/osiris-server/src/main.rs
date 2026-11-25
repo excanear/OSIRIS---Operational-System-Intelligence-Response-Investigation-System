@@ -34,6 +34,11 @@ const CORRELATION_WINDOW_NS: u64 = 60_000_000_000;
 
 #[tokio::main]
 async fn main() {
+    if osiris_config::is_version_flag(std::env::args().nth(1).as_deref()) {
+        println!("{}", osiris_config::version_string("osiris-server"));
+        return;
+    }
+
     osiris_selftelemetry::init_logging("info");
 
     let config_path = std::env::args()

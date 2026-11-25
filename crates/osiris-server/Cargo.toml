@@ -17,6 +17,7 @@ axum = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
+osiris-config = { path = "../osiris-config" }
 osiris-storage = { path = "../osiris-storage" }
 osiris-storage-sqlite = { path = "../osiris-storage-sqlite" }
 osiris-storage-clickhouse = { path = "../osiris-storage-clickhouse" }

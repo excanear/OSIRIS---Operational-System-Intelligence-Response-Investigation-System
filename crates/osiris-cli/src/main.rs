@@ -10,6 +10,7 @@ use osiris_schema::CanonicalEvent;
 #[derive(Parser)]
 #[command(
     name = "osiris",
+    version = osiris_config::version_suffix(),
     about = "OSIRIS CLI — thin HTTP client over the Server API and the Agent's local status endpoint"
 )]
 struct Cli {
