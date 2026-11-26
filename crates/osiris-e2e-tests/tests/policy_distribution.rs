@@ -128,6 +128,7 @@ async fn a_group_policy_reaches_a_real_agent_and_reports_in_sync() {
     };
     tokio::spawn(run_ingestion_context_loop(
         spool_path.clone(),
+        None,
         ingest,
         Duration::from_millis(50),
         cancel.clone(),

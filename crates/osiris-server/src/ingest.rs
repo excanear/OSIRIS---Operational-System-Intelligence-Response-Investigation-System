@@ -9,7 +9,7 @@ use osiris_schema::{Alert, CanonicalEvent, EntityRef, EntityRelationship, RiskSc
 use osiris_storage::{RelationshipQueryPlan, Storage};
 use tokio_util::sync::CancellationToken;
 
-use osiris_fileutil::LineTailer;
+use osiris_fileutil::SpoolTailer;
 
 /// The server's own wall clock, nanoseconds since the Unix epoch — used to
 /// clamp agent-supplied `event.timestamp` values before they reach the fleet
@@ -392,23 +392,40 @@ pub async fn run_ingestion_loop(
         exporters: None,
         plugins: None,
     };
-    run_ingestion_context_loop(spool_path, context, poll_interval, cancellation).await;
+    run_ingestion_context_loop(spool_path, None, context, poll_interval, cancellation).await;
 }
 
 /// `run_ingestion_loop` with a caller-built context (so the spool path shares
 /// the server's policy reconciler slot).
+///
+/// With `cursor_path` the read position survives a restart: it is stored
+/// after every ingest (whether or not the ingest succeeded — the position
+/// has moved past those events either way), so a restart resumes instead of
+/// re-reading the whole spool. `None` keeps it in memory, as before 13a.
+/// Either way the tailer follows the Agent's spool rotation.
 pub async fn run_ingestion_context_loop(
     spool_path: impl Into<std::path::PathBuf>,
+    cursor_path: Option<std::path::PathBuf>,
     context: IngestContext,
     poll_interval: Duration,
     cancellation: CancellationToken,
 ) {
-    let mut tailer = LineTailer::new(spool_path);
+    let mut tailer = SpoolTailer::new(spool_path, cursor_path);
+    let mut lost_rotations = 0;
     loop {
         if cancellation.is_cancelled() {
             return;
         }
-        match tailer.poll() {
+        let polled = tailer.poll();
+        if tailer.lost_rotations() > lost_rotations {
+            lost_rotations = tailer.lost_rotations();
+            tracing::warn!(
+                lost_rotations,
+                "spool tailer position is gone (more than one rotation behind, or an unreadable \
+                 cursor file); events in between were lost, resuming at the current spool"
+            );
+        }
+        match polled {
             Ok(lines) => {
                 let events: Vec<CanonicalEvent> = lines
                     .iter()
@@ -421,6 +438,12 @@ pub async fn run_ingestion_context_loop(
                         event_count,
                         "batch ingest failed; tailer offset already advanced past these events \
                          — they are permanently lost"
+                    );
+                }
+                if let Err(error) = tailer.commit() {
+                    tracing::error!(
+                        %error,
+                        "cannot persist the spool tailer cursor (events may be re-read after a restart)"
                     );
                 }
             }
@@ -787,6 +810,57 @@ mod tests {
             stored.len(),
             1,
             "the underlying event is still stored even though its registry upsert was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingestion_loop_persists_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.ndjson");
+        let cursor_path = dir.path().join("spool.offset");
+        let id = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let mut text = osiris_fileutil::spool::header_line(id);
+        for _ in 0..2 {
+            text.push_str(&serde_json::to_string(&sample_event()).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&spool_path, &text).unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(SqliteStorage::open(dir.path().join("events.db")).unwrap());
+        let (baseline_engine, risk_engine, correlation_engine) = test_engines(dir.path());
+        let context = IngestContext {
+            storage: storage.clone(),
+            detection_engine: Arc::new(DetectionEngine::new(vec![])),
+            baseline_engine,
+            risk_engine,
+            correlation_engine,
+            broadcaster: Arc::new(osiris_api::LiveEventBroadcaster::new()),
+            fleet_registry: Arc::new(
+                osiris_fleet::SqliteHostRegistry::open(dir.path().join("hosts.db")).unwrap(),
+            ),
+            policy_reconciler: Arc::new(std::sync::OnceLock::new()),
+            exporters: None,
+            plugins: None,
+        };
+        let cancellation = CancellationToken::new();
+        let handle = tokio::spawn(run_ingestion_context_loop(
+            spool_path.clone(),
+            Some(cursor_path.clone()),
+            context,
+            Duration::from_millis(20),
+            cancellation.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancellation.cancel();
+        handle.await.unwrap();
+
+        assert_eq!(storage.query(&QueryPlan::new()).unwrap().len(), 2);
+        assert_eq!(
+            osiris_fileutil::spool::SpoolCursor::load(&cursor_path),
+            osiris_fileutil::spool::CursorLoad::Loaded(osiris_fileutil::spool::SpoolCursor {
+                id: Some(id.to_string()),
+                offset: text.len() as u64,
+            })
         );
     }
 

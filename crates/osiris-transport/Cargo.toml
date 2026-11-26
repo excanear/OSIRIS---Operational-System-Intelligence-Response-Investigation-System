@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 osiris-schema = { path = "../osiris-schema" }
 osiris-command = { path = "../osiris-command" }
+osiris-fileutil = { path = "../osiris-fileutil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

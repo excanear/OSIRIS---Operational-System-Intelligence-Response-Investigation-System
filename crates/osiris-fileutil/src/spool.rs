@@ -60,8 +60,15 @@ pub fn read_spool_id(path: &Path) -> std::io::Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    read_spool_id_from(file)
+}
+
+/// The id in the header at the start of `reader` (a spool file positioned
+/// at 0). Lets a reader check the id of the very handle it then reads
+/// from, so a rotation between choosing a path and opening it is caught.
+pub fn read_spool_id_from(reader: impl Read) -> std::io::Result<Option<String>> {
     let mut first = Vec::new();
-    BufReader::new(file.take(MAX_HEADER_LINE)).read_until(b'\n', &mut first)?;
+    BufReader::new(reader.take(MAX_HEADER_LINE)).read_until(b'\n', &mut first)?;
     Ok(header_id(&first).map(str::to_owned))
 }
 

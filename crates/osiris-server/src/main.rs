@@ -237,6 +237,10 @@ async fn main() {
     };
     let mut ingestion_tasks = vec![tokio::spawn(run_ingestion_context_loop(
         spool_path,
+        config
+            .spool_cursor_path
+            .as_deref()
+            .map(std::path::PathBuf::from),
         ingest_context.clone(),
         Duration::from_millis(200),
         cancellation.clone(),

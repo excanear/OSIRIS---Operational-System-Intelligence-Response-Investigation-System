@@ -2,11 +2,13 @@
 //! spool file and ships batches to the Server, advancing a persisted offset only
 //! after the Server acknowledges each batch (at-least-once delivery).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use osiris_fileutil::spool::{is_header_line, CursorLoad, SpoolCursor};
+use osiris_fileutil::SpoolReader;
 use osiris_schema::CanonicalEvent;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
@@ -81,65 +83,55 @@ impl Backoff {
     }
 }
 
-/// Where the acknowledged offset lives: `<spool>.offset`.
+/// Where the acknowledged cursor lives: `<spool>.offset`. It holds a
+/// [`SpoolCursor`] (`"<spool id> <offset>"`); a pre-13a bare offset still
+/// loads, as a position in a legacy (header-less) spool.
 pub fn offset_path(spool: &Path) -> PathBuf {
     let mut name = spool.as_os_str().to_owned();
     name.push(".offset");
     PathBuf::from(name)
 }
 
-fn load_offset(spool: &Path) -> u64 {
-    std::fs::read_to_string(offset_path(spool))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+fn load_cursor(spool: &Path) -> CursorLoad {
+    SpoolCursor::load(&offset_path(spool))
 }
 
-fn store_offset(spool: &Path, offset: u64) -> std::io::Result<()> {
-    let path = offset_path(spool);
-    let tmp = path.with_extension("offset.tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(offset.to_string().as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)
+fn store_cursor(spool: &Path, cursor: &SpoolCursor) -> std::io::Result<()> {
+    cursor.store(&offset_path(spool))
 }
 
-/// One batch read from the spool.
+/// One batch read from one spool file.
 struct Batch {
     events: Vec<CanonicalEvent>,
-    /// Spool bytes covered (including unparsable lines, which are skipped).
+    /// Bytes of that file covered (including header, blank and unparsable
+    /// lines, which are skipped).
     consumed: u64,
+    /// Lines that were neither events nor spool headers (each one logged).
+    #[cfg_attr(not(test), allow(dead_code))]
+    unparsable: usize,
 }
 
 enum ReadOutcome {
     Batch(Batch),
     Idle,
-    /// The spool is shorter than the offset: it was truncated or rotated.
-    Truncated,
 }
 
-fn read_batch(spool: &Path, offset: u64) -> std::io::Result<ReadOutcome> {
-    let mut file = match std::fs::File::open(spool) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ReadOutcome::Idle),
-        Err(e) => return Err(e),
+/// Reads the next batch from the file `reader` points into (never from two
+/// files: `consumed` is always relative to that one file). The caller
+/// advances `reader` by `consumed` only once the batch is acknowledged.
+fn read_batch(reader: &mut SpoolReader) -> std::io::Result<ReadOutcome> {
+    let Some(mut open) = reader.open()? else {
+        return Ok(ReadOutcome::Idle);
     };
-    let len = file.metadata()?.len();
-    if len < offset {
-        return Ok(ReadOutcome::Truncated);
-    }
-    if len == offset {
+    if open.len <= open.offset {
         return Ok(ReadOutcome::Idle);
     }
-    file.seek(SeekFrom::Start(offset))?;
-    let want = (len - offset).min(BATCH_MAX_BYTES as u64);
+    let want = (open.len - open.offset).min(BATCH_MAX_BYTES as u64);
     let mut chunk = Vec::with_capacity(want as usize);
-    (&mut file).take(want).read_to_end(&mut chunk)?;
+    (&mut open.file).take(want).read_to_end(&mut chunk)?;
 
     let mut events = Vec::new();
+    let mut unparsable = 0usize;
     let mut consumed = 0usize;
     let mut lines = 0usize;
     while lines < BATCH_MAX_EVENTS {
@@ -148,29 +140,38 @@ fn read_batch(spool: &Path, offset: u64) -> std::io::Result<ReadOutcome> {
         };
         let line = &chunk[consumed..consumed + nl];
         consumed += nl + 1;
-        lines += 1;
-        if line.is_empty() {
+        if line.is_empty() || is_header_line(line) {
             continue;
         }
+        lines += 1;
         match serde_json::from_slice::<CanonicalEvent>(line) {
             Ok(event) => events.push(event),
-            Err(e) => tracing::warn!(error = %e, "skipping an unparsable spool line"),
+            Err(e) => {
+                unparsable += 1;
+                tracing::warn!(error = %e, "skipping an unparsable spool line");
+            }
         }
     }
     if consumed == 0 {
         if chunk.len() >= BATCH_MAX_BYTES {
             // One line longer than the whole read window: skip it rather than stall.
             tracing::error!("spool line exceeds {BATCH_MAX_BYTES} bytes; skipping the window");
-            return Ok(ReadOutcome::Batch(Batch {
-                events: vec![],
-                consumed: chunk.len() as u64,
-            }));
+        } else if open.rotated {
+            // The rotated file ends in a torn line that will never complete.
+            tracing::warn!("skipping a partial last line of the rotated spool");
+        } else {
+            return Ok(ReadOutcome::Idle); // a partial last line: wait for the rest
         }
-        return Ok(ReadOutcome::Idle); // a partial last line: wait for the rest
+        return Ok(ReadOutcome::Batch(Batch {
+            events: vec![],
+            consumed: chunk.len() as u64,
+            unparsable: 1,
+        }));
     }
     Ok(ReadOutcome::Batch(Batch {
         events,
         consumed: consumed as u64,
+        unparsable,
     }))
 }
 
@@ -184,7 +185,9 @@ pub async fn run_forwarder(
         .map_err(|e| TlsError::Rustls(format!("invalid server_name: {e}")))?;
     let connector = TlsConnector::from(Arc::clone(&tls));
 
-    let mut offset = load_offset(&config.spool_path);
+    let mut reader = SpoolReader::new(&config.spool_path, load_cursor(&config.spool_path));
+    let mut losses = LossReport::default();
+    losses.check(&reader);
     let mut seq: u64 = 0;
     let mut backoff = Backoff::default();
     let mut permanently_rejected: u64 = 0;
@@ -237,18 +240,14 @@ pub async fn run_forwarder(
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            let batch = match read_batch(&config.spool_path, offset) {
+            let read = read_batch(&mut reader);
+            losses.check(&reader);
+            let batch = match read {
                 Ok(ReadOutcome::Batch(b)) => b,
                 Ok(ReadOutcome::Idle) => {
                     if sleep_or_cancel(POLL_INTERVAL, &cancel).await {
                         return Ok(());
                     }
-                    continue;
-                }
-                Ok(ReadOutcome::Truncated) => {
-                    tracing::warn!("spool shrank below the acknowledged offset; restarting from 0");
-                    offset = 0;
-                    let _ = store_offset(&config.spool_path, 0);
                     continue;
                 }
                 Err(e) => {
@@ -321,10 +320,36 @@ pub async fn run_forwarder(
                     }
                 }
             }
-            offset += batch.consumed;
-            if let Err(e) = store_offset(&config.spool_path, offset) {
-                tracing::error!(error = %e, "cannot persist the forwarder offset (events may be resent after a restart)");
+            reader.advance(batch.consumed);
+            if let Some(cursor) = reader.cursor() {
+                if let Err(e) = store_cursor(&config.spool_path, cursor) {
+                    tracing::error!(error = %e, "cannot persist the forwarder offset (events may be resent after a restart)");
+                }
             }
+        }
+    }
+}
+
+/// Logs each newly counted loss or truncation of a [`SpoolReader`] once.
+#[derive(Default)]
+struct LossReport {
+    lost_rotations: u64,
+    truncations: u64,
+}
+
+impl LossReport {
+    fn check(&mut self, reader: &SpoolReader) {
+        if reader.lost_rotations() > self.lost_rotations {
+            self.lost_rotations = reader.lost_rotations();
+            tracing::warn!(
+                lost_rotations = self.lost_rotations,
+                "the forwarder's spool position is gone (more than one rotation behind, or an \
+                 unreadable offset file); unsent events were lost, restarting at the current spool"
+            );
+        }
+        if reader.truncations() > self.truncations {
+            self.truncations = reader.truncations();
+            tracing::warn!("spool shrank below the acknowledged offset; restarting from 0");
         }
     }
 }
@@ -340,6 +365,176 @@ pub(crate) async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use osiris_fileutil::spool::{header_line, rotated_path, CursorLoad, SpoolCursor};
+    use osiris_fileutil::SpoolReader;
+    use osiris_schema::{Category, EventType, HostRef, Severity, Source, SCHEMA_VERSION};
+
+    const ID_A: &str = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    const ID_B: &str = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+
+    fn event(n: u64) -> CanonicalEvent {
+        let host = uuid::Uuid::nil();
+        CanonicalEvent {
+            event_id: uuid::Uuid::now_v7(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            host_id: host,
+            boot_id: "b".to_string(),
+            timestamp: n,
+            monotonic_timestamp: n,
+            event_type: EventType::ProcessExec,
+            category: Category::Process,
+            severity: Severity::Info,
+            host: HostRef {
+                host_id: host,
+                hostname: "h".to_string(),
+                distro: "d".to_string(),
+                kernel_version: "k".to_string(),
+                cloud: None,
+            },
+            user: None,
+            session: None,
+            process: None,
+            parent_process: None,
+            thread: None,
+            file: None,
+            network: None,
+            dns: None,
+            device: None,
+            service: None,
+            container: None,
+            namespace: None,
+            cgroup: None,
+            kernel: None,
+            source: Source::Synthetic,
+            provider: "test".to_string(),
+            raw_event: None,
+            relationships: vec![],
+            tags: vec![],
+            risk: None,
+            event_data: serde_json::json!({}),
+        }
+    }
+
+    fn event_lines(ns: &[u64]) -> String {
+        ns.iter()
+            .map(|n| serde_json::to_string(&event(*n)).unwrap() + "\n")
+            .collect()
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    /// The `SpoolFileSink` rotation: headered `.tmp`, spool → `.1`, `.tmp` → spool.
+    fn rotate(spool: &Path, new_id: &str, text: &str) {
+        let mut tmp = spool.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, header_line(new_id) + text).unwrap();
+        std::fs::rename(spool, rotated_path(spool)).unwrap();
+        std::fs::rename(&tmp, spool).unwrap();
+    }
+
+    /// One forwarder step as `run_forwarder` does it after an ack.
+    fn next(reader: &mut SpoolReader) -> Option<Batch> {
+        match read_batch(reader).unwrap() {
+            ReadOutcome::Batch(batch) => {
+                reader.advance(batch.consumed);
+                Some(batch)
+            }
+            ReadOutcome::Idle => None,
+        }
+    }
+
+    fn stamps(batch: &Batch) -> Vec<u64> {
+        batch.events.iter().map(|e| e.timestamp).collect()
+    }
+
+    #[test]
+    fn forwarder_cursor_loads_legacy_offset_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        std::fs::write(offset_path(&spool), "4096\n").unwrap();
+        assert_eq!(
+            load_cursor(&spool),
+            CursorLoad::Loaded(SpoolCursor {
+                id: None,
+                offset: 4096
+            })
+        );
+
+        // A legacy cursor resumes a legacy spool where it left off.
+        let first = event_lines(&[1]);
+        std::fs::write(&spool, first.clone() + &event_lines(&[2])).unwrap();
+        std::fs::write(offset_path(&spool), first.len().to_string()).unwrap();
+        let mut reader = SpoolReader::new(&spool, load_cursor(&spool));
+        assert_eq!(stamps(&next(&mut reader).unwrap()), [2]);
+    }
+
+    #[test]
+    fn forwarder_finishes_rotated_file_before_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        std::fs::write(&spool, header_line(ID_A) + &event_lines(&[1])).unwrap();
+        let mut reader = SpoolReader::new(&spool, load_cursor(&spool));
+        assert_eq!(stamps(&next(&mut reader).unwrap()), [1]);
+
+        append(&spool, &event_lines(&[2, 3]));
+        rotate(&spool, ID_B, &event_lines(&[4, 5, 6, 7, 8]));
+
+        let old = next(&mut reader).unwrap();
+        assert_eq!(stamps(&old), [2, 3], "the rest of .1, and nothing else");
+        let new = next(&mut reader).unwrap();
+        assert_eq!(stamps(&new), [4, 5, 6, 7, 8]);
+        assert!(next(&mut reader).is_none());
+
+        let cursor = reader.cursor().unwrap().clone();
+        assert_eq!(cursor.id.as_deref(), Some(ID_B));
+        assert_eq!(cursor.offset, std::fs::metadata(&spool).unwrap().len());
+        store_cursor(&spool, &cursor).unwrap();
+        assert_eq!(load_cursor(&spool), CursorLoad::Loaded(cursor));
+    }
+
+    #[test]
+    fn forwarder_skips_header_without_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        std::fs::write(&spool, header_line(ID_A) + &event_lines(&[1])).unwrap();
+        let mut reader = SpoolReader::new(&spool, load_cursor(&spool));
+        let batch = next(&mut reader).unwrap();
+        assert_eq!(stamps(&batch), [1]);
+        assert_eq!(batch.unparsable, 0, "the header is not an unparsable event");
+        assert_eq!(batch.consumed, std::fs::metadata(&spool).unwrap().len());
+    }
+
+    #[test]
+    fn forwarder_never_reads_across_the_switch() {
+        // A rotation while the forwarder still has unacked bytes of the old
+        // file: the retried read must come from `.1` at the same offset.
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        std::fs::write(&spool, header_line(ID_A) + &event_lines(&[1, 2])).unwrap();
+        let mut reader = SpoolReader::new(&spool, load_cursor(&spool));
+        let ReadOutcome::Batch(unacked) = read_batch(&mut reader).unwrap() else {
+            panic!("expected a batch");
+        };
+        assert_eq!(stamps(&unacked), [1, 2]);
+
+        rotate(&spool, ID_B, &event_lines(&[3]));
+        assert_eq!(
+            stamps(&next(&mut reader).unwrap()),
+            [1, 2],
+            "resent from .1"
+        );
+        assert_eq!(stamps(&next(&mut reader).unwrap()), [3]);
+    }
 
     #[test]
     fn backoff_grows_to_the_cap_and_resets_only_on_reset() {

@@ -99,6 +99,11 @@ pub struct ServerConfig {
     /// non-API path. Absent = API only, exactly as before.
     #[serde(default)]
     pub console_dir: Option<String>,
+    /// Phase 13a: where the same-host spool tailer persists its read
+    /// position, so a restart resumes instead of re-reading the spool.
+    /// Absent = the position is kept in memory only, exactly as before.
+    #[serde(default)]
+    pub spool_cursor_path: Option<String>,
 }
 
 /// The telemetry storage backend.
@@ -412,6 +417,19 @@ mod tests {
         let path = dir.path().join("server.yaml");
         std::fs::write(&path, yaml).unwrap();
         ServerConfig::load(&path)
+    }
+
+    #[test]
+    fn spool_cursor_path_is_optional_and_parses() {
+        assert!(load_yaml(BASE_YAML).unwrap().spool_cursor_path.is_none());
+        let config = load_yaml(&format!(
+            "{BASE_YAML}spool_cursor_path: /var/lib/osiris/spool.offset\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.spool_cursor_path.as_deref(),
+            Some("/var/lib/osiris/spool.offset")
+        );
     }
 
     #[test]
