@@ -197,7 +197,17 @@ pub struct SpoolTailer {
     cursor_path: Option<PathBuf>,
     /// The cursor last stored, so an idle poll loop does not rewrite it.
     committed: Mutex<Option<SpoolCursor>>,
+    /// Most bytes one [`SpoolTailer::poll`] reads, across `.1` and the
+    /// current file together.
+    max_bytes: u64,
+    /// Inside a line longer than `max_bytes`: drop bytes up to its `\n`.
+    discarding: bool,
+    oversized_lines: u64,
 }
+
+/// Default [`SpoolTailer`] per-poll read cap; the same as the forwarder's
+/// per-batch byte cap.
+pub const DEFAULT_POLL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 impl SpoolTailer {
     /// Loads the cursor from `cursor_path` when given; `None` keeps the
@@ -215,7 +225,22 @@ impl SpoolTailer {
             reader: SpoolReader::new(spool, load),
             cursor_path,
             committed: Mutex::new(committed),
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
+            discarding: false,
+            oversized_lines: 0,
         }
+    }
+
+    /// Overrides the per-poll read cap ([`DEFAULT_POLL_MAX_BYTES`]); a
+    /// line longer than it is skipped and counted. At least 1.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
+    }
+
+    /// Lines skipped because they were longer than the per-poll cap.
+    pub fn oversized_lines(&self) -> u64 {
+        self.oversized_lines
     }
 
     /// Complete new lines (header lines dropped). Empty, not an error, if
@@ -223,32 +248,77 @@ impl SpoolTailer {
     /// length measured on the handle, so a concurrent append is never cut.
     /// After a rotation the rest of `<spool>.1` comes first, then the new
     /// file from 0, in this poll or the next.
+    ///
+    /// One poll reads at most `max_bytes` in total (`.1` and the current
+    /// file together); the rest comes in later polls. A line longer than
+    /// that is skipped (counted in [`SpoolTailer::oversized_lines`]) rather
+    /// than stalling the tailer.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
         let mut out = Vec::new();
+        let mut budget = self.max_bytes;
         // At most: the rest of `.1`, then the current file.
         for _ in 0..3 {
+            if budget == 0 {
+                break;
+            }
             let Some(mut open) = self.reader.open()? else {
                 break;
             };
+            let remaining = open.len - open.offset;
+            let want = remaining.min(budget);
+            let capped = want < remaining;
+            budget -= want;
             let mut buf = Vec::new();
-            (&mut open.file)
-                .take(open.len - open.offset)
-                .read_to_end(&mut buf)?;
-            let complete = match buf.iter().rposition(|b| *b == b'\n') {
+            (&mut open.file).take(want).read_to_end(&mut buf)?;
+
+            // Finish discarding an over-cap line first.
+            let mut start = 0;
+            if self.discarding {
+                match buf.iter().position(|b| *b == b'\n') {
+                    Some(nl) => {
+                        start = nl + 1;
+                        self.discarding = false;
+                    }
+                    None => start = buf.len(),
+                }
+            }
+            let body = &buf[start..];
+            let complete = match body.iter().rposition(|b| *b == b'\n') {
                 Some(last_nl) => last_nl + 1,
                 None => 0,
             };
-            let consumed = if open.rotated { buf.len() } else { complete };
-            for line in buf[..consumed].split(|b| *b == b'\n') {
-                if line.is_empty() || is_header_line(line) {
-                    continue;
+            let consumed = if !self.discarding
+                && complete == 0
+                && capped
+                && start == 0
+                && want == self.max_bytes
+            {
+                // A whole cap's window from a line start holds no `\n`.
+                self.oversized_lines += 1;
+                self.discarding = true;
+                buf.len()
+            } else {
+                // `.1` read to its end will never grow: take its torn tail.
+                let body_consumed = if open.rotated && !capped {
+                    body.len()
+                } else {
+                    complete
+                };
+                for line in body[..body_consumed].split(|b| *b == b'\n') {
+                    if line.is_empty() || is_header_line(line) {
+                        continue;
+                    }
+                    out.push(String::from_utf8_lossy(line).into_owned());
                 }
-                out.push(String::from_utf8_lossy(line).into_owned());
-            }
+                start + body_consumed
+            };
             self.reader.advance(consumed as u64);
-            if !open.rotated {
+            if !open.rotated || capped {
                 break;
             }
+            // `.1` is finished; whatever it ended in, the next file starts
+            // on a line boundary.
+            self.discarding = false;
         }
         Ok(out)
     }
@@ -324,6 +394,85 @@ mod tests {
             out.extend(tailer.poll().unwrap());
         }
         out
+    }
+
+    /// Bytes of spool the lines of one poll cover (each plus its `\n`).
+    fn line_bytes(polled: &[String]) -> u64 {
+        polled.iter().map(|l| l.len() as u64 + 1).sum()
+    }
+
+    fn numbered(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i:02}")).collect()
+    }
+
+    #[test]
+    fn tailer_caps_one_poll_and_returns_the_rest_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        let all = numbered("e", 20); // 4 bytes per line with its `\n`
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        write_spool(&spool, None, &refs);
+        let mut tailer = SpoolTailer::new(&spool, None).with_max_bytes(10);
+
+        let mut seen = Vec::new();
+        for _ in 0..30 {
+            let polled = tailer.poll().unwrap();
+            assert!(line_bytes(&polled) <= 10, "poll over the cap: {polled:?}");
+            seen.extend(polled);
+        }
+        assert_eq!(seen, all, "in order, no loss, no duplicates");
+        assert_eq!(tailer.oversized_lines(), 0);
+    }
+
+    #[test]
+    fn tailer_cap_spans_rotated_and_current_in_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        write_spool(&spool, Some(ID_A), &[]);
+        let mut tailer = SpoolTailer::new(&spool, None).with_max_bytes(100);
+        assert!(tailer.poll().unwrap().is_empty());
+
+        let old = numbered("a", 10);
+        let new = numbered("b", 10);
+        append(&spool, &old.iter().map(String::as_str).collect::<Vec<_>>());
+        rotate(
+            &spool,
+            ID_B,
+            &new.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        // `.1` holds 40 event bytes, the new file a 54-byte header and 40
+        // event bytes: more than one cap's worth in total.
+        let first = tailer.poll().unwrap();
+        assert!(
+            first.len() < 20,
+            "one poll took both whole files: {first:?}"
+        );
+        let mut seen = first;
+        for _ in 0..10 {
+            seen.extend(tailer.poll().unwrap());
+        }
+        let expected: Vec<String> = old.into_iter().chain(new).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn tailer_skips_an_over_cap_line_without_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        let huge = "x".repeat(25);
+        write_spool(&spool, Some(ID_A), &["short", &huge, "after"]);
+        let mut tailer = SpoolTailer::new(&spool, None).with_max_bytes(10);
+        // The 54-byte header itself is over this cap too; it is skipped the
+        // same way (and is dropped anyway).
+        let seen = (0..30)
+            .flat_map(|_| tailer.poll().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, lines(&["short", "after"]));
+        assert_eq!(tailer.oversized_lines(), 2, "the header and the huge line");
+
+        append(&spool, &["later"]);
+        assert_eq!(drain(&mut tailer), lines(&["later"]));
     }
 
     #[test]

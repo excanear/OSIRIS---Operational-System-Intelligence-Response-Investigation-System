@@ -412,6 +412,7 @@ pub async fn run_ingestion_context_loop(
 ) {
     let mut tailer = SpoolTailer::new(spool_path, cursor_path);
     let mut lost_rotations = 0;
+    let mut oversized_lines = 0;
     loop {
         if cancellation.is_cancelled() {
             return;
@@ -423,6 +424,14 @@ pub async fn run_ingestion_context_loop(
                 lost_rotations,
                 "spool tailer position is gone (more than one rotation behind, or an unreadable \
                  cursor file); events in between were lost, resuming at the current spool"
+            );
+        }
+        if tailer.oversized_lines() > oversized_lines {
+            oversized_lines = tailer.oversized_lines();
+            tracing::error!(
+                oversized_lines,
+                "spool line exceeds {} bytes; skipping it",
+                osiris_fileutil::spool_tailer::DEFAULT_POLL_MAX_BYTES
             );
         }
         match polled {
