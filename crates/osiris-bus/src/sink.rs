@@ -83,40 +83,70 @@ impl SpoolFileSink {
         })
     }
 
-    /// Renames the spool to `<spool>.1`, replacing an older `.1`, and starts
-    /// a new spool with a fresh header. Called with the state lock held.
+    /// Renames the spool to `<spool>.1`, replacing an older `.1`, and puts a
+    /// new, already-headered spool in its place. Called with the state lock
+    /// held. The new file is prepared first, so a failure there leaves the
+    /// spool untouched; between the two renames `<spool>` is briefly
+    /// missing, which readers handle (`osiris_fileutil::spool::locate`).
     async fn rotate(&self, state: &mut SpoolState) -> std::io::Result<()> {
+        let (tmp, header_len) = write_headered_tmp(&self.path).await?;
         let rotated = osiris_fileutil::spool::rotated_path(&self.path);
         tokio::fs::rename(&self.path, &rotated).await?;
-        *state = ensure_header(&self.path).await?;
+        tokio::fs::rename(&tmp, &self.path).await?;
+        *state = SpoolState {
+            len: header_len,
+            header_len,
+        };
         Ok(())
     }
 }
 
 fn spool_open_options() -> tokio::fs::OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = tokio::fs::OpenOptions::new();
-    options.append(true);
     #[cfg(unix)]
     options.mode(0o640);
     options
 }
 
-/// Opens (creating it if missing) the spool at `path`, writes a new header
-/// if the file is empty, and returns its state.
+/// Writes a fresh header (new uuid v7) to `<spool>.tmp`, truncating any
+/// leftover from a crash, and syncs it. Returns the tmp path and the
+/// header's length.
+async fn write_headered_tmp(spool: &std::path::Path) -> std::io::Result<(PathBuf, u64)> {
+    let mut tmp = spool.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let header = osiris_fileutil::spool::header_line(&uuid::Uuid::now_v7().to_string());
+    let mut file = spool_open_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .await?;
+    file.write_all(header.as_bytes()).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok((tmp, header.len() as u64))
+}
+
+/// Makes sure a spool exists at `path` and returns its state. A missing or
+/// empty spool is replaced by a headered one via `<spool>.tmp` + rename, so
+/// no reader ever sees a new spool without its header. An existing
+/// non-empty spool is left exactly as it is (a legacy one keeps no header).
 async fn ensure_header(path: &std::path::Path) -> std::io::Result<SpoolState> {
-    let mut file = spool_open_options().create(true).open(path).await?;
-    let len = file.metadata().await?.len();
+    let len = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
     if len == 0 {
-        let header = osiris_fileutil::spool::header_line(&uuid::Uuid::now_v7().to_string());
-        file.write_all(header.as_bytes()).await?;
-        file.flush().await?;
-        let header_len = header.len() as u64;
+        let (tmp, header_len) = write_headered_tmp(path).await?;
+        tokio::fs::rename(&tmp, path).await?;
         return Ok(SpoolState {
             len: header_len,
             header_len,
         });
     }
-    drop(file);
     let header_len = match osiris_fileutil::spool::read_spool_id(path)? {
         Some(id) => osiris_fileutil::spool::header_line(&id).len() as u64,
         None => 0,
@@ -155,6 +185,7 @@ impl Sink for SpoolFileSink {
             }
         }
         let mut file = spool_open_options()
+            .append(true)
             .open(&self.path)
             .await
             .map_err(write_err)?;
@@ -519,6 +550,66 @@ mod tests {
         }
         assert_eq!(per_file, vec![100, TASKS * PER_TASK - 100]);
         assert_eq!(seen, sent);
+    }
+
+    /// A headered spool must never be observable without its header: a
+    /// reader that saw it empty or header-less would adopt `id: None` for
+    /// it. An observer polls the spool path through many rotations; every
+    /// time the path exists it must already start with a header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_spool_is_never_observed_without_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let (path, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut bad = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Missing is fine (between the Agent's two renames).
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let first = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+                        if !spool::is_header_line(first) {
+                            bad.push(String::from_utf8_lossy(&bytes).into_owned());
+                        }
+                    }
+                }
+                bad
+            })
+        };
+        // Cap 1: every send after the first rotates.
+        let sink = SpoolFileSink::open_with(&path, Some(1)).await.unwrap();
+        for _ in 0..300 {
+            sink.send(sample_event()).await.unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bad = observer.join().unwrap();
+        assert!(
+            bad.is_empty(),
+            "observed {} header-less spool states, first: {:?}",
+            bad.len(),
+            bad.first()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_tmp_file_from_a_crash_does_not_leak_into_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let tmp = dir.path().join("spool.ndjson.tmp");
+        std::fs::write(&tmp, "garbage from a crashed run\n").unwrap();
+        let sink = SpoolFileSink::open_with(&path, Some(1)).await.unwrap();
+        sink.send(sample_event()).await.unwrap();
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        header_id(&lines[0]);
+        assert!(!tmp.exists());
+        std::fs::write(&tmp, "garbage again\n").unwrap();
+        sink.send(sample_event()).await.unwrap();
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2, "after rotation: {lines:?}");
+        header_id(&lines[0]);
+        assert!(!tmp.exists());
     }
 
     #[cfg(unix)]

@@ -74,35 +74,56 @@ pub fn rotated_path(spool: &Path) -> PathBuf {
 
 /// A reader's durable position: which spool file (`id`; `None` = a legacy
 /// file without a header) and the byte offset read up to in it.
+///
+/// A reader must store the id [`read_spool_id`] gave for the file it is
+/// actually reading. The Agent never exposes a headered spool without its
+/// header (it writes each new spool to a temporary file and renames it
+/// into place), so `id: None` only ever describes a genuine legacy file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpoolCursor {
     pub id: Option<String>,
     pub offset: u64,
 }
 
+/// What [`SpoolCursor::load`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorLoad {
+    /// No cursor file: this reader has no position yet. Pass `None` to
+    /// [`locate`], which answers [`SpoolPosition::Start`].
+    Missing,
+    /// A cursor file exists but cannot be read or parsed. The position is a
+    /// real unknown: treat it as [`SpoolPosition::Lost`] (count and log the
+    /// loss), then restart the current file at 0.
+    Garbled,
+    /// A valid cursor.
+    Loaded(SpoolCursor),
+}
+
 impl SpoolCursor {
     /// Reads a cursor stored by [`SpoolCursor::store`]: `"<id> <offset>"`.
     /// A bare number is a legacy (pre-13a) offset file, `{ id: None,
-    /// offset }`. A missing or garbled file is the default cursor.
-    pub fn load(path: &Path) -> SpoolCursor {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return SpoolCursor::default();
+    /// offset }`.
+    pub fn load(path: &Path) -> CursorLoad {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CursorLoad::Missing,
+            Err(_) => return CursorLoad::Garbled,
         };
         let mut parts = text.split_whitespace();
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some(offset), None, None) => match offset.parse() {
-                Ok(offset) => SpoolCursor { id: None, offset },
-                Err(_) => SpoolCursor::default(),
-            },
-            (Some(id), Some(offset), None) if is_plain_id(id) => match offset.parse() {
-                Ok(offset) => SpoolCursor {
+        let cursor = match (parts.next(), parts.next(), parts.next()) {
+            (Some(offset), None, None) => offset
+                .parse()
+                .ok()
+                .map(|offset| SpoolCursor { id: None, offset }),
+            (Some(id), Some(offset), None) if is_plain_id(id) => {
+                offset.parse().ok().map(|offset| SpoolCursor {
                     id: Some(id.to_owned()),
                     offset,
-                },
-                Err(_) => SpoolCursor::default(),
-            },
-            _ => SpoolCursor::default(),
-        }
+                })
+            }
+            _ => None,
+        };
+        cursor.map_or(CursorLoad::Garbled, CursorLoad::Loaded)
     }
 
     /// Stores the cursor durably: written to `<path>.tmp`, `sync_all`ed,
@@ -125,31 +146,42 @@ impl SpoolCursor {
     }
 }
 
-/// Which file a [`SpoolCursor`] now points into.
+/// Where a reader should resume, as decided by [`locate`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpoolPosition {
+    /// The reader has no cursor yet (`locate(spool, None)`, i.e.
+    /// [`CursorLoad::Missing`]): begin `<spool>` at 0. Not a loss.
+    Start,
     /// Still `<spool>`: keep reading it from `offset`.
     Current { offset: u64 },
     /// The cursor's file was rotated to `<spool>.1`: finish it from
     /// `offset`, then start `<spool>` at 0.
     Rotated { offset: u64 },
     /// The cursor's file is gone (the reader fell more than one rotation
-    /// behind, or the files were removed): its unread tail is lost.
+    /// behind, or the files were removed or truncated): its unread tail is
+    /// lost. Count and log it, then begin `<spool>` at 0.
     Lost,
 }
 
-/// Finds the file `cursor` refers to. Ids are compared with
-/// [`read_spool_id`]; `None == None` matches (legacy files):
+/// Finds the file `cursor` refers to; `None` (no cursor yet) is always
+/// `Start`. Otherwise ids are compared with [`read_spool_id`], and
+/// `None == None` matches (legacy files):
 /// 1. `<spool>` exists, is non-empty and its id matches → `Current`;
 /// 2. `<spool>.1` exists and its id matches → `Rotated`;
-/// 3. `<spool>` is missing or empty and the cursor has no id → `Current`
-///    (nothing written yet, or a legacy spool truncated away);
-/// 4. otherwise → `Lost`.
+/// 3. `<spool>` is missing or empty, the cursor has no id and offset 0 →
+///    `Current { offset: 0 }` (a legacy reader that has read nothing);
+/// 4. otherwise → `Lost`, including a legacy cursor with offset > 0 whose
+///    file is now missing or empty and is not `.1` (the bytes it pointed
+///    past are gone).
 ///
-/// Step 3 comes after step 2 so that a crash between the Agent's rename
-/// and its new header write (current missing or empty, `.1` a legacy file)
-/// still sends a legacy cursor to `.1` instead of losing its tail.
-pub fn locate(spool: &Path, cursor: &SpoolCursor) -> std::io::Result<SpoolPosition> {
+/// The Agent renames `<spool>` to `.1` and then renames a ready-made,
+/// headered file into `<spool>`, so between the two `<spool>` is missing.
+/// Step 3 comes after step 2, which sends a legacy cursor to a legacy `.1`
+/// in that window instead of losing its tail.
+pub fn locate(spool: &Path, cursor: Option<&SpoolCursor>) -> std::io::Result<SpoolPosition> {
+    let Some(cursor) = cursor else {
+        return Ok(SpoolPosition::Start);
+    };
     let offset = cursor.offset;
     let current_has_content = match std::fs::metadata(spool) {
         Ok(meta) => meta.len() > 0,
@@ -164,8 +196,8 @@ pub fn locate(spool: &Path, cursor: &SpoolCursor) -> std::io::Result<SpoolPositi
     if rotated.exists() && cursor.id == read_spool_id(&rotated)? {
         return Ok(SpoolPosition::Rotated { offset });
     }
-    if !current_has_content && cursor.id.is_none() {
-        return Ok(SpoolPosition::Current { offset });
+    if !current_has_content && cursor.id.is_none() && offset == 0 {
+        return Ok(SpoolPosition::Current { offset: 0 });
     }
     Ok(SpoolPosition::Lost)
 }
@@ -224,16 +256,23 @@ mod tests {
         );
     }
 
+    fn loaded(path: &Path) -> SpoolCursor {
+        match SpoolCursor::load(path) {
+            CursorLoad::Loaded(cursor) => cursor,
+            other => panic!("expected a loaded cursor, got {other:?}"),
+        }
+    }
+
     #[test]
     fn cursor_store_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.offset");
         let with_id = cursor(Some(ID_A), 12345);
         with_id.store(&path).unwrap();
-        assert_eq!(SpoolCursor::load(&path), with_id);
+        assert_eq!(loaded(&path), with_id);
         let legacy = cursor(None, 77);
         legacy.store(&path).unwrap();
-        assert_eq!(SpoolCursor::load(&path), legacy);
+        assert_eq!(loaded(&path), legacy);
         assert!(!dir.path().join("spool.offset.tmp").exists());
     }
 
@@ -242,22 +281,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.offset");
         std::fs::write(&path, "4096").unwrap();
-        assert_eq!(SpoolCursor::load(&path), cursor(None, 4096));
+        assert_eq!(loaded(&path), cursor(None, 4096));
+        // A legacy "0" is a real position (offset 0 of a legacy file), not
+        // "no cursor".
+        std::fs::write(&path, "0").unwrap();
+        assert_eq!(loaded(&path), cursor(None, 0));
     }
 
     #[test]
-    fn cursor_garbled_is_default() {
+    fn cursor_missing_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.offset");
-        assert_eq!(SpoolCursor::load(&path), SpoolCursor::default(), "missing");
+        assert_eq!(SpoolCursor::load(&path), CursorLoad::Missing);
+    }
+
+    #[test]
+    fn cursor_garbled_is_garbled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.offset");
         for garbled in ["", "abc", "id 12 extra", "id notanumber", "-5", "a\"b 3"] {
             std::fs::write(&path, garbled).unwrap();
-            assert_eq!(
-                SpoolCursor::load(&path),
-                SpoolCursor::default(),
-                "{garbled:?}"
-            );
+            assert_eq!(SpoolCursor::load(&path), CursorLoad::Garbled, "{garbled:?}");
         }
+        // Unreadable (here: a directory where the file should be).
+        let dir_path = dir.path().join("dir.offset");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert_eq!(SpoolCursor::load(&dir_path), CursorLoad::Garbled);
+    }
+
+    #[test]
+    fn no_cursor_is_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        assert_eq!(
+            locate(&spool, None).unwrap(),
+            SpoolPosition::Start,
+            "no spool"
+        );
+        write(&spool, Some(ID_A), 2);
+        write(&rotated_path(&spool), Some(ID_B), 2);
+        assert_eq!(
+            locate(&spool, None).unwrap(),
+            SpoolPosition::Start,
+            "headered"
+        );
+        write(&spool, None, 2);
+        assert_eq!(
+            locate(&spool, None).unwrap(),
+            SpoolPosition::Start,
+            "legacy"
+        );
     }
 
     #[test]
@@ -267,7 +340,7 @@ mod tests {
         write(&spool, Some(ID_A), 2);
         write(&rotated_path(&spool), Some(ID_B), 2);
         assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
+            locate(&spool, Some(&cursor(Some(ID_A), 70))).unwrap(),
             SpoolPosition::Current { offset: 70 }
         );
     }
@@ -279,19 +352,13 @@ mod tests {
         write(&spool, Some(ID_B), 1);
         write(&rotated_path(&spool), Some(ID_A), 2);
         assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
+            locate(&spool, Some(&cursor(Some(ID_A), 70))).unwrap(),
             SpoolPosition::Rotated { offset: 70 }
         );
-        // Crash between the Agent's rename and its new header write: the
-        // current file is missing, or created but still empty.
+        // Between the Agent's two renames the current file is missing.
         std::fs::remove_file(&spool).unwrap();
         assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
-            SpoolPosition::Rotated { offset: 70 }
-        );
-        std::fs::write(&spool, "").unwrap();
-        assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
+            locate(&spool, Some(&cursor(Some(ID_A), 70))).unwrap(),
             SpoolPosition::Rotated { offset: 70 }
         );
     }
@@ -302,7 +369,7 @@ mod tests {
         let spool = dir.path().join("spool.ndjson");
         write(&spool, Some(ID_B), 1);
         assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
+            locate(&spool, Some(&cursor(Some(ID_A), 70))).unwrap(),
             SpoolPosition::Lost,
             "no .1"
         );
@@ -312,12 +379,12 @@ mod tests {
             1,
         );
         assert_eq!(
-            locate(&spool, &cursor(Some(ID_A), 70)).unwrap(),
+            locate(&spool, Some(&cursor(Some(ID_A), 70))).unwrap(),
             SpoolPosition::Lost,
             ".1 is a newer file"
         );
         assert_eq!(
-            locate(&spool, &cursor(None, 70)).unwrap(),
+            locate(&spool, Some(&cursor(None, 70))).unwrap(),
             SpoolPosition::Lost,
             "legacy cursor, both files have headers"
         );
@@ -329,14 +396,31 @@ mod tests {
         let spool = dir.path().join("spool.ndjson");
         write(&spool, None, 3);
         assert_eq!(
-            locate(&spool, &cursor(None, 34)).unwrap(),
+            locate(&spool, Some(&cursor(None, 34))).unwrap(),
             SpoolPosition::Current { offset: 34 }
         );
-        // Nothing written yet: a fresh reader on a missing spool.
+        // A legacy reader that has read nothing, on a missing spool.
         std::fs::remove_file(&spool).unwrap();
         assert_eq!(
-            locate(&spool, &SpoolCursor::default()).unwrap(),
+            locate(&spool, Some(&cursor(None, 0))).unwrap(),
             SpoolPosition::Current { offset: 0 }
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_past_a_missing_or_empty_spool_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.ndjson");
+        assert_eq!(
+            locate(&spool, Some(&cursor(None, 34))).unwrap(),
+            SpoolPosition::Lost,
+            "missing"
+        );
+        std::fs::write(&spool, "").unwrap();
+        assert_eq!(
+            locate(&spool, Some(&cursor(None, 34))).unwrap(),
+            SpoolPosition::Lost,
+            "empty"
         );
     }
 
@@ -347,13 +431,13 @@ mod tests {
         write(&spool, Some(ID_A), 1);
         write(&rotated_path(&spool), None, 3);
         assert_eq!(
-            locate(&spool, &cursor(None, 34)).unwrap(),
+            locate(&spool, Some(&cursor(None, 34))).unwrap(),
             SpoolPosition::Rotated { offset: 34 }
         );
-        // Same, if the Agent crashed before writing the new header.
-        std::fs::write(&spool, "").unwrap();
+        // Same between the Agent's two renames (current missing).
+        std::fs::remove_file(&spool).unwrap();
         assert_eq!(
-            locate(&spool, &cursor(None, 34)).unwrap(),
+            locate(&spool, Some(&cursor(None, 34))).unwrap(),
             SpoolPosition::Rotated { offset: 34 }
         );
     }
