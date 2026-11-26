@@ -223,6 +223,7 @@ async fn a_group_policy_reaches_a_real_agent_and_reports_in_sync() {
         enable_synthetic: true,
         synthetic_scenario: None,
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     agent_config.fleet.health_interval_secs = 1;

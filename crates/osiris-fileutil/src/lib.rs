@@ -2,6 +2,7 @@ pub mod audit_kv;
 pub mod cgroup;
 pub mod line_tailer;
 pub mod nested_msg_record;
+pub mod spool;
 
 pub use audit_kv::{parse_audit_msg_id, tokenize, AuditMsgId};
 pub use cgroup::{container_id_from_cgroup_path, parse_cgroup_file, CgroupFileVersion};

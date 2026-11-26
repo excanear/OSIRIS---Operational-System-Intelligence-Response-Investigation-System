@@ -279,6 +279,11 @@ pub struct AgentConfig {
     pub synthetic_scenario: Option<String>,
     /// Path to the NDJSON spool file (plan Global Constraints #3).
     pub spool_path: String,
+    /// Size cap per spool file in bytes (Phase 13a, spec §5.2b): before a
+    /// line would take the spool past it, the Agent rotates the spool to
+    /// `<spool_path>.1` and starts a new one. `None` = never rotate.
+    #[serde(default)]
+    pub spool_max_bytes: Option<u64>,
     /// Loopback address for the local status HTTP endpoint (plan Global
     /// Constraints #4).
     pub status_addr: String,
@@ -397,6 +402,21 @@ mod tests {
         assert_eq!(
             config.persistence_watch_paths[0].path,
             "/etc/systemd/system"
+        );
+    }
+
+    #[test]
+    fn spool_max_bytes_defaults_to_none_and_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        let minimal = "enable_synthetic: false\nspool_path: /tmp/spool.ndjson\n\
+                       status_addr: 127.0.0.1:9200\n";
+        std::fs::write(&path, minimal).unwrap();
+        assert_eq!(AgentConfig::load(&path).unwrap().spool_max_bytes, None);
+        std::fs::write(&path, format!("{minimal}spool_max_bytes: 268435456\n")).unwrap();
+        assert_eq!(
+            AgentConfig::load(&path).unwrap().spool_max_bytes,
+            Some(268_435_456)
         );
     }
 

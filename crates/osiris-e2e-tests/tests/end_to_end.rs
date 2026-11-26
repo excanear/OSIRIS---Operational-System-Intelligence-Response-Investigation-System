@@ -107,6 +107,7 @@ async fn synthetic_exec_chain_flows_end_to_end_through_agent_server_and_api() {
         enable_synthetic: true,
         synthetic_scenario: None,
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -289,6 +290,7 @@ async fn web_shell_drop_scenario_flows_end_to_end_and_triggers_detection() {
         enable_synthetic: true,
         synthetic_scenario: Some("web_shell_drop".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -556,6 +558,7 @@ async fn network_download_then_write_scenario_flows_end_to_end_through_every_pha
         enable_synthetic: true,
         synthetic_scenario: Some("network_download_then_write".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -775,6 +778,7 @@ async fn network_beacon_scenario_flows_end_to_end_and_triggers_detection() {
         enable_synthetic: true,
         synthetic_scenario: Some("network_beacon".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -1118,6 +1122,7 @@ async fn ssh_sudo_escalation_flows_end_to_end_and_triggers_detection() {
         enable_synthetic: true,
         synthetic_scenario: Some("ssh_sudo_escalation".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -1553,6 +1558,7 @@ async fn persistence_via_systemd_service_scenario_flows_end_to_end_and_triggers_
         enable_synthetic: true,
         synthetic_scenario: Some("persistence_via_systemd_service".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -1887,6 +1893,7 @@ async fn container_deploy_in_remote_session_scenario_flows_end_to_end_and_trigge
         enable_synthetic: true,
         synthetic_scenario: Some("container_deploy_in_remote_session".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -2162,6 +2169,7 @@ async fn phase_7a_investigation_evidence_hunting_flows_end_to_end_over_real_http
         enable_synthetic: true,
         synthetic_scenario: Some("network_download_then_write".to_string()),
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     let agent = Agent::start(agent_config, host, "e2e-boot".to_string())
@@ -2441,6 +2449,7 @@ async fn spawn_fleet_harness() -> FleetHarness {
         enable_synthetic: false,
         synthetic_scenario: None,
         spool_path: spool_path.to_string_lossy().to_string(),
+        spool_max_bytes: None,
         status_addr: "127.0.0.1:0".to_string(),
     };
     // The minimum the Agent accepts (Task 2 clamps to `.max(1)`) — keeps

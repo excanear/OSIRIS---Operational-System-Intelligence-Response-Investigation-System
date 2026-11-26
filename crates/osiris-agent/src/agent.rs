@@ -287,7 +287,8 @@ impl Agent {
 
         let metrics = Arc::new(MetricsRegistry::new());
         let (bus, receivers) = EventBus::new(metrics.clone());
-        let sink: Arc<dyn Sink> = Arc::new(SpoolFileSink::open(&config.spool_path).await?);
+        let sink: Arc<dyn Sink> =
+            Arc::new(SpoolFileSink::open_with(&config.spool_path, config.spool_max_bytes).await?);
         let drain_handle = tokio::spawn(run_drain_loop(
             receivers,
             sink,
@@ -591,6 +592,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// Event lines in a spool's contents: its header line (Phase 13a) is
+    /// not an event.
+    fn is_spool_header(line: &str) -> bool {
+        line.starts_with("{\"osiris_spool\":")
+    }
+
+    fn spool_event_count(contents: &str) -> usize {
+        contents.lines().filter(|l| !is_spool_header(l)).count()
+    }
+
     pub(crate) fn base_config(dir: &tempfile::TempDir) -> AgentConfig {
         AgentConfig {
             forward: None,
@@ -622,6 +633,7 @@ pub(crate) mod tests {
                 .join("spool.ndjson")
                 .to_string_lossy()
                 .to_string(),
+            spool_max_bytes: None,
             status_addr: "127.0.0.1:0".to_string(),
         }
     }
@@ -881,7 +893,7 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert_eq!(contents.lines().count(), 3);
+        assert_eq!(spool_event_count(&contents), 3);
         assert!(contents.contains("\"PROCESS_EXEC\""));
     }
 
@@ -972,7 +984,7 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert_eq!(contents.lines().count(), 7);
+        assert_eq!(spool_event_count(&contents), 7);
         assert!(contents.contains("\"PROCESS_EXEC\""));
         assert!(contents.contains("\"FILE_CREATE\""));
         assert!(contents.contains("\"FILE_WRITE\""));
@@ -995,7 +1007,7 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert_eq!(contents.lines().count(), 3);
+        assert_eq!(spool_event_count(&contents), 3);
     }
 
     #[tokio::test]
@@ -1059,7 +1071,7 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert_eq!(contents.lines().count(), 6);
+        assert_eq!(spool_event_count(&contents), 6);
         assert!(contents.contains("\"DNS_QUERY\""));
         assert!(contents.contains("\"NETWORK_CONNECT\""));
         assert!(contents.contains("\"NETWORK_CLOSE\""));
@@ -1081,7 +1093,7 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let contents = tokio::fs::read_to_string(&spool_path).await.unwrap();
-        assert_eq!(contents.lines().count(), 5);
+        assert_eq!(spool_event_count(&contents), 5);
         assert!(contents.contains("\"NETWORK_CONNECT\""));
         assert!(contents.contains("\"FILE_CREATE\""));
         assert!(contents.contains("203.0.113.90"));
@@ -1140,7 +1152,11 @@ pub(crate) mod tests {
         agent.shutdown().await;
 
         let spool = std::fs::read_to_string(dir.path().join("spool.ndjson")).unwrap();
-        let lines: Vec<&str> = spool.lines().filter(|l| !l.trim().is_empty()).collect();
+        let lines: Vec<&str> = spool
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| !is_spool_header(l))
+            .collect();
         assert_eq!(
             lines.len(),
             9,

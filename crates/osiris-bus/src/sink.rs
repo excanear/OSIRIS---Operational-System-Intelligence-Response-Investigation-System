@@ -31,20 +31,46 @@ pub trait Sink: Send + Sync {
 /// this is the entire Agent→Server "transport" for Phase 1. A tokio Mutex
 /// serializes concurrent `send` calls; each `send` returns only once its
 /// complete line (event + `\n`) has been written.
+///
+/// Phase 13a (spec §5.2b): a spool file this sink creates starts with a
+/// header line naming it (`osiris_fileutil::spool`), and with `max_bytes`
+/// set the sink rotates `<spool>` to `<spool>.1` before a line that would
+/// take it past the cap. Readers follow the rotation by the header id.
 pub struct SpoolFileSink {
     path: PathBuf,
-    lock: tokio::sync::Mutex<()>,
+    max_bytes: Option<u64>,
+    /// Held across each whole send, rotation included, so no append can
+    /// land between the rename and the new file's header.
+    state: tokio::sync::Mutex<SpoolState>,
+}
+
+/// What the sink knows about the current spool file without a stat per
+/// send. Only this sink writes the file, so it stays accurate.
+struct SpoolState {
+    /// Bytes in the file.
+    len: u64,
+    /// Bytes of the header line at its start (0 for a legacy file). The
+    /// file holds at least one event iff `len > header_len`.
+    header_len: u64,
 }
 
 impl SpoolFileSink {
-    /// Creates the spool file if it does not already exist (never
-    /// truncates an existing one — the Server may already be tailing it).
+    /// `open_with(path, None)`: a spool that never rotates.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SinkError> {
+        Self::open_with(path, None).await
+    }
+
+    /// Creates the spool file if it does not already exist, with a header
+    /// line if it is new or empty. Never truncates or rewrites an existing
+    /// file — the Server may already be tailing it — so a legacy spool
+    /// stays header-less until its first rotation. `max_bytes` caps each
+    /// spool file (`None` = never rotate).
+    pub async fn open_with(
+        path: impl Into<PathBuf>,
+        max_bytes: Option<u64>,
+    ) -> Result<Self, SinkError> {
         let path = path.into();
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        let state = ensure_header(&path)
             .await
             .map_err(|source| SinkError::Write {
                 path: path.clone(),
@@ -52,9 +78,50 @@ impl SpoolFileSink {
             })?;
         Ok(Self {
             path,
-            lock: tokio::sync::Mutex::new(()),
+            max_bytes,
+            state: tokio::sync::Mutex::new(state),
         })
     }
+
+    /// Renames the spool to `<spool>.1`, replacing an older `.1`, and starts
+    /// a new spool with a fresh header. Called with the state lock held.
+    async fn rotate(&self, state: &mut SpoolState) -> std::io::Result<()> {
+        let rotated = osiris_fileutil::spool::rotated_path(&self.path);
+        tokio::fs::rename(&self.path, &rotated).await?;
+        *state = ensure_header(&self.path).await?;
+        Ok(())
+    }
+}
+
+fn spool_open_options() -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.append(true);
+    #[cfg(unix)]
+    options.mode(0o640);
+    options
+}
+
+/// Opens (creating it if missing) the spool at `path`, writes a new header
+/// if the file is empty, and returns its state.
+async fn ensure_header(path: &std::path::Path) -> std::io::Result<SpoolState> {
+    let mut file = spool_open_options().create(true).open(path).await?;
+    let len = file.metadata().await?.len();
+    if len == 0 {
+        let header = osiris_fileutil::spool::header_line(&uuid::Uuid::now_v7().to_string());
+        file.write_all(header.as_bytes()).await?;
+        file.flush().await?;
+        let header_len = header.len() as u64;
+        return Ok(SpoolState {
+            len: header_len,
+            header_len,
+        });
+    }
+    drop(file);
+    let header_len = match osiris_fileutil::spool::read_spool_id(path)? {
+        Some(id) => osiris_fileutil::spool::header_line(&id).len() as u64,
+        None => 0,
+    };
+    Ok(SpoolState { len, header_len })
 }
 
 #[async_trait]
@@ -65,13 +132,29 @@ impl Sink for SpoolFileSink {
         // between an event and its newline.
         let mut line = serde_json::to_string(&event)?;
         line.push('\n');
+        let line_len = line.len() as u64;
         let write_err = |source| SinkError::Write {
             path: self.path.clone(),
             source,
         };
-        let _guard = self.lock.lock().await;
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
+        let mut state = self.state.lock().await;
+        if let Some(max) = self.max_bytes {
+            // A file holding no event yet is never rotated: a line larger
+            // than the cap still gets written, alone in its own file.
+            if state.len > state.header_len && state.len + line_len > max {
+                if let Err(e) = self.rotate(&mut state).await {
+                    // Keep the event: append it to whatever file is at the
+                    // path now (past the cap) rather than dropping it.
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %e,
+                        "spool rotation failed; appending past the size cap"
+                    );
+                    *state = ensure_header(&self.path).await.map_err(write_err)?;
+                }
+            }
+        }
+        let mut file = spool_open_options()
             .open(&self.path)
             .await
             .map_err(write_err)?;
@@ -81,6 +164,7 @@ impl Sink for SpoolFileSink {
         // Without this flush the previous send's bytes could land after the
         // next send's (Phase 10 real-Linux finding: two events on one line).
         file.flush().await.map_err(write_err)?;
+        state.len += line_len;
         Ok(())
     }
 }
@@ -124,6 +208,7 @@ impl Sink for InMemorySink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osiris_fileutil::spool;
     use osiris_schema::{Category, EventType, HostRef, Severity, Source, SCHEMA_VERSION};
     use uuid::Uuid;
 
@@ -180,8 +265,9 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2);
-        let parsed: CanonicalEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(lines.len(), 3, "header + two events");
+        assert!(spool::is_header_line(lines[0].as_bytes()));
+        let parsed: CanonicalEvent = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed.event_type, EventType::ProcessExec);
     }
 
@@ -198,7 +284,7 @@ mod tests {
             sink.send(sample_event()).await.unwrap();
         }
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
-        assert_eq!(contents.lines().count(), 2);
+        assert_eq!(contents.lines().count(), 3, "one header + two events");
     }
 
     /// Real-Linux finding (Phase 10, Ubuntu 24.04 agent spool): two events
@@ -230,6 +316,8 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.ends_with('\n'), "the last line must be complete");
         let lines: Vec<&str> = contents.split_terminator('\n').collect();
+        assert!(spool::is_header_line(lines[0].as_bytes()));
+        let lines = &lines[1..];
         for (i, line) in lines.iter().enumerate() {
             serde_json::from_str::<CanonicalEvent>(line).unwrap_or_else(|e| {
                 panic!("spool line {} is not one event ({e}): {line:.200}", i + 1)
@@ -248,7 +336,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.ndjson");
         let sink = SpoolFileSink::open(&path).await.unwrap();
-        let mut expected_len = 0u64;
+        let mut expected_len = std::fs::metadata(&path).unwrap().len();
+        assert!(expected_len > 0, "the header is on disk once open returns");
         for i in 0..200 {
             let event = sample_event();
             expected_len += serde_json::to_string(&event).unwrap().len() as u64 + 1;
@@ -258,6 +347,192 @@ mod tests {
                 on_disk, expected_len,
                 "after send #{i} returned, the spool holds {on_disk} bytes, expected {expected_len}"
             );
+        }
+    }
+
+    fn read_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn event_line(event: &CanonicalEvent) -> String {
+        let mut line = serde_json::to_string(event).unwrap();
+        line.push('\n');
+        line
+    }
+
+    fn header_id(line: &str) -> String {
+        assert!(
+            spool::is_header_line(line.as_bytes()),
+            "not a spool header: {line}"
+        );
+        line.trim_start_matches("{\"osiris_spool\":\"")
+            .trim_end_matches("\"}")
+            .to_owned()
+    }
+
+    fn header_len() -> u64 {
+        spool::header_line(&Uuid::now_v7().to_string()).len() as u64
+    }
+
+    #[tokio::test]
+    async fn new_spool_starts_with_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let sink = SpoolFileSink::open(&path).await.unwrap();
+        let id = spool::read_spool_id(&path)
+            .unwrap()
+            .expect("a new spool carries a header");
+        assert!(Uuid::parse_str(&id).is_ok(), "header id is a uuid: {id}");
+        sink.send(sample_event()).await.unwrap();
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(header_id(&lines[0]), id);
+        serde_json::from_str::<CanonicalEvent>(&lines[1]).unwrap();
+
+        // An existing but empty spool gets one too.
+        let empty = dir.path().join("empty.ndjson");
+        std::fs::write(&empty, "").unwrap();
+        SpoolFileSink::open(&empty).await.unwrap();
+        assert!(spool::read_spool_id(&empty).unwrap().is_some());
+
+        // Reopening keeps the header, and its id, as they are.
+        drop(sink);
+        SpoolFileSink::open(&path).await.unwrap();
+        let reopened = read_lines(&path);
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(header_id(&reopened[0]), id);
+    }
+
+    #[tokio::test]
+    async fn existing_legacy_spool_gets_no_header_prepended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let legacy = event_line(&sample_event());
+        std::fs::write(&path, &legacy).unwrap();
+        let sink = SpoolFileSink::open_with(&path, Some(1 << 20))
+            .await
+            .unwrap();
+        let second = sample_event();
+        sink.send(second.clone()).await.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, format!("{legacy}{}", event_line(&second)));
+        assert_eq!(spool::read_spool_id(&path).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rotates_when_next_line_would_exceed_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let rotated = spool::rotated_path(&path);
+        let events: Vec<CanonicalEvent> = (0..3).map(|_| sample_event()).collect();
+        let line_len = event_line(&events[0]).len() as u64;
+        let sink = SpoolFileSink::open_with(&path, Some(header_len() + 2 * line_len))
+            .await
+            .unwrap();
+        let first_id = spool::read_spool_id(&path).unwrap().unwrap();
+        sink.send(events[0].clone()).await.unwrap();
+        sink.send(events[1].clone()).await.unwrap();
+        assert!(!rotated.exists(), "exactly at the cap must not rotate");
+        sink.send(events[2].clone()).await.unwrap();
+
+        let old = read_lines(&rotated);
+        assert_eq!(old.len(), 3);
+        assert_eq!(header_id(&old[0]), first_id);
+        assert_eq!(format!("{}\n", old[1]), event_line(&events[0]));
+        assert_eq!(format!("{}\n", old[2]), event_line(&events[1]));
+
+        let new = read_lines(&path);
+        assert_eq!(new.len(), 2);
+        assert_ne!(header_id(&new[0]), first_id, "rotation starts a new id");
+        assert_eq!(format!("{}\n", new[1]), event_line(&events[2]));
+    }
+
+    #[tokio::test]
+    async fn rotation_replaces_previous_dot1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let rotated = spool::rotated_path(&path);
+        let events: Vec<CanonicalEvent> = (0..3).map(|_| sample_event()).collect();
+        let line_len = event_line(&events[0]).len() as u64;
+        let sink = SpoolFileSink::open_with(&path, Some(header_len() + line_len))
+            .await
+            .unwrap();
+        sink.send(events[0].clone()).await.unwrap();
+        sink.send(events[1].clone()).await.unwrap();
+        let second_id = spool::read_spool_id(&path).unwrap().unwrap();
+        sink.send(events[2].clone()).await.unwrap();
+
+        let old = read_lines(&rotated);
+        assert_eq!(old.len(), 2, "the older .1 was replaced, not appended to");
+        assert_eq!(header_id(&old[0]), second_id);
+        assert_eq!(format!("{}\n", old[1]), event_line(&events[1]));
+        let new = read_lines(&path);
+        assert_eq!(new.len(), 2);
+        assert_eq!(format!("{}\n", new[1]), event_line(&events[2]));
+    }
+
+    /// Concurrent senders across one rotation: every event lands exactly
+    /// once, whole, in `.1` or the new spool, and each file has one header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_senders_across_a_rotation_lose_and_split_nothing() {
+        const TASKS: usize = 16;
+        const PER_TASK: usize = 10;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let line_len = event_line(&sample_event()).len() as u64;
+        let cap = header_len() + 100 * line_len;
+        let sink = Arc::new(SpoolFileSink::open_with(&path, Some(cap)).await.unwrap());
+        let handles: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let mut ids = Vec::new();
+                    for _ in 0..PER_TASK {
+                        let event = sample_event();
+                        ids.push(event.event_id);
+                        sink.send(event).await.unwrap();
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let mut sent = std::collections::HashSet::new();
+        for handle in handles {
+            sent.extend(handle.await.unwrap());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut per_file = Vec::new();
+        for p in [spool::rotated_path(&path), path.clone()] {
+            let lines = read_lines(&p);
+            header_id(&lines[0]);
+            for line in &lines[1..] {
+                let event: CanonicalEvent = serde_json::from_str(line).unwrap();
+                assert!(seen.insert(event.event_id), "duplicate event");
+            }
+            assert!(std::fs::metadata(&p).unwrap().len() <= cap);
+            per_file.push(lines.len() - 1);
+        }
+        assert_eq!(per_file, vec![100, TASKS * PER_TASK - 100]);
+        assert_eq!(seen, sent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spool_files_are_0640() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.ndjson");
+        let sink = SpoolFileSink::open_with(&path, Some(1)).await.unwrap();
+        sink.send(sample_event()).await.unwrap();
+        sink.send(sample_event()).await.unwrap();
+        for p in [path.clone(), spool::rotated_path(&path)] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "{}", p.display());
         }
     }
 

@@ -13,7 +13,8 @@ tracing = { workspace = true }
 osiris-schema = { path = "../osiris-schema" }
 osiris-pipeline = { path = "../osiris-pipeline" }
 osiris-selftelemetry = { path = "../osiris-selftelemetry" }
+osiris-fileutil = { path = "../osiris-fileutil" }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-uuid = { workspace = true }
